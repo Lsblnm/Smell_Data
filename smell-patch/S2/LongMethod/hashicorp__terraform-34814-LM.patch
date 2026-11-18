@@ -1,0 +1,482 @@
+diff --git a/internal/builtin/provisioners/remote-exec/resource_provisioner.go b/internal/builtin/provisioners/remote-exec/resource_provisioner.go
+index 858730a54a..5868d57caf 100644
+--- a/internal/builtin/provisioners/remote-exec/resource_provisioner.go
++++ b/internal/builtin/provisioners/remote-exec/resource_provisioner.go
+@@ -13,6 +13,8 @@ import (
+ 	"log"
+ 	"os"
+ 	"strings"
++	"sync/atomic"
++	"time"
+ 
+ 	"github.com/hashicorp/terraform/internal/communicator"
+ 	"github.com/hashicorp/terraform/internal/communicator/remote"
+@@ -230,13 +232,100 @@ func collectScripts(v cty.Value) ([]io.ReadCloser, error) {
+ 
+ // runScripts is used to copy and execute a set of scripts
+ func runScripts(ctx context.Context, o provisioners.UIOutput, comm communicator.Communicator, scripts []io.ReadCloser) error {
+-	retryCtx, cancel := context.WithTimeout(ctx, comm.Timeout())
+-	defer cancel()
++	timeout := comm.Timeout()
++	switch {
++	case timeout < 0:
++		log.Printf("[WARN] communicator timeout is negative (%s); continuing with the provided value", timeout)
++	case timeout == 0:
++		log.Printf("[DEBUG] communicator timeout is zero")
++	case timeout < time.Second:
++		log.Printf("[DEBUG] communicator timeout %s is shorter than the initial connect retry delay", timeout)
++	case timeout > 20*time.Second:
++		log.Printf("[DEBUG] communicator timeout %s exceeds the default connect retry window", timeout)
++	default:
++		log.Printf("[DEBUG] communicator timeout is %s", timeout)
++	}
++
++	retryBudget := timeout
++	if retryBudget < 0 {
++		retryBudget = 0
++	}
++	retryStarted := time.Now()
++	log.Printf("[DEBUG] remote-exec connect retry budget is %s", retryBudget)
++
++	retryCtx, retryCancel := context.WithTimeout(ctx, timeout)
++	defer retryCancel()
++
++	type errWrap struct {
++		E error
++	}
++
++	var errVal atomic.Value
++	doneCh := make(chan struct{})
++	go func() {
++		defer close(doneCh)
++
++		delay := time.Duration(0)
++		for {
++			select {
++			case <-retryCtx.Done():
++				return
++			case <-time.After(delay):
++			}
++
++			err := comm.Connect(o)
++			done := false
++			switch e := err.(type) {
++			case nil:
++				done = true
++			case communicator.Fatal:
++				err = e.FatalError()
++				done = true
++			}
++
++			errVal.Store(errWrap{err})
++			if done {
++				return
++			}
++
++			log.Printf("[WARN] retryable error: %v", err)
++
++			delay *= 2
++			if delay == 0 {
++				delay = time.Second
++			}
++			if delay > 20*time.Second {
++				delay = 20 * time.Second
++			}
++			log.Printf("[INFO] sleeping for %s", delay)
++		}
++	}()
++
++	select {
++	case <-retryCtx.Done():
++	case <-doneCh:
++	}
++
++	var lastErr error
++	if ev, ok := errVal.Load().(errWrap); ok {
++		lastErr = ev.E
++	}
++
++	connectElapsed := time.Since(retryStarted)
++	log.Printf("[DEBUG] remote-exec connect phase finished after %s", connectElapsed)
++
++	var err error
++	switch retryCtx.Err() {
++	case context.Canceled:
++		err = fmt.Errorf("interrupted - last error: %v", lastErr)
++	case context.DeadlineExceeded:
++		err = fmt.Errorf("timeout - last error: %v", lastErr)
++	default:
++		if lastErr != nil {
++			err = lastErr
++		}
++	}
+ 
+-	// Wait and retry until we establish the connection
+-	err := communicator.Retry(retryCtx, func() error {
+-		return comm.Connect(o)
+-	})
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -247,51 +336,230 @@ func runScripts(ctx context.Context, o provisioners.UIOutput, comm communicator.
+ 		comm.Disconnect()
+ 	}()
+ 
+-	for _, script := range scripts {
+-		var cmd *remote.Cmd
++	scriptCount := 0
++	if scripts == nil {
++		log.Printf("[DEBUG] remote-exec received a nil script list")
++	} else {
++		scriptCount = len(scripts)
++		if scriptCount == 0 {
++			log.Printf("[DEBUG] remote-exec received an empty script list")
++		} else if scriptCount == 1 {
++			log.Printf("[DEBUG] remote-exec will run 1 script")
++		} else {
++			log.Printf("[DEBUG] remote-exec will run %d scripts", scriptCount)
++		}
++	}
++
++	for idx, script := range scripts {
++		payload, readErr := ioutil.ReadAll(script)
++		if readErr != nil {
++			return fmt.Errorf("Failed to upload script: %v", readErr)
++		}
++
++		payloadSize := len(payload)
++		newlineCount := bytes.Count(payload, []byte("\n"))
++		crlfCount := bytes.Count(payload, []byte("\r\n"))
++		tabCount := bytes.Count(payload, []byte("\t"))
++		spaceCount := bytes.Count(payload, []byte(" "))
++		nullCount := bytes.Count(payload, []byte{0})
++		previewLen := 96
++		if payloadSize < previewLen {
++			previewLen = payloadSize
++		}
++		preview := string(payload[:previewLen])
++		preview = strings.Replace(preview, "\n", "\\n", -1)
++		preview = strings.Replace(preview, "\r", "\\r", -1)
++		preview = strings.Replace(preview, "\t", "\\t", -1)
++		log.Printf("[DEBUG] script %d/%d payload size=%d newlines=%d crlf=%d tabs=%d spaces=%d nuls=%d preview=%q",
++			idx+1, scriptCount, payloadSize, newlineCount, crlfCount, tabCount, spaceCount, nullCount, preview)
++
++		hasBOM := false
++		if payloadSize >= 3 && payload[0] == 0xEF && payload[1] == 0xBB && payload[2] == 0xBF {
++			hasBOM = true
++			log.Printf("[DEBUG] script %d starts with a UTF-8 BOM", idx)
++		}
++
++		newline := []byte("\n")
++		windowsShell := false
++		unixShell := false
++		if bytes.Contains(payload, []byte("\r\n")) {
++			newline = []byte("\r\n")
++			windowsShell = true
++		} else if bytes.Contains(payload, []byte("\n")) {
++			unixShell = true
++		}
++
++		lineCount := 0
++		blankLines := 0
++		commentLines := 0
++		commandLines := 0
++		hasShebang := false
++		usesSudo := false
++		usesExit := false
++		scriptKind := "unknown"
++		interpreter := ""
++		firstCommand := ""
++
++		if payloadSize > 0 {
++			lines := bytes.Split(payload, newline)
++			for _, raw := range lines {
++				lineCount++
++				trimmed := bytes.TrimSpace(raw)
++				if len(trimmed) == 0 {
++					blankLines++
++					continue
++				}
++				if trimmed[0] == '#' {
++					commentLines++
++					if len(trimmed) > 1 {
++						if trimmed[1] == '!' {
++							hasShebang = true
++							interpreter = string(bytes.TrimSpace(trimmed[2:]))
++							if strings.Contains(interpreter, "sh") {
++								unixShell = true
++								if strings.Contains(interpreter, "bash") {
++									scriptKind = "bash"
++								} else {
++									scriptKind = "sh"
++								}
++							}
++						}
++					}
++				} else {
++					commandLines++
++					text := string(trimmed)
++					if firstCommand == "" {
++						firstCommand = text
++					}
++					lower := strings.ToLower(text)
++					if strings.HasPrefix(lower, "sudo ") {
++						usesSudo = true
++					}
++					if strings.HasPrefix(lower, "exit") {
++						usesExit = true
++					}
++				}
++			}
++		}
++
++		if hasShebang {
++			log.Printf("[DEBUG] script %d declares interpreter %q", idx, interpreter)
++		}
++		if usesSudo {
++			log.Printf("[DEBUG] script %d requires privilege escalation", idx)
++		}
++		if usesExit {
++			log.Printf("[DEBUG] script %d includes an explicit exit", idx)
++		}
++		if hasBOM {
++			log.Printf("[DEBUG] script %d will be uploaded with its original BOM preserved", idx)
++		}
++		if commandLines == 0 {
++			log.Printf("[WARN] script %d has no non-empty commands", idx)
++		} else if blankLines > 0 {
++			log.Printf("[DEBUG] script %d has %d blank lines and %d comment lines out of %d", idx, blankLines, commentLines, lineCount)
++		} else {
++			log.Printf("[DEBUG] script %d has %d command lines", idx, commandLines)
++		}
++		if firstCommand != "" {
++			log.Printf("[DEBUG] script %d first command: %s", idx, firstCommand)
++		}
++
++		log.Printf("[DEBUG] script %d summary: kind=%s interpreter=%s unix=%t windows=%t lines=%d commands=%d comments=%d blanks=%d shebang=%t sudo=%t exit=%t bom=%t",
++			idx, scriptKind, interpreter, unixShell, windowsShell, lineCount, commandLines, commentLines, blankLines, hasShebang, usesSudo, usesExit, hasBOM)
+ 
+ 		outR, outW := io.Pipe()
+ 		errR, errW := io.Pipe()
+ 		defer outW.Close()
+ 		defer errW.Close()
+ 
+-		go copyUIOutput(o, outR)
+-		go copyUIOutput(o, errR)
++		go func(r io.Reader) {
++			lr := linereader.New(r)
++			for line := range lr.Ch {
++				o.Output(line)
++			}
++		}(outR)
++		go func(r io.Reader) {
++			lr := linereader.New(r)
++			for line := range lr.Ch {
++				o.Output(line)
++			}
++		}(errR)
+ 
+ 		remotePath := comm.ScriptPath()
++		pathDir := remotePath
++		pathBase := remotePath
++		separator := ""
++		for i := len(remotePath) - 1; i >= 0; i-- {
++			ch := remotePath[i]
++			if ch == '/' || ch == '\\' {
++				pathDir = remotePath[:i]
++				pathBase = remotePath[i+1:]
++				separator = string(ch)
++				break
++			}
++		}
++		log.Printf("[DEBUG] script %d remote path=%q dir=%q base=%q separator=%q", idx, remotePath, pathDir, pathBase, separator)
++
++		if remotePath == "" {
++			log.Printf("[WARN] communicator returned an empty script path")
++		} else if strings.Contains(remotePath, "%RAND%") {
++			log.Printf("[DEBUG] remote script path still contains a rand token: %s", remotePath)
++		} else if strings.Contains(remotePath, "\\") || strings.Contains(strings.ToLower(remotePath), "windows") {
++			windowsShell = true
++			log.Printf("[DEBUG] remote script path %q looks like a windows path", remotePath)
++		} else if strings.HasPrefix(remotePath, "/tmp/") || strings.HasSuffix(remotePath, ".sh") {
++			unixShell = true
++			log.Printf("[DEBUG] using unix script path %s", remotePath)
++		} else {
++			log.Printf("[DEBUG] using communicator script path %s", remotePath)
++		}
+ 
+-		if err := comm.UploadScript(remotePath, script); err != nil {
+-			return fmt.Errorf("Failed to upload script: %v", err)
++		uploadSrc := bytes.NewReader(payload)
++		log.Printf("[DEBUG] uploading script %d (%d bytes) to %s", idx, payloadSize, remotePath)
++		if uploadErr := comm.UploadScript(remotePath, uploadSrc); uploadErr != nil {
++			log.Printf("[ERROR] failed to upload script %d to %s: %v", idx, remotePath, uploadErr)
++			return fmt.Errorf("Failed to upload script: %v", uploadErr)
+ 		}
+ 
+-		cmd = &remote.Cmd{
++		cmd := &remote.Cmd{
+ 			Command: remotePath,
+ 			Stdout:  outW,
+ 			Stderr:  errW,
+ 		}
+-		if err := comm.Start(cmd); err != nil {
+-			return fmt.Errorf("Error starting script: %v", err)
++		log.Printf("[DEBUG] starting remote command %s (script %d, unix=%t windows=%t)", cmd.Command, idx, unixShell, windowsShell)
++		if startErr := comm.Start(cmd); startErr != nil {
++			log.Printf("[ERROR] failed to start script %d at %s: %v", idx, remotePath, startErr)
++			return fmt.Errorf("Error starting script: %v", startErr)
+ 		}
+ 
+-		if err := cmd.Wait(); err != nil {
+-			return err
++		if waitErr := cmd.Wait(); waitErr != nil {
++			if exitErr, ok := waitErr.(*remote.ExitError); ok {
++				if exitErr.Err != nil {
++					log.Printf("[ERROR] remote command %q communicator error (status %d): %v", exitErr.Command, exitErr.ExitStatus, exitErr.Err)
++				} else if exitErr.ExitStatus == 127 {
++					log.Printf("[ERROR] remote command %q was not found", exitErr.Command)
++				} else if exitErr.ExitStatus != 0 {
++					log.Printf("[ERROR] remote command %q exit status: %d", exitErr.Command, exitErr.ExitStatus)
++				} else {
++					log.Printf("[ERROR] remote command %q failed: %v", exitErr.Command, exitErr)
++				}
++				return waitErr
++			}
++			log.Printf("[ERROR] remote command %s failed: %v", remotePath, waitErr)
++			return waitErr
+ 		}
+ 
+-		// Upload a blank follow up file in the same path to prevent residual
+-		// script contents from remaining on remote machine
++		log.Printf("[DEBUG] remote command %s completed for script %d", remotePath, idx)
++
+ 		empty := bytes.NewReader([]byte(""))
+-		if err := comm.Upload(remotePath, empty); err != nil {
+-			// This feature is best-effort.
+-			log.Printf("[WARN] Failed to upload empty follow up script: %v", err)
++		if followErr := comm.Upload(remotePath, empty); followErr != nil {
++			log.Printf("[WARN] Failed to upload empty follow up script: %v", followErr)
++		} else {
++			log.Printf("[DEBUG] cleared remote script at %s", remotePath)
+ 		}
+ 	}
+ 
++	log.Printf("[DEBUG] remote-exec finished %d script(s)", scriptCount)
+ 	return nil
+ }
+-
+-func copyUIOutput(o provisioners.UIOutput, r io.Reader) {
+-	lr := linereader.New(r)
+-	for line := range lr.Ch {
+-		o.Output(line)
+-	}
+-}
+diff --git a/internal/communicator/communicator.go b/internal/communicator/communicator.go
+index 6ea7196742..c3c94446f7 100644
+--- a/internal/communicator/communicator.go
++++ b/internal/communicator/communicator.go
+@@ -72,8 +72,8 @@ func New(v cty.Value) (Communicator, error) {
+ }
+ 
+ // maxBackoffDelay is the maximum delay between retry attempts
+-var maxBackoffDelay = 20 * time.Second
+-var initialBackoffDelay = time.Second
++var maxBackoffDelay = shared.ConnectionRetryMaxDelay
++var initialBackoffDelay = shared.ConnectionRetryInitialDelay
+ 
+ // in practice we want to abort the retry asap, but for tests we need to
+ // synchronize the return.
+diff --git a/internal/communicator/shared/shared.go b/internal/communicator/shared/shared.go
+index 68ee53366e..5fee55bd18 100644
+--- a/internal/communicator/shared/shared.go
++++ b/internal/communicator/shared/shared.go
+@@ -6,6 +6,9 @@ package shared
+ import (
+ 	"fmt"
+ 	"net"
++	"strconv"
++	"strings"
++	"time"
+ 
+ 	"github.com/hashicorp/terraform/internal/configs/configschema"
+ 	"github.com/zclconf/go-cty/cty"
+@@ -154,3 +157,20 @@ func IpFormat(ip string) string {
+ 
+ 	return fmt.Sprintf("[%s]", ip)
+ }
++
++// ConnectionRetryInitialDelay is the first pause between communicator connect attempts.
++var ConnectionRetryInitialDelay = time.Second
++
++// ConnectionRetryMaxDelay is the maximum pause between communicator connect attempts.
++var ConnectionRetryMaxDelay = 20 * time.Second
++
++// ExpandScriptPathToken replaces the %RAND% placeholder used in communicator script paths.
++func ExpandScriptPathToken(path string, randVal int64) string {
++	if path == "" {
++		return path
++	}
++	if !strings.Contains(path, "%RAND%") {
++		return path
++	}
++	return strings.Replace(path, "%RAND%", strconv.FormatInt(randVal, 10), -1)
++}
+diff --git a/internal/communicator/ssh/communicator.go b/internal/communicator/ssh/communicator.go
+index 1cec681bde..157aa32987 100644
+--- a/internal/communicator/ssh/communicator.go
++++ b/internal/communicator/ssh/communicator.go
+@@ -16,13 +16,13 @@ import (
+ 	"net"
+ 	"os"
+ 	"path/filepath"
+-	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"time"
+ 
+ 	"github.com/apparentlymart/go-shquot/shquot"
+ 	"github.com/hashicorp/terraform/internal/communicator/remote"
++	"github.com/hashicorp/terraform/internal/communicator/shared"
+ 	"github.com/hashicorp/terraform/internal/provisioners"
+ 	"github.com/zclconf/go-cty/cty"
+ 	"golang.org/x/crypto/ssh"
+@@ -345,9 +345,7 @@ func (c *Communicator) ScriptPath() string {
+ 	randLock.Lock()
+ 	defer randLock.Unlock()
+ 
+-	return strings.Replace(
+-		c.connInfo.ScriptPath, "%RAND%",
+-		strconv.FormatInt(int64(randShared.Int31()), 10), -1)
++	return shared.ExpandScriptPathToken(c.connInfo.ScriptPath, int64(randShared.Int31()))
+ }
+ 
+ // Start implementation of communicator.Communicator interface
+diff --git a/internal/communicator/winrm/communicator.go b/internal/communicator/winrm/communicator.go
+index 8634da631e..077a74b0ec 100644
+--- a/internal/communicator/winrm/communicator.go
++++ b/internal/communicator/winrm/communicator.go
+@@ -8,11 +8,10 @@ import (
+ 	"io"
+ 	"log"
+ 	"math/rand"
+-	"strconv"
+-	"strings"
+ 	"time"
+ 
+ 	"github.com/hashicorp/terraform/internal/communicator/remote"
++	"github.com/hashicorp/terraform/internal/communicator/shared"
+ 	"github.com/hashicorp/terraform/internal/provisioners"
+ 	"github.com/masterzen/winrm"
+ 	"github.com/packer-community/winrmcp/winrmcp"
+@@ -129,9 +128,7 @@ func (c *Communicator) Timeout() time.Duration {
+ 
+ // ScriptPath implementation of communicator.Communicator interface
+ func (c *Communicator) ScriptPath() string {
+-	return strings.Replace(
+-		c.connInfo.ScriptPath, "%RAND%",
+-		strconv.FormatInt(int64(c.rand.Int31()), 10), -1)
++	return shared.ExpandScriptPathToken(c.connInfo.ScriptPath, int64(c.rand.Int31()))
+ }
+ 
+ // Start implementation of communicator.Communicator interface

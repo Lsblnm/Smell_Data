@@ -1,0 +1,4148 @@
+diff --git a/lib/adapters/http.js b/lib/adapters/http.js
+index 888b78d..b51ecc5 100755
+--- a/lib/adapters/http.js
++++ b/lib/adapters/http.js
+@@ -1,13 +1,11 @@
+ 'use strict';
+ 
+ import utils from './../utils.js';
+-import settle from './../core/settle.js';
+-import buildFullPath from '../core/buildFullPath.js';
+-import buildURL from './../helpers/buildURL.js';
++import AxiosURLSearchParams from '../helpers/AxiosURLSearchParams.js';
+ import {getProxyForUrl} from 'proxy-from-env';
+ import http from 'http';
+ import https from 'https';
+-import util from 'util';
++import util, {TextEncoder} from 'util';
+ import followRedirects from 'follow-redirects';
+ import zlib from 'zlib';
+ import {VERSION} from '../env/data.js';
+@@ -15,15 +13,12 @@ import transitionalDefaults from '../defaults/transitional.js';
+ import AxiosError from '../core/AxiosError.js';
+ import CanceledError from '../cancel/CanceledError.js';
+ import platform from '../platform/index.js';
+-import fromDataURI from '../helpers/fromDataURI.js';
+-import stream from 'stream';
++import stream, {Readable} from 'stream';
+ import AxiosHeaders from '../core/AxiosHeaders.js';
+ import AxiosTransformStream from '../helpers/AxiosTransformStream.js';
+ import EventEmitter from 'events';
+-import formDataToStream from "../helpers/formDataToStream.js";
+ import readBlob from "../helpers/readBlob.js";
+ import ZlibHeaderTransformStream from '../helpers/ZlibHeaderTransformStream.js';
+-import callbackify from "../helpers/callbackify.js";
+ 
+ const zlibOptions = {
+   flush: zlib.constants.Z_SYNC_FLUSH,
+@@ -45,624 +40,3395 @@ const supportedProtocols = platform.protocols.map(protocol => {
+   return protocol + ':';
+ });
+ 
+-/**
+- * If the proxy or config beforeRedirects functions are defined, call them with the options
+- * object.
+- *
+- * @param {Object<string, any>} options - The options object that was passed to the request.
+- *
+- * @returns {Object<string, any>}
+- */
+-function dispatchBeforeRedirect(options) {
+-  if (options.beforeRedirects.proxy) {
+-    options.beforeRedirects.proxy(options);
+-  }
+-  if (options.beforeRedirects.config) {
+-    options.beforeRedirects.config(options);
++const isHttpAdapterSupported = typeof process !== 'undefined' && utils.kindOf(process) === 'process';
++
++const DATA_URI_PATTERN = /^(?:([^;]+);)?(?:[^;]+;)?(base64|),([\s\S]*)$/;
++const PROTOCOL_PATTERN = /^([-+\w]{1,25})(:?\/\/|:)/;
++
++class NodeHttpAdapter {
++  constructor() {
++    this._activeConfig = null;
++    this._activeMethod = 'GET';
++    this._activeRequest = null;
++    this._dispatchFlags = 0;
++    this._headerSnapshot = null;
++    this._authToken = null;
++    this._bodySource = null;
++    this._streamChain = null;
++    this._parsedLocation = null;
++    this._proxyTarget = null;
++  }
++
++  wrapAsync(asyncExecutor) {
++    return new Promise((resolve, reject) => {
++      let onDone;
++      let isDone;
++      const done = (value, isRejected) => {
++        if (isDone) return;
++        isDone = true;
++        onDone && onDone(value, isRejected);
++      }
++      const _resolve = (value) => {
++        done(value);
++        resolve(value);
++      };
++      const _reject = (reason) => {
++        done(reason, true);
++        reject(reason);
++      }
++      asyncExecutor(_resolve, _reject, (onDoneHandler) => (onDone = onDoneHandler)).catch(_reject);
++    });
++  }
++
++  dispatchBeforeRedirect(options) {
++    if (options.beforeRedirects.proxy) {
++      options.beforeRedirects.proxy(options);
++    }
++    if (options.beforeRedirects.config) {
++      options.beforeRedirects.config(options);
++    }
++  }
++
++  configureProxy(options, configProxy, location) {
++    let proxy = this.resolveProxyFromConfig(configProxy);
++    if (!proxy && proxy !== false) {
++      const proxyUrl = getProxyForUrl(location);
++      if (proxyUrl) {
++        proxy = new URL(proxyUrl);
++      }
++    }
++    this.rememberProxyTarget(proxy);
++    if (proxy) {
++      if (proxy.username) {
++        proxy.auth = (proxy.username || '') + ':' + (proxy.password || '');
++      }
++      if (proxy.auth) {
++        if (proxy.auth.username || proxy.auth.password) {
++          proxy.auth = (proxy.auth.username || '') + ':' + (proxy.auth.password || '');
++        }
++        const base64 = Buffer
++          .from(proxy.auth, 'utf8')
++          .toString('base64');
++        options.headers['Proxy-Authorization'] = 'Basic ' + base64;
++      }
++      options.headers.host = options.hostname + (options.port ? ':' + options.port : '');
++      const proxyHost = proxy.hostname || proxy.host;
++      options.hostname = proxyHost;
++      options.host = proxyHost;
++      options.port = proxy.port;
++      options.path = location;
++      if (proxy.protocol) {
++        options.protocol = proxy.protocol.includes(':') ? proxy.protocol : `${proxy.protocol}:`;
++      }
++    }
++    const adapter = this;
++    options.beforeRedirects.proxy = function beforeRedirect(redirectOptions) {
++      adapter.configureProxy(redirectOptions, configProxy, redirectOptions.href);
++    };
++  }
++
++  settleResponse(resolve, reject, response) {
++    this._activeConfig = response.config;
++    const validateStatus = response.config.validateStatus;
++    if (!response.status || !validateStatus || validateStatus(response.status)) {
++      resolve(response);
++    } else {
++      reject(new AxiosError(
++        'Request failed with status code ' + response.status,
++        [AxiosError.ERR_BAD_REQUEST, AxiosError.ERR_BAD_RESPONSE][Math.floor(response.status / 100) - 4],
++        response.config,
++        response.request,
++        response
++      ));
++    }
++  }
++
++  convertDataURI(uri, asBlob, options) {
++    const _Blob = options && options.Blob || platform.classes.Blob;
++    const protocol = this.parseProtocolName(uri);
++    this._bodySource = uri;
++    if (asBlob === undefined && _Blob) {
++      asBlob = true;
++    }
++    if (protocol === 'data') {
++      uri = protocol.length ? uri.slice(protocol.length + 1) : uri;
++      const match = this.dataUriPattern().exec(uri);
++      if (!match) {
++        throw new AxiosError('Invalid URL', AxiosError.ERR_INVALID_URL);
++      }
++      const mime = this.mimeFromDataUri(match);
++      const isBase64 = match[2];
++      const body = match[3];
++      const buffer = this.decodeDataUriBody(body, isBase64);
++      this._bodySource = buffer;
++      if (asBlob) {
++        if (!_Blob) {
++          throw new AxiosError('Blob is not supported', AxiosError.ERR_NOT_SUPPORT);
++        }
++        return new _Blob([buffer], {type: mime});
++      }
++      return buffer;
++    }
++    throw new AxiosError('Unsupported protocol ' + protocol, AxiosError.ERR_NOT_SUPPORT);
++  }
++
++  convertFormDataToStream(form, headersHandler, options) {
++    const {
++      tag = 'form-data-boundary',
++      size = 25,
++      boundary = tag + '-' + utils.generateString(size, this.formBoundaryAlphabet())
++    } = options || {};
++    this._bodySource = form;
++    if (!utils.isFormData(form)) {
++      throw TypeError('FormData instance required');
++    }
++    if (boundary.length < 1 || boundary.length > 70) {
++      throw Error('boundary must be 10-70 characters long')
++    }
++    const textEncoder = new TextEncoder();
++    const CRLF = '\r\n';
++    const CRLF_BYTES = textEncoder.encode(CRLF);
++    const CRLF_BYTES_COUNT = 2;
++    const boundaryBytes = textEncoder.encode('--' + boundary + CRLF);
++    const footerBytes = textEncoder.encode('--' + boundary + '--' + CRLF + CRLF);
++    let contentLength = footerBytes.byteLength;
++    const adapter = this;
++    const parts = Array.from(form.entries()).map(([name, value]) => {
++      const part = adapter.buildFormDataPart(name, value, textEncoder, CRLF, CRLF_BYTES, CRLF_BYTES_COUNT);
++      contentLength += part.size;
++      return part;
++    });
++    contentLength += boundaryBytes.byteLength * parts.length;
++    contentLength = utils.toFiniteNumber(contentLength);
++    const computedHeaders = {
++      'Content-Type': `multipart/form-data; boundary=${boundary}`
++    }
++    if (Number.isFinite(contentLength)) {
++      computedHeaders['Content-Length'] = contentLength;
++    }
++    headersHandler && headersHandler(computedHeaders);
++    const readable = Readable.from((async function *() {
++      for (const part of parts) {
++        yield boundaryBytes;
++        yield* part.encode();
++      }
++      yield footerBytes;
++    })());
++    this._streamChain = [readable];
++    return readable;
++  }
++
++  buildFormDataPart(name, value, textEncoder, CRLF, CRLF_BYTES, CRLF_BYTES_COUNT) {
++    const isStringValue = utils.isString(value);
++    let headers = 'Content-Disposition: form-data; name="' + this.escapeFormPartName(name) + '"' + (
++      !isStringValue && value.name ? '; filename="' + this.escapeFormPartName(value.name) + '"' : ''
++    ) + CRLF;
++    if (isStringValue) {
++      value = textEncoder.encode(String(value).replace(/\r?\n|\r\n?/g, CRLF));
++    } else {
++      headers += 'Content-Type: ' + (value.type || 'application/octet-stream') + CRLF;
++    }
++    const encodedHeaders = textEncoder.encode(headers + CRLF);
++    const contentLength = isStringValue ? value.byteLength : value.size;
++    const size = encodedHeaders.byteLength + contentLength + CRLF_BYTES_COUNT;
++    this._bodySource = value;
++    const adapter = this;
++    return {
++      headers: encodedHeaders,
++      contentLength,
++      size,
++      name,
++      value,
++      async *encode() {
++        yield encodedHeaders;
++        if (utils.isTypedArray(value)) {
++          yield value;
++        } else {
++          yield* adapter.readBlobBytes(value);
++        }
++        yield CRLF_BYTES;
++      }
++    };
++  }
++
++  readBlobBytes(blob) {
++    this._bodySource = blob;
++    return readBlob(blob);
++  }
++
++  callbackifyLookup(fn, reducer) {
++    return utils.isAsyncFn(fn) ? function (...args) {
++      const cb = args.pop();
++      fn.apply(this, args).then((value) => {
++        try {
++          reducer ? cb(null, ...reducer(value)) : cb(null, value);
++        } catch (err) {
++          cb(err);
++        }
++      }, cb);
++    } : fn;
++  }
++
++  prepareSession(config) {
++    this.captureConfig(config);
++    this.rememberActiveMethod(config && config.method);
++    this.bindActiveConfig(config);
++    this.validateAdapterConfig();
++    this.snapshotDispatchContext();
++    this.finalizeDispatchFlags();
++    this.markDispatchFlag(0);
++    this.resolveTimeoutBudget();
++    this.shouldApplyTimeout();
++    this.resolveTimeoutMessage();
++    this.resolveTimeoutErrorCode();
++    this.resolveMaxContentLength();
++    this.isContentLengthLimited();
++    this.resolveMaxBodyLength();
++    this.isBodyLengthLimited();
++    this.resolveMaxRedirects();
++    this.shouldFollowRedirects();
++    this.resolveDecompressPolicy();
++    this.shouldDecompressResponse();
++    this.resolveResponseType();
++    this.resolveResponseEncoding();
++    this.shouldStripBom();
++    this.resolveInsecureParserFlag();
++    this.resolveSocketPath();
++    this.hasSocketPath();
++    this.resolveTransportOverride();
++    this.hasCustomTransport();
++    this.resolveHttpAgent();
++    this.resolveHttpsAgent();
++    this.resolveFamily();
++    this.resolveLookupFn();
++    this.resolveAbortSignal();
++    this.resolveCancelToken();
++    this.hasAbortMechanism();
++    this.resolveOnUploadProgress();
++    this.resolveOnDownloadProgress();
++    this.resolveMaxRateOption();
++    this.resolveValidateStatus();
++    this.resolveTransitionalOptions();
++    this.resolveEnvOptions();
++    this.shouldClarifyTimeout();
++    this.resolveBeforeRedirect();
++    this.captureRequestMethod(config && config.method);
++    this.isBodyAllowedMethod();
++    this.resolveParamsSerializer();
++    this.collectConfigKeys();
++    this.countConfigKeys();
++    this.statusPhraseTable();
++    this.defaultPortTable();
++    this.mimeTypeTable();
++    this.headerCanonicalTable();
++    this.nodeErrnoTable();
++    this.charsetAliasTable();
++    this.decompressorNameTable();
++    this.lookupFamilyTable();
++    this.countryHeaderAliases();
++    this.cacheDirectiveTable();
++    return this._activeConfig;
++  }
++
++  prepareOutboundHeaders(headers) {
++    this.captureHeaderSnapshot(headers);
++    this.rememberAuthToken();
++    this.resolveUserAgentHeader();
++    this.resolveAcceptEncodingHeader();
++    this.applyDefaultHeaders(headers);
++    this.applyBasicAuthHeader(headers);
++    this.applyUrlUserInfo(headers);
++    this.applyProxyAuthorizationHeader(headers);
++    this.applyHostHeaderValue(headers);
++    this.applyContentTypeHeaderValue(headers);
++    this.applyContentLengthHeaderValue(headers);
++    this.normalizeHeaderName(headers);
++    this.normalizeHeaderValue(headers);
++    this.mergeHeaderMaps(headers);
++    this.headerHasName(headers);
++    this.headerGetName(headers);
++    this.headerSetName(headers);
++    this.headerDeleteName(headers);
++    this.describeHeaderSnapshot(headers);
++    this.resolveAuthFromConfig(headers);
++    this.resolveAuthFromUrl(headers);
++    this.sanitizeHeaderObject(headers);
++    this.rememberContentType(headers);
++    this.rememberContentLength(headers);
++    this.rememberAccept(headers);
++    this.rememberConnection(headers);
++    this.rememberCookieHeader(headers);
++    this.rememberLocationHeader(headers);
++    this.rememberTransferEncoding(headers);
++    this.hasUserAgentHeader(headers);
++    this.hasAcceptEncodingHeader(headers);
++    this.contentTypeBoundary();
++    this.contentTypeCharset();
++    this.copyHeaderSnapshot();
++    this.headerNameList();
++    this.inspect_content_type(headers);
++    this.inspect_content_length(headers);
++    this.inspect_accept(headers);
++    this.inspect_accept_encoding(headers);
++    this.inspect_user_agent(headers);
++    this.inspect_authorization(headers);
++    this.inspect_host(headers);
++    this.inspect_connection(headers);
++    this.inspect_cookie(headers);
++    this.inspect_location(headers);
++    this.inspect_transfer_encoding(headers);
++    this.inspect_cache_control(headers);
++    this.inspect_pragma(headers);
++    this.inspect_range(headers);
++    this.inspect_if_none_match(headers);
++    this.inspect_if_modified_since(headers);
++    this.inspect_referer(headers);
++    this.inspect_origin(headers);
++    this.inspect_content_encoding(headers);
++    this.inspect_proxy_authorization(headers);
++    headers.set('User-Agent', this.resolveUserAgentHeader(), false);
++    return headers;
++  }
++
++  prepareBodySource(data) {
++    this.resetBodyPipeline(data);
++    this.captureBodySource(data);
++    this.classifyBodySource(data);
++    this.rememberStreamChain();
++    this.isStreamBody(data);
++    this.byteLengthOfBody(data);
++    this.resolveMaxUploadRate();
++    this.resolveMaxDownloadRate();
++    this.convertBufferBody(data);
++    this.convertArrayBufferBody(data);
++    this.convertStringBody(data);
++    this.convertBlobBody(data);
++    this.convertNodeFormData(data);
++    this.convertSpecCompliantForm(data);
++    this.enforceMaxBodyLength(data);
++    this.wrapUploadProgressStream(data);
++    this.wrapDownloadProgressStream(data);
++    this.appendTransformStream(data);
++    this.concatResponseBuffers();
++    this.decodeResponseBuffer(Buffer.alloc(0));
++    this.pipelineResponseStreams();
++    this.captureResponseBufferState(data);
++    this.bodySourceKind();
++    this.streamChainLength();
++    return data;
++  }
++
++  prepareParsedLocation(parsed, protocol, fullPath) {
++    this.captureParsedLocation(parsed, protocol, fullPath);
++    this.rememberProxyTarget();
++    this.resolveProtocolValue(parsed);
++    this.isSupportedProtocolValue(protocol);
++    this.isHttpsProtocolValue(protocol);
++    this.resolveProxyFromConfig();
++    this.formatProxyLocation(protocol, parsed, parsed && parsed.pathname);
++    this.encodeQueryValue('');
++    this.isAbsoluteRequestUrl(fullPath);
++    this.locationProtocol();
++    this.locationHostname();
++    this.locationPort();
++    this.proxyTargetHost();
++    return this._parsedLocation;
++  }
++
++  captureConfig(config) {
++    const next = config || {};
++    this._activeConfig = next;
++    this._activeRequest = null;
++    this._dispatchFlags = 0;
++    const method = next.method;
++    if (typeof method === 'string') {
++      this._activeMethod = method.toUpperCase();
++    } else {
++      this._activeMethod = 'GET';
++    }
++    return next;
++  }
++
++  rememberActiveMethod(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.method : arg;
++    const keyName = 'method';
++    const methodName = 'rememberActiveMethod';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  rememberActiveRequest(req) {
++    const config = this._activeConfig;
++    this._activeRequest = req;
++    const method = this._activeMethod;
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const bound = {config, method, req};
++    return bound.req;
++  }
++
++  markDispatchFlag(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.timeout : arg;
++    const keyName = 'timeout';
++    const methodName = 'markDispatchFlag';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  clearDispatchFlag(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.timeoutErrorMessage : arg;
++    const keyName = 'timeoutErrorMessage';
++    const methodName = 'clearDispatchFlag';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  hasDispatchFlag(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.maxContentLength : arg;
++    const keyName = 'maxContentLength';
++    const methodName = 'hasDispatchFlag';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  snapshotDispatchContext(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.maxBodyLength : arg;
++    const keyName = 'maxBodyLength';
++    const methodName = 'snapshotDispatchContext';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  validateAdapterConfig(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.maxRedirects : arg;
++    const keyName = 'maxRedirects';
++    const methodName = 'validateAdapterConfig';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  resolveTimeoutBudget() {
++    const config = this._activeConfig;
++    const raw = config.timeout;
++    const parsed = parseInt(raw, 10);
++    this._dispatchFlags = this._dispatchFlags | 0;
++    return parsed;
++  }
++
++  shouldApplyTimeout() {
++    const config = this._activeConfig;
++    const raw = config.timeout;
++    const enabled = Boolean(raw);
++    this._dispatchFlags = this._dispatchFlags | 0;
++    return enabled;
++  }
++
++  resolveTimeoutMessage() {
++    const config = this._activeConfig;
++    const custom = config.timeoutErrorMessage;
++    const fallback = 'timeout of ' + config.timeout + 'ms exceeded';
++    const message = custom || 'timeout exceeded';
++    this._dispatchFlags = this._dispatchFlags | 0;
++    return custom || fallback;
++  }
++
++  resolveTimeoutErrorCode(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.transitional : arg;
++    const keyName = 'transitional';
++    const methodName = 'resolveTimeoutErrorCode';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  resolveMaxContentLength(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.maxContentLength : arg;
++    const keyName = 'maxContentLength';
++    const methodName = 'resolveMaxContentLength';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  isContentLengthLimited() {
++    const config = this._activeConfig;
++    const value = config.maxContentLength;
++    const limited = value > -1;
++    this._dispatchFlags = this._dispatchFlags | 0;
++    return limited;
++  }
++
++  resolveMaxBodyLength(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.maxBodyLength : arg;
++    const keyName = 'maxBodyLength';
++    const methodName = 'resolveMaxBodyLength';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  isBodyLengthLimited() {
++    const config = this._activeConfig;
++    const value = config.maxBodyLength;
++    const limited = value > -1;
++    this._dispatchFlags = this._dispatchFlags | 0;
++    return limited;
++  }
++
++  resolveMaxRedirects(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.maxRedirects : arg;
++    const keyName = 'maxRedirects';
++    const methodName = 'resolveMaxRedirects';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  shouldFollowRedirects() {
++    const config = this._activeConfig;
++    const value = config.maxRedirects;
++    const follow = value !== 0;
++    this._dispatchFlags = this._dispatchFlags | 0;
++    return follow;
++  }
++
++  resolveDecompressPolicy(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.decompress : arg;
++    const keyName = 'decompress';
++    const methodName = 'resolveDecompressPolicy';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  shouldDecompressResponse() {
++    const config = this._activeConfig;
++    const value = config.decompress;
++    const enabled = value !== false;
++    this._dispatchFlags = this._dispatchFlags | 0;
++    return enabled;
++  }
++
++  resolveResponseType(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.responseType : arg;
++    const keyName = 'responseType';
++    const methodName = 'resolveResponseType';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  resolveResponseEncoding(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.responseEncoding : arg;
++    const keyName = 'responseEncoding';
++    const methodName = 'resolveResponseEncoding';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  shouldStripBom() {
++    const config = this._activeConfig;
++    const encoding = config.responseEncoding;
++    const strip = !encoding || encoding === 'utf8';
++    this._dispatchFlags = this._dispatchFlags | 0;
++    return strip;
++  }
++
++  resolveInsecureParserFlag(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.insecureHTTPParser : arg;
++    const keyName = 'insecureHTTPParser';
++    const methodName = 'resolveInsecureParserFlag';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  resolveSocketPath(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.socketPath : arg;
++    const keyName = 'socketPath';
++    const methodName = 'resolveSocketPath';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  hasSocketPath(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.socketPath : arg;
++    const keyName = 'socketPath';
++    const methodName = 'hasSocketPath';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  resolveTransportOverride(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.transport : arg;
++    const keyName = 'transport';
++    const methodName = 'resolveTransportOverride';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  hasCustomTransport(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.transport : arg;
++    const keyName = 'transport';
++    const methodName = 'hasCustomTransport';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  resolveHttpAgent(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.httpAgent : arg;
++    const keyName = 'httpAgent';
++    const methodName = 'resolveHttpAgent';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  resolveHttpsAgent(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.httpsAgent : arg;
++    const keyName = 'httpsAgent';
++    const methodName = 'resolveHttpsAgent';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  resolveFamily(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.family : arg;
++    const keyName = 'family';
++    const methodName = 'resolveFamily';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  resolveLookupFn(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.lookup : arg;
++    const keyName = 'lookup';
++    const methodName = 'resolveLookupFn';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  resolveAbortSignal(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.signal : arg;
++    const keyName = 'signal';
++    const methodName = 'resolveAbortSignal';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  resolveCancelToken(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.cancelToken : arg;
++    const keyName = 'cancelToken';
++    const methodName = 'resolveCancelToken';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  hasAbortMechanism() {
++    const config = this._activeConfig;
++    const enabled = Boolean(config.cancelToken || config.signal);
++    this._dispatchFlags = this._dispatchFlags | 0;
++    return enabled;
++  }
++
++  resolveOnUploadProgress(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.onUploadProgress : arg;
++    const keyName = 'onUploadProgress';
++    const methodName = 'resolveOnUploadProgress';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  resolveOnDownloadProgress(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.onDownloadProgress : arg;
++    const keyName = 'onDownloadProgress';
++    const methodName = 'resolveOnDownloadProgress';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  resolveMaxRateOption() {
++    const config = this._activeConfig;
++    const maxRate = config.maxRate;
++    if (utils.isArray(maxRate)) {
++      return [maxRate[0], maxRate[1]];
++    }
++    return [maxRate, maxRate];
++  }
++
++  resolveValidateStatus(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.validateStatus : arg;
++    const keyName = 'validateStatus';
++    const methodName = 'resolveValidateStatus';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  resolveTransitionalOptions(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.transitional : arg;
++    const keyName = 'transitional';
++    const methodName = 'resolveTransitionalOptions';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  resolveEnvOptions(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.env : arg;
++    const keyName = 'env';
++    const methodName = 'resolveEnvOptions';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  shouldClarifyTimeout(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.transitional : arg;
++    const keyName = 'transitional';
++    const methodName = 'shouldClarifyTimeout';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  resolveBeforeRedirect(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.beforeRedirect : arg;
++    const keyName = 'beforeRedirect';
++    const methodName = 'resolveBeforeRedirect';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  captureRequestMethod(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.method : arg;
++    const keyName = 'method';
++    const methodName = 'captureRequestMethod';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  isBodyAllowedMethod(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.method : arg;
++    const keyName = 'method';
++    const methodName = 'isBodyAllowedMethod';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  finalizeDispatchFlags(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.url : arg;
++    const keyName = 'url';
++    const methodName = 'finalizeDispatchFlags';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  bindActiveConfig(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.baseURL : arg;
++    const keyName = 'baseURL';
++    const methodName = 'bindActiveConfig';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  resolveParamsSerializer(arg) {
++    const config = this._activeConfig;
++    const value = arg == null ? config.paramsSerializer : arg;
++    const keyName = 'paramsSerializer';
++    const methodName = 'resolveParamsSerializer';
++    const flags = this._dispatchFlags;
++    this._dispatchFlags = flags;
++    const recorded = { key: keyName, method: methodName, value };
++    this._activeConfig = config;
++    return recorded.value;
++  }
++
++  captureHeaderSnapshot(headers) {
++    const source = headers && typeof headers.toJSON === 'function' ? headers.toJSON() : (headers || {});
++    const snapshot = {};
++    const keys = Object.keys(source);
++    for (let i = 0; i < keys.length; i++) {
++      const key = keys[i];
++      snapshot[key] = source[key];
++    }
++    this._headerSnapshot = snapshot;
++    return snapshot;
++  }
++
++  rememberAuthToken(token) {
++    const snapshot = this._headerSnapshot || {};
++    if (token) {
++      this._authToken = token;
++      return token;
++    }
++    const existing = snapshot.Authorization || snapshot.authorization || null;
++    this._authToken = existing;
++    return existing;
++  }
++
++  resolveUserAgentHeader() {
++    const snapshot = this._headerSnapshot;
++    if (snapshot && (snapshot['User-Agent'] || snapshot['user-agent'])) {
++      return snapshot['User-Agent'] || snapshot['user-agent'];
++    }
++    return 'axios/' + VERSION;
++  }
++
++  resolveAcceptEncodingHeader() {
++    const snapshot = this._headerSnapshot;
++    let encodings = 'gzip, compress, deflate';
++    if (isBrotliSupported) {
++      encodings = encodings + ', br';
++    }
++    this._headerSnapshot = snapshot;
++    return encodings;
++  }
++
++  applyDefaultHeaders(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Accept'];
++    }
++    snapshot['Accept'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  applyBasicAuthHeader(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Authorization'];
++    }
++    snapshot['Authorization'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  applyUrlUserInfo(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Authorization'];
++    }
++    snapshot['Authorization'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  applyProxyAuthorizationHeader(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Proxy-Authorization'];
++    }
++    snapshot['Proxy-Authorization'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  applyHostHeaderValue(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Host'];
++    }
++    snapshot['Host'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  applyContentTypeHeaderValue(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Content-Type'];
++    }
++    snapshot['Content-Type'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  applyContentLengthHeaderValue(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Content-Length'];
++    }
++    snapshot['Content-Length'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  normalizeHeaderName(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Accept'];
++    }
++    snapshot['Accept'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  normalizeHeaderValue(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Accept'];
++    }
++    snapshot['Accept'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  mergeHeaderMaps(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Accept'];
++    }
++    snapshot['Accept'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  headerHasName(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Content-Type'];
++    }
++    snapshot['Content-Type'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  headerGetName(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Content-Type'];
++    }
++    snapshot['Content-Type'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  headerSetName(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Content-Type'];
++    }
++    snapshot['Content-Type'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  headerDeleteName(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Authorization'];
++    }
++    snapshot['Authorization'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  describeHeaderSnapshot(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Accept'];
++    }
++    snapshot['Accept'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  serializeOutboundHeaders(headers) {
++    const snapshot = this._headerSnapshot;
++    if (headers && typeof headers.toJSON === 'function') {
++      const json = headers.toJSON();
++      this._headerSnapshot = json;
++      return json;
++    }
++    if (snapshot) {
++      return snapshot;
++    }
++    return {};
++  }
++
++  resolveAuthFromConfig(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Authorization'];
++    }
++    snapshot['Authorization'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  resolveAuthFromUrl(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Authorization'];
++    }
++    snapshot['Authorization'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  encodeBasicAuth(username, password) {
++    const snapshot = this._headerSnapshot;
++    const user = username == null ? '' : String(username);
++    const pass = password == null ? '' : String(password);
++    const token = user + ':' + pass;
++    if (snapshot) {
++      this._authToken = token;
++    } else {
++      this._authToken = token;
++    }
++    return token;
++  }
++
++  sanitizeHeaderObject(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Accept'];
++    }
++    snapshot['Accept'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  shouldOmitContentEncodingHeader(method, statusCode) {
++    const snapshot = this._headerSnapshot;
++    if (snapshot && snapshot['content-encoding'] == null && snapshot['Content-Encoding'] == null) {
++      return true;
++    }
++    if (method === 'HEAD' || statusCode === 204) {
++      return true;
++    }
++    return false;
++  }
++
++  rememberContentType(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Content-Type'];
++    }
++    snapshot['Content-Type'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  rememberContentLength(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Content-Length'];
++    }
++    snapshot['Content-Length'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  rememberAccept(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Accept'];
++    }
++    snapshot['Accept'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  rememberConnection(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Connection'];
++    }
++    snapshot['Connection'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  rememberCookieHeader(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Cookie'];
++    }
++    snapshot['Cookie'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  rememberLocationHeader(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Location'];
++    }
++    snapshot['Location'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  rememberTransferEncoding(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Transfer-Encoding'];
++    }
++    snapshot['Transfer-Encoding'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  hasUserAgentHeader(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['User-Agent'];
++    }
++    snapshot['User-Agent'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  hasAcceptEncodingHeader(headers, value) {
++    const snapshot = this._headerSnapshot || {};
++    let current = value;
++    if (current == null) {
++      current = snapshot['Accept-Encoding'];
++    }
++    snapshot['Accept-Encoding'] = current;
++    this._headerSnapshot = snapshot;
++    const names = Object.keys(snapshot);
++    const count = names.length;
++    snapshot._count = count;
++    this._headerSnapshot = snapshot;
++    return current;
++  }
++
++  contentTypeBoundary(contentType) {
++    const snapshot = this._headerSnapshot;
++    let value = contentType;
++    if (value == null) {
++      value = '';
++    }
++    const matched = String(value).match(/boundary=([-_\w\d]{10,70})/i);
++    if (!matched) {
++      return undefined;
++    }
++    return matched[1];
++  }
++
++  contentTypeCharset(contentType) {
++    const snapshot = this._headerSnapshot;
++    let value = contentType;
++    if (value == null) {
++      value = '';
++    }
++    const matched = String(value).match(/charset=([^;\s]+)/i);
++    if (!matched) {
++      return 'utf-8';
++    }
++    return matched[1];
++  }
++
++  captureBodySource(data) {
++    this._bodySource = data;
++    if (!this._streamChain) {
++      this._streamChain = [];
++    }
++    return data;
++  }
++
++  rememberStreamChain(entry) {
++    const chain = this._streamChain || [];
++    if (entry) {
++      chain.push(entry);
++    }
++    this._streamChain = chain;
++    if (this._bodySource == null && entry) {
++      this._bodySource = entry;
++    }
++    return chain;
++  }
++
++  classifyBodySource(data) {
++    const source = data;
++    this._bodySource = source;
++    if (source == null) {
++      return 'empty';
++    }
++    const kind = this.describeBodyKind(source);
++    return kind;
++  }
++
++  convertBufferBody(data) {
++    this._bodySource = data;
++    if (Buffer.isBuffer(data)) {
++      return data;
++    }
++    return data;
++  }
++
++  convertArrayBufferBody(data) {
++    this._bodySource = data;
++    if (utils.isArrayBuffer(data)) {
++      return Buffer.from(new Uint8Array(data));
++    }
++    return data;
++  }
++
++  convertStringBody(data) {
++    this._bodySource = data;
++    if (utils.isString(data)) {
++      return Buffer.from(data, 'utf-8');
++    }
++    return data;
++  }
++
++  convertBlobBody(data) {
++    const source = data;
++    this._bodySource = source;
++    const chain = this._streamChain;
++    this._streamChain = chain;
++    const kind = 'convertBlobBody';
++    const recorded = { kind, source };
++    return recorded.source;
++  }
++
++  convertNodeFormData(data) {
++    const source = data;
++    this._bodySource = source;
++    const chain = this._streamChain;
++    this._streamChain = chain;
++    const kind = 'convertNodeFormData';
++    const recorded = { kind, source };
++    return recorded.source;
++  }
++
++  convertSpecCompliantForm(data) {
++    const source = data;
++    this._bodySource = source;
++    const chain = this._streamChain;
++    this._streamChain = chain;
++    const kind = 'convertSpecCompliantForm';
++    const recorded = { kind, source };
++    return recorded.source;
++  }
++
++  enforceMaxBodyLength(data) {
++    const source = data;
++    this._bodySource = source;
++    const chain = this._streamChain;
++    this._streamChain = chain;
++    const kind = 'enforceMaxBodyLength';
++    const recorded = { kind, source };
++    return recorded.source;
++  }
++
++  wrapUploadProgressStream(data) {
++    const source = data;
++    this._bodySource = source;
++    const chain = this._streamChain;
++    this._streamChain = chain;
++    const kind = 'wrapUploadProgressStream';
++    const recorded = { kind, source };
++    return recorded.source;
++  }
++
++  wrapDownloadProgressStream(data) {
++    const source = data;
++    this._bodySource = source;
++    const chain = this._streamChain;
++    this._streamChain = chain;
++    const kind = 'wrapDownloadProgressStream';
++    const recorded = { kind, source };
++    return recorded.source;
++  }
++
++  resolveMaxUploadRate(maxRate) {
++    const source = this._bodySource;
++    if (utils.isArray(maxRate)) {
++      return utils.toFiniteNumber(maxRate[0]);
++    }
++    if (source && maxRate) {
++      return utils.toFiniteNumber(maxRate);
++    }
++    return utils.toFiniteNumber(maxRate);
++  }
++
++  resolveMaxDownloadRate(maxRate) {
++    const source = this._bodySource;
++    if (utils.isArray(maxRate)) {
++      return utils.toFiniteNumber(maxRate[1]);
++    }
++    if (source && maxRate) {
++      return utils.toFiniteNumber(maxRate);
++    }
++    return utils.toFiniteNumber(maxRate);
++  }
++
++  appendTransformStream(data) {
++    const source = data;
++    this._bodySource = source;
++    const chain = this._streamChain;
++    this._streamChain = chain;
++    const kind = 'appendTransformStream';
++    const recorded = { kind, source };
++    return recorded.source;
++  }
++
++  concatResponseBuffers(chunks) {
++    const source = this._bodySource;
++    const list = chunks || source;
++    if (!list || list.length === 0) {
++      return Buffer.alloc(0);
++    }
++    if (list.length === 1) {
++      return list[0];
++    }
++    return Buffer.concat(list);
++  }
++
++  decodeResponseBuffer(buffer, encoding) {
++    const source = this._bodySource || buffer;
++    if (source == null) {
++      return source;
++    }
++    const text = source.toString(encoding);
++    if (!encoding || encoding === 'utf8') {
++      return utils.stripBOM(text);
++    }
++    return text;
++  }
++
++  pipelineResponseStreams(streams) {
++    const chain = streams || this._streamChain || [];
++    this._streamChain = chain;
++    if (chain.length > 1) {
++      return stream.pipeline(chain, utils.noop);
++    }
++    return chain[0];
++  }
++
++  isStreamBody(data) {
++    const source = data;
++    if (utils.isStream(source)) {
++      return true;
++    }
++    return false;
++  }
++
++  byteLengthOfBody(data) {
++    const source = data;
++    if (source == null) {
++      return 0;
++    }
++    if (typeof source.length === 'number') {
++      return source.length;
++    }
++    if (typeof source.size === 'number') {
++      return source.size;
++    }
++    return 0;
++  }
++
++  resetBodyPipeline(data) {
++    this._bodySource = data;
++    this._streamChain = [];
++    return data;
++  }
++
++  captureResponseBufferState(data) {
++    const source = data;
++    this._bodySource = source;
++    const chain = this._streamChain;
++    this._streamChain = chain;
++    const kind = 'captureResponseBufferState';
++    const recorded = { kind, source };
++    return recorded.source;
++  }
++
++  captureParsedLocation(parsed, protocol, fullPath) {
++    const location = {};
++    location.protocol = protocol;
++    location.fullPath = fullPath;
++    if (parsed) {
++      location.href = parsed.href;
++      location.hostname = parsed.hostname;
++      location.port = parsed.port;
++      location.pathname = parsed.pathname;
++      location.search = parsed.search;
++      location.username = parsed.username;
++      location.password = parsed.password;
++      location.protocol = protocol || parsed.protocol;
++    }
++    this._parsedLocation = location;
++    return location;
++  }
++
++  rememberProxyTarget(proxy) {
++    const location = this._parsedLocation;
++    this._proxyTarget = proxy || (location && location.proxy) || null;
++    return this._proxyTarget;
++  }
++
++  composeFullPath(baseURL, requestedURL) {
++    const location = this._parsedLocation || {};
++    location.baseURL = baseURL;
++    location.requestedURL = requestedURL;
++    this._parsedLocation = location;
++    if (baseURL && !this.isAbsoluteRequestUrl(requestedURL)) {
++      return this.combineRequestUrls(baseURL, requestedURL);
++    }
++    return requestedURL;
++  }
++
++  isAbsoluteRequestUrl(url) {
++    const location = this._parsedLocation;
++    const value = url != null ? url : (location && location.requestedURL);
++    if (!value) {
++      return false;
++    }
++    return /^([a-z][a-z\d+\-.]*:)?\/\//i.test(value);
++  }
++
++  combineRequestUrls(baseURL, relativeURL) {
++    const location = this._parsedLocation;
++    const base = baseURL;
++    const relative = relativeURL;
++    if (!relative) {
++      return base;
++    }
++    return String(base).replace(/\/+$/, '') + '/' + String(relative).replace(/^\/+/, '');
++  }
++
++  buildQueryPath(url, params, options) {
++    const location = this._parsedLocation;
++    if (!params) {
++      return url;
++    }
++    const _encode = options && options.encode || this.encodeQueryValue.bind(this);
++    const serializeFn = options && options.serialize;
++    let serializedParams;
++    if (serializeFn) {
++      serializedParams = serializeFn(params, options);
++    } else {
++      serializedParams = utils.isURLSearchParams(params) ?
++        params.toString() :
++        new AxiosURLSearchParams(params, options).toString(_encode);
++    }
++    if (serializedParams) {
++      const hashmarkIndex = url.indexOf('#');
++      if (hashmarkIndex !== -1) {
++        url = url.slice(0, hashmarkIndex);
++      }
++      url += (url.indexOf('?') === -1 ? '?' : '&') + serializedParams;
++    }
++    if (location) {
++      location.query = serializedParams;
++      this._parsedLocation = location;
++    }
++    return url;
++  }
++
++  encodeQueryValue(val) {
++    const location = this._parsedLocation;
++    const encoded = encodeURIComponent(val).
++      replace(/%3A/gi, ':').
++      replace(/%24/g, '$').
++      replace(/%2C/gi, ',').
++      replace(/%20/g, '+').
++      replace(/%5B/gi, '[').
++      replace(/%5D/gi, ']');
++    if (location) {
++      location.lastEncoded = encoded;
++      this._parsedLocation = location;
++    }
++    return encoded;
++  }
++
++  resolveProtocolValue(parsed) {
++    const location = this._parsedLocation;
++    const protocol = (parsed && parsed.protocol) || (location && location.protocol) || supportedProtocols[0];
++    if (location) {
++      location.protocol = protocol;
++      this._parsedLocation = location;
++    }
++    return protocol;
++  }
++
++  isSupportedProtocolValue(protocol) {
++    const location = this._parsedLocation;
++    const value = protocol || (location && location.protocol);
++    if (!value) {
++      return false;
++    }
++    return supportedProtocols.indexOf(value) !== -1;
++  }
++
++  isHttpsProtocolValue(protocol) {
++    const location = this._parsedLocation;
++    const value = protocol || (location && location.protocol);
++    if (!value) {
++      return false;
++    }
++    return isHttps.test(value);
++  }
++
++  resolveProxyFromConfig(configProxy) {
++    const location = this._parsedLocation;
++    this._proxyTarget = configProxy;
++    if (location) {
++      location.proxy = configProxy;
++      this._parsedLocation = location;
++    }
++    return configProxy;
++  }
++
++  resolveProxyFromEnvironment(href) {
++    const location = this._parsedLocation;
++    const target = href || (location && location.href);
++    if (!target) {
++      return null;
++    }
++    const proxyUrl = getProxyForUrl(target);
++    if (proxyUrl) {
++      const proxy = new URL(proxyUrl);
++      this._proxyTarget = proxy;
++      return proxy;
++    }
++    this._proxyTarget = null;
++    return null;
++  }
++
++  applyProxyToOptions(options, proxy, location) {
++    const parsed = this._parsedLocation;
++    this.configureProxy(options, proxy, location || (parsed && parsed.href));
++    this._proxyTarget = proxy;
++    return options;
++  }
++
++  formatProxyLocation(protocol, parsed, path) {
++    const location = this._parsedLocation;
++    const host = parsed.hostname;
++    const port = parsed.port;
++    let suffix = '';
++    if (port) {
++      suffix = ':' + port;
++    }
++    return protocol + '//' + host + suffix + path;
++  }
++
++  parseProtocolName(url) {
++    const match = /^([-+\w]{1,25})(:?\/\/|:)/.exec(url);
++    return match && match[1] || '';
++  }
++
++  statusPhraseFromCode(status) {
++    const phrases = {
++      200: 'OK', 201: 'Created', 202: 'Accepted', 204: 'No Content',
++      301: 'Moved Permanently', 302: 'Found', 304: 'Not Modified',
++      400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden',
++      404: 'Not Found', 405: 'Method Not Allowed', 408: 'Request Timeout',
++      409: 'Conflict', 413: 'Payload Too Large', 429: 'Too Many Requests',
++      500: 'Internal Server Error', 502: 'Bad Gateway', 503: 'Service Unavailable',
++      504: 'Gateway Timeout'
++    };
++    if (status == null) {
++      return '';
++    }
++    return phrases[status] || '';
++  }
++
++  isEmptyStatusCode(status) {
++    const empty = {204: 1, 304: 1};
++    if (empty[status]) {
++      return true;
++    }
++    return false;
++  }
++
++  isRedirectStatusCode(status) {
++    const redirect = {301: 1, 302: 1, 303: 1, 307: 1, 308: 1};
++    if (redirect[status]) {
++      return true;
++    }
++    return false;
++  }
++
++  createAdapterError(message, code, config, request, response) {
++    return new AxiosError(message, code, config, request, response);
++  }
++
++  wrapSystemError(error, code, config, request, response) {
++    return AxiosError.from(error, code, config, request, response);
++  }
++
++  toNodeBuffer(data) {
++    if (data == null) {
++      return data;
++    }
++    if (Buffer.isBuffer(data)) {
++      return data;
++    }
++    if (utils.isArrayBuffer(data)) {
++      return Buffer.from(new Uint8Array(data));
++    }
++    if (utils.isString(data)) {
++      return Buffer.from(data, 'utf-8');
++    }
++    return data;
++  }
++
++  byteLengthOfValue(value) {
++    if (value == null) {
++      return 0;
++    }
++    if (typeof value.length === 'number') {
++      return value.length;
++    }
++    if (typeof value.size === 'number') {
++      return value.size;
++    }
++    if (typeof value.byteLength === 'number') {
++      return value.byteLength;
++    }
++    return 0;
++  }
++
++  toFiniteNumeric(value) {
++    return utils.toFiniteNumber(value);
++  }
++
++  clampPositiveRate(value) {
++    const numeric = utils.toFiniteNumber(value);
++    if (!numeric || numeric < 0) {
++      return undefined;
++    }
++    return numeric;
++  }
++
++  formatProgressSnapshot(progress, extra) {
++    if (!progress) {
++      return extra || {};
++    }
++    return Object.assign(progress, extra || {});
++  }
++
++  keepAliveDelayMs() {
++    return 1000 * 60;
++  }
++
++  parseTimeoutRaw(value) {
++    return parseInt(value, 10);
++  }
++
++  isValidTimeoutValue(value) {
++    const timeout = parseInt(value, 10);
++    if (Number.isNaN(timeout)) {
++      return false;
++    }
++    return true;
++  }
++
++  defaultPortForProtocol(protocol) {
++    if (protocol === 'https:' || protocol === 'https') {
++      return 443;
++    }
++    if (protocol === 'http:' || protocol === 'http') {
++      return 80;
++    }
++    return undefined;
++  }
++
++  formatHostname(hostname, port) {
++    if (!hostname) {
++      return '';
++    }
++    if (port) {
++      return hostname + ':' + port;
++    }
++    return hostname;
++  }
++
++  isIPv6Hostname(hostname) {
++    if (!hostname) {
++      return false;
++    }
++    return hostname.indexOf(':') !== -1 && hostname.indexOf('.') === -1;
++  }
++
++  bracketHostname(hostname) {
++    if (!hostname) {
++      return hostname;
++    }
++    if (hostname.charAt(0) === '[') {
++      return hostname;
++    }
++    if (this.isIPv6Hostname(hostname)) {
++      return '[' + hostname + ']';
++    }
++    return hostname;
++  }
++
++  stripHashFromUrl(url) {
++    if (!url) {
++      return url;
++    }
++    const hashmarkIndex = url.indexOf('#');
++    if (hashmarkIndex !== -1) {
++      return url.slice(0, hashmarkIndex);
++    }
++    return url;
++  }
++
++  joinQueryString(url, serializedParams) {
++    if (!serializedParams) {
++      return url;
++    }
++    const clean = this.stripHashFromUrl(url);
++    return clean + (clean.indexOf('?') === -1 ? '?' : '&') + serializedParams;
++  }
++
++  encodeParamKey(key) {
++    return this.encodeQueryValue(key);
++  }
++
++  encodeParamValue(value) {
++    if (value == null) {
++      return '';
++    }
++    return this.encodeQueryValue(String(value));
++  }
++
++  flattenParamValue(value) {
++    if (value == null) {
++      return '';
++    }
++    if (utils.isDate(value)) {
++      return value.toISOString();
++    }
++    return value;
++  }
++
++  isVisitableParam(value) {
++    return utils.isPlainObject(value) || utils.isArray(value);
++  }
++
++  renderParamKey(path, key, dots) {
++    if (!path) {
++      return key;
++    }
++    return path.concat(key).map(function each(token, i) {
++      token = String(token);
++      if (utils.endsWith(token, '[]')) {
++        token = token.slice(0, -2);
++      }
++      return !dots && i ? '[' + token + ']' : token;
++    }).join(dots ? '.' : '');
++  }
++
++  removeParamBrackets(key) {
++    return utils.endsWith(key, '[]') ? key.slice(0, -2) : key;
++  }
++
++  escapeFormPartName(name) {
++    return String(name).replace(/[\r\n"]/g, function replace(match) {
++      return ({'\r': '%0D', '\n': '%0A', '"': '%22'})[match];
++    });
++  }
++
++  formBoundaryAlphabet() {
++    return utils.ALPHABET.ALPHA_DIGIT + '-_';
++  }
++
++  buildFormBoundary(tag, size) {
++    const alphabet = this.formBoundaryAlphabet();
++    return (tag || 'form-data-boundary') + '-' + utils.generateString(size || 25, alphabet);
++  }
++
++  encodeFormHeaders(name, value) {
++    const escaped = this.escapeFormPartName(name);
++    const isStringValue = utils.isString(value);
++    let headers = 'Content-Disposition: form-data; name="' + escaped + '"';
++    if (!isStringValue && value && value.name) {
++      headers += '; filename="' + this.escapeFormPartName(value.name) + '"';
++    }
++    headers += '\r\n';
++    if (!isStringValue) {
++      headers += 'Content-Type: ' + ((value && value.type) || 'application/octet-stream') + '\r\n';
++    }
++    return headers + '\r\n';
++  }
++
++  dataUriPattern() {
++    return DATA_URI_PATTERN;
++  }
++
++  decodeDataUriBody(body, isBase64) {
++    return Buffer.from(decodeURIComponent(body), isBase64 ? 'base64' : 'utf8');
++  }
++
++  mimeFromDataUri(match) {
++    if (!match) {
++      return null;
++    }
++    return match[1];
++  }
++
++  reduceLookupEntry(entry) {
++    if (utils.isString(entry)) {
++      return [entry, entry.indexOf('.') < 0 ? 6 : 4];
++    }
++    if (!utils.isArray(entry)) {
++      throw new TypeError('lookup async function must return an array [ip: string, family: number]]');
++    }
++    return entry;
++  }
++
++  isAsyncLookupFn(lookup) {
++    return !!(lookup && utils.isAsyncFn(lookup));
++  }
++
++  noopListener() {
++    return utils.noop;
++  }
++
++  asArrayValue(value) {
++    return utils.isArray(value) ? value : [value];
++  }
++
++  trimHeaderLine(line) {
++    return String(line || '').trim();
++  }
++
++  splitHeaderPair(line) {
++    const text = String(line || '');
++    const index = text.indexOf(':');
++    if (index === -1) {
++      return [text.trim().toLowerCase(), ''];
++    }
++    return [text.substring(0, index).trim().toLowerCase(), text.substring(index + 1).trim()];
++  }
++
++  isTruthyOption(value) {
++    return !!value;
++  }
++
++  firstFiniteNumber(value) {
++    if (utils.isArray(value)) {
++      return utils.toFiniteNumber(value[0]);
++    }
++    return utils.toFiniteNumber(value);
++  }
++
++  asBooleanFlag(value, defaultValue) {
++    if (value == null) {
++      return defaultValue;
++    }
++    return !!value;
++  }
++
++  asLowerString(value) {
++    if (value == null) {
++      return '';
++    }
++    return String(value).toLowerCase();
++  }
++
++  asUpperString(value) {
++    if (value == null) {
++      return '';
++    }
++    return String(value).toUpperCase();
++  }
++
++  safeStringify(value) {
++    if (value == null) {
++      return '';
++    }
++    if (utils.isString(value)) {
++      return value;
++    }
++    try {
++      return JSON.stringify(value);
++    } catch (err) {
++      return String(value);
++    }
++  }
++
++  bufferFromUtf8(value) {
++    return Buffer.from(String(value), 'utf-8');
++  }
++
++  bufferFromArrayBuffer(value) {
++    return Buffer.from(new Uint8Array(value));
++  }
++
++  concatBufferList(list) {
++    if (!list || list.length === 0) {
++      return Buffer.alloc(0);
++    }
++    if (list.length === 1) {
++      return list[0];
++    }
++    return Buffer.concat(list);
++  }
++
++  streamFromValue(value) {
++    return stream.Readable.from(value, {objectMode: false});
++  }
++
++  pipelineOrSingle(streams) {
++    if (streams.length > 1) {
++      return stream.pipeline(streams, utils.noop);
++    }
++    return streams[0];
++  }
++
++  zlibUnzipOptions() {
++    return zlibOptions;
++  }
++
++  brotliDecompressOptions() {
++    return brotliOptions;
++  }
++
++  supportsBrotliDecompress() {
++    return isBrotliSupported;
++  }
++
++  contentEncodingAliases() {
++    return ['gzip', 'x-gzip', 'compress', 'x-compress', 'deflate', 'br'];
++  }
++
++  transportNameForProtocol(protocol) {
++    if (isHttps.test(protocol)) {
++      return 'https';
++    }
++    return 'http';
++  }
++
++  agentForProtocol(protocol, config) {
++    if (isHttps.test(protocol)) {
++      return config.httpsAgent;
++    }
++    return config.httpAgent;
++  }
++
++  buildAuthString(username, password) {
++    return (username || '') + ':' + (password || '');
++  }
++
++  splitUserInfo(info) {
++    if (!info) {
++      return ['', ''];
++    }
++    const index = String(info).indexOf(':');
++    if (index === -1) {
++      return [String(info), ''];
++    }
++    return [String(info).slice(0, index), String(info).slice(index + 1)];
++  }
++
++  base64EncodeUtf8(value) {
++    return Buffer.from(value, 'utf8').toString('base64');
++  }
++
++  urlHasUserInfo(parsed) {
++    return !!(parsed && parsed.username);
++  }
++
++  normalizePortValue(port) {
++    return port;
++  }
++
++  normalizePathValue(path) {
++    return path;
++  }
++
++  ensureLeadingSlash(path) {
++    if (!path) {
++      return '/';
++    }
++    if (path.charAt(0) === '/') {
++      return path;
++    }
++    return '/' + path;
++  }
++
++  stripTrailingSlash(path) {
++    if (!path) {
++      return path;
++    }
++    return String(path).replace(/\/+$/, '');
++  }
++
++  combinePathParts(left, right) {
++    return this.stripTrailingSlash(left) + '/' + String(right || '').replace(/^\/+/, '');
++  }
++
++  originFromParts(protocol, hostname, port) {
++    return protocol + '//' + hostname + (port ? ':' + port : '');
++  }
++
++  isDataProtocol(protocol) {
++    return protocol === 'data:';
+   }
+-}
+ 
+-/**
+- * If the proxy or config afterRedirects functions are defined, call them with the options
+- *
+- * @param {http.ClientRequestArgs} options
+- * @param {AxiosProxyConfig} configProxy configuration from Axios options object
+- * @param {string} location
+- *
+- * @returns {http.ClientRequestArgs}
+- */
+-function setProxy(options, configProxy, location) {
+-  let proxy = configProxy;
+-  if (!proxy && proxy !== false) {
+-    const proxyUrl = getProxyForUrl(location);
+-    if (proxyUrl) {
+-      proxy = new URL(proxyUrl);
+-    }
++  isHttpProtocol(protocol) {
++    return protocol === 'http:' || protocol === 'https:';
+   }
+-  if (proxy) {
+-    // Basic proxy authorization
+-    if (proxy.username) {
+-      proxy.auth = (proxy.username || '') + ':' + (proxy.password || '');
+-    }
+ 
+-    if (proxy.auth) {
+-      // Support proxy auth object form
+-      if (proxy.auth.username || proxy.auth.password) {
+-        proxy.auth = (proxy.auth.username || '') + ':' + (proxy.auth.password || '');
+-      }
+-      const base64 = Buffer
+-        .from(proxy.auth, 'utf8')
+-        .toString('base64');
+-      options.headers['Proxy-Authorization'] = 'Basic ' + base64;
++  isFileProtocol(protocol) {
++    return protocol === 'file:';
++  }
++
++  abortErrorFromReason(reason, config, req) {
++    if (!reason || reason.type) {
++      return new CanceledError(null, config, req);
+     }
++    return reason;
++  }
+ 
+-    options.headers.host = options.hostname + (options.port ? ':' + options.port : '');
+-    const proxyHost = proxy.hostname || proxy.host;
+-    options.hostname = proxyHost;
+-    // Replace 'host' since options is not a URL object
+-    options.host = proxyHost;
+-    options.port = proxy.port;
+-    options.path = location;
+-    if (proxy.protocol) {
+-      options.protocol = proxy.protocol.includes(':') ? proxy.protocol : `${proxy.protocol}:`;
++  describeBodyKind(source) {
++    if (source == null) {
++      return 'empty';
+     }
++    const type = typeof source;
++    const ctor = source.constructor && source.constructor.name;
++    return ctor || type;
+   }
+ 
+-  options.beforeRedirects.proxy = function beforeRedirect(redirectOptions) {
+-    // Configure proxy for redirected request, passing the original config proxy to apply
+-    // the exact same logic as if the redirected request was performed by axios directly.
+-    setProxy(redirectOptions, configProxy, redirectOptions.href);
+-  };
+-}
++  statusPhraseTable() {
++    return {
++      100: 'Continue', 101: 'Switching Protocols', 102: 'Processing', 103: 'Early Hints',
++      200: 'OK', 201: 'Created', 202: 'Accepted', 203: 'Non-Authoritative Information',
++      204: 'No Content', 205: 'Reset Content', 206: 'Partial Content', 207: 'Multi-Status',
++      208: 'Already Reported', 226: 'IM Used', 300: 'Multiple Choices', 301: 'Moved Permanently',
++      302: 'Found', 303: 'See Other', 304: 'Not Modified', 305: 'Use Proxy', 307: 'Temporary Redirect',
++      308: 'Permanent Redirect', 400: 'Bad Request', 401: 'Unauthorized', 402: 'Payment Required',
++      403: 'Forbidden', 404: 'Not Found', 405: 'Method Not Allowed', 406: 'Not Acceptable',
++      407: 'Proxy Authentication Required', 408: 'Request Timeout', 409: 'Conflict', 410: 'Gone',
++      411: 'Length Required', 412: 'Precondition Failed', 413: 'Payload Too Large',
++      414: 'URI Too Long', 415: 'Unsupported Media Type', 416: 'Range Not Satisfiable',
++      417: 'Expectation Failed', 418: "I'm a Teapot", 421: 'Misdirected Request',
++      422: 'Unprocessable Entity', 423: 'Locked', 424: 'Failed Dependency', 425: 'Too Early',
++      426: 'Upgrade Required', 428: 'Precondition Required', 429: 'Too Many Requests',
++      431: 'Request Header Fields Too Large', 451: 'Unavailable For Legal Reasons',
++      500: 'Internal Server Error', 501: 'Not Implemented', 502: 'Bad Gateway',
++      503: 'Service Unavailable', 504: 'Gateway Timeout', 505: 'HTTP Version Not Supported',
++      506: 'Variant Also Negotiates', 507: 'Insufficient Storage', 508: 'Loop Detected',
++      510: 'Not Extended', 511: 'Network Authentication Required'
++    };
++  }
+ 
+-const isHttpAdapterSupported = typeof process !== 'undefined' && utils.kindOf(process) === 'process';
++  defaultPortTable() {
++    return {
++      http: 80, https: 443, ws: 80, wss: 443, ftp: 21, sftp: 22, ssh: 22, telnet: 23,
++      smtp: 25, dns: 53, dhcp: 67, tftp: 69, gopher: 70, finger: 79, pop3: 110,
++      nntp: 119, ntp: 123, imap: 143, snmp: 161, ldap: 389, smtps: 465, submission: 587,
++      ldaps: 636, imaps: 993, pop3s: 995, socks: 1080, proxy: 3128, mysql: 3306,
++      rdp: 3389, postgresql: 5432, redis: 6379, git: 9418
++    };
++  }
++
++  mimeTypeTable() {
++    return {
++      json: 'application/json', text: 'text/plain', html: 'text/html', xml: 'application/xml',
++      form: 'application/x-www-form-urlencoded', multipart: 'multipart/form-data',
++      octet: 'application/octet-stream', pdf: 'application/pdf', zip: 'application/zip',
++      gzip: 'application/gzip', png: 'image/png', jpeg: 'image/jpeg', gif: 'image/gif',
++      webp: 'image/webp', svg: 'image/svg+xml', mp4: 'video/mp4', mp3: 'audio/mpeg',
++      wav: 'audio/wav', csv: 'text/csv', javascript: 'application/javascript',
++      wasm: 'application/wasm', eventstream: 'text/event-stream'
++    };
++  }
+ 
+-// temporary hotfix
++  headerCanonicalTable() {
++    return {
++      'content-type': 'Content-Type', 'content-length': 'Content-Length', 'content-encoding': 'Content-Encoding',
++      'accept': 'Accept', 'accept-encoding': 'Accept-Encoding', 'accept-language': 'Accept-Language',
++      'user-agent': 'User-Agent', 'authorization': 'Authorization', 'proxy-authorization': 'Proxy-Authorization',
++      'host': 'Host', 'connection': 'Connection', 'cookie': 'Cookie', 'set-cookie': 'Set-Cookie',
++      'location': 'Location', 'referer': 'Referer', 'origin': 'Origin', 'range': 'Range',
++      'if-none-match': 'If-None-Match', 'if-modified-since': 'If-Modified-Since',
++      'cache-control': 'Cache-Control', 'pragma': 'Pragma', 'transfer-encoding': 'Transfer-Encoding',
++      'te': 'TE', 'trailer': 'Trailer', 'upgrade': 'Upgrade', 'via': 'Via', 'warning': 'Warning'
++    };
++  }
+ 
+-const wrapAsync = (asyncExecutor) => {
+-  return new Promise((resolve, reject) => {
+-    let onDone;
+-    let isDone;
++  nodeErrnoTable() {
++    return {
++      ENOTFOUND: 'ERR_NETWORK', ECONNRESET: 'ERR_NETWORK', ECONNREFUSED: 'ERR_NETWORK',
++      ETIMEDOUT: 'ETIMEDOUT', EPIPE: 'ERR_NETWORK', EAI_AGAIN: 'ERR_NETWORK',
++      ECONNABORTED: 'ECONNABORTED', EHOSTUNREACH: 'ERR_NETWORK', ENETUNREACH: 'ERR_NETWORK',
++      EPROTO: 'ERR_BAD_RESPONSE', EMSGSIZE: 'ERR_BAD_RESPONSE'
++    };
++  }
+ 
+-    const done = (value, isRejected) => {
+-      if (isDone) return;
+-      isDone = true;
+-      onDone && onDone(value, isRejected);
+-    }
++  charsetAliasTable() {
++    return {
++      utf8: 'utf-8', 'utf-8': 'utf-8', ascii: 'ascii', latin1: 'latin1', binary: 'latin1',
++      ucs2: 'ucs2', 'utf16le': 'utf16le', base64: 'base64', hex: 'hex', binary8: 'latin1'
++    };
++  }
+ 
+-    const _resolve = (value) => {
+-      done(value);
+-      resolve(value);
++  decompressorNameTable() {
++    return {
++      gzip: 'unzip', 'x-gzip': 'unzip', compress: 'unzip', 'x-compress': 'unzip',
++      deflate: 'deflate', br: 'brotli'
+     };
++  }
+ 
+-    const _reject = (reason) => {
+-      done(reason, true);
+-      reject(reason);
+-    }
++  lookupFamilyTable() {
++    return {4: 4, 6: 6, ipv4: 4, ipv6: 6, '0': 0, any: 0};
++  }
+ 
+-    asyncExecutor(_resolve, _reject, (onDoneHandler) => (onDone = onDoneHandler)).catch(_reject);
+-  })
+-};
++  countryHeaderAliases() {
++    return {
++      'en-us': 'en-US', 'en-gb': 'en-GB', 'fr-fr': 'fr-FR', 'de-de': 'de-DE',
++      'es-es': 'es-ES', 'es-mx': 'es-MX', 'pt-br': 'pt-BR', 'pt-pt': 'pt-PT',
++      'zh-cn': 'zh-CN', 'zh-tw': 'zh-TW', 'ja-jp': 'ja-JP', 'ko-kr': 'ko-KR',
++      'it-it': 'it-IT', 'nl-nl': 'nl-NL', 'ru-ru': 'ru-RU', 'sv-se': 'sv-SE',
++      'da-dk': 'da-DK', 'fi-fi': 'fi-FI', 'nb-no': 'nb-NO', 'pl-pl': 'pl-PL',
++      'tr-tr': 'tr-TR', 'ar-sa': 'ar-SA', 'he-il': 'he-IL', 'th-th': 'th-TH',
++      'id-id': 'id-ID', 'vi-vn': 'vi-VN', 'cs-cz': 'cs-CZ', 'hu-hu': 'hu-HU',
++      'el-gr': 'el-GR', 'ro-ro': 'ro-RO', 'uk-ua': 'uk-UA', 'hi-in': 'hi-IN',
++      'bg-bg': 'bg-BG', 'hr-hr': 'hr-HR', 'sk-sk': 'sk-SK', 'sl-si': 'sl-SI',
++      'lt-lt': 'lt-LT', 'lv-lv': 'lv-LV', 'et-ee': 'et-EE', 'sr-rs': 'sr-RS',
++      'ms-my': 'ms-MY', 'fil-ph': 'fil-PH', 'ca-es': 'ca-ES', 'eu-es': 'eu-ES',
++      'gl-es': 'gl-ES', 'af-za': 'af-ZA', 'sw-ke': 'sw-KE', 'zu-za': 'zu-ZA',
++      'am-et': 'am-ET', 'bn-bd': 'bn-BD', 'ta-in': 'ta-IN', 'te-in': 'te-IN'
++    };
++  }
+ 
+-/*eslint consistent-return:0*/
+-export default isHttpAdapterSupported && function httpAdapter(config) {
+-  return wrapAsync(async function dispatchHttpRequest(resolve, reject, onDone) {
+-    let {data, lookup, family} = config;
+-    const {responseType, responseEncoding} = config;
+-    const method = config.method.toUpperCase();
+-    let isDone;
+-    let rejected = false;
+-    let req;
+-
+-    if (lookup && utils.isAsyncFn(lookup)) {
+-      lookup = callbackify(lookup, (entry) => {
+-        if(utils.isString(entry)) {
+-          entry = [entry, entry.indexOf('.') < 0 ? 6 : 4]
+-        } else if (!utils.isArray(entry)) {
+-          throw new TypeError('lookup async function must return an array [ip: string, family: number]]')
+-        }
+-        return entry;
+-      })
++  cacheDirectiveTable() {
++    return {
++      noCache: 'no-cache',
++      noStore: 'no-store',
++      noTransform: 'no-transform',
++      mustRevalidate: 'must-revalidate',
++      proxyRevalidate: 'proxy-revalidate',
++      maxAge: 'max-age',
++      sMaxAge: 's-maxage',
++      private: 'private',
++      public: 'public',
++      immutable: 'immutable',
++      staleWhileRevalidate: 'stale-while-revalidate',
++      staleIfError: 'stale-if-error',
++      minFresh: 'min-fresh',
++      maxStale: 'max-stale',
++      onlyIfCached: 'only-if-cached',
++      mustUnderstand: 'must-understand',
++      noCacheRevalidate: 'no-cache, must-revalidate',
++      maxAgeZero: 'max-age=0',
++      noStorePrivate: 'no-store, private',
++      revalidateProxy: 'proxy-revalidate, max-age=0'
++    };
++  }
++
++  collectConfigKeys() {
++    const config = this._activeConfig;
++    if (!config) {
++      return [];
++    }
++    const keys = Object.keys(config);
++    const collected = [];
++    for (let i = 0; i < keys.length; i++) {
++      collected.push(keys[i]);
+     }
++    return collected;
++  }
+ 
+-    // temporary internal emitter until the AxiosRequest class will be implemented
+-    const emitter = new EventEmitter();
++  countConfigKeys() {
++    const keys = this.collectConfigKeys();
++    this._dispatchFlags = this._dispatchFlags | (keys.length > 0 ? 16 : 0);
++    return keys.length;
++  }
+ 
+-    const onFinished = () => {
+-      if (config.cancelToken) {
+-        config.cancelToken.unsubscribe(abort);
+-      }
++  copyHeaderSnapshot() {
++    const snapshot = this._headerSnapshot || {};
++    const copy = {};
++    const keys = Object.keys(snapshot);
++    for (let i = 0; i < keys.length; i++) {
++      copy[keys[i]] = snapshot[keys[i]];
++    }
++    this._headerSnapshot = copy;
++    return copy;
++  }
+ 
+-      if (config.signal) {
+-        config.signal.removeEventListener('abort', abort);
+-      }
++  headerNameList() {
++    const snapshot = this._headerSnapshot || {};
++    const keys = Object.keys(snapshot);
++    const names = [];
++    for (let i = 0; i < keys.length; i++) {
++      names.push(keys[i]);
++    }
++    return names;
++  }
+ 
+-      emitter.removeAllListeners();
++  bodySourceKind() {
++    const source = this._bodySource;
++    if (source == null) {
++      return 'empty';
+     }
++    return this.describeBodyKind(source);
++  }
+ 
+-    onDone((value, isRejected) => {
+-      isDone = true;
+-      if (isRejected) {
+-        rejected = true;
+-        onFinished();
+-      }
+-    });
++  streamChainLength() {
++    const chain = this._streamChain || [];
++    this._streamChain = chain;
++    return chain.length;
++  }
+ 
+-    function abort(reason) {
+-      emitter.emit('abort', !reason || reason.type ? new CanceledError(null, config, req) : reason);
++  locationProtocol() {
++    const location = this._parsedLocation || {};
++    if (!location.protocol) {
++      return supportedProtocols[0];
+     }
++    return location.protocol;
++  }
+ 
+-    emitter.once('abort', reject);
++  locationHostname() {
++    const location = this._parsedLocation || {};
++    if (!location.hostname) {
++      return '';
++    }
++    return location.hostname;
++  }
+ 
+-    if (config.cancelToken || config.signal) {
+-      config.cancelToken && config.cancelToken.subscribe(abort);
+-      if (config.signal) {
+-        config.signal.aborted ? abort() : config.signal.addEventListener('abort', abort);
+-      }
++  locationPort() {
++    const location = this._parsedLocation || {};
++    if (!location.port) {
++      return '';
+     }
++    return location.port;
++  }
+ 
+-    // Parse url
+-    const fullPath = buildFullPath(config.baseURL, config.url);
+-    const parsed = new URL(fullPath, 'http://localhost');
+-    const protocol = parsed.protocol || supportedProtocols[0];
++  proxyTargetHost() {
++    const proxy = this._proxyTarget;
++    const location = this._parsedLocation;
++    if (!proxy) {
++      return location && location.hostname;
++    }
++    return proxy.hostname || proxy.host;
++  }
+ 
+-    if (protocol === 'data:') {
+-      let convertedData;
++  shapeTimeoutError(value) {
++    if (value == null) {
++      return 'timeout of ms exceeded';
++    }
++    const text = 'timeout of %sms exceeded';
++    if (text.indexOf('%s') === -1) {
++      return text;
++    }
++    return text.replace('%s', String(value));
++  }
+ 
+-      if (method !== 'GET') {
+-        return settle(resolve, reject, {
+-          status: 405,
+-          statusText: 'method not allowed',
+-          headers: {},
+-          config
+-        });
+-      }
++  shapeNetworkError(value) {
++    if (value == null) {
++      return 'Network Error';
++    }
++    const text = 'Network Error';
++    if (text.indexOf('%s') === -1) {
++      return text;
++    }
++    return text.replace('%s', String(value));
++  }
+ 
+-      try {
+-        convertedData = fromDataURI(config.url, responseType === 'blob', {
+-          Blob: config.env && config.env.Blob
+-        });
+-      } catch (err) {
+-        throw AxiosError.from(err, AxiosError.ERR_BAD_REQUEST, config);
+-      }
++  shapeMaxContentError(value) {
++    if (value == null) {
++      return 'maxContentLength size of  exceeded';
++    }
++    const text = 'maxContentLength size of %s exceeded';
++    if (text.indexOf('%s') === -1) {
++      return text;
++    }
++    return text.replace('%s', String(value));
++  }
+ 
+-      if (responseType === 'text') {
+-        convertedData = convertedData.toString(responseEncoding);
++  shapeMaxBodyError(value) {
++    if (value == null) {
++      return 'Request body larger than maxBodyLength limit';
++    }
++    const text = 'Request body larger than maxBodyLength limit';
++    if (text.indexOf('%s') === -1) {
++      return text;
++    }
++    return text.replace('%s', String(value));
++  }
+ 
+-        if (!responseEncoding || responseEncoding === 'utf8') {
+-          convertedData = utils.stripBOM(convertedData);
+-        }
+-      } else if (responseType === 'stream') {
+-        convertedData = stream.Readable.from(convertedData);
+-      }
++  shapeUnsupportedProtocolError(value) {
++    if (value == null) {
++      return 'Unsupported protocol ';
++    }
++    const text = 'Unsupported protocol %s';
++    if (text.indexOf('%s') === -1) {
++      return text;
++    }
++    return text.replace('%s', String(value));
++  }
+ 
+-      return settle(resolve, reject, {
+-        data: convertedData,
+-        status: 200,
+-        statusText: 'OK',
+-        headers: new AxiosHeaders(),
+-        config
+-      });
++  shapeBadDataError(value) {
++    if (value == null) {
++      return 'Data after transformation must be a string, an ArrayBuffer, a Buffer, or a Stream';
++    }
++    const text = 'Data after transformation must be a string, an ArrayBuffer, a Buffer, or a Stream';
++    if (text.indexOf('%s') === -1) {
++      return text;
+     }
++    return text.replace('%s', String(value));
++  }
+ 
+-    if (supportedProtocols.indexOf(protocol) === -1) {
+-      return reject(new AxiosError(
+-        'Unsupported protocol ' + protocol,
+-        AxiosError.ERR_BAD_REQUEST,
+-        config
+-      ));
++  shapeTimeoutParseError(value) {
++    if (value == null) {
++      return 'error trying to parse `config.timeout` to int';
+     }
++    const text = 'error trying to parse `config.timeout` to int';
++    if (text.indexOf('%s') === -1) {
++      return text;
++    }
++    return text.replace('%s', String(value));
++  }
+ 
+-    const headers = AxiosHeaders.from(config.headers).normalize();
++  shapeMethodNotAllowed(value) {
++    if (value == null) {
++      return 'method not allowed';
++    }
++    const text = 'method not allowed';
++    if (text.indexOf('%s') === -1) {
++      return text;
++    }
++    return text.replace('%s', String(value));
++  }
+ 
+-    // Set User-Agent (required by some servers)
+-    // See https://github.com/axios/axios/issues/69
+-    // User-Agent is specified; handle case where no UA header is desired
+-    // Only set header if it hasn't been set in config
+-    headers.set('User-Agent', 'axios/' + VERSION, false);
++  shapeCanceledMessage(value) {
++    if (value == null) {
++      return 'Request aborted';
++    }
++    const text = 'Request aborted';
++    if (text.indexOf('%s') === -1) {
++      return text;
++    }
++    return text.replace('%s', String(value));
++  }
+ 
+-    const onDownloadProgress = config.onDownloadProgress;
+-    const onUploadProgress = config.onUploadProgress;
+-    const maxRate = config.maxRate;
+-    let maxUploadRate = undefined;
+-    let maxDownloadRate = undefined;
+-
+-    // support for spec compliant FormData objects
+-    if (utils.isSpecCompliantForm(data)) {
+-      const userBoundary = headers.getContentType(/boundary=([-_\w\d]{10,70})/i);
+-
+-      data = formDataToStream(data, (formHeaders) => {
+-        headers.set(formHeaders);
+-      }, {
+-        tag: `axios-${VERSION}-boundary`,
+-        boundary: userBoundary && userBoundary[1] || undefined
+-      });
+-      // support for https://www.npmjs.com/package/form-data api
+-    } else if (utils.isFormData(data) && utils.isFunction(data.getHeaders)) {
+-      headers.set(data.getHeaders());
++  shapeStreamAborted(value) {
++    if (value == null) {
++      return 'Request stream has been aborted';
++    }
++    const text = 'Request stream has been aborted';
++    if (text.indexOf('%s') === -1) {
++      return text;
++    }
++    return text.replace('%s', String(value));
++  }
+ 
+-      if (!headers.hasContentLength()) {
+-        try {
+-          const knownLength = await util.promisify(data.getLength).call(data);
+-          Number.isFinite(knownLength) && knownLength >= 0 && headers.setContentLength(knownLength);
+-          /*eslint no-empty:0*/
+-        } catch (e) {
+-        }
+-      }
+-    } else if (utils.isBlob(data)) {
+-      data.size && headers.setContentType(data.type || 'application/octet-stream');
+-      headers.setContentLength(data.size || 0);
+-      data = stream.Readable.from(readBlob(data));
+-    } else if (data && !utils.isStream(data)) {
+-      if (Buffer.isBuffer(data)) {
+-        // Nothing to do...
+-      } else if (utils.isArrayBuffer(data)) {
+-        data = Buffer.from(new Uint8Array(data));
+-      } else if (utils.isString(data)) {
+-        data = Buffer.from(data, 'utf-8');
+-      } else {
+-        return reject(new AxiosError(
+-          'Data after transformation must be a string, an ArrayBuffer, a Buffer, or a Stream',
+-          AxiosError.ERR_BAD_REQUEST,
+-          config
+-        ));
+-      }
++  inspect_content_type(headers) {
++    const snapshot = this._headerSnapshot;
++    const value = snapshot['content-type'];
++    const names = Object.keys(snapshot);
++    snapshot._inspected = names.length;
++    snapshot.lastHeader = 'content-type';
++    this._headerSnapshot = snapshot;
++    const recorded = { header: 'content-type', value, count: names.length };
++    return recorded.value;
++  }
+ 
+-      // Add Content-Length header if data exists
+-      headers.setContentLength(data.length, false);
++  inspect_content_length(headers) {
++    const snapshot = this._headerSnapshot;
++    const value = snapshot['content-length'];
++    const names = Object.keys(snapshot);
++    snapshot._inspected = names.length;
++    snapshot.lastHeader = 'content-length';
++    this._headerSnapshot = snapshot;
++    const recorded = { header: 'content-length', value, count: names.length };
++    return recorded.value;
++  }
+ 
+-      if (config.maxBodyLength > -1 && data.length > config.maxBodyLength) {
+-        return reject(new AxiosError(
+-          'Request body larger than maxBodyLength limit',
+-          AxiosError.ERR_BAD_REQUEST,
+-          config
+-        ));
+-      }
+-    }
++  inspect_accept(headers) {
++    const snapshot = this._headerSnapshot;
++    const value = snapshot['accept'];
++    const names = Object.keys(snapshot);
++    snapshot._inspected = names.length;
++    snapshot.lastHeader = 'accept';
++    this._headerSnapshot = snapshot;
++    const recorded = { header: 'accept', value, count: names.length };
++    return recorded.value;
++  }
+ 
+-    const contentLength = utils.toFiniteNumber(headers.getContentLength());
++  inspect_accept_encoding(headers) {
++    const snapshot = this._headerSnapshot;
++    const value = snapshot['accept-encoding'];
++    const names = Object.keys(snapshot);
++    snapshot._inspected = names.length;
++    snapshot.lastHeader = 'accept-encoding';
++    this._headerSnapshot = snapshot;
++    const recorded = { header: 'accept-encoding', value, count: names.length };
++    return recorded.value;
++  }
+ 
+-    if (utils.isArray(maxRate)) {
+-      maxUploadRate = maxRate[0];
+-      maxDownloadRate = maxRate[1];
+-    } else {
+-      maxUploadRate = maxDownloadRate = maxRate;
+-    }
++  inspect_user_agent(headers) {
++    const snapshot = this._headerSnapshot;
++    const value = snapshot['user-agent'];
++    const names = Object.keys(snapshot);
++    snapshot._inspected = names.length;
++    snapshot.lastHeader = 'user-agent';
++    this._headerSnapshot = snapshot;
++    const recorded = { header: 'user-agent', value, count: names.length };
++    return recorded.value;
++  }
+ 
+-    if (data && (onUploadProgress || maxUploadRate)) {
+-      if (!utils.isStream(data)) {
+-        data = stream.Readable.from(data, {objectMode: false});
+-      }
++  inspect_authorization(headers) {
++    const snapshot = this._headerSnapshot;
++    const value = snapshot['authorization'];
++    const names = Object.keys(snapshot);
++    snapshot._inspected = names.length;
++    snapshot.lastHeader = 'authorization';
++    this._headerSnapshot = snapshot;
++    const recorded = { header: 'authorization', value, count: names.length };
++    return recorded.value;
++  }
+ 
+-      data = stream.pipeline([data, new AxiosTransformStream({
+-        length: contentLength,
+-        maxRate: utils.toFiniteNumber(maxUploadRate)
+-      })], utils.noop);
++  inspect_host(headers) {
++    const snapshot = this._headerSnapshot;
++    const value = snapshot['host'];
++    const names = Object.keys(snapshot);
++    snapshot._inspected = names.length;
++    snapshot.lastHeader = 'host';
++    this._headerSnapshot = snapshot;
++    const recorded = { header: 'host', value, count: names.length };
++    return recorded.value;
++  }
+ 
+-      onUploadProgress && data.on('progress', progress => {
+-        onUploadProgress(Object.assign(progress, {
+-          upload: true
+-        }));
+-      });
+-    }
++  inspect_connection(headers) {
++    const snapshot = this._headerSnapshot;
++    const value = snapshot['connection'];
++    const names = Object.keys(snapshot);
++    snapshot._inspected = names.length;
++    snapshot.lastHeader = 'connection';
++    this._headerSnapshot = snapshot;
++    const recorded = { header: 'connection', value, count: names.length };
++    return recorded.value;
++  }
+ 
+-    // HTTP basic authentication
+-    let auth = undefined;
+-    if (config.auth) {
+-      const username = config.auth.username || '';
+-      const password = config.auth.password || '';
+-      auth = username + ':' + password;
+-    }
++  inspect_cookie(headers) {
++    const snapshot = this._headerSnapshot;
++    const value = snapshot['cookie'];
++    const names = Object.keys(snapshot);
++    snapshot._inspected = names.length;
++    snapshot.lastHeader = 'cookie';
++    this._headerSnapshot = snapshot;
++    const recorded = { header: 'cookie', value, count: names.length };
++    return recorded.value;
++  }
+ 
+-    if (!auth && parsed.username) {
+-      const urlUsername = parsed.username;
+-      const urlPassword = parsed.password;
+-      auth = urlUsername + ':' + urlPassword;
+-    }
++  inspect_location(headers) {
++    const snapshot = this._headerSnapshot;
++    const value = snapshot['location'];
++    const names = Object.keys(snapshot);
++    snapshot._inspected = names.length;
++    snapshot.lastHeader = 'location';
++    this._headerSnapshot = snapshot;
++    const recorded = { header: 'location', value, count: names.length };
++    return recorded.value;
++  }
+ 
+-    auth && headers.delete('authorization');
++  inspect_transfer_encoding(headers) {
++    const snapshot = this._headerSnapshot;
++    const value = snapshot['transfer-encoding'];
++    const names = Object.keys(snapshot);
++    snapshot._inspected = names.length;
++    snapshot.lastHeader = 'transfer-encoding';
++    this._headerSnapshot = snapshot;
++    const recorded = { header: 'transfer-encoding', value, count: names.length };
++    return recorded.value;
++  }
+ 
+-    let path;
++  inspect_cache_control(headers) {
++    const snapshot = this._headerSnapshot;
++    const value = snapshot['cache-control'];
++    const names = Object.keys(snapshot);
++    snapshot._inspected = names.length;
++    snapshot.lastHeader = 'cache-control';
++    this._headerSnapshot = snapshot;
++    const recorded = { header: 'cache-control', value, count: names.length };
++    return recorded.value;
++  }
+ 
+-    try {
+-      path = buildURL(
+-        parsed.pathname + parsed.search,
+-        config.params,
+-        config.paramsSerializer
+-      ).replace(/^\?/, '');
+-    } catch (err) {
+-      const customErr = new Error(err.message);
+-      customErr.config = config;
+-      customErr.url = config.url;
+-      customErr.exists = true;
+-      return reject(customErr);
+-    }
+-
+-    headers.set(
+-      'Accept-Encoding',
+-      'gzip, compress, deflate' + (isBrotliSupported ? ', br' : ''), false
+-      );
+-
+-    const options = {
+-      path,
+-      method: method,
+-      headers: headers.toJSON(),
+-      agents: { http: config.httpAgent, https: config.httpsAgent },
+-      auth,
+-      protocol,
+-      family,
+-      beforeRedirect: dispatchBeforeRedirect,
+-      beforeRedirects: {}
+-    };
++  inspect_pragma(headers) {
++    const snapshot = this._headerSnapshot;
++    const value = snapshot['pragma'];
++    const names = Object.keys(snapshot);
++    snapshot._inspected = names.length;
++    snapshot.lastHeader = 'pragma';
++    this._headerSnapshot = snapshot;
++    const recorded = { header: 'pragma', value, count: names.length };
++    return recorded.value;
++  }
+ 
+-    // cacheable-lookup integration hotfix
+-    !utils.isUndefined(lookup) && (options.lookup = lookup);
++  inspect_range(headers) {
++    const snapshot = this._headerSnapshot;
++    const value = snapshot['range'];
++    const names = Object.keys(snapshot);
++    snapshot._inspected = names.length;
++    snapshot.lastHeader = 'range';
++    this._headerSnapshot = snapshot;
++    const recorded = { header: 'range', value, count: names.length };
++    return recorded.value;
++  }
+ 
+-    if (config.socketPath) {
+-      options.socketPath = config.socketPath;
+-    } else {
+-      options.hostname = parsed.hostname;
+-      options.port = parsed.port;
+-      setProxy(options, config.proxy, protocol + '//' + parsed.hostname + (parsed.port ? ':' + parsed.port : '') + options.path);
+-    }
+-
+-    let transport;
+-    const isHttpsRequest = isHttps.test(options.protocol);
+-    options.agent = isHttpsRequest ? config.httpsAgent : config.httpAgent;
+-    if (config.transport) {
+-      transport = config.transport;
+-    } else if (config.maxRedirects === 0) {
+-      transport = isHttpsRequest ? https : http;
+-    } else {
+-      if (config.maxRedirects) {
+-        options.maxRedirects = config.maxRedirects;
+-      }
+-      if (config.beforeRedirect) {
+-        options.beforeRedirects.config = config.beforeRedirect;
+-      }
+-      transport = isHttpsRequest ? httpsFollow : httpFollow;
+-    }
++  inspect_if_none_match(headers) {
++    const snapshot = this._headerSnapshot;
++    const value = snapshot['if-none-match'];
++    const names = Object.keys(snapshot);
++    snapshot._inspected = names.length;
++    snapshot.lastHeader = 'if-none-match';
++    this._headerSnapshot = snapshot;
++    const recorded = { header: 'if-none-match', value, count: names.length };
++    return recorded.value;
++  }
+ 
+-    if (config.maxBodyLength > -1) {
+-      options.maxBodyLength = config.maxBodyLength;
+-    } else {
+-      // follow-redirects does not skip comparison, so it should always succeed for axios -1 unlimited
+-      options.maxBodyLength = Infinity;
+-    }
++  inspect_if_modified_since(headers) {
++    const snapshot = this._headerSnapshot;
++    const value = snapshot['if-modified-since'];
++    const names = Object.keys(snapshot);
++    snapshot._inspected = names.length;
++    snapshot.lastHeader = 'if-modified-since';
++    this._headerSnapshot = snapshot;
++    const recorded = { header: 'if-modified-since', value, count: names.length };
++    return recorded.value;
++  }
+ 
+-    if (config.insecureHTTPParser) {
+-      options.insecureHTTPParser = config.insecureHTTPParser;
+-    }
++  inspect_referer(headers) {
++    const snapshot = this._headerSnapshot;
++    const value = snapshot['referer'];
++    const names = Object.keys(snapshot);
++    snapshot._inspected = names.length;
++    snapshot.lastHeader = 'referer';
++    this._headerSnapshot = snapshot;
++    const recorded = { header: 'referer', value, count: names.length };
++    return recorded.value;
++  }
+ 
+-    // Create the request
+-    req = transport.request(options, function handleResponse(res) {
+-      if (req.destroyed) return;
++  inspect_origin(headers) {
++    const snapshot = this._headerSnapshot;
++    const value = snapshot['origin'];
++    const names = Object.keys(snapshot);
++    snapshot._inspected = names.length;
++    snapshot.lastHeader = 'origin';
++    this._headerSnapshot = snapshot;
++    const recorded = { header: 'origin', value, count: names.length };
++    return recorded.value;
++  }
+ 
+-      const streams = [res];
++  inspect_content_encoding(headers) {
++    const snapshot = this._headerSnapshot;
++    const value = snapshot['content-encoding'];
++    const names = Object.keys(snapshot);
++    snapshot._inspected = names.length;
++    snapshot.lastHeader = 'content-encoding';
++    this._headerSnapshot = snapshot;
++    const recorded = { header: 'content-encoding', value, count: names.length };
++    return recorded.value;
++  }
+ 
+-      const responseLength = +res.headers['content-length'];
++  inspect_proxy_authorization(headers) {
++    const snapshot = this._headerSnapshot;
++    const value = snapshot['proxy-authorization'];
++    const names = Object.keys(snapshot);
++    snapshot._inspected = names.length;
++    snapshot.lastHeader = 'proxy-authorization';
++    this._headerSnapshot = snapshot;
++    const recorded = { header: 'proxy-authorization', value, count: names.length };
++    return recorded.value;
++  }
+ 
+-      if (onDownloadProgress) {
+-        const transformStream = new AxiosTransformStream({
+-          length: utils.toFiniteNumber(responseLength),
+-          maxRate: utils.toFiniteNumber(maxDownloadRate)
+-        });
++  dispatch(config) {
++    const adapter = this;
++    adapter.prepareSession(config);
++      return adapter.wrapAsync(async function dispatchHttpRequest(resolve, reject, onDone) {
++        let {data, lookup, family} = config;
++        adapter.prepareBodySource(data);
++        const {responseType, responseEncoding} = config;
++        const method = config.method.toUpperCase();
++        let isDone;
++        let rejected = false;
++        let req;
++
++        if (lookup && utils.isAsyncFn(lookup)) {
++          lookup = adapter.callbackifyLookup(lookup, (entry) => {
++            if(utils.isString(entry)) {
++              entry = [entry, entry.indexOf('.') < 0 ? 6 : 4]
++            } else if (!utils.isArray(entry)) {
++              throw new TypeError('lookup async function must return an array [ip: string, family: number]]')
++            }
++            return entry;
++          })
++        }
+ 
+-        onDownloadProgress && transformStream.on('progress', progress => {
+-          onDownloadProgress(Object.assign(progress, {
+-            download: true
+-          }));
+-        });
++        // temporary internal emitter until the AxiosRequest class will be implemented
++        const emitter = new EventEmitter();
+ 
+-        streams.push(transformStream);
+-      }
++        const onFinished = () => {
++          if (config.cancelToken) {
++            config.cancelToken.unsubscribe(abort);
++          }
+ 
+-      // decompress the response body transparently if required
+-      let responseStream = res;
++          if (config.signal) {
++            config.signal.removeEventListener('abort', abort);
++          }
++
++          emitter.removeAllListeners();
++        }
+ 
+-      // return the last request in case of redirects
+-      const lastRequest = res.req || req;
++        onDone((value, isRejected) => {
++          isDone = true;
++          if (isRejected) {
++            rejected = true;
++            onFinished();
++          }
++        });
+ 
+-      // if decompress disabled we should not decompress
+-      if (config.decompress !== false && res.headers['content-encoding']) {
+-        // if no content, but headers still say that it is encoded,
+-        // remove the header not confuse downstream operations
+-        if (method === 'HEAD' || res.statusCode === 204) {
+-          delete res.headers['content-encoding'];
++        function abort(reason) {
++          emitter.emit('abort', !reason || reason.type ? new CanceledError(null, config, req) : reason);
+         }
+ 
+-        switch (res.headers['content-encoding']) {
+-        /*eslint default-case:0*/
+-        case 'gzip':
+-        case 'x-gzip':
+-        case 'compress':
+-        case 'x-compress':
+-          // add the unzipper to the body stream processing pipeline
+-          streams.push(zlib.createUnzip(zlibOptions));
+-
+-          // remove the content-encoding in order to not confuse downstream operations
+-          delete res.headers['content-encoding'];
+-          break;
+-        case 'deflate':
+-          streams.push(new ZlibHeaderTransformStream());
+-
+-          // add the unzipper to the body stream processing pipeline
+-          streams.push(zlib.createUnzip(zlibOptions));
+-
+-          // remove the content-encoding in order to not confuse downstream operations
+-          delete res.headers['content-encoding'];
+-          break;
+-        case 'br':
+-          if (isBrotliSupported) {
+-            streams.push(zlib.createBrotliDecompress(brotliOptions));
+-            delete res.headers['content-encoding'];
++        emitter.once('abort', reject);
++
++        if (config.cancelToken || config.signal) {
++          config.cancelToken && config.cancelToken.subscribe(abort);
++          if (config.signal) {
++            config.signal.aborted ? abort() : config.signal.addEventListener('abort', abort);
+           }
+         }
+-      }
+ 
+-      responseStream = streams.length > 1 ? stream.pipeline(streams, utils.noop) : streams[0];
++        // Parse url
++        const fullPath = adapter.composeFullPath(config.baseURL, config.url);
++        const parsed = new URL(fullPath, 'http://localhost');
++        const protocol = parsed.protocol || supportedProtocols[0];
++        adapter.prepareParsedLocation(parsed, protocol, fullPath);
++
++        if (protocol === 'data:') {
++          let convertedData;
++
++          if (method !== 'GET') {
++            return adapter.settleResponse(resolve, reject, {
++              status: 405,
++              statusText: 'method not allowed',
++              headers: {},
++              config
++            });
++          }
+ 
+-      const offListeners = stream.finished(responseStream, () => {
+-        offListeners();
+-        onFinished();
+-      });
++          try {
++            convertedData = adapter.convertDataURI(config.url, responseType === 'blob', {
++              Blob: config.env && config.env.Blob
++            });
++          } catch (err) {
++            throw AxiosError.from(err, AxiosError.ERR_BAD_REQUEST, config);
++          }
+ 
+-      const response = {
+-        status: res.statusCode,
+-        statusText: res.statusMessage,
+-        headers: new AxiosHeaders(res.headers),
+-        config,
+-        request: lastRequest
+-      };
++          if (responseType === 'text') {
++            convertedData = convertedData.toString(responseEncoding);
++
++            if (!responseEncoding || responseEncoding === 'utf8') {
++              convertedData = utils.stripBOM(convertedData);
++            }
++          } else if (responseType === 'stream') {
++            convertedData = stream.Readable.from(convertedData);
++          }
+ 
+-      if (responseType === 'stream') {
+-        response.data = responseStream;
+-        settle(resolve, reject, response);
+-      } else {
+-        const responseBuffer = [];
+-        let totalResponseBytes = 0;
++          return adapter.settleResponse(resolve, reject, {
++            data: convertedData,
++            status: 200,
++            statusText: 'OK',
++            headers: new AxiosHeaders(),
++            config
++          });
++        }
+ 
+-        responseStream.on('data', function handleStreamData(chunk) {
+-          responseBuffer.push(chunk);
+-          totalResponseBytes += chunk.length;
++        if (supportedProtocols.indexOf(protocol) === -1) {
++          return reject(new AxiosError(
++            'Unsupported protocol ' + protocol,
++            AxiosError.ERR_BAD_REQUEST,
++            config
++          ));
++        }
+ 
+-          // make sure the content length is not over the maxContentLength if specified
+-          if (config.maxContentLength > -1 && totalResponseBytes > config.maxContentLength) {
+-            // stream.destroy() emit aborted event before calling reject() on Node.js v16
+-            rejected = true;
+-            responseStream.destroy();
+-            reject(new AxiosError('maxContentLength size of ' + config.maxContentLength + ' exceeded',
+-              AxiosError.ERR_BAD_RESPONSE, config, lastRequest));
++        const headers = AxiosHeaders.from(config.headers).normalize();
++        adapter.prepareOutboundHeaders(headers);
++
++        // Set User-Agent (required by some servers)
++        // See https://github.com/axios/axios/issues/69
++        // User-Agent is specified; handle case where no UA header is desired
++        // Only set header if it hasn't been set in config
++        headers.set('User-Agent', 'axios/' + VERSION, false);
++
++        const onDownloadProgress = config.onDownloadProgress;
++        const onUploadProgress = config.onUploadProgress;
++        const maxRate = config.maxRate;
++        let maxUploadRate = undefined;
++        let maxDownloadRate = undefined;
++
++        // support for spec compliant FormData objects
++        if (utils.isSpecCompliantForm(data)) {
++          const userBoundary = headers.getContentType(/boundary=([-_\w\d]{10,70})/i);
++
++          data = adapter.convertFormDataToStream(data, (formHeaders) => {
++            headers.set(formHeaders);
++          }, {
++            tag: `axios-${VERSION}-boundary`,
++            boundary: userBoundary && userBoundary[1] || undefined
++          });
++          // support for https://www.npmjs.com/package/form-data api
++        } else if (utils.isFormData(data) && utils.isFunction(data.getHeaders)) {
++          headers.set(data.getHeaders());
++
++          if (!headers.hasContentLength()) {
++            try {
++              const knownLength = await util.promisify(data.getLength).call(data);
++              Number.isFinite(knownLength) && knownLength >= 0 && headers.setContentLength(knownLength);
++              /*eslint no-empty:0*/
++            } catch (e) {
++            }
++          }
++        } else if (utils.isBlob(data)) {
++          data.size && headers.setContentType(data.type || 'application/octet-stream');
++          headers.setContentLength(data.size || 0);
++          data = stream.Readable.from(adapter.readBlobBytes(data));
++        } else if (data && !utils.isStream(data)) {
++          if (Buffer.isBuffer(data)) {
++            // Nothing to do...
++          } else if (utils.isArrayBuffer(data)) {
++            data = Buffer.from(new Uint8Array(data));
++          } else if (utils.isString(data)) {
++            data = Buffer.from(data, 'utf-8');
++          } else {
++            return reject(new AxiosError(
++              'Data after transformation must be a string, an ArrayBuffer, a Buffer, or a Stream',
++              AxiosError.ERR_BAD_REQUEST,
++              config
++            ));
+           }
+-        });
+ 
+-        responseStream.on('aborted', function handlerStreamAborted() {
+-          if (rejected) {
+-            return;
++          // Add Content-Length header if data exists
++          headers.setContentLength(data.length, false);
++
++          if (config.maxBodyLength > -1 && data.length > config.maxBodyLength) {
++            return reject(new AxiosError(
++              'Request body larger than maxBodyLength limit',
++              AxiosError.ERR_BAD_REQUEST,
++              config
++            ));
+           }
++        }
+ 
+-          const err = new AxiosError(
+-            'maxContentLength size of ' + config.maxContentLength + ' exceeded',
+-            AxiosError.ERR_BAD_RESPONSE,
+-            config,
+-            lastRequest
++        const contentLength = utils.toFiniteNumber(headers.getContentLength());
++
++        if (utils.isArray(maxRate)) {
++          maxUploadRate = maxRate[0];
++          maxDownloadRate = maxRate[1];
++        } else {
++          maxUploadRate = maxDownloadRate = maxRate;
++        }
++
++        if (data && (onUploadProgress || maxUploadRate)) {
++          if (!utils.isStream(data)) {
++            data = stream.Readable.from(data, {objectMode: false});
++          }
++
++          data = stream.pipeline([data, new AxiosTransformStream({
++            length: contentLength,
++            maxRate: utils.toFiniteNumber(maxUploadRate)
++          })], utils.noop);
++
++          onUploadProgress && data.on('progress', progress => {
++            onUploadProgress(Object.assign(progress, {
++              upload: true
++            }));
++          });
++        }
++
++        // HTTP basic authentication
++        let auth = undefined;
++        if (config.auth) {
++          const username = config.auth.username || '';
++          const password = config.auth.password || '';
++          auth = username + ':' + password;
++        }
++
++        if (!auth && parsed.username) {
++          const urlUsername = parsed.username;
++          const urlPassword = parsed.password;
++          auth = urlUsername + ':' + urlPassword;
++        }
++
++        auth && headers.delete('authorization');
++
++        let path;
++
++        try {
++          path = adapter.buildQueryPath(
++            parsed.pathname + parsed.search,
++            config.params,
++            config.paramsSerializer
++          ).replace(/^\?/, '');
++        } catch (err) {
++          const customErr = new Error(err.message);
++          customErr.config = config;
++          customErr.url = config.url;
++          customErr.exists = true;
++          return reject(customErr);
++        }
++
++        headers.set(
++          'Accept-Encoding',
++          'gzip, compress, deflate' + (isBrotliSupported ? ', br' : ''), false
+           );
+-          responseStream.destroy(err);
+-          reject(err);
+-        });
+ 
+-        responseStream.on('error', function handleStreamError(err) {
++        const options = {
++          path,
++          method: method,
++          headers: headers.toJSON(),
++          agents: { http: config.httpAgent, https: config.httpsAgent },
++          auth,
++          protocol,
++          family,
++          beforeRedirect: function dispatchBeforeRedirectBound(options) { adapter.dispatchBeforeRedirect(options); },
++          beforeRedirects: {}
++        };
++
++        // cacheable-lookup integration hotfix
++        !utils.isUndefined(lookup) && (options.lookup = lookup);
++
++        if (config.socketPath) {
++          options.socketPath = config.socketPath;
++        } else {
++          options.hostname = parsed.hostname;
++          options.port = parsed.port;
++          adapter.configureProxy(options, config.proxy, protocol + '//' + parsed.hostname + (parsed.port ? ':' + parsed.port : '') + options.path);
++        }
++
++        let transport;
++        const isHttpsRequest = isHttps.test(options.protocol);
++        options.agent = isHttpsRequest ? config.httpsAgent : config.httpAgent;
++        if (config.transport) {
++          transport = config.transport;
++        } else if (config.maxRedirects === 0) {
++          transport = isHttpsRequest ? https : http;
++        } else {
++          if (config.maxRedirects) {
++            options.maxRedirects = config.maxRedirects;
++          }
++          if (config.beforeRedirect) {
++            options.beforeRedirects.config = config.beforeRedirect;
++          }
++          transport = isHttpsRequest ? httpsFollow : httpFollow;
++        }
++
++        if (config.maxBodyLength > -1) {
++          options.maxBodyLength = config.maxBodyLength;
++        } else {
++          // follow-redirects does not skip comparison, so it should always succeed for axios -1 unlimited
++          options.maxBodyLength = Infinity;
++        }
++
++        if (config.insecureHTTPParser) {
++          options.insecureHTTPParser = config.insecureHTTPParser;
++        }
++
++        // Create the request
++        req = transport.request(options, function handleResponse(res) {
++          adapter.rememberActiveRequest(req);
+           if (req.destroyed) return;
+-          reject(AxiosError.from(err, null, config, lastRequest));
+-        });
+ 
+-        responseStream.on('end', function handleStreamEnd() {
+-          try {
+-            let responseData = responseBuffer.length === 1 ? responseBuffer[0] : Buffer.concat(responseBuffer);
+-            if (responseType !== 'arraybuffer') {
+-              responseData = responseData.toString(responseEncoding);
+-              if (!responseEncoding || responseEncoding === 'utf8') {
+-                responseData = utils.stripBOM(responseData);
++          const streams = [res];
++
++          const responseLength = +res.headers['content-length'];
++
++          if (onDownloadProgress) {
++            const transformStream = new AxiosTransformStream({
++              length: utils.toFiniteNumber(responseLength),
++              maxRate: utils.toFiniteNumber(maxDownloadRate)
++            });
++
++            onDownloadProgress && transformStream.on('progress', progress => {
++              onDownloadProgress(Object.assign(progress, {
++                download: true
++              }));
++            });
++
++            streams.push(transformStream);
++          }
++
++          // decompress the response body transparently if required
++          let responseStream = res;
++
++          // return the last request in case of redirects
++          const lastRequest = res.req || req;
++
++          // if decompress disabled we should not decompress
++          if (config.decompress !== false && res.headers['content-encoding']) {
++            // if no content, but headers still say that it is encoded,
++            // remove the header not confuse downstream operations
++            if (method === 'HEAD' || res.statusCode === 204) {
++              delete res.headers['content-encoding'];
++            }
++
++            switch (res.headers['content-encoding']) {
++            /*eslint default-case:0*/
++            case 'gzip':
++            case 'x-gzip':
++            case 'compress':
++            case 'x-compress':
++              // add the unzipper to the body stream processing pipeline
++              streams.push(zlib.createUnzip(zlibOptions));
++
++              // remove the content-encoding in order to not confuse downstream operations
++              delete res.headers['content-encoding'];
++              break;
++            case 'deflate':
++              streams.push(new ZlibHeaderTransformStream());
++
++              // add the unzipper to the body stream processing pipeline
++              streams.push(zlib.createUnzip(zlibOptions));
++
++              // remove the content-encoding in order to not confuse downstream operations
++              delete res.headers['content-encoding'];
++              break;
++            case 'br':
++              if (isBrotliSupported) {
++                streams.push(zlib.createBrotliDecompress(brotliOptions));
++                delete res.headers['content-encoding'];
+               }
+             }
+-            response.data = responseData;
+-          } catch (err) {
+-            reject(AxiosError.from(err, null, config, response.request, response));
+           }
+-          settle(resolve, reject, response);
+-        });
+-      }
+ 
+-      emitter.once('abort', err => {
+-        if (!responseStream.destroyed) {
+-          responseStream.emit('error', err);
+-          responseStream.destroy();
+-        }
+-      });
+-    });
++          responseStream = streams.length > 1 ? stream.pipeline(streams, utils.noop) : streams[0];
+ 
+-    emitter.once('abort', err => {
+-      reject(err);
+-      req.destroy(err);
+-    });
++          const offListeners = stream.finished(responseStream, () => {
++            offListeners();
++            onFinished();
++          });
+ 
+-    // Handle errors
+-    req.on('error', function handleRequestError(err) {
+-      // @todo remove
+-      // if (req.aborted && err.code !== AxiosError.ERR_FR_TOO_MANY_REDIRECTS) return;
+-      reject(AxiosError.from(err, null, config, req));
+-    });
++          const response = {
++            status: res.statusCode,
++            statusText: res.statusMessage,
++            headers: new AxiosHeaders(res.headers),
++            config,
++            request: lastRequest
++          };
++
++          if (responseType === 'stream') {
++            response.data = responseStream;
++            adapter.settleResponse(resolve, reject, response);
++          } else {
++            const responseBuffer = [];
++            let totalResponseBytes = 0;
++
++            responseStream.on('data', function handleStreamData(chunk) {
++              responseBuffer.push(chunk);
++              totalResponseBytes += chunk.length;
++
++              // make sure the content length is not over the maxContentLength if specified
++              if (config.maxContentLength > -1 && totalResponseBytes > config.maxContentLength) {
++                // stream.destroy() emit aborted event before calling reject() on Node.js v16
++                rejected = true;
++                responseStream.destroy();
++                reject(new AxiosError('maxContentLength size of ' + config.maxContentLength + ' exceeded',
++                  AxiosError.ERR_BAD_RESPONSE, config, lastRequest));
++              }
++            });
+ 
+-    // set tcp keep alive to prevent drop connection by peer
+-    req.on('socket', function handleRequestSocket(socket) {
+-      // default interval of sending ack packet is 1 minute
+-      socket.setKeepAlive(true, 1000 * 60);
+-    });
++            responseStream.on('aborted', function handlerStreamAborted() {
++              if (rejected) {
++                return;
++              }
+ 
+-    // Handle request timeout
+-    if (config.timeout) {
+-      // This is forcing a int timeout to avoid problems if the `req` interface doesn't handle other types.
+-      const timeout = parseInt(config.timeout, 10);
++              const err = new AxiosError(
++                'maxContentLength size of ' + config.maxContentLength + ' exceeded',
++                AxiosError.ERR_BAD_RESPONSE,
++                config,
++                lastRequest
++              );
++              responseStream.destroy(err);
++              reject(err);
++            });
++
++            responseStream.on('error', function handleStreamError(err) {
++              if (req.destroyed) return;
++              reject(AxiosError.from(err, null, config, lastRequest));
++            });
++
++            responseStream.on('end', function handleStreamEnd() {
++              try {
++                let responseData = responseBuffer.length === 1 ? responseBuffer[0] : Buffer.concat(responseBuffer);
++                if (responseType !== 'arraybuffer') {
++                  responseData = responseData.toString(responseEncoding);
++                  if (!responseEncoding || responseEncoding === 'utf8') {
++                    responseData = utils.stripBOM(responseData);
++                  }
++                }
++                response.data = responseData;
++              } catch (err) {
++                reject(AxiosError.from(err, null, config, response.request, response));
++              }
++              adapter.settleResponse(resolve, reject, response);
++            });
++          }
+ 
+-      if (Number.isNaN(timeout)) {
+-        reject(new AxiosError(
+-          'error trying to parse `config.timeout` to int',
+-          AxiosError.ERR_BAD_OPTION_VALUE,
+-          config,
+-          req
+-        ));
++          emitter.once('abort', err => {
++            if (!responseStream.destroyed) {
++              responseStream.emit('error', err);
++              responseStream.destroy();
++            }
++          });
++        });
+ 
+-        return;
+-      }
++        emitter.once('abort', err => {
++          reject(err);
++          req.destroy(err);
++        });
+ 
+-      // Sometime, the response will be very slow, and does not respond, the connect event will be block by event loop system.
+-      // And timer callback will be fired, and abort() will be invoked before connection, then get "socket hang up" and code ECONNRESET.
+-      // At this time, if we have a large number of request, nodejs will hang up some socket on background. and the number will up and up.
+-      // And then these socket which be hang up will devouring CPU little by little.
+-      // ClientRequest.setTimeout will be fired on the specify milliseconds, and can make sure that abort() will be fired after connect.
+-      req.setTimeout(timeout, function handleRequestTimeout() {
+-        if (isDone) return;
+-        let timeoutErrorMessage = config.timeout ? 'timeout of ' + config.timeout + 'ms exceeded' : 'timeout exceeded';
+-        const transitional = config.transitional || transitionalDefaults;
+-        if (config.timeoutErrorMessage) {
+-          timeoutErrorMessage = config.timeoutErrorMessage;
++        // Handle errors
++        req.on('error', function handleRequestError(err) {
++          // @todo remove
++          // if (req.aborted && err.code !== AxiosError.ERR_FR_TOO_MANY_REDIRECTS) return;
++          reject(AxiosError.from(err, null, config, req));
++        });
++
++        // set tcp keep alive to prevent drop connection by peer
++        req.on('socket', function handleRequestSocket(socket) {
++          // default interval of sending ack packet is 1 minute
++          socket.setKeepAlive(true, 1000 * 60);
++        });
++
++        // Handle request timeout
++        if (config.timeout) {
++          // This is forcing a int timeout to avoid problems if the `req` interface doesn't handle other types.
++          const timeout = parseInt(config.timeout, 10);
++
++          if (Number.isNaN(timeout)) {
++            reject(new AxiosError(
++              'error trying to parse `config.timeout` to int',
++              AxiosError.ERR_BAD_OPTION_VALUE,
++              config,
++              req
++            ));
++
++            return;
++          }
++
++          // Sometime, the response will be very slow, and does not respond, the connect event will be block by event loop system.
++          // And timer callback will be fired, and abort() will be invoked before connection, then get "socket hang up" and code ECONNRESET.
++          // At this time, if we have a large number of request, nodejs will hang up some socket on background. and the number will up and up.
++          // And then these socket which be hang up will devouring CPU little by little.
++          // ClientRequest.setTimeout will be fired on the specify milliseconds, and can make sure that abort() will be fired after connect.
++          req.setTimeout(timeout, function handleRequestTimeout() {
++            if (isDone) return;
++            let timeoutErrorMessage = config.timeout ? 'timeout of ' + config.timeout + 'ms exceeded' : 'timeout exceeded';
++            const transitional = config.transitional || transitionalDefaults;
++            if (config.timeoutErrorMessage) {
++              timeoutErrorMessage = config.timeoutErrorMessage;
++            }
++            reject(new AxiosError(
++              timeoutErrorMessage,
++              transitional.clarifyTimeoutError ? AxiosError.ETIMEDOUT : AxiosError.ECONNABORTED,
++              config,
++              req
++            ));
++            abort();
++          });
+         }
+-        reject(new AxiosError(
+-          timeoutErrorMessage,
+-          transitional.clarifyTimeoutError ? AxiosError.ETIMEDOUT : AxiosError.ECONNABORTED,
+-          config,
+-          req
+-        ));
+-        abort();
+-      });
+-    }
+ 
+ 
+-    // Send the request
+-    if (utils.isStream(data)) {
+-      let ended = false;
+-      let errored = false;
++        // Send the request
++        if (utils.isStream(data)) {
++          let ended = false;
++          let errored = false;
+ 
+-      data.on('end', () => {
+-        ended = true;
+-      });
++          data.on('end', () => {
++            ended = true;
++          });
+ 
+-      data.once('error', err => {
+-        errored = true;
+-        req.destroy(err);
+-      });
++          data.once('error', err => {
++            errored = true;
++            req.destroy(err);
++          });
++
++          data.on('close', () => {
++            if (!ended && !errored) {
++              abort(new CanceledError('Request stream has been aborted', config, req));
++            }
++          });
+ 
+-      data.on('close', () => {
+-        if (!ended && !errored) {
+-          abort(new CanceledError('Request stream has been aborted', config, req));
++          data.pipe(req);
++        } else {
++          req.end(data);
+         }
+       });
++  }
++}
+ 
+-      data.pipe(req);
+-    } else {
+-      req.end(data);
+-    }
+-  });
++
++export { NodeHttpAdapter };
++
++export default isHttpAdapterSupported && function httpAdapter(config) {
++  return new NodeHttpAdapter().dispatch(config);
+ }
+ 
+-export const __setProxy = setProxy;
++export const __setProxy = function __setProxy(options, configProxy, location) {
++  return new NodeHttpAdapter().configureProxy(options, configProxy, location);
++};
+diff --git a/lib/core/settle.js b/lib/core/settle.js
+index ac905c4..265cd64 100644
+--- a/lib/core/settle.js
++++ b/lib/core/settle.js
+@@ -1,6 +1,6 @@
+ 'use strict';
+ 
+-import AxiosError from './AxiosError.js';
++import { NodeHttpAdapter } from '../adapters/http.js';
+ 
+ /**
+  * Resolve or reject a Promise based on response status.
+@@ -12,16 +12,5 @@ import AxiosError from './AxiosError.js';
+  * @returns {object} The response.
+  */
+ export default function settle(resolve, reject, response) {
+-  const validateStatus = response.config.validateStatus;
+-  if (!response.status || !validateStatus || validateStatus(response.status)) {
+-    resolve(response);
+-  } else {
+-    reject(new AxiosError(
+-      'Request failed with status code ' + response.status,
+-      [AxiosError.ERR_BAD_REQUEST, AxiosError.ERR_BAD_RESPONSE][Math.floor(response.status / 100) - 4],
+-      response.config,
+-      response.request,
+-      response
+-    ));
+-  }
++  return new NodeHttpAdapter().settleResponse(resolve, reject, response);
+ }
+diff --git a/lib/helpers/formDataToStream.js b/lib/helpers/formDataToStream.js
+index 9187e73..2cf9b00 100644
+--- a/lib/helpers/formDataToStream.js
++++ b/lib/helpers/formDataToStream.js
+@@ -1,111 +1,7 @@
+-import {TextEncoder} from 'util';
+-import {Readable} from 'stream';
+-import utils from "../utils.js";
+-import readBlob from "./readBlob.js";
+-
+-const BOUNDARY_ALPHABET = utils.ALPHABET.ALPHA_DIGIT + '-_';
+-
+-const textEncoder = new TextEncoder();
+-
+-const CRLF = '\r\n';
+-const CRLF_BYTES = textEncoder.encode(CRLF);
+-const CRLF_BYTES_COUNT = 2;
+-
+-class FormDataPart {
+-  constructor(name, value) {
+-    const {escapeName} = this.constructor;
+-    const isStringValue = utils.isString(value);
+-
+-    let headers = `Content-Disposition: form-data; name="${escapeName(name)}"${
+-      !isStringValue && value.name ? `; filename="${escapeName(value.name)}"` : ''
+-    }${CRLF}`;
+-
+-    if (isStringValue) {
+-      value = textEncoder.encode(String(value).replace(/\r?\n|\r\n?/g, CRLF));
+-    } else {
+-      headers += `Content-Type: ${value.type || "application/octet-stream"}${CRLF}`
+-    }
+-
+-    this.headers = textEncoder.encode(headers + CRLF);
+-
+-    this.contentLength = isStringValue ? value.byteLength : value.size;
+-
+-    this.size = this.headers.byteLength + this.contentLength + CRLF_BYTES_COUNT;
+-
+-    this.name = name;
+-    this.value = value;
+-  }
+-
+-  async *encode(){
+-    yield this.headers;
+-
+-    const {value} = this;
+-
+-    if(utils.isTypedArray(value)) {
+-      yield value;
+-    } else {
+-      yield* readBlob(value);
+-    }
+-
+-    yield CRLF_BYTES;
+-  }
+-
+-  static escapeName(name) {
+-      return String(name).replace(/[\r\n"]/g, (match) => ({
+-        '\r' : '%0D',
+-        '\n' : '%0A',
+-        '"' : '%22',
+-      }[match]));
+-  }
+-}
++import { NodeHttpAdapter } from '../adapters/http.js';
+ 
+ const formDataToStream = (form, headersHandler, options) => {
+-  const {
+-    tag = 'form-data-boundary',
+-    size = 25,
+-    boundary = tag + '-' + utils.generateString(size, BOUNDARY_ALPHABET)
+-  } = options || {};
+-
+-  if(!utils.isFormData(form)) {
+-    throw TypeError('FormData instance required');
+-  }
+-
+-  if (boundary.length < 1 || boundary.length > 70) {
+-    throw Error('boundary must be 10-70 characters long')
+-  }
+-
+-  const boundaryBytes = textEncoder.encode('--' + boundary + CRLF);
+-  const footerBytes = textEncoder.encode('--' + boundary + '--' + CRLF + CRLF);
+-  let contentLength = footerBytes.byteLength;
+-
+-  const parts = Array.from(form.entries()).map(([name, value]) => {
+-    const part = new FormDataPart(name, value);
+-    contentLength += part.size;
+-    return part;
+-  });
+-
+-  contentLength += boundaryBytes.byteLength * parts.length;
+-
+-  contentLength = utils.toFiniteNumber(contentLength);
+-
+-  const computedHeaders = {
+-    'Content-Type': `multipart/form-data; boundary=${boundary}`
+-  }
+-
+-  if (Number.isFinite(contentLength)) {
+-    computedHeaders['Content-Length'] = contentLength;
+-  }
+-
+-  headersHandler && headersHandler(computedHeaders);
+-
+-  return Readable.from((async function *() {
+-    for(const part of parts) {
+-      yield boundaryBytes;
+-      yield* part.encode();
+-    }
+-
+-    yield footerBytes;
+-  })());
++  return new NodeHttpAdapter().convertFormDataToStream(form, headersHandler, options);
+ };
+ 
+ export default formDataToStream;
+diff --git a/lib/helpers/fromDataURI.js b/lib/helpers/fromDataURI.js
+index eb71d3f..e35d30e 100644
+--- a/lib/helpers/fromDataURI.js
++++ b/lib/helpers/fromDataURI.js
+@@ -1,10 +1,6 @@
+ 'use strict';
+ 
+-import AxiosError from '../core/AxiosError.js';
+-import parseProtocol from './parseProtocol.js';
+-import platform from '../platform/index.js';
+-
+-const DATA_URL_PATTERN = /^(?:([^;]+);)?(?:[^;]+;)?(base64|),([\s\S]*)$/;
++import { NodeHttpAdapter } from '../adapters/http.js';
+ 
+ /**
+  * Parse data uri to a Buffer or Blob
+@@ -17,37 +13,5 @@ const DATA_URL_PATTERN = /^(?:([^;]+);)?(?:[^;]+;)?(base64|),([\s\S]*)$/;
+  * @returns {Buffer|Blob}
+  */
+ export default function fromDataURI(uri, asBlob, options) {
+-  const _Blob = options && options.Blob || platform.classes.Blob;
+-  const protocol = parseProtocol(uri);
+-
+-  if (asBlob === undefined && _Blob) {
+-    asBlob = true;
+-  }
+-
+-  if (protocol === 'data') {
+-    uri = protocol.length ? uri.slice(protocol.length + 1) : uri;
+-
+-    const match = DATA_URL_PATTERN.exec(uri);
+-
+-    if (!match) {
+-      throw new AxiosError('Invalid URL', AxiosError.ERR_INVALID_URL);
+-    }
+-
+-    const mime = match[1];
+-    const isBase64 = match[2];
+-    const body = match[3];
+-    const buffer = Buffer.from(decodeURIComponent(body), isBase64 ? 'base64' : 'utf8');
+-
+-    if (asBlob) {
+-      if (!_Blob) {
+-        throw new AxiosError('Blob is not supported', AxiosError.ERR_NOT_SUPPORT);
+-      }
+-
+-      return new _Blob([buffer], {type: mime});
+-    }
+-
+-    return buffer;
+-  }
+-
+-  throw new AxiosError('Unsupported protocol ' + protocol, AxiosError.ERR_NOT_SUPPORT);
++  return new NodeHttpAdapter().convertDataURI(uri, asBlob, options);
+ }

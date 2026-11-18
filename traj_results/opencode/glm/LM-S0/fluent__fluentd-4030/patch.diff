@@ -1,0 +1,172 @@
+diff --git a/lib/fluent/plugin/out_forward/ack_handler.rb b/lib/fluent/plugin/out_forward/ack_handler.rb
+index d9626113..04948eaf 100644
+--- a/lib/fluent/plugin/out_forward/ack_handler.rb
++++ b/lib/fluent/plugin/out_forward/ack_handler.rb
+@@ -38,127 +38,45 @@ module Fluent::Plugin
+       end
+ 
+       def collect_response(select_interval)
+-        frozen_clock = Fluent::Clock.class_variable_get(:@@frozen_clock)
+-        if frozen_clock
+-          now = frozen_clock
+-        else
+-          now = Process.clock_gettime(Fluent::Clock::CLOCK_ID)
+-        end
+-
++        now = Fluent::Clock.now
+         sockets = []
+         results = []
+         begin
+           new_list = []
+           @mutex.synchronize do
+             @ack_waitings.each do |info|
+-              expired = info.expired_time < now
+-              if expired
++              if info.expired?(now)
+                 # There are 2 types of cases when no response has been received from socket:
+                 # (1) the node does not support sending responses
+                 # (2) the node does support sending response but responses have not arrived for some reasons.
+-                node = info.node
+-                @log.warn 'no response from node. regard it as unavailable.', host: node.host, port: node.port
++                @log.warn 'no response from node. regard it as unavailable.', host: info.node.host, port: info.node.port
+                 results << [info, Result::FAILED]
+               else
+-                sock = info.sock
+-                sockets << sock
++                sockets << info.sock
+                 new_list << info
+               end
+             end
+             @ack_waitings = new_list
+           end
+-        rescue => e
+-          @log.error 'unexpected error while receiving ack', error: e
+-          @log.error_backtrace
+-          return
+-        end
+ 
+-        if sockets.empty?
+-          @log.trace 'no sockets to wait for ack response'
+-        end
+-
+-        begin
+-          readable_sockets, _, _ = IO.select(sockets, nil, nil, select_interval)
+-        rescue => e
+-          @log.error 'unexpected error while receiving ack', error: e
+-          @log.error_backtrace
+-          return
+-        end
+-
+-        readable_list = readable_sockets || []
+-        readable_list.each do |sock|
+-          info = nil
+-          raw_data = ''
+-          recv_error = nil
+-          tls_klass = Fluent::PluginHelper::Socket::WrappedSocket::TLS
+-          tcp_klass = Fluent::PluginHelper::Socket::WrappedSocket::TCP
+           begin
+-            if sock.instance_of?(tls_klass)
+-              raw_data = sock.readpartial(@read_length)
+-            elsif sock.instance_of?(tcp_klass)
+-              raw_data = sock.recv(@read_length)
+-            else
+-              raw_data = sock.recv(@read_length)
+-            end
+-          rescue Errno::ECONNRESET, EOFError # ECONNRESET for #recv, #EOFError for #readpartial
+-            raw_data = ''
+-          rescue => e
+-            recv_error = e
++            readable_sockets, _, _ = IO.select(sockets, nil, nil, select_interval)
++          rescue IOError
++            @log.info "connection closed while waiting for readable sockets"
++            readable_sockets = nil
+           end
+ 
+-          begin
+-            if recv_error
+-              @log.error 'unexpected error while receiving ack message', error: recv_error
+-              @log.error_backtrace(recv_error.backtrace)
+-              results << [nil, Result::FAILED]
+-            else
+-              info = find(sock)
+-
+-              # When connection is closed by remote host, socket is ready to read and #recv returns an empty string that means EOF.
+-              # If this happens we assume the data wasn't delivered and retry it.
+-              if raw_data.empty?
+-                node = info.node
+-                @log.warn 'destination node closed the connection. regard it as unavailable.', host: node.host, port: node.port
+-                # info.node.disable!
+-                results << [info, Result::FAILED]
+-                next
+-              end
+-
+-              unpacker = Fluent::MessagePackFactory.msgpack_unpacker
+-              unpacker.feed(raw_data)
+-              res = unpacker.read
+-
+-              chunk_id = info.chunk_id
+-              chunk_hex = Fluent::UniqueId.hex(chunk_id)
+-              node = info.node
+-              @log.trace 'getting response from destination', host: node.host, port: node.port, chunk_id: chunk_hex, response: res
+-
+-              expected_ack = info.chunk_id_base64
+-              actual_ack = res['ack']
+-              if actual_ack != expected_ack
+-                # Some errors may have occurred when ack and chunk id is different, so send the chunk again.
+-                @log.warn 'ack in response and chunk id in sent data are different', chunk_id: chunk_hex, ack: actual_ack
+-                results << [info, Result::CHUNKID_UNMATCHED]
+-              else
+-                @log.trace 'got a correct ack response', chunk_id: chunk_hex
+-                results << [info, Result::SUCCESS]
+-              end
++          if readable_sockets
++            readable_sockets.each do |sock|
++              results << read_ack_from_sock(sock)
+             end
+-          rescue => e
+-            @log.error 'unexpected error while receiving ack message', error: e
+-            @log.error_backtrace
+-            results << [nil, Result::FAILED]
+-          ensure
+-            delete(info)
+           end
+-        end
+ 
+-        begin
+-          results.each do |acked, ret|
+-            if acked.nil?
++          results.each do |info, ret|
++            if info.nil?
+               yield nil, nil, nil, ret
+             else
+-              yield acked.chunk_id, acked.node, acked.sock, ret
++              yield info.chunk_id, info.node, info.sock, ret
+             end
+           end
+         rescue => e
+@@ -197,13 +115,22 @@ module Fluent::Plugin
+           raw_data = sock.instance_of?(Fluent::PluginHelper::Socket::WrappedSocket::TLS) ? sock.readpartial(@read_length) : sock.recv(@read_length)
+         rescue Errno::ECONNRESET, EOFError # ECONNRESET for #recv, #EOFError for #readpartial
+           raw_data = ''
++        rescue IOError
++          @log.info "socket closed while receiving ack response"
++          return nil, Result::FAILED
+         end
+ 
+         info = find(sock)
+ 
+-        # When connection is closed by remote host, socket is ready to read and #recv returns an empty string that means EOF.
+-        # If this happens we assume the data wasn't delivered and retry it.
+-        if raw_data.empty?
++        if info.nil?
++          # The info can be deleted by another thread during `sock.recv()` and `find()`.
++          # This is OK since another thread has completed to process the ack, so we can skip this.
++          # Note: exclusion mechanism about `collect_response()` may need to be considered.
++          @log.debug "could not find the ack info. this ack may be processed by another thread."
++          return nil, Result::FAILED
++        elsif raw_data.nil? || raw_data.empty?
++          # A nil or empty response means the remote host closed the connection.
++          # If this happens we assume the data wasn't delivered and retry it.
+           @log.warn 'destination node closed the connection. regard it as unavailable.', host: info.node.host, port: info.node.port
+           # info.node.disable!
+           return info, Result::FAILED

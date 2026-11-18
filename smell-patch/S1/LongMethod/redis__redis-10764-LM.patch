@@ -1,0 +1,219 @@
+diff --git a/src/t_zset.c b/src/t_zset.c
+index 2efa73936..28ec923f6 100644
+--- a/src/t_zset.c
++++ b/src/t_zset.c
+@@ -3994,38 +3994,201 @@ void blockingGenericZpopCommand(client *c, robj **keys, int numkeys, int where,
+                                 int timeout_idx, long count, int use_nested_array, int reply_nil_when_empty) {
+     robj *o;
+     robj *key;
++    robj *timeoutobj;
++    robj *popcmd;
+     mstime_t timeout;
++    long double timeout_ld;
++    long long timeout_ms;
+     int j;
+ 
+-    if (getTimeoutFromObjectOrReply(c,c->argv[timeout_idx],&timeout,UNIT_SECONDS)
+-        != C_OK) return;
++    UNUSED(reply_nil_when_empty);
++
++    /* Parse the timeout argument in seconds and convert it to an absolute
++     * millisecond timestamp. A zero timeout means block forever. */
++    timeoutobj = c->argv[timeout_idx];
++    timeout_ld = 0;
++    if (timeoutobj == NULL) {
++        timeout_ld = 0;
++    } else {
++        serverAssertWithInfo(NULL,timeoutobj,timeoutobj->type == OBJ_STRING);
++        if (sdsEncodedObject(timeoutobj)) {
++            if (!string2ld(timeoutobj->ptr, sdslen(timeoutobj->ptr), &timeout_ld)) {
++                addReplyError(c,"timeout is not a float or out of range");
++                return;
++            }
++        } else if (timeoutobj->encoding == OBJ_ENCODING_INT) {
++            timeout_ld = (long)timeoutobj->ptr;
++        } else {
++            serverPanic("Unknown string encoding");
++        }
++    }
++    timeout_ms = (long long) (timeout_ld * 1000.0);
++    if (timeout_ms < 0) {
++        addReplyError(c,"timeout is negative");
++        return;
++    }
++    if (timeout_ms > 0) {
++        timeout_ms += mstime();
++    }
++    timeout = timeout_ms;
+ 
+     for (j = 0; j < numkeys; j++) {
++        dictEntry *de;
++        robj *val;
++        int is_ro_replica;
++        int force_delete_expired;
++        unsigned long llen;
++        long pop_count;
++        long rangelen;
++        long result_count;
++        sds ele;
++        double score;
++
+         key = keys[j];
+-        o = lookupKeyWrite(c->db,key);
++
++        /* Locate the key for writing, expire it if needed, and refresh LRU/LFU. */
++        de = dictFind(c->db->dict, key->ptr);
++        val = NULL;
++        if (de != NULL) {
++            val = dictGetVal(de);
++            is_ro_replica = server.masterhost && server.repl_slave_ro;
++            force_delete_expired = !is_ro_replica;
++            if (keyIsExpired(c->db, key)) {
++                if (server.masterhost != NULL) {
++                    if (server.current_client == server.master) {
++                        /* Keep the key while a replica applies a master command. */
++                    } else if (!force_delete_expired) {
++                        val = NULL;
++                    } else {
++                        if (checkClientPauseTimeoutAndReturnIfPaused()) {
++                            val = NULL;
++                        } else {
++                            deleteExpiredKeyAndPropagate(c->db, key);
++                            val = NULL;
++                        }
++                    }
++                } else {
++                    if (checkClientPauseTimeoutAndReturnIfPaused()) {
++                        val = NULL;
++                    } else {
++                        deleteExpiredKeyAndPropagate(c->db, key);
++                        val = NULL;
++                    }
++                }
++            }
++        }
++        if (val != NULL) {
++            if (!hasActiveChildProcess()) {
++                if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
++                    unsigned long counter = LFUDecrAndReturn(val);
++                    counter = LFULogIncr(counter);
++                    val->lru = (LFUGetTimeInMinutes()<<8) | counter;
++                } else {
++                    val->lru = LRU_CLOCK();
++                }
++            }
++        }
++        o = val;
++
+         /* Non-existing key, move to next key. */
+         if (o == NULL) continue;
+ 
+-        if (checkType(c,o,OBJ_ZSET)) return;
++        if (o->type != OBJ_ZSET) {
++            addReplyErrorObject(c,shared.wrongtypeerr);
++            return;
++        }
+ 
+-        long llen = zsetLength(o);
++        llen = zsetLength(o);
+         /* Empty zset, move to next key. */
+         if (llen == 0) continue;
+ 
+         /* Non empty zset, this is like a normal ZPOP[MIN|MAX]. */
+-        genericZpopCommand(c, &key, 1, where, 1, count, use_nested_array, reply_nil_when_empty, NULL);
++        pop_count = count;
++        if (pop_count == -1) pop_count = 1;
++        rangelen = (pop_count > (long)llen) ? (long)llen : pop_count;
++
++        if (!use_nested_array) {
++            /* BZPOPMIN/BZPOPMAX in RESP2 and RESP3. */
++            addReplyArrayLen(c, rangelen * 2 + 1);
++            addReplyBulk(c, key);
++        } else {
++            /* BZMPOP in RESP2 and RESP3. */
++            addReplyArrayLen(c, 2);
++            addReplyBulk(c, key);
++            addReplyArrayLen(c, rangelen);
++        }
++
++        result_count = 0;
++        do {
++            if (o->encoding == OBJ_ENCODING_LISTPACK) {
++                unsigned char *zl = o->ptr;
++                unsigned char *eptr, *sptr;
++                unsigned char *vstr;
++                unsigned int vlen;
++                long long vlong;
++
++                /* Get the first or last element in the sorted set. */
++                eptr = lpSeek(zl,where == ZSET_MAX ? -2 : 0);
++                serverAssertWithInfo(c,o,eptr != NULL);
++                vstr = lpGetValue(eptr,&vlen,&vlong);
++                if (vstr == NULL)
++                    ele = sdsfromlonglong(vlong);
++                else
++                    ele = sdsnewlen(vstr,vlen);
++
++                /* Get the score. */
++                sptr = lpNext(zl,eptr);
++                serverAssertWithInfo(c,o,sptr != NULL);
++                score = zzlGetScore(sptr);
++            } else if (o->encoding == OBJ_ENCODING_SKIPLIST) {
++                zset *zs = o->ptr;
++                zskiplist *zsl = zs->zsl;
++                zskiplistNode *zln;
++
++                /* Get the first or last element in the sorted set. */
++                zln = (where == ZSET_MAX ? zsl->tail :
++                                           zsl->header->level[0].forward);
++
++                /* There must be an element in the sorted set. */
++                serverAssertWithInfo(c,o,zln != NULL);
++                ele = sdsdup(zln->ele);
++                score = zln->score;
++            } else {
++                serverPanic("Unknown sorted set encoding");
++            }
++
++            serverAssertWithInfo(c,o,zsetDel(o,ele));
++            server.dirty++;
++
++            if (result_count == 0) { /* Do this only for the first iteration. */
++                char *events[2] = {"zpopmin","zpopmax"};
++                notifyKeyspaceEvent(NOTIFY_ZSET,events[where],key,c->db->id);
++                signalModifiedKey(c,c->db,key);
++            }
++
++            if (use_nested_array) {
++                addReplyArrayLen(c,2);
++            }
++            addReplyBulkCBuffer(c,ele,sdslen(ele));
++            addReplyDouble(c,score);
++            sdsfree(ele);
++            ++result_count;
++        } while(--rangelen);
++
++        /* Remove the key, if indeed needed. */
++        if (zsetLength(o) == 0) {
++            dbDelete(c->db,key);
++            notifyKeyspaceEvent(NOTIFY_GENERIC,"del",key,c->db->id);
++        }
+ 
++        popcmd = (where == ZSET_MAX) ? shared.zpopmax : shared.zpopmin;
+         if (count == -1) {
+             /* Replicate it as ZPOP[MIN|MAX] instead of BZPOP[MIN|MAX]. */
+-            rewriteClientCommandVector(c,2,
+-                                       (where == ZSET_MAX) ? shared.zpopmax : shared.zpopmin,
+-                                       key);
++            rewriteClientCommandVector(c,2, popcmd, key);
+         } else {
+             /* Replicate it as ZPOP[MIN|MAX] with COUNT option. */
+-            robj *count_obj = createStringObjectFromLongLong((count > llen) ? llen : count);
+-            rewriteClientCommandVector(c, 3,
+-                                       (where == ZSET_MAX) ? shared.zpopmax : shared.zpopmin,
+-                                       key, count_obj);
++            robj *count_obj = createStringObjectFromLongLong((count > (long)llen) ? (long)llen : count);
++            rewriteClientCommandVector(c, 3, popcmd, key, count_obj);
+             decrRefCount(count_obj);
+         }
+ 

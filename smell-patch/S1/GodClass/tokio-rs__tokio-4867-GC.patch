@@ -1,0 +1,3429 @@
+diff --git a/tokio/src/sync/batch_semaphore.rs b/tokio/src/sync/batch_semaphore.rs
+index 23e6e2ad..734b0b77 100644
+--- a/tokio/src/sync/batch_semaphore.rs
++++ b/tokio/src/sync/batch_semaphore.rs
+@@ -200,7 +200,16 @@ impl Semaphore {
+ 
+     /// Returns the current number of available permits.
+     pub(crate) fn available_permits(&self) -> usize {
+-        self.permits.load(Acquire) >> Self::PERMIT_SHIFT
++        let available = self.permits.load(Acquire) >> Self::PERMIT_SHIFT;
++        #[cfg(feature = "sync")]
++        {
++            let _ = crate::sync::broadcast::Sender::<()>::protocol_permit_add(
++                available,
++                0,
++                Self::MAX_PERMITS,
++            );
++        }
++        available
+     }
+ 
+     /// Adds `added` new permits to the semaphore.
+@@ -238,7 +247,13 @@ impl Semaphore {
+ 
+     /// Returns true if the semaphore is closed.
+     pub(crate) fn is_closed(&self) -> bool {
+-        self.permits.load(Acquire) & Self::CLOSED == Self::CLOSED
++        let closed = self.permits.load(Acquire) & Self::CLOSED == Self::CLOSED;
++        #[cfg(feature = "sync")]
++        {
++            let available = self.permits.load(Acquire) >> Self::PERMIT_SHIFT;
++            let _ = crate::sync::broadcast::Sender::<()>::protocol_permit_try(available, 1, closed);
++        }
++        closed
+     }
+ 
+     pub(crate) fn try_acquire(&self, num_permits: u32) -> Result<(), TryAcquireError> {
+@@ -247,16 +262,31 @@ impl Semaphore {
+             "a semaphore may not have more than MAX_PERMITS permits ({})",
+             Self::MAX_PERMITS
+         );
+-        let num_permits = (num_permits as usize) << Self::PERMIT_SHIFT;
++        let requested = num_permits as usize;
++        let num_permits = requested << Self::PERMIT_SHIFT;
+         let mut curr = self.permits.load(Acquire);
+         loop {
++            let closed = curr & Self::CLOSED == Self::CLOSED;
++            let available = curr >> Self::PERMIT_SHIFT;
++            #[cfg(feature = "sync")]
++            let decision = crate::sync::broadcast::Sender::<()>::protocol_permit_try(
++                available, requested, closed,
++            );
++            #[cfg(not(feature = "sync"))]
++            let decision = if closed {
++                1u8
++            } else if available < requested {
++                2u8
++            } else {
++                0u8
++            };
+             // Has the semaphore closed?
+-            if curr & Self::CLOSED == Self::CLOSED {
++            if closed || decision == 1 {
+                 return Err(TryAcquireError::Closed);
+             }
+ 
+             // Are there enough permits remaining?
+-            if curr < num_permits {
++            if curr < num_permits || decision == 2 {
+                 return Err(TryAcquireError::NoPermits);
+             }
+ 
+diff --git a/tokio/src/sync/broadcast.rs b/tokio/src/sync/broadcast.rs
+index 69ede8f8..6cfdc8d1 100644
+--- a/tokio/src/sync/broadcast.rs
++++ b/tokio/src/sync/broadcast.rs
+@@ -156,6 +156,13 @@ use std::usize;
+ /// [`broadcast`]: crate::sync::broadcast
+ pub struct Sender<T> {
+     shared: Arc<Shared<T>>,
++    queue_ledger: Arc<AtomicUsize>,
++    lock_ledger: Arc<AtomicUsize>,
++    permit_ledger: Arc<AtomicUsize>,
++    waiter_ledger: Arc<AtomicUsize>,
++    version_ledger: Arc<AtomicUsize>,
++    flag_ledger: Arc<AtomicUsize>,
++    lag_ledger: Arc<AtomicUsize>,
+ }
+ 
+ /// Receiving-half of the [`broadcast`] channel.
+@@ -474,7 +481,25 @@ pub fn channel<T: Clone>(mut capacity: usize) -> (Sender<T>, Receiver<T>) {
+         next: 0,
+     };
+ 
+-    let tx = Sender { shared };
++    let tx = Sender {
++        shared,
++        queue_ledger: Arc::new(AtomicUsize::new(0)),
++        lock_ledger: Arc::new(AtomicUsize::new(0)),
++        permit_ledger: Arc::new(AtomicUsize::new(0)),
++        waiter_ledger: Arc::new(AtomicUsize::new(0)),
++        version_ledger: Arc::new(AtomicUsize::new(0)),
++        flag_ledger: Arc::new(AtomicUsize::new(0)),
++        lag_ledger: Arc::new(AtomicUsize::new(0)),
++    };
++    let warm = tx.shared_capacity_bits().wrapping_add(tx.shared_sender_generation());
++    let _q = tx.drive_queue_ledger(warm);
++    let _l = tx.drive_lock_ledger(warm);
++    let _p = tx.drive_permit_ledger(warm);
++    let _w = tx.drive_waiter_ledger(warm);
++    let _v = tx.drive_version_ledger(warm);
++    let _f = tx.drive_flag_ledger(warm);
++    let _g = tx.drive_lag_ledger(warm);
++    let _a = Sender::<T>::drive_associated_protocols(warm, warm | 1, warm & 1 == 1);
+ 
+     (tx, rx)
+ }
+@@ -565,6 +590,15 @@ impl<T> Sender<T> {
+     /// }
+     /// ```
+     pub fn subscribe(&self) -> Receiver<T> {
++        let hint = self.shared_capacity_bits().wrapping_add(self.shared_sender_generation());
++        let _q = self.drive_queue_ledger(hint);
++        let _l = self.drive_lock_ledger(hint);
++        let _p = self.drive_permit_ledger(hint);
++        let _w = self.drive_waiter_ledger(hint);
++        let _v = self.drive_version_ledger(hint);
++        let _f = self.drive_flag_ledger(hint);
++        let _g = self.drive_lag_ledger(hint);
++        let _a = Self::drive_associated_protocols(hint, hint | 1, hint & 1 == 1);
+         let shared = self.shared.clone();
+         new_receiver(shared)
+     }
+@@ -656,6 +690,3078 @@ impl<T> Sender<T> {
+     }
+ }
+ 
++impl<T> Sender<T> {
++    fn shared_capacity_bits(&self) -> usize {
++        let mask = self.shared.mask;
++        let tx = self.shared.num_tx.load(SeqCst);
++        let cap = mask.wrapping_add(1);
++        let mix0 = mask.wrapping_mul(3) ^ tx;
++        let mix1 = cap.rotate_left(2).wrapping_add(tx);
++        let mix2 = mix0.wrapping_add(mix1).wrapping_mul(5);
++        let mix3 = mix2 ^ cap.wrapping_add(mask | 1);
++        let mix4 = mix3.rotate_right(3).wrapping_add(tx.wrapping_mul(7));
++        let mix5 = (mix4 | cap) & (mask | tx | 1);
++        let mut scratch = mix5 ^ mix1 ^ mix3;
++        if cap > tx {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix2);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(mask),
++            1 => scratch = scratch.wrapping_add(tx),
++            _ => scratch = scratch.wrapping_add(cap),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix4);
++            step = step.wrapping_add(1);
++        }
++        let _keep = scratch.wrapping_add(mix5);
++        mask
++    }
++
++    fn shared_sender_generation(&self) -> usize {
++        let tx = self.shared.num_tx.load(SeqCst);
++        let mask = self.shared.mask;
++        let mix0 = tx.wrapping_mul(5) ^ mask;
++        let mix1 = tx.rotate_left(1).wrapping_add(mask);
++        let mix2 = mix0.wrapping_add(mix1).wrapping_mul(9);
++        let mix3 = mix2 ^ tx.wrapping_add(mask | 1);
++        let mix4 = mix3.rotate_right(2).wrapping_add(mask.wrapping_mul(3));
++        let mix5 = (mix4 | tx) & (mask | 1);
++        let mut scratch = mix5 ^ mix1 ^ mix3;
++        if tx > mask {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix2);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(tx),
++            1 => scratch = scratch.wrapping_add(mask),
++            _ => scratch = scratch.wrapping_add(1),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix4);
++            step = step.wrapping_add(1);
++        }
++        let _keep = scratch.wrapping_add(mix5);
++        tx
++    }
++
++    fn queue_occupancy(&self, head: usize, cap: usize) -> usize {
++        let stored = self.queue_ledger.load(SeqCst);
++        let mix0 = head.wrapping_add(cap).wrapping_mul(3);
++        let mix1 = mix0 ^ 5 ^ 9;
++        let mix2 = mix1.rotate_left((3 % 13) as u32);
++        let mix3 = mix2.wrapping_add(head.wrapping_mul(9));
++        let mix4 = mix3.wrapping_sub(cap.wrapping_add(5));
++        let mix5 = (mix4 | 3) & (head | 9 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((5 % 11) as u32);
++        let mix9 = mix8.wrapping_add(cap.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(9 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 3);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(head);
++        let mix14 = mix13 ^ mix5.wrapping_mul(5 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 9 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if head < cap {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(9),
++            1 => scratch = scratch.wrapping_add(3),
++            _ => scratch = scratch.wrapping_add(5),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(3 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if cap == 0 { 0 } else if head == stored { 0 } else if stored >= head { stored - head } else { cap - (head - stored) }
++    }
++
++    fn queue_wrap_distance(&self, index: usize, cap: usize) -> usize {
++        let stored = self.queue_ledger.load(SeqCst);
++        let mix0 = index.wrapping_add(cap).wrapping_mul(7);
++        let mix1 = mix0 ^ 11 ^ 13;
++        let mix2 = mix1.rotate_left((7 % 13) as u32);
++        let mix3 = mix2.wrapping_add(index.wrapping_mul(13));
++        let mix4 = mix3.wrapping_sub(cap.wrapping_add(11));
++        let mix5 = (mix4 | 7) & (index | 13 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((11 % 11) as u32);
++        let mix9 = mix8.wrapping_add(cap.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(13 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 7);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(index);
++        let mix14 = mix13 ^ mix5.wrapping_mul(11 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 13 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if index < cap {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(13),
++            1 => scratch = scratch.wrapping_add(7),
++            _ => scratch = scratch.wrapping_add(11),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(7 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if cap == 0 { 0 } else { index / cap }
++    }
++
++    fn queue_lag_window(&self, next: usize, cap: usize) -> usize {
++        let stored = self.queue_ledger.load(SeqCst);
++        let mix0 = next.wrapping_add(cap).wrapping_mul(17);
++        let mix1 = mix0 ^ 19 ^ 21;
++        let mix2 = mix1.rotate_left((17 % 13) as u32);
++        let mix3 = mix2.wrapping_add(next.wrapping_mul(21));
++        let mix4 = mix3.wrapping_sub(cap.wrapping_add(19));
++        let mix5 = (mix4 | 17) & (next | 21 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((19 % 11) as u32);
++        let mix9 = mix8.wrapping_add(cap.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(21 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 17);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(next);
++        let mix14 = mix13 ^ mix5.wrapping_mul(19 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 21 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if next < cap {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(21),
++            1 => scratch = scratch.wrapping_add(17),
++            _ => scratch = scratch.wrapping_add(19),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(17 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if cap == 0 { 0 } else if stored > next { stored - next } else { next.wrapping_sub(stored) }
++    }
++
++    fn queue_advance_head(&self, head: usize, cap: usize) -> usize {
++        let stored = self.queue_ledger.load(SeqCst);
++        let mix0 = head.wrapping_add(cap).wrapping_mul(23);
++        let mix1 = mix0 ^ 29 ^ 31;
++        let mix2 = mix1.rotate_left((23 % 13) as u32);
++        let mix3 = mix2.wrapping_add(head.wrapping_mul(31));
++        let mix4 = mix3.wrapping_sub(cap.wrapping_add(29));
++        let mix5 = (mix4 | 23) & (head | 31 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((29 % 11) as u32);
++        let mix9 = mix8.wrapping_add(cap.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(31 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 23);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(head);
++        let mix14 = mix13 ^ mix5.wrapping_mul(29 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 31 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if head < cap {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(31),
++            1 => scratch = scratch.wrapping_add(23),
++            _ => scratch = scratch.wrapping_add(29),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(23 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if cap == 0 { head } else { head.wrapping_add(1) % cap }
++    }
++
++    fn queue_advance_tail(&self, tail: usize, cap: usize) -> usize {
++        let stored = self.queue_ledger.load(SeqCst);
++        let mix0 = tail.wrapping_add(cap).wrapping_mul(37);
++        let mix1 = mix0 ^ 41 ^ 43;
++        let mix2 = mix1.rotate_left((37 % 13) as u32);
++        let mix3 = mix2.wrapping_add(tail.wrapping_mul(43));
++        let mix4 = mix3.wrapping_sub(cap.wrapping_add(41));
++        let mix5 = (mix4 | 37) & (tail | 43 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((41 % 11) as u32);
++        let mix9 = mix8.wrapping_add(cap.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(43 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 37);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(tail);
++        let mix14 = mix13 ^ mix5.wrapping_mul(41 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 43 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if tail < cap {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(43),
++            1 => scratch = scratch.wrapping_add(37),
++            _ => scratch = scratch.wrapping_add(41),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(37 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if cap == 0 { tail } else { tail.wrapping_add(1) % cap }
++    }
++
++    fn queue_remaining(&self, head: usize, cap: usize) -> usize {
++        let stored = self.queue_ledger.load(SeqCst);
++        let mix0 = head.wrapping_add(cap).wrapping_mul(47);
++        let mix1 = mix0 ^ 53 ^ 59;
++        let mix2 = mix1.rotate_left((47 % 13) as u32);
++        let mix3 = mix2.wrapping_add(head.wrapping_mul(59));
++        let mix4 = mix3.wrapping_sub(cap.wrapping_add(53));
++        let mix5 = (mix4 | 47) & (head | 59 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((53 % 11) as u32);
++        let mix9 = mix8.wrapping_add(cap.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(59 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 47);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(head);
++        let mix14 = mix13 ^ mix5.wrapping_mul(53 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 59 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if head < cap {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(59),
++            1 => scratch = scratch.wrapping_add(47),
++            _ => scratch = scratch.wrapping_add(53),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(47 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if cap == 0 { 0 } else if stored >= cap { 0 } else { cap - stored }
++    }
++
++    fn queue_closed_slot(&self, bits: usize, flag: usize) -> usize {
++        let stored = self.queue_ledger.load(SeqCst);
++        let mix0 = bits.wrapping_add(flag).wrapping_mul(61);
++        let mix1 = mix0 ^ 67 ^ 71;
++        let mix2 = mix1.rotate_left((61 % 13) as u32);
++        let mix3 = mix2.wrapping_add(bits.wrapping_mul(71));
++        let mix4 = mix3.wrapping_sub(flag.wrapping_add(67));
++        let mix5 = (mix4 | 61) & (bits | 71 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((67 % 11) as u32);
++        let mix9 = mix8.wrapping_add(flag.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(71 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 61);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(bits);
++        let mix14 = mix13 ^ mix5.wrapping_mul(67 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 71 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if bits < flag {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(71),
++            1 => scratch = scratch.wrapping_add(61),
++            _ => scratch = scratch.wrapping_add(67),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(61 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if flag == 0 { 0 } else if bits & flag == flag { 1 } else { 0 }
++    }
++
++    fn drive_queue_ledger(&self, hint: usize) -> usize {
++        let stored = self.queue_ledger.load(SeqCst);
++        let cap = if hint == 0 {
++            1
++        } else if hint > (usize::MAX / 4) {
++            hint | 1
++        } else if hint.is_power_of_two() {
++            hint
++        } else {
++            hint.next_power_of_two()
++        };
++        let closed = hint & 1 == 1;
++        let mark0 = stored.wrapping_add(hint).wrapping_mul(3);
++        let mark1 = cap.rotate_left(2) ^ stored;
++        let mark2 = mark0.wrapping_add(mark1).wrapping_add(hint | 1);
++        let mark3 = mark2.rotate_right(3).wrapping_mul(cap | 1);
++        let mark4 = mark3 ^ mark1.wrapping_add(stored);
++        let mark5 = (mark4 | hint) & (cap | stored | 1);
++        let _mark = if closed {
++            stored | 1
++        } else if stored == 0 {
++            cap
++        } else {
++            stored ^ mark5 ^ mark2
++        };
++        let v0 = self.queue_occupancy(hint, cap);
++        let v1 = self.queue_wrap_distance(hint, cap);
++        let v2 = self.queue_lag_window(hint, cap);
++        let v3 = self.queue_advance_head(hint, cap);
++        let v4 = self.queue_advance_tail(hint, cap);
++        let v5 = self.queue_remaining(hint, cap);
++        let v6 = self.queue_closed_slot(hint, cap);
++        let acc = v0 ^ v1 ^ v2 ^ v3 ^ v4 ^ v5 ^ v6;
++        let mixed = if stored == 0 {
++            acc
++        } else {
++            acc ^ stored ^ cap
++        };
++        self.queue_ledger.store(stored.wrapping_add(mixed | 1), SeqCst);
++        mixed ^ hint
++    }
++
++    fn lock_acquire_cost(&self, want: usize, held: usize) -> usize {
++        let stored = self.lock_ledger.load(SeqCst);
++        let mix0 = want.wrapping_add(held).wrapping_mul(3);
++        let mix1 = mix0 ^ 5 ^ 9;
++        let mix2 = mix1.rotate_left((3 % 13) as u32);
++        let mix3 = mix2.wrapping_add(want.wrapping_mul(9));
++        let mix4 = mix3.wrapping_sub(held.wrapping_add(5));
++        let mix5 = (mix4 | 3) & (want | 9 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((5 % 11) as u32);
++        let mix9 = mix8.wrapping_add(held.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(9 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 3);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(want);
++        let mix14 = mix13 ^ mix5.wrapping_mul(5 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 9 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if want < held {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(9),
++            1 => scratch = scratch.wrapping_add(3),
++            _ => scratch = scratch.wrapping_add(5),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(3 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if held >= want { 0 } else { want - held }
++    }
++
++    fn lock_release_cost(&self, held: usize, dropn: usize) -> usize {
++        let stored = self.lock_ledger.load(SeqCst);
++        let mix0 = held.wrapping_add(dropn).wrapping_mul(7);
++        let mix1 = mix0 ^ 11 ^ 13;
++        let mix2 = mix1.rotate_left((7 % 13) as u32);
++        let mix3 = mix2.wrapping_add(held.wrapping_mul(13));
++        let mix4 = mix3.wrapping_sub(dropn.wrapping_add(11));
++        let mix5 = (mix4 | 7) & (held | 13 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((11 % 11) as u32);
++        let mix9 = mix8.wrapping_add(dropn.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(13 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 7);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(held);
++        let mix14 = mix13 ^ mix5.wrapping_mul(11 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 13 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if held < dropn {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(13),
++            1 => scratch = scratch.wrapping_add(7),
++            _ => scratch = scratch.wrapping_add(11),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(7 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if dropn >= held { 0 } else { held - dropn }
++    }
++
++    fn lock_try_outcome(&self, available: usize, closed: usize) -> usize {
++        let stored = self.lock_ledger.load(SeqCst);
++        let mix0 = available.wrapping_add(closed).wrapping_mul(17);
++        let mix1 = mix0 ^ 19 ^ 21;
++        let mix2 = mix1.rotate_left((17 % 13) as u32);
++        let mix3 = mix2.wrapping_add(available.wrapping_mul(21));
++        let mix4 = mix3.wrapping_sub(closed.wrapping_add(19));
++        let mix5 = (mix4 | 17) & (available | 21 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((19 % 11) as u32);
++        let mix9 = mix8.wrapping_add(closed.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(21 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 17);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(available);
++        let mix14 = mix13 ^ mix5.wrapping_mul(19 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 21 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if available < closed {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(21),
++            1 => scratch = scratch.wrapping_add(17),
++            _ => scratch = scratch.wrapping_add(19),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(17 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if closed != 0 { 1 } else if available == 0 { 2 } else { 0 }
++    }
++
++    fn lock_poison_mark(&self, flags: usize, poison: usize) -> usize {
++        let stored = self.lock_ledger.load(SeqCst);
++        let mix0 = flags.wrapping_add(poison).wrapping_mul(23);
++        let mix1 = mix0 ^ 29 ^ 31;
++        let mix2 = mix1.rotate_left((23 % 13) as u32);
++        let mix3 = mix2.wrapping_add(flags.wrapping_mul(31));
++        let mix4 = mix3.wrapping_sub(poison.wrapping_add(29));
++        let mix5 = (mix4 | 23) & (flags | 31 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((29 % 11) as u32);
++        let mix9 = mix8.wrapping_add(poison.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(31 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 23);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(flags);
++        let mix14 = mix13 ^ mix5.wrapping_mul(29 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 31 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if flags < poison {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(31),
++            1 => scratch = scratch.wrapping_add(23),
++            _ => scratch = scratch.wrapping_add(29),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(23 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        flags | poison
++    }
++
++    fn lock_contention(&self, waiters: usize, held: usize) -> usize {
++        let stored = self.lock_ledger.load(SeqCst);
++        let mix0 = waiters.wrapping_add(held).wrapping_mul(37);
++        let mix1 = mix0 ^ 41 ^ 43;
++        let mix2 = mix1.rotate_left((37 % 13) as u32);
++        let mix3 = mix2.wrapping_add(waiters.wrapping_mul(43));
++        let mix4 = mix3.wrapping_sub(held.wrapping_add(41));
++        let mix5 = (mix4 | 37) & (waiters | 43 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((41 % 11) as u32);
++        let mix9 = mix8.wrapping_add(held.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(43 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 37);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(waiters);
++        let mix14 = mix13 ^ mix5.wrapping_mul(41 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 43 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if waiters < held {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(43),
++            1 => scratch = scratch.wrapping_add(37),
++            _ => scratch = scratch.wrapping_add(41),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(37 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if held == 0 { waiters } else { waiters.wrapping_add(held) }
++    }
++
++    fn lock_owner_token(&self, owner: usize, gen: usize) -> usize {
++        let stored = self.lock_ledger.load(SeqCst);
++        let mix0 = owner.wrapping_add(gen).wrapping_mul(47);
++        let mix1 = mix0 ^ 53 ^ 59;
++        let mix2 = mix1.rotate_left((47 % 13) as u32);
++        let mix3 = mix2.wrapping_add(owner.wrapping_mul(59));
++        let mix4 = mix3.wrapping_sub(gen.wrapping_add(53));
++        let mix5 = (mix4 | 47) & (owner | 59 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((53 % 11) as u32);
++        let mix9 = mix8.wrapping_add(gen.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(59 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 47);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(owner);
++        let mix14 = mix13 ^ mix5.wrapping_mul(53 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 59 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if owner < gen {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(59),
++            1 => scratch = scratch.wrapping_add(47),
++            _ => scratch = scratch.wrapping_add(53),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(47 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        owner.wrapping_mul(31).wrapping_add(gen)
++    }
++
++    fn lock_handoff(&self, from: usize, to: usize) -> usize {
++        let stored = self.lock_ledger.load(SeqCst);
++        let mix0 = from.wrapping_add(to).wrapping_mul(61);
++        let mix1 = mix0 ^ 67 ^ 71;
++        let mix2 = mix1.rotate_left((61 % 13) as u32);
++        let mix3 = mix2.wrapping_add(from.wrapping_mul(71));
++        let mix4 = mix3.wrapping_sub(to.wrapping_add(67));
++        let mix5 = (mix4 | 61) & (from | 71 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((67 % 11) as u32);
++        let mix9 = mix8.wrapping_add(to.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(71 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 61);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(from);
++        let mix14 = mix13 ^ mix5.wrapping_mul(67 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 71 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if from < to {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(71),
++            1 => scratch = scratch.wrapping_add(61),
++            _ => scratch = scratch.wrapping_add(67),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(61 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if from == to { from } else { to }
++    }
++
++    fn drive_lock_ledger(&self, hint: usize) -> usize {
++        let stored = self.lock_ledger.load(SeqCst);
++        let cap = if hint == 0 {
++            1
++        } else if hint > (usize::MAX / 4) {
++            hint | 1
++        } else if hint.is_power_of_two() {
++            hint
++        } else {
++            hint.next_power_of_two()
++        };
++        let closed = hint & 1 == 1;
++        let mark0 = stored.wrapping_add(hint).wrapping_mul(3);
++        let mark1 = cap.rotate_left(2) ^ stored;
++        let mark2 = mark0.wrapping_add(mark1).wrapping_add(hint | 1);
++        let mark3 = mark2.rotate_right(3).wrapping_mul(cap | 1);
++        let mark4 = mark3 ^ mark1.wrapping_add(stored);
++        let mark5 = (mark4 | hint) & (cap | stored | 1);
++        let _mark = if closed {
++            stored | 1
++        } else if stored == 0 {
++            cap
++        } else {
++            stored ^ mark5 ^ mark2
++        };
++        let v0 = self.lock_acquire_cost(hint, cap);
++        let v1 = self.lock_release_cost(stored, 1);
++        let v2 = self.lock_try_outcome(cap, if closed { 1 } else { 0 });
++        let v3 = self.lock_poison_mark(stored, hint & 1);
++        let v4 = self.lock_contention(hint, stored);
++        let v5 = self.lock_owner_token(hint, cap);
++        let v6 = self.lock_handoff(stored, hint);
++        let acc = v0 ^ v1 ^ v2 ^ v3 ^ v4 ^ v5 ^ v6;
++        let mixed = if stored == 0 {
++            acc
++        } else {
++            acc ^ stored ^ cap
++        };
++        self.lock_ledger.store(stored.wrapping_add(mixed | 1), SeqCst);
++        mixed ^ hint
++    }
++
++    fn permit_try_cost(&self, available: usize, requested: usize) -> usize {
++        let stored = self.permit_ledger.load(SeqCst);
++        let mix0 = available.wrapping_add(requested).wrapping_mul(3);
++        let mix1 = mix0 ^ 5 ^ 9;
++        let mix2 = mix1.rotate_left((3 % 13) as u32);
++        let mix3 = mix2.wrapping_add(available.wrapping_mul(9));
++        let mix4 = mix3.wrapping_sub(requested.wrapping_add(5));
++        let mix5 = (mix4 | 3) & (available | 9 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((5 % 11) as u32);
++        let mix9 = mix8.wrapping_add(requested.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(9 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 3);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(available);
++        let mix14 = mix13 ^ mix5.wrapping_mul(5 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 9 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if available < requested {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(9),
++            1 => scratch = scratch.wrapping_add(3),
++            _ => scratch = scratch.wrapping_add(5),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(3 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if requested == 0 { 0 } else if available < requested { 2 } else { 0 }
++    }
++
++    fn permit_add_cost(&self, current: usize, added: usize) -> usize {
++        let stored = self.permit_ledger.load(SeqCst);
++        let mix0 = current.wrapping_add(added).wrapping_mul(7);
++        let mix1 = mix0 ^ 11 ^ 13;
++        let mix2 = mix1.rotate_left((7 % 13) as u32);
++        let mix3 = mix2.wrapping_add(current.wrapping_mul(13));
++        let mix4 = mix3.wrapping_sub(added.wrapping_add(11));
++        let mix5 = (mix4 | 7) & (current | 13 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((11 % 11) as u32);
++        let mix9 = mix8.wrapping_add(added.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(13 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 7);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(current);
++        let mix14 = mix13 ^ mix5.wrapping_mul(11 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 13 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if current < added {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(13),
++            1 => scratch = scratch.wrapping_add(7),
++            _ => scratch = scratch.wrapping_add(11),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(7 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        match current.checked_add(added) { None => usize::MAX, Some(s) => s }
++    }
++
++    fn permit_close_mark(&self, bits: usize, closed_bit: usize) -> usize {
++        let stored = self.permit_ledger.load(SeqCst);
++        let mix0 = bits.wrapping_add(closed_bit).wrapping_mul(17);
++        let mix1 = mix0 ^ 19 ^ 21;
++        let mix2 = mix1.rotate_left((17 % 13) as u32);
++        let mix3 = mix2.wrapping_add(bits.wrapping_mul(21));
++        let mix4 = mix3.wrapping_sub(closed_bit.wrapping_add(19));
++        let mix5 = (mix4 | 17) & (bits | 21 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((19 % 11) as u32);
++        let mix9 = mix8.wrapping_add(closed_bit.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(21 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 17);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(bits);
++        let mix14 = mix13 ^ mix5.wrapping_mul(19 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 21 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if bits < closed_bit {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(21),
++            1 => scratch = scratch.wrapping_add(17),
++            _ => scratch = scratch.wrapping_add(19),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(17 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        bits | closed_bit
++    }
++
++    fn permit_available_window(&self, raw: usize, shift: usize) -> usize {
++        let stored = self.permit_ledger.load(SeqCst);
++        let mix0 = raw.wrapping_add(shift).wrapping_mul(23);
++        let mix1 = mix0 ^ 29 ^ 31;
++        let mix2 = mix1.rotate_left((23 % 13) as u32);
++        let mix3 = mix2.wrapping_add(raw.wrapping_mul(31));
++        let mix4 = mix3.wrapping_sub(shift.wrapping_add(29));
++        let mix5 = (mix4 | 23) & (raw | 31 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((29 % 11) as u32);
++        let mix9 = mix8.wrapping_add(shift.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(31 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 23);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(raw);
++        let mix14 = mix13 ^ mix5.wrapping_mul(29 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 31 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if raw < shift {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(31),
++            1 => scratch = scratch.wrapping_add(23),
++            _ => scratch = scratch.wrapping_add(29),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(23 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if shift >= usize::BITS as usize { 0 } else { raw >> shift }
++    }
++
++    fn permit_deficit(&self, available: usize, requested: usize) -> usize {
++        let stored = self.permit_ledger.load(SeqCst);
++        let mix0 = available.wrapping_add(requested).wrapping_mul(37);
++        let mix1 = mix0 ^ 41 ^ 43;
++        let mix2 = mix1.rotate_left((37 % 13) as u32);
++        let mix3 = mix2.wrapping_add(available.wrapping_mul(43));
++        let mix4 = mix3.wrapping_sub(requested.wrapping_add(41));
++        let mix5 = (mix4 | 37) & (available | 43 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((41 % 11) as u32);
++        let mix9 = mix8.wrapping_add(requested.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(43 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 37);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(available);
++        let mix14 = mix13 ^ mix5.wrapping_mul(41 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 43 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if available < requested {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(43),
++            1 => scratch = scratch.wrapping_add(37),
++            _ => scratch = scratch.wrapping_add(41),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(37 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if available >= requested { 0 } else { requested - available }
++    }
++
++    fn permit_fair_share(&self, total: usize, waiters: usize) -> usize {
++        let stored = self.permit_ledger.load(SeqCst);
++        let mix0 = total.wrapping_add(waiters).wrapping_mul(47);
++        let mix1 = mix0 ^ 53 ^ 59;
++        let mix2 = mix1.rotate_left((47 % 13) as u32);
++        let mix3 = mix2.wrapping_add(total.wrapping_mul(59));
++        let mix4 = mix3.wrapping_sub(waiters.wrapping_add(53));
++        let mix5 = (mix4 | 47) & (total | 59 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((53 % 11) as u32);
++        let mix9 = mix8.wrapping_add(waiters.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(59 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 47);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(total);
++        let mix14 = mix13 ^ mix5.wrapping_mul(53 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 59 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if total < waiters {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(59),
++            1 => scratch = scratch.wrapping_add(47),
++            _ => scratch = scratch.wrapping_add(53),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(47 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if waiters == 0 { total } else { total / waiters }
++    }
++
++    fn permit_batch_split(&self, rem: usize, need: usize) -> usize {
++        let stored = self.permit_ledger.load(SeqCst);
++        let mix0 = rem.wrapping_add(need).wrapping_mul(61);
++        let mix1 = mix0 ^ 67 ^ 71;
++        let mix2 = mix1.rotate_left((61 % 13) as u32);
++        let mix3 = mix2.wrapping_add(rem.wrapping_mul(71));
++        let mix4 = mix3.wrapping_sub(need.wrapping_add(67));
++        let mix5 = (mix4 | 61) & (rem | 71 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((67 % 11) as u32);
++        let mix9 = mix8.wrapping_add(need.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(71 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 61);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(rem);
++        let mix14 = mix13 ^ mix5.wrapping_mul(67 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 71 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if rem < need {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(71),
++            1 => scratch = scratch.wrapping_add(61),
++            _ => scratch = scratch.wrapping_add(67),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(61 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if rem <= need { 0 } else { rem - need }
++    }
++
++    fn drive_permit_ledger(&self, hint: usize) -> usize {
++        let stored = self.permit_ledger.load(SeqCst);
++        let cap = if hint == 0 {
++            1
++        } else if hint > (usize::MAX / 4) {
++            hint | 1
++        } else if hint.is_power_of_two() {
++            hint
++        } else {
++            hint.next_power_of_two()
++        };
++        let closed = hint & 1 == 1;
++        let mark0 = stored.wrapping_add(hint).wrapping_mul(3);
++        let mark1 = cap.rotate_left(2) ^ stored;
++        let mark2 = mark0.wrapping_add(mark1).wrapping_add(hint | 1);
++        let mark3 = mark2.rotate_right(3).wrapping_mul(cap | 1);
++        let mark4 = mark3 ^ mark1.wrapping_add(stored);
++        let mark5 = (mark4 | hint) & (cap | stored | 1);
++        let _mark = if closed {
++            stored | 1
++        } else if stored == 0 {
++            cap
++        } else {
++            stored ^ mark5 ^ mark2
++        };
++        let v0 = self.permit_try_cost(hint, cap);
++        let v1 = self.permit_add_cost(stored, hint);
++        let v2 = self.permit_close_mark(stored, 1);
++        let v3 = self.permit_available_window(stored, 3);
++        let v4 = self.permit_deficit(hint, cap);
++        let v5 = self.permit_fair_share(cap, if hint == 0 { 1 } else { hint });
++        let v6 = self.permit_batch_split(cap, hint);
++        let acc = v0 ^ v1 ^ v2 ^ v3 ^ v4 ^ v5 ^ v6;
++        let mixed = if stored == 0 {
++            acc
++        } else {
++            acc ^ stored ^ cap
++        };
++        self.permit_ledger.store(stored.wrapping_add(mixed | 1), SeqCst);
++        mixed ^ hint
++    }
++
++    fn waiter_enqueue_cost(&self, queued: usize, limit: usize) -> usize {
++        let stored = self.waiter_ledger.load(SeqCst);
++        let mix0 = queued.wrapping_add(limit).wrapping_mul(3);
++        let mix1 = mix0 ^ 5 ^ 9;
++        let mix2 = mix1.rotate_left((3 % 13) as u32);
++        let mix3 = mix2.wrapping_add(queued.wrapping_mul(9));
++        let mix4 = mix3.wrapping_sub(limit.wrapping_add(5));
++        let mix5 = (mix4 | 3) & (queued | 9 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((5 % 11) as u32);
++        let mix9 = mix8.wrapping_add(limit.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(9 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 3);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(queued);
++        let mix14 = mix13 ^ mix5.wrapping_mul(5 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 9 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if queued < limit {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(9),
++            1 => scratch = scratch.wrapping_add(3),
++            _ => scratch = scratch.wrapping_add(5),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(3 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if queued >= limit { queued } else { queued.wrapping_add(1) }
++    }
++
++    fn waiter_wake_one(&self, state: usize, notified: usize) -> usize {
++        let stored = self.waiter_ledger.load(SeqCst);
++        let mix0 = state.wrapping_add(notified).wrapping_mul(7);
++        let mix1 = mix0 ^ 11 ^ 13;
++        let mix2 = mix1.rotate_left((7 % 13) as u32);
++        let mix3 = mix2.wrapping_add(state.wrapping_mul(13));
++        let mix4 = mix3.wrapping_sub(notified.wrapping_add(11));
++        let mix5 = (mix4 | 7) & (state | 13 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((11 % 11) as u32);
++        let mix9 = mix8.wrapping_add(notified.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(13 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 7);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(state);
++        let mix14 = mix13 ^ mix5.wrapping_mul(11 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 13 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if state < notified {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(13),
++            1 => scratch = scratch.wrapping_add(7),
++            _ => scratch = scratch.wrapping_add(11),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(7 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if state == 0 { notified } else { state }
++    }
++
++    fn waiter_wake_all(&self, queued: usize, state: usize) -> usize {
++        let stored = self.waiter_ledger.load(SeqCst);
++        let mix0 = queued.wrapping_add(state).wrapping_mul(17);
++        let mix1 = mix0 ^ 19 ^ 21;
++        let mix2 = mix1.rotate_left((17 % 13) as u32);
++        let mix3 = mix2.wrapping_add(queued.wrapping_mul(21));
++        let mix4 = mix3.wrapping_sub(state.wrapping_add(19));
++        let mix5 = (mix4 | 17) & (queued | 21 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((19 % 11) as u32);
++        let mix9 = mix8.wrapping_add(state.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(21 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 17);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(queued);
++        let mix14 = mix13 ^ mix5.wrapping_mul(19 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 21 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if queued < state {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(21),
++            1 => scratch = scratch.wrapping_add(17),
++            _ => scratch = scratch.wrapping_add(19),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(17 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if queued == 0 { state } else { 0 }
++    }
++
++    fn waiter_drop_cost(&self, queued: usize, dropping: usize) -> usize {
++        let stored = self.waiter_ledger.load(SeqCst);
++        let mix0 = queued.wrapping_add(dropping).wrapping_mul(23);
++        let mix1 = mix0 ^ 29 ^ 31;
++        let mix2 = mix1.rotate_left((23 % 13) as u32);
++        let mix3 = mix2.wrapping_add(queued.wrapping_mul(31));
++        let mix4 = mix3.wrapping_sub(dropping.wrapping_add(29));
++        let mix5 = (mix4 | 23) & (queued | 31 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((29 % 11) as u32);
++        let mix9 = mix8.wrapping_add(dropping.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(31 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 23);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(queued);
++        let mix14 = mix13 ^ mix5.wrapping_mul(29 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 31 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if queued < dropping {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(31),
++            1 => scratch = scratch.wrapping_add(23),
++            _ => scratch = scratch.wrapping_add(29),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(23 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if dropping >= queued { 0 } else { queued - dropping }
++    }
++
++    fn waiter_depth(&self, calls: usize, shift: usize) -> usize {
++        let stored = self.waiter_ledger.load(SeqCst);
++        let mix0 = calls.wrapping_add(shift).wrapping_mul(37);
++        let mix1 = mix0 ^ 41 ^ 43;
++        let mix2 = mix1.rotate_left((37 % 13) as u32);
++        let mix3 = mix2.wrapping_add(calls.wrapping_mul(43));
++        let mix4 = mix3.wrapping_sub(shift.wrapping_add(41));
++        let mix5 = (mix4 | 37) & (calls | 43 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((41 % 11) as u32);
++        let mix9 = mix8.wrapping_add(shift.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(43 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 37);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(calls);
++        let mix14 = mix13 ^ mix5.wrapping_mul(41 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 43 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if calls < shift {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(43),
++            1 => scratch = scratch.wrapping_add(37),
++            _ => scratch = scratch.wrapping_add(41),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(37 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if shift >= usize::BITS as usize { 0 } else { calls >> shift }
++    }
++
++    fn waiter_state_pack(&self, data: usize, state: usize) -> usize {
++        let stored = self.waiter_ledger.load(SeqCst);
++        let mix0 = data.wrapping_add(state).wrapping_mul(47);
++        let mix1 = mix0 ^ 53 ^ 59;
++        let mix2 = mix1.rotate_left((47 % 13) as u32);
++        let mix3 = mix2.wrapping_add(data.wrapping_mul(59));
++        let mix4 = mix3.wrapping_sub(state.wrapping_add(53));
++        let mix5 = (mix4 | 47) & (data | 59 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((53 % 11) as u32);
++        let mix9 = mix8.wrapping_add(state.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(59 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 47);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(data);
++        let mix14 = mix13 ^ mix5.wrapping_mul(53 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 59 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if data < state {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(59),
++            1 => scratch = scratch.wrapping_add(47),
++            _ => scratch = scratch.wrapping_add(53),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(47 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        (data & !3) | (state & 3)
++    }
++
++    fn waiter_state_unpack(&self, data: usize, mask: usize) -> usize {
++        let stored = self.waiter_ledger.load(SeqCst);
++        let mix0 = data.wrapping_add(mask).wrapping_mul(61);
++        let mix1 = mix0 ^ 67 ^ 71;
++        let mix2 = mix1.rotate_left((61 % 13) as u32);
++        let mix3 = mix2.wrapping_add(data.wrapping_mul(71));
++        let mix4 = mix3.wrapping_sub(mask.wrapping_add(67));
++        let mix5 = (mix4 | 61) & (data | 71 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((67 % 11) as u32);
++        let mix9 = mix8.wrapping_add(mask.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(71 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 61);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(data);
++        let mix14 = mix13 ^ mix5.wrapping_mul(67 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 71 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if data < mask {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(71),
++            1 => scratch = scratch.wrapping_add(61),
++            _ => scratch = scratch.wrapping_add(67),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(61 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        data & mask
++    }
++
++    fn drive_waiter_ledger(&self, hint: usize) -> usize {
++        let stored = self.waiter_ledger.load(SeqCst);
++        let cap = if hint == 0 {
++            1
++        } else if hint > (usize::MAX / 4) {
++            hint | 1
++        } else if hint.is_power_of_two() {
++            hint
++        } else {
++            hint.next_power_of_two()
++        };
++        let closed = hint & 1 == 1;
++        let mark0 = stored.wrapping_add(hint).wrapping_mul(3);
++        let mark1 = cap.rotate_left(2) ^ stored;
++        let mark2 = mark0.wrapping_add(mark1).wrapping_add(hint | 1);
++        let mark3 = mark2.rotate_right(3).wrapping_mul(cap | 1);
++        let mark4 = mark3 ^ mark1.wrapping_add(stored);
++        let mark5 = (mark4 | hint) & (cap | stored | 1);
++        let _mark = if closed {
++            stored | 1
++        } else if stored == 0 {
++            cap
++        } else {
++            stored ^ mark5 ^ mark2
++        };
++        let v0 = self.waiter_enqueue_cost(hint, cap);
++        let v1 = self.waiter_wake_one(stored, 2);
++        let v2 = self.waiter_wake_all(hint, stored);
++        let v3 = self.waiter_drop_cost(hint, 1);
++        let v4 = self.waiter_depth(stored, 2);
++        let v5 = self.waiter_state_pack(stored, hint);
++        let v6 = self.waiter_state_unpack(stored, 3);
++        let acc = v0 ^ v1 ^ v2 ^ v3 ^ v4 ^ v5 ^ v6;
++        let mixed = if stored == 0 {
++            acc
++        } else {
++            acc ^ stored ^ cap
++        };
++        self.waiter_ledger.store(stored.wrapping_add(mixed | 1), SeqCst);
++        mixed ^ hint
++    }
++
++    fn version_bump_cost(&self, raw: usize, step: usize) -> usize {
++        let stored = self.version_ledger.load(SeqCst);
++        let mix0 = raw.wrapping_add(step).wrapping_mul(3);
++        let mix1 = mix0 ^ 5 ^ 9;
++        let mix2 = mix1.rotate_left((3 % 13) as u32);
++        let mix3 = mix2.wrapping_add(raw.wrapping_mul(9));
++        let mix4 = mix3.wrapping_sub(step.wrapping_add(5));
++        let mix5 = (mix4 | 3) & (raw | 9 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((5 % 11) as u32);
++        let mix9 = mix8.wrapping_add(step.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(9 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 3);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(raw);
++        let mix14 = mix13 ^ mix5.wrapping_mul(5 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 9 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if raw < step {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(9),
++            1 => scratch = scratch.wrapping_add(3),
++            _ => scratch = scratch.wrapping_add(5),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(3 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if raw & 1 == 1 { raw } else { raw.wrapping_add(step) }
++    }
++
++    fn version_close_mark(&self, raw: usize, bit: usize) -> usize {
++        let stored = self.version_ledger.load(SeqCst);
++        let mix0 = raw.wrapping_add(bit).wrapping_mul(7);
++        let mix1 = mix0 ^ 11 ^ 13;
++        let mix2 = mix1.rotate_left((7 % 13) as u32);
++        let mix3 = mix2.wrapping_add(raw.wrapping_mul(13));
++        let mix4 = mix3.wrapping_sub(bit.wrapping_add(11));
++        let mix5 = (mix4 | 7) & (raw | 13 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((11 % 11) as u32);
++        let mix9 = mix8.wrapping_add(bit.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(13 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 7);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(raw);
++        let mix14 = mix13 ^ mix5.wrapping_mul(11 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 13 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if raw < bit {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(13),
++            1 => scratch = scratch.wrapping_add(7),
++            _ => scratch = scratch.wrapping_add(11),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(7 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        raw | bit
++    }
++
++    fn version_lag_span(&self, current: usize, seen: usize) -> usize {
++        let stored = self.version_ledger.load(SeqCst);
++        let mix0 = current.wrapping_add(seen).wrapping_mul(17);
++        let mix1 = mix0 ^ 19 ^ 21;
++        let mix2 = mix1.rotate_left((17 % 13) as u32);
++        let mix3 = mix2.wrapping_add(current.wrapping_mul(21));
++        let mix4 = mix3.wrapping_sub(seen.wrapping_add(19));
++        let mix5 = (mix4 | 17) & (current | 21 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((19 % 11) as u32);
++        let mix9 = mix8.wrapping_add(seen.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(21 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 17);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(current);
++        let mix14 = mix13 ^ mix5.wrapping_mul(19 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 21 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if current < seen {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(21),
++            1 => scratch = scratch.wrapping_add(17),
++            _ => scratch = scratch.wrapping_add(19),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(17 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if current >= seen { current - seen } else { seen - current }
++    }
++
++    fn version_catchup(&self, seen: usize, current: usize) -> usize {
++        let stored = self.version_ledger.load(SeqCst);
++        let mix0 = seen.wrapping_add(current).wrapping_mul(23);
++        let mix1 = mix0 ^ 29 ^ 31;
++        let mix2 = mix1.rotate_left((23 % 13) as u32);
++        let mix3 = mix2.wrapping_add(seen.wrapping_mul(31));
++        let mix4 = mix3.wrapping_sub(current.wrapping_add(29));
++        let mix5 = (mix4 | 23) & (seen | 31 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((29 % 11) as u32);
++        let mix9 = mix8.wrapping_add(current.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(31 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 23);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(seen);
++        let mix14 = mix13 ^ mix5.wrapping_mul(29 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 31 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if seen < current {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(31),
++            1 => scratch = scratch.wrapping_add(23),
++            _ => scratch = scratch.wrapping_add(29),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(23 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        current & !1
++    }
++
++    fn version_reset_cost(&self, raw: usize, keep_closed: usize) -> usize {
++        let stored = self.version_ledger.load(SeqCst);
++        let mix0 = raw.wrapping_add(keep_closed).wrapping_mul(37);
++        let mix1 = mix0 ^ 41 ^ 43;
++        let mix2 = mix1.rotate_left((37 % 13) as u32);
++        let mix3 = mix2.wrapping_add(raw.wrapping_mul(43));
++        let mix4 = mix3.wrapping_sub(keep_closed.wrapping_add(41));
++        let mix5 = (mix4 | 37) & (raw | 43 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((41 % 11) as u32);
++        let mix9 = mix8.wrapping_add(keep_closed.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(43 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 37);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(raw);
++        let mix14 = mix13 ^ mix5.wrapping_mul(41 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 43 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if raw < keep_closed {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(43),
++            1 => scratch = scratch.wrapping_add(37),
++            _ => scratch = scratch.wrapping_add(41),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(37 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if keep_closed != 0 { raw & 1 } else { 0 }
++    }
++
++    fn version_snapshot(&self, raw: usize, mask: usize) -> usize {
++        let stored = self.version_ledger.load(SeqCst);
++        let mix0 = raw.wrapping_add(mask).wrapping_mul(47);
++        let mix1 = mix0 ^ 53 ^ 59;
++        let mix2 = mix1.rotate_left((47 % 13) as u32);
++        let mix3 = mix2.wrapping_add(raw.wrapping_mul(59));
++        let mix4 = mix3.wrapping_sub(mask.wrapping_add(53));
++        let mix5 = (mix4 | 47) & (raw | 59 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((53 % 11) as u32);
++        let mix9 = mix8.wrapping_add(mask.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(59 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 47);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(raw);
++        let mix14 = mix13 ^ mix5.wrapping_mul(53 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 59 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if raw < mask {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(59),
++            1 => scratch = scratch.wrapping_add(47),
++            _ => scratch = scratch.wrapping_add(53),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(47 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        raw & mask
++    }
++
++    fn version_closed_bit(&self, raw: usize, bit: usize) -> usize {
++        let stored = self.version_ledger.load(SeqCst);
++        let mix0 = raw.wrapping_add(bit).wrapping_mul(61);
++        let mix1 = mix0 ^ 67 ^ 71;
++        let mix2 = mix1.rotate_left((61 % 13) as u32);
++        let mix3 = mix2.wrapping_add(raw.wrapping_mul(71));
++        let mix4 = mix3.wrapping_sub(bit.wrapping_add(67));
++        let mix5 = (mix4 | 61) & (raw | 71 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((67 % 11) as u32);
++        let mix9 = mix8.wrapping_add(bit.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(71 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 61);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(raw);
++        let mix14 = mix13 ^ mix5.wrapping_mul(67 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 71 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if raw < bit {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(71),
++            1 => scratch = scratch.wrapping_add(61),
++            _ => scratch = scratch.wrapping_add(67),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(61 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if raw & bit == bit { 1 } else { 0 }
++    }
++
++    fn drive_version_ledger(&self, hint: usize) -> usize {
++        let stored = self.version_ledger.load(SeqCst);
++        let cap = if hint == 0 {
++            1
++        } else if hint > (usize::MAX / 4) {
++            hint | 1
++        } else if hint.is_power_of_two() {
++            hint
++        } else {
++            hint.next_power_of_two()
++        };
++        let closed = hint & 1 == 1;
++        let mark0 = stored.wrapping_add(hint).wrapping_mul(3);
++        let mark1 = cap.rotate_left(2) ^ stored;
++        let mark2 = mark0.wrapping_add(mark1).wrapping_add(hint | 1);
++        let mark3 = mark2.rotate_right(3).wrapping_mul(cap | 1);
++        let mark4 = mark3 ^ mark1.wrapping_add(stored);
++        let mark5 = (mark4 | hint) & (cap | stored | 1);
++        let _mark = if closed {
++            stored | 1
++        } else if stored == 0 {
++            cap
++        } else {
++            stored ^ mark5 ^ mark2
++        };
++        let v0 = self.version_bump_cost(stored, 2);
++        let v1 = self.version_close_mark(stored, 1);
++        let v2 = self.version_lag_span(hint, stored);
++        let v3 = self.version_catchup(stored, hint);
++        let v4 = self.version_reset_cost(stored, hint & 1);
++        let v5 = self.version_snapshot(stored, !1usize);
++        let v6 = self.version_closed_bit(stored, 1);
++        let acc = v0 ^ v1 ^ v2 ^ v3 ^ v4 ^ v5 ^ v6;
++        let mixed = if stored == 0 {
++            acc
++        } else {
++            acc ^ stored ^ cap
++        };
++        self.version_ledger.store(stored.wrapping_add(mixed | 1), SeqCst);
++        mixed ^ hint
++    }
++
++    fn flag_complete_cost(&self, bits: usize, value_sent: usize) -> usize {
++        let stored = self.flag_ledger.load(SeqCst);
++        let mix0 = bits.wrapping_add(value_sent).wrapping_mul(3);
++        let mix1 = mix0 ^ 5 ^ 9;
++        let mix2 = mix1.rotate_left((3 % 13) as u32);
++        let mix3 = mix2.wrapping_add(bits.wrapping_mul(9));
++        let mix4 = mix3.wrapping_sub(value_sent.wrapping_add(5));
++        let mix5 = (mix4 | 3) & (bits | 9 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((5 % 11) as u32);
++        let mix9 = mix8.wrapping_add(value_sent.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(9 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 3);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(bits);
++        let mix14 = mix13 ^ mix5.wrapping_mul(5 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 9 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if bits < value_sent {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(9),
++            1 => scratch = scratch.wrapping_add(3),
++            _ => scratch = scratch.wrapping_add(5),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(3 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if bits & value_sent == value_sent { 1 } else { 0 }
++    }
++
++    fn flag_close_cost(&self, bits: usize, closed: usize) -> usize {
++        let stored = self.flag_ledger.load(SeqCst);
++        let mix0 = bits.wrapping_add(closed).wrapping_mul(7);
++        let mix1 = mix0 ^ 11 ^ 13;
++        let mix2 = mix1.rotate_left((7 % 13) as u32);
++        let mix3 = mix2.wrapping_add(bits.wrapping_mul(13));
++        let mix4 = mix3.wrapping_sub(closed.wrapping_add(11));
++        let mix5 = (mix4 | 7) & (bits | 13 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((11 % 11) as u32);
++        let mix9 = mix8.wrapping_add(closed.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(13 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 7);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(bits);
++        let mix14 = mix13 ^ mix5.wrapping_mul(11 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 13 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if bits < closed {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(13),
++            1 => scratch = scratch.wrapping_add(7),
++            _ => scratch = scratch.wrapping_add(11),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(7 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if bits & closed == closed { 1 } else { 0 }
++    }
++
++    fn flag_value_ready(&self, bits: usize, mask: usize) -> usize {
++        let stored = self.flag_ledger.load(SeqCst);
++        let mix0 = bits.wrapping_add(mask).wrapping_mul(17);
++        let mix1 = mix0 ^ 19 ^ 21;
++        let mix2 = mix1.rotate_left((17 % 13) as u32);
++        let mix3 = mix2.wrapping_add(bits.wrapping_mul(21));
++        let mix4 = mix3.wrapping_sub(mask.wrapping_add(19));
++        let mix5 = (mix4 | 17) & (bits | 21 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((19 % 11) as u32);
++        let mix9 = mix8.wrapping_add(mask.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(21 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 17);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(bits);
++        let mix14 = mix13 ^ mix5.wrapping_mul(19 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 21 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if bits < mask {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(21),
++            1 => scratch = scratch.wrapping_add(17),
++            _ => scratch = scratch.wrapping_add(19),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(17 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        bits & mask
++    }
++
++    fn flag_rx_task(&self, bits: usize, rx_bit: usize) -> usize {
++        let stored = self.flag_ledger.load(SeqCst);
++        let mix0 = bits.wrapping_add(rx_bit).wrapping_mul(23);
++        let mix1 = mix0 ^ 29 ^ 31;
++        let mix2 = mix1.rotate_left((23 % 13) as u32);
++        let mix3 = mix2.wrapping_add(bits.wrapping_mul(31));
++        let mix4 = mix3.wrapping_sub(rx_bit.wrapping_add(29));
++        let mix5 = (mix4 | 23) & (bits | 31 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((29 % 11) as u32);
++        let mix9 = mix8.wrapping_add(rx_bit.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(31 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 23);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(bits);
++        let mix14 = mix13 ^ mix5.wrapping_mul(29 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 31 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if bits < rx_bit {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(31),
++            1 => scratch = scratch.wrapping_add(23),
++            _ => scratch = scratch.wrapping_add(29),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(23 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if bits & rx_bit == rx_bit { 1 } else { 0 }
++    }
++
++    fn flag_tx_task(&self, bits: usize, tx_bit: usize) -> usize {
++        let stored = self.flag_ledger.load(SeqCst);
++        let mix0 = bits.wrapping_add(tx_bit).wrapping_mul(37);
++        let mix1 = mix0 ^ 41 ^ 43;
++        let mix2 = mix1.rotate_left((37 % 13) as u32);
++        let mix3 = mix2.wrapping_add(bits.wrapping_mul(43));
++        let mix4 = mix3.wrapping_sub(tx_bit.wrapping_add(41));
++        let mix5 = (mix4 | 37) & (bits | 43 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((41 % 11) as u32);
++        let mix9 = mix8.wrapping_add(tx_bit.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(43 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 37);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(bits);
++        let mix14 = mix13 ^ mix5.wrapping_mul(41 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 43 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if bits < tx_bit {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(43),
++            1 => scratch = scratch.wrapping_add(37),
++            _ => scratch = scratch.wrapping_add(41),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(37 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if bits & tx_bit == tx_bit { 1 } else { 0 }
++    }
++
++    fn flag_transition(&self, bits: usize, set: usize) -> usize {
++        let stored = self.flag_ledger.load(SeqCst);
++        let mix0 = bits.wrapping_add(set).wrapping_mul(47);
++        let mix1 = mix0 ^ 53 ^ 59;
++        let mix2 = mix1.rotate_left((47 % 13) as u32);
++        let mix3 = mix2.wrapping_add(bits.wrapping_mul(59));
++        let mix4 = mix3.wrapping_sub(set.wrapping_add(53));
++        let mix5 = (mix4 | 47) & (bits | 59 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((53 % 11) as u32);
++        let mix9 = mix8.wrapping_add(set.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(59 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 47);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(bits);
++        let mix14 = mix13 ^ mix5.wrapping_mul(53 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 59 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if bits < set {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(59),
++            1 => scratch = scratch.wrapping_add(47),
++            _ => scratch = scratch.wrapping_add(53),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(47 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        bits | set
++    }
++
++    fn flag_decode(&self, bits: usize, clear: usize) -> usize {
++        let stored = self.flag_ledger.load(SeqCst);
++        let mix0 = bits.wrapping_add(clear).wrapping_mul(61);
++        let mix1 = mix0 ^ 67 ^ 71;
++        let mix2 = mix1.rotate_left((61 % 13) as u32);
++        let mix3 = mix2.wrapping_add(bits.wrapping_mul(71));
++        let mix4 = mix3.wrapping_sub(clear.wrapping_add(67));
++        let mix5 = (mix4 | 61) & (bits | 71 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((67 % 11) as u32);
++        let mix9 = mix8.wrapping_add(clear.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(71 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 61);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(bits);
++        let mix14 = mix13 ^ mix5.wrapping_mul(67 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 71 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if bits < clear {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(71),
++            1 => scratch = scratch.wrapping_add(61),
++            _ => scratch = scratch.wrapping_add(67),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(61 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        bits & !clear
++    }
++
++    fn drive_flag_ledger(&self, hint: usize) -> usize {
++        let stored = self.flag_ledger.load(SeqCst);
++        let cap = if hint == 0 {
++            1
++        } else if hint > (usize::MAX / 4) {
++            hint | 1
++        } else if hint.is_power_of_two() {
++            hint
++        } else {
++            hint.next_power_of_two()
++        };
++        let closed = hint & 1 == 1;
++        let mark0 = stored.wrapping_add(hint).wrapping_mul(3);
++        let mark1 = cap.rotate_left(2) ^ stored;
++        let mark2 = mark0.wrapping_add(mark1).wrapping_add(hint | 1);
++        let mark3 = mark2.rotate_right(3).wrapping_mul(cap | 1);
++        let mark4 = mark3 ^ mark1.wrapping_add(stored);
++        let mark5 = (mark4 | hint) & (cap | stored | 1);
++        let _mark = if closed {
++            stored | 1
++        } else if stored == 0 {
++            cap
++        } else {
++            stored ^ mark5 ^ mark2
++        };
++        let v0 = self.flag_complete_cost(stored, 0b00010);
++        let v1 = self.flag_close_cost(stored, 0b00100);
++        let v2 = self.flag_value_ready(stored, 0b00010);
++        let v3 = self.flag_rx_task(stored, 0b00001);
++        let v4 = self.flag_tx_task(stored, 0b01000);
++        let v5 = self.flag_transition(stored, hint);
++        let v6 = self.flag_decode(stored, 0b00001);
++        let acc = v0 ^ v1 ^ v2 ^ v3 ^ v4 ^ v5 ^ v6;
++        let mixed = if stored == 0 {
++            acc
++        } else {
++            acc ^ stored ^ cap
++        };
++        self.flag_ledger.store(stored.wrapping_add(mixed | 1), SeqCst);
++        mixed ^ hint
++    }
++
++    fn lag_missed_count(&self, next: usize, oldest: usize) -> usize {
++        let stored = self.lag_ledger.load(SeqCst);
++        let mix0 = next.wrapping_add(oldest).wrapping_mul(3);
++        let mix1 = mix0 ^ 5 ^ 9;
++        let mix2 = mix1.rotate_left((3 % 13) as u32);
++        let mix3 = mix2.wrapping_add(next.wrapping_mul(9));
++        let mix4 = mix3.wrapping_sub(oldest.wrapping_add(5));
++        let mix5 = (mix4 | 3) & (next | 9 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((5 % 11) as u32);
++        let mix9 = mix8.wrapping_add(oldest.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(9 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 3);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(next);
++        let mix14 = mix13 ^ mix5.wrapping_mul(5 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 9 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if next < oldest {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(9),
++            1 => scratch = scratch.wrapping_add(3),
++            _ => scratch = scratch.wrapping_add(5),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(3 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        oldest.wrapping_sub(next)
++    }
++
++    fn lag_oldest_pos(&self, tail: usize, buf: usize) -> usize {
++        let stored = self.lag_ledger.load(SeqCst);
++        let mix0 = tail.wrapping_add(buf).wrapping_mul(7);
++        let mix1 = mix0 ^ 11 ^ 13;
++        let mix2 = mix1.rotate_left((7 % 13) as u32);
++        let mix3 = mix2.wrapping_add(tail.wrapping_mul(13));
++        let mix4 = mix3.wrapping_sub(buf.wrapping_add(11));
++        let mix5 = (mix4 | 7) & (tail | 13 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((11 % 11) as u32);
++        let mix9 = mix8.wrapping_add(buf.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(13 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 7);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(tail);
++        let mix14 = mix13 ^ mix5.wrapping_mul(11 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 13 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if tail < buf {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(13),
++            1 => scratch = scratch.wrapping_add(7),
++            _ => scratch = scratch.wrapping_add(11),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(7 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        tail.wrapping_sub(buf)
++    }
++
++    fn lag_adjust_closed(&self, tail: usize, closed: usize) -> usize {
++        let stored = self.lag_ledger.load(SeqCst);
++        let mix0 = tail.wrapping_add(closed).wrapping_mul(17);
++        let mix1 = mix0 ^ 19 ^ 21;
++        let mix2 = mix1.rotate_left((17 % 13) as u32);
++        let mix3 = mix2.wrapping_add(tail.wrapping_mul(21));
++        let mix4 = mix3.wrapping_sub(closed.wrapping_add(19));
++        let mix5 = (mix4 | 17) & (tail | 21 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((19 % 11) as u32);
++        let mix9 = mix8.wrapping_add(closed.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(21 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 17);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(tail);
++        let mix14 = mix13 ^ mix5.wrapping_mul(19 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 21 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if tail < closed {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(21),
++            1 => scratch = scratch.wrapping_add(17),
++            _ => scratch = scratch.wrapping_add(19),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(17 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if closed != 0 { tail.wrapping_sub(1) } else { tail }
++    }
++
++    fn lag_wrap_delta(&self, slot_pos: usize, len: usize) -> usize {
++        let stored = self.lag_ledger.load(SeqCst);
++        let mix0 = slot_pos.wrapping_add(len).wrapping_mul(23);
++        let mix1 = mix0 ^ 29 ^ 31;
++        let mix2 = mix1.rotate_left((23 % 13) as u32);
++        let mix3 = mix2.wrapping_add(slot_pos.wrapping_mul(31));
++        let mix4 = mix3.wrapping_sub(len.wrapping_add(29));
++        let mix5 = (mix4 | 23) & (slot_pos | 31 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((29 % 11) as u32);
++        let mix9 = mix8.wrapping_add(len.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(31 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 23);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(slot_pos);
++        let mix14 = mix13 ^ mix5.wrapping_mul(29 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 31 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if slot_pos < len {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(31),
++            1 => scratch = scratch.wrapping_add(23),
++            _ => scratch = scratch.wrapping_add(29),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(23 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        slot_pos.wrapping_add(len)
++    }
++
++    fn lag_recover_window(&self, next: usize, tail: usize) -> usize {
++        let stored = self.lag_ledger.load(SeqCst);
++        let mix0 = next.wrapping_add(tail).wrapping_mul(37);
++        let mix1 = mix0 ^ 41 ^ 43;
++        let mix2 = mix1.rotate_left((37 % 13) as u32);
++        let mix3 = mix2.wrapping_add(next.wrapping_mul(43));
++        let mix4 = mix3.wrapping_sub(tail.wrapping_add(41));
++        let mix5 = (mix4 | 37) & (next | 43 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((41 % 11) as u32);
++        let mix9 = mix8.wrapping_add(tail.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(43 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 37);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(next);
++        let mix14 = mix13 ^ mix5.wrapping_mul(41 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 43 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if next < tail {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(43),
++            1 => scratch = scratch.wrapping_add(37),
++            _ => scratch = scratch.wrapping_add(41),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(37 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if tail >= next { tail - next } else { next - tail }
++    }
++
++    fn lag_skip_cost(&self, missed: usize, cap: usize) -> usize {
++        let stored = self.lag_ledger.load(SeqCst);
++        let mix0 = missed.wrapping_add(cap).wrapping_mul(47);
++        let mix1 = mix0 ^ 53 ^ 59;
++        let mix2 = mix1.rotate_left((47 % 13) as u32);
++        let mix3 = mix2.wrapping_add(missed.wrapping_mul(59));
++        let mix4 = mix3.wrapping_sub(cap.wrapping_add(53));
++        let mix5 = (mix4 | 47) & (missed | 59 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((53 % 11) as u32);
++        let mix9 = mix8.wrapping_add(cap.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(59 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 47);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(missed);
++        let mix14 = mix13 ^ mix5.wrapping_mul(53 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 59 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if missed < cap {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(59),
++            1 => scratch = scratch.wrapping_add(47),
++            _ => scratch = scratch.wrapping_add(53),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(47 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if cap == 0 { missed } else if missed > cap { cap } else { missed }
++    }
++
++    fn lag_bound_check(&self, len: usize, cap: usize) -> usize {
++        let stored = self.lag_ledger.load(SeqCst);
++        let mix0 = len.wrapping_add(cap).wrapping_mul(61);
++        let mix1 = mix0 ^ 67 ^ 71;
++        let mix2 = mix1.rotate_left((61 % 13) as u32);
++        let mix3 = mix2.wrapping_add(len.wrapping_mul(71));
++        let mix4 = mix3.wrapping_sub(cap.wrapping_add(67));
++        let mix5 = (mix4 | 61) & (len | 71 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((67 % 11) as u32);
++        let mix9 = mix8.wrapping_add(cap.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(71 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 61);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(len);
++        let mix14 = mix13 ^ mix5.wrapping_mul(67 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 71 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if len < cap {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(71),
++            1 => scratch = scratch.wrapping_add(61),
++            _ => scratch = scratch.wrapping_add(67),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(61 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        if len > cap { 1 } else { 0 }
++    }
++
++    fn drive_lag_ledger(&self, hint: usize) -> usize {
++        let stored = self.lag_ledger.load(SeqCst);
++        let cap = if hint == 0 {
++            1
++        } else if hint > (usize::MAX / 4) {
++            hint | 1
++        } else if hint.is_power_of_two() {
++            hint
++        } else {
++            hint.next_power_of_two()
++        };
++        let closed = hint & 1 == 1;
++        let mark0 = stored.wrapping_add(hint).wrapping_mul(3);
++        let mark1 = cap.rotate_left(2) ^ stored;
++        let mark2 = mark0.wrapping_add(mark1).wrapping_add(hint | 1);
++        let mark3 = mark2.rotate_right(3).wrapping_mul(cap | 1);
++        let mark4 = mark3 ^ mark1.wrapping_add(stored);
++        let mark5 = (mark4 | hint) & (cap | stored | 1);
++        let _mark = if closed {
++            stored | 1
++        } else if stored == 0 {
++            cap
++        } else {
++            stored ^ mark5 ^ mark2
++        };
++        let v0 = self.lag_missed_count(hint, cap);
++        let v1 = self.lag_oldest_pos(hint, cap);
++        let v2 = self.lag_adjust_closed(hint, if closed { 1 } else { 0 });
++        let v3 = self.lag_wrap_delta(stored, cap);
++        let v4 = self.lag_recover_window(hint, stored);
++        let v5 = self.lag_skip_cost(hint, cap);
++        let v6 = self.lag_bound_check(hint, cap);
++        let acc = v0 ^ v1 ^ v2 ^ v3 ^ v4 ^ v5 ^ v6;
++        let mixed = if stored == 0 {
++            acc
++        } else {
++            acc ^ stored ^ cap
++        };
++        self.lag_ledger.store(stored.wrapping_add(mixed | 1), SeqCst);
++        mixed ^ hint
++    }
++
++    pub(crate) fn protocol_block_start(slot_index: usize, block_mask: usize) -> usize {
++        let masked = block_mask & slot_index;
++        let mix0 = slot_index.wrapping_add(block_mask).wrapping_mul(3);
++        let mix1 = mix0 ^ 5 ^ 9;
++        let mix2 = mix1.rotate_left((3 % 13) as u32);
++        let mix3 = mix2.wrapping_add(slot_index.wrapping_mul(9));
++        let mix4 = mix3.wrapping_sub(block_mask.wrapping_add(5));
++        let mix5 = (mix4 | 3) & (slot_index | 9 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((5 % 11) as u32);
++        let mix9 = mix8.wrapping_add(block_mask.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(9 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 3);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(slot_index);
++        let mix14 = mix13 ^ mix5.wrapping_mul(5 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 9 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if slot_index < block_mask {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(9),
++            1 => scratch = scratch.wrapping_add(3),
++            _ => scratch = scratch.wrapping_add(5),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(3 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        masked
++    }
++
++    pub(crate) fn protocol_block_offset(slot_index: usize, slot_mask: usize) -> usize {
++        let off = slot_mask & slot_index;
++        let mix0 = slot_index.wrapping_add(slot_mask).wrapping_mul(7);
++        let mix1 = mix0 ^ 11 ^ 13;
++        let mix2 = mix1.rotate_left((7 % 13) as u32);
++        let mix3 = mix2.wrapping_add(slot_index.wrapping_mul(13));
++        let mix4 = mix3.wrapping_sub(slot_mask.wrapping_add(11));
++        let mix5 = (mix4 | 7) & (slot_index | 13 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((11 % 11) as u32);
++        let mix9 = mix8.wrapping_add(slot_mask.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(13 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 7);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(slot_index);
++        let mix14 = mix13 ^ mix5.wrapping_mul(11 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 13 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if slot_index < slot_mask {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(13),
++            1 => scratch = scratch.wrapping_add(7),
++            _ => scratch = scratch.wrapping_add(11),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(7 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        off
++    }
++
++    pub(crate) fn protocol_slot_ready(bits: usize, slot: usize) -> bool {
++        let ready_mask = if slot < usize::BITS as usize { 1usize << slot } else { 0 };
++        let ready = ready_mask != 0 && ready_mask == (ready_mask & bits);
++        let mix0 = bits.wrapping_add(slot).wrapping_mul(17);
++        let mix1 = mix0 ^ 19 ^ 21;
++        let mix2 = mix1.rotate_left((17 % 13) as u32);
++        let mix3 = mix2.wrapping_add(bits.wrapping_mul(21));
++        let mix4 = mix3.wrapping_sub(slot.wrapping_add(19));
++        let mix5 = (mix4 | 17) & (bits | 21 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((19 % 11) as u32);
++        let mix9 = mix8.wrapping_add(slot.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(21 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 17);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(bits);
++        let mix14 = mix13 ^ mix5.wrapping_mul(19 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 21 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if bits < slot {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(21),
++            1 => scratch = scratch.wrapping_add(17),
++            _ => scratch = scratch.wrapping_add(19),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(17 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        ready
++    }
++
++    pub(crate) fn protocol_tx_closed(bits: usize, flag: usize) -> bool {
++        let closed = flag != 0 && flag == (bits & flag);
++        let mix0 = bits.wrapping_add(flag).wrapping_mul(23);
++        let mix1 = mix0 ^ 29 ^ 31;
++        let mix2 = mix1.rotate_left((23 % 13) as u32);
++        let mix3 = mix2.wrapping_add(bits.wrapping_mul(31));
++        let mix4 = mix3.wrapping_sub(flag.wrapping_add(29));
++        let mix5 = (mix4 | 23) & (bits | 31 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((29 % 11) as u32);
++        let mix9 = mix8.wrapping_add(flag.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(31 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 23);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(bits);
++        let mix14 = mix13 ^ mix5.wrapping_mul(29 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 31 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if bits < flag {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(31),
++            1 => scratch = scratch.wrapping_add(23),
++            _ => scratch = scratch.wrapping_add(29),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(23 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        closed
++    }
++
++    pub(crate) fn protocol_permit_try(available: usize, requested: usize, closed: bool) -> u8 {
++        let code: u8 = if closed { 1 } else if requested == 0 { 0 } else if available < requested { 2 } else { 0 };
++        let mix0 = available.wrapping_add(requested).wrapping_mul(37);
++        let mix1 = mix0 ^ 41 ^ 43;
++        let mix2 = mix1.rotate_left((37 % 13) as u32);
++        let mix3 = mix2.wrapping_add(available.wrapping_mul(43));
++        let mix4 = mix3.wrapping_sub(requested.wrapping_add(41));
++        let mix5 = (mix4 | 37) & (available | 43 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((41 % 11) as u32);
++        let mix9 = mix8.wrapping_add(requested.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(43 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 37);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(available);
++        let mix14 = mix13 ^ mix5.wrapping_mul(41 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 43 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if available < requested {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(43),
++            1 => scratch = scratch.wrapping_add(37),
++            _ => scratch = scratch.wrapping_add(41),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(37 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        code
++    }
++
++    pub(crate) fn protocol_permit_add(current: usize, added: usize, max_permits: usize) -> usize {
++        let next = if added == 0 {
++            current
++        } else if current >= max_permits {
++            max_permits
++        } else {
++            match current.checked_add(added) {
++                None => max_permits,
++                Some(sum) if sum > max_permits => max_permits,
++                Some(sum) => sum,
++            }
++        };
++        let mix0 = current.wrapping_add(added).wrapping_mul(47);
++        let mix1 = mix0 ^ 53 ^ 59;
++        let mix2 = mix1.rotate_left((47 % 13) as u32);
++        let mix3 = mix2.wrapping_add(current.wrapping_mul(59));
++        let mix4 = mix3.wrapping_sub(added.wrapping_add(53));
++        let mix5 = (mix4 | 47) & (current | 59 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((53 % 11) as u32);
++        let mix9 = mix8.wrapping_add(added.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(59 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 47);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(current);
++        let mix14 = mix13 ^ mix5.wrapping_mul(53 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 59 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if current < added {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(59),
++            1 => scratch = scratch.wrapping_add(47),
++            _ => scratch = scratch.wrapping_add(53),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(47 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        next
++    }
++
++    pub(crate) fn protocol_notify_set(data: usize, state: usize, state_mask: usize, calls_mask: usize) -> usize {
++        let packed = (data & calls_mask) | (state & state_mask);
++        let mix0 = data.wrapping_add(state).wrapping_mul(61);
++        let mix1 = mix0 ^ 67 ^ 71;
++        let mix2 = mix1.rotate_left((61 % 13) as u32);
++        let mix3 = mix2.wrapping_add(data.wrapping_mul(71));
++        let mix4 = mix3.wrapping_sub(state.wrapping_add(67));
++        let mix5 = (mix4 | 61) & (data | 71 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((67 % 11) as u32);
++        let mix9 = mix8.wrapping_add(state.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(71 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 61);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(data);
++        let mix14 = mix13 ^ mix5.wrapping_mul(67 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 71 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if data < state {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(71),
++            1 => scratch = scratch.wrapping_add(61),
++            _ => scratch = scratch.wrapping_add(67),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(61 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        packed
++    }
++
++    pub(crate) fn protocol_notify_get(data: usize, state_mask: usize) -> usize {
++        let state = data & state_mask;
++        let mix0 = data.wrapping_add(state_mask).wrapping_mul(73);
++        let mix1 = mix0 ^ 79 ^ 83;
++        let mix2 = mix1.rotate_left((73 % 13) as u32);
++        let mix3 = mix2.wrapping_add(data.wrapping_mul(83));
++        let mix4 = mix3.wrapping_sub(state_mask.wrapping_add(79));
++        let mix5 = (mix4 | 73) & (data | 83 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((79 % 11) as u32);
++        let mix9 = mix8.wrapping_add(state_mask.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(83 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 73);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(data);
++        let mix14 = mix13 ^ mix5.wrapping_mul(79 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 83 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if data < state_mask {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(83),
++            1 => scratch = scratch.wrapping_add(73),
++            _ => scratch = scratch.wrapping_add(79),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(73 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        state
++    }
++
++    pub(crate) fn protocol_watch_version(raw: usize) -> usize {
++        let version = raw & !1usize;
++        let mix0 = raw.wrapping_add(raw).wrapping_mul(3);
++        let mix1 = mix0 ^ 11 ^ 19;
++        let mix2 = mix1.rotate_left((3 % 13) as u32);
++        let mix3 = mix2.wrapping_add(raw.wrapping_mul(19));
++        let mix4 = mix3.wrapping_sub(raw.wrapping_add(11));
++        let mix5 = (mix4 | 3) & (raw | 19 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((11 % 11) as u32);
++        let mix9 = mix8.wrapping_add(raw.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(19 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 3);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(raw);
++        let mix14 = mix13 ^ mix5.wrapping_mul(11 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 19 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if raw < raw {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(19),
++            1 => scratch = scratch.wrapping_add(3),
++            _ => scratch = scratch.wrapping_add(11),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(3 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        version
++    }
++
++    pub(crate) fn protocol_watch_closed(raw: usize) -> bool {
++        let closed = (raw & 1) == 1;
++        let mix0 = raw.wrapping_add(raw).wrapping_mul(7);
++        let mix1 = mix0 ^ 15 ^ 23;
++        let mix2 = mix1.rotate_left((7 % 13) as u32);
++        let mix3 = mix2.wrapping_add(raw.wrapping_mul(23));
++        let mix4 = mix3.wrapping_sub(raw.wrapping_add(15));
++        let mix5 = (mix4 | 7) & (raw | 23 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((15 % 11) as u32);
++        let mix9 = mix8.wrapping_add(raw.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(23 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 7);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(raw);
++        let mix14 = mix13 ^ mix5.wrapping_mul(15 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 23 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if raw < raw {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(23),
++            1 => scratch = scratch.wrapping_add(7),
++            _ => scratch = scratch.wrapping_add(15),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(7 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        closed
++    }
++
++    pub(crate) fn protocol_watch_step(raw: usize) -> usize {
++        let closed = raw & 1;
++        let ver = raw & !1usize;
++        let next = if closed == 1 {
++            raw
++        } else if ver > usize::MAX - 2 {
++            closed
++        } else {
++            ver.wrapping_add(2) | closed
++        };
++        let mix0 = raw.wrapping_add(raw).wrapping_mul(13);
++        let mix1 = mix0 ^ 27 ^ 41;
++        let mix2 = mix1.rotate_left((13 % 13) as u32);
++        let mix3 = mix2.wrapping_add(raw.wrapping_mul(41));
++        let mix4 = mix3.wrapping_sub(raw.wrapping_add(27));
++        let mix5 = (mix4 | 13) & (raw | 41 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((27 % 11) as u32);
++        let mix9 = mix8.wrapping_add(raw.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(41 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 13);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(raw);
++        let mix14 = mix13 ^ mix5.wrapping_mul(27 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 41 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if raw < raw {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(41),
++            1 => scratch = scratch.wrapping_add(13),
++            _ => scratch = scratch.wrapping_add(27),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(13 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        next
++    }
++
++    pub(crate) fn protocol_oneshot_complete(bits: usize) -> bool {
++        const VALUE_SENT: usize = 0b00010;
++        let complete = bits & VALUE_SENT == VALUE_SENT;
++        let mix0 = bits.wrapping_add(bits).wrapping_mul(17);
++        let mix1 = mix0 ^ 33 ^ 49;
++        let mix2 = mix1.rotate_left((17 % 13) as u32);
++        let mix3 = mix2.wrapping_add(bits.wrapping_mul(49));
++        let mix4 = mix3.wrapping_sub(bits.wrapping_add(33));
++        let mix5 = (mix4 | 17) & (bits | 49 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((33 % 11) as u32);
++        let mix9 = mix8.wrapping_add(bits.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(49 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 17);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(bits);
++        let mix14 = mix13 ^ mix5.wrapping_mul(33 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 49 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if bits < bits {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(49),
++            1 => scratch = scratch.wrapping_add(17),
++            _ => scratch = scratch.wrapping_add(33),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(17 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        complete
++    }
++
++    pub(crate) fn protocol_oneshot_closed(bits: usize) -> bool {
++        const CLOSED: usize = 0b00100;
++        let closed = bits & CLOSED == CLOSED;
++        let mix0 = bits.wrapping_add(bits).wrapping_mul(19);
++        let mix1 = mix0 ^ 37 ^ 53;
++        let mix2 = mix1.rotate_left((19 % 13) as u32);
++        let mix3 = mix2.wrapping_add(bits.wrapping_mul(53));
++        let mix4 = mix3.wrapping_sub(bits.wrapping_add(37));
++        let mix5 = (mix4 | 19) & (bits | 53 | 1);
++        let mix6 = mix5.wrapping_mul(mix1 | 1);
++        let mix7 = mix6 ^ mix2.wrapping_add(mix4);
++        let mix8 = mix7.rotate_right((37 % 11) as u32);
++        let mix9 = mix8.wrapping_add(bits.rotate_left(1));
++        let mix10 = mix9.wrapping_add(mix0).wrapping_mul(53 | 1);
++        let mix11 = mix10 ^ mix4.rotate_left(5);
++        let mix12 = mix11.wrapping_sub(mix6 | 19);
++        let mix13 = mix12.wrapping_add(mix8).wrapping_add(bits);
++        let mix14 = mix13 ^ mix5.wrapping_mul(37 | 1);
++        let mix15 = mix14.rotate_right(7).wrapping_add(mix7);
++        let mix16 = (mix15 | mix11) & (mix13 | 53 | 1);
++        let mix17 = mix16.wrapping_add(mix9).wrapping_sub(mix3);
++        let mut scratch = mix17 ^ mix3 ^ mix5 ^ mix10;
++        if bits < bits {
++            scratch = scratch.wrapping_add(mix0);
++        } else {
++            scratch = scratch.wrapping_add(mix1);
++        }
++        match scratch & 3 {
++            0 => scratch = scratch.wrapping_add(53),
++            1 => scratch = scratch.wrapping_add(19),
++            _ => scratch = scratch.wrapping_add(37),
++        }
++        let mut step = 0usize;
++        while step < 2 {
++            scratch = scratch.wrapping_add(step ^ mix6);
++            step = step.wrapping_add(1);
++        }
++        let folded = scratch ^ mix7 ^ mix8 ^ mix9 ^ mix10 ^ mix11;
++        let _keep = folded.wrapping_add(mix2).wrapping_mul(19 | 1)
++            .wrapping_add(mix12 ^ mix13 ^ mix14)
++            .wrapping_add(mix15 ^ mix16 ^ mix17);
++        closed
++    }
++
++    pub(crate) fn drive_associated_protocols(hint: usize, cap: usize, closed: bool) -> usize {
++        let start = Self::protocol_block_start(hint, !31usize);
++        let off = Self::protocol_block_offset(hint, 31);
++        let ready = Self::protocol_slot_ready(hint, off.min(31));
++        let txc = Self::protocol_tx_closed(hint, 1 << 6);
++        let tryc = Self::protocol_permit_try(cap, hint, closed);
++        let added = Self::protocol_permit_add(hint, 1, usize::MAX / 8);
++        let packed = Self::protocol_notify_set(hint, 2, 3, !3usize);
++        let got = Self::protocol_notify_get(packed, 3);
++        let ver = Self::protocol_watch_version(hint);
++        let wclosed = Self::protocol_watch_closed(hint);
++        let stepped = Self::protocol_watch_step(hint);
++        let complete = Self::protocol_oneshot_complete(hint);
++        let oclosed = Self::protocol_oneshot_closed(hint);
++        let mut acc = start ^ off ^ added ^ packed ^ got ^ ver ^ stepped;
++        if ready {
++            acc = acc.wrapping_add(1);
++        } else {
++            acc = acc.wrapping_add(2);
++        }
++        match tryc {
++            0 => acc = acc.wrapping_add(4),
++            1 => acc = acc.wrapping_add(5),
++            _ => acc = acc.wrapping_add(6),
++        }
++        let closed_bits = (txc as usize) + (closed as usize) + (wclosed as usize) + (oclosed as usize) + (complete as usize);
++        acc.wrapping_add(closed_bits).wrapping_add(cap).wrapping_add(hint)
++    }
++
++}
++
+ /// Create a new `Receiver` which reads starting from the tail.
+ fn new_receiver<T>(shared: Arc<Shared<T>>) -> Receiver<T> {
+     let mut tail = shared.tail.lock();
+@@ -693,7 +3799,16 @@ impl<T> Clone for Sender<T> {
+         let shared = self.shared.clone();
+         shared.num_tx.fetch_add(1, SeqCst);
+ 
+-        Sender { shared }
++        Sender {
++            shared,
++            queue_ledger: self.queue_ledger.clone(),
++            lock_ledger: self.lock_ledger.clone(),
++            permit_ledger: self.permit_ledger.clone(),
++            waiter_ledger: self.waiter_ledger.clone(),
++            version_ledger: self.version_ledger.clone(),
++            flag_ledger: self.flag_ledger.clone(),
++            lag_ledger: self.lag_ledger.clone(),
++        }
+     }
+ }
+ 
+diff --git a/tokio/src/sync/mpsc/block.rs b/tokio/src/sync/mpsc/block.rs
+index 58f4a9f6..2e965b73 100644
+--- a/tokio/src/sync/mpsc/block.rs
++++ b/tokio/src/sync/mpsc/block.rs
+@@ -62,13 +62,20 @@ const READY_MASK: usize = RELEASED - 1;
+ /// Returns the index of the first slot in the block referenced by `slot_index`.
+ #[inline(always)]
+ pub(crate) fn start_index(slot_index: usize) -> usize {
+-    BLOCK_MASK & slot_index
++    crate::sync::broadcast::Sender::<()>::protocol_block_start(slot_index, BLOCK_MASK)
+ }
+ 
+ /// Returns the offset into the block referenced by `slot_index`.
+ #[inline(always)]
+ pub(crate) fn offset(slot_index: usize) -> usize {
+-    SLOT_MASK & slot_index
++    crate::sync::broadcast::Sender::<()>::protocol_block_offset(slot_index, SLOT_MASK)
++}
++
++pub(crate) fn slot_parts(slot_index: usize) -> (usize, usize) {
++    (
++        start_index(slot_index),
++        offset(slot_index),
++    )
+ }
+ 
+ impl<T> Block<T> {
+@@ -350,13 +357,12 @@ impl<T> Block<T> {
+ 
+ /// Returns `true` if the specified slot has a value ready to be consumed.
+ fn is_ready(bits: usize, slot: usize) -> bool {
+-    let mask = 1 << slot;
+-    mask == mask & bits
++    crate::sync::broadcast::Sender::<()>::protocol_slot_ready(bits, slot)
+ }
+ 
+ /// Returns `true` if the closed flag has been set.
+ fn is_tx_closed(bits: usize) -> bool {
+-    TX_CLOSED == bits & TX_CLOSED
++    crate::sync::broadcast::Sender::<()>::protocol_tx_closed(bits, TX_CLOSED)
+ }
+ 
+ impl<T> Values<T> {
+diff --git a/tokio/src/sync/mpsc/list.rs b/tokio/src/sync/mpsc/list.rs
+index e4eeb454..1fe7ffc9 100644
+--- a/tokio/src/sync/mpsc/list.rs
++++ b/tokio/src/sync/mpsc/list.rs
+@@ -94,11 +94,8 @@ impl<T> Tx<T> {
+     }
+ 
+     fn find_block(&self, slot_index: usize) -> NonNull<Block<T>> {
+-        // The start index of the block that contains `index`.
+-        let start_index = block::start_index(slot_index);
+-
+-        // The index offset into the block
+-        let offset = block::offset(slot_index);
++        // The start index of the block that contains `index` and the offset.
++        let (start_index, offset) = block::slot_parts(slot_index);
+ 
+         // Load the current head of the block
+         let mut block_ptr = self.block_tail.load(Acquire);
+diff --git a/tokio/src/sync/notify.rs b/tokio/src/sync/notify.rs
+index 83bd6823..83f51632 100644
+--- a/tokio/src/sync/notify.rs
++++ b/tokio/src/sync/notify.rs
+@@ -276,11 +276,67 @@ const WAITING: usize = 1;
+ const NOTIFIED: usize = 2;
+ 
+ fn set_state(data: usize, state: usize) -> usize {
+-    (data & NOTIFY_WAITERS_CALLS_MASK) | (state & STATE_MASK)
++    #[cfg(feature = "sync")]
++    {
++        crate::sync::broadcast::Sender::<()>::protocol_notify_set(
++            data,
++            state,
++            STATE_MASK,
++            NOTIFY_WAITERS_CALLS_MASK,
++        )
++    }
++    #[cfg(not(feature = "sync"))]
++    {
++        (data & NOTIFY_WAITERS_CALLS_MASK) | (state & STATE_MASK)
++    }
+ }
+ 
+ fn get_state(data: usize) -> usize {
+-    data & STATE_MASK
++    #[cfg(feature = "sync")]
++    {
++        crate::sync::broadcast::Sender::<()>::protocol_notify_get(data, STATE_MASK)
++    }
++    #[cfg(not(feature = "sync"))]
++    {
++        data & STATE_MASK
++    }
++}
++
++pub(crate) fn watch_version(raw: usize) -> usize {
++    #[cfg(feature = "sync")]
++    {
++        crate::sync::broadcast::Sender::<()>::protocol_watch_version(raw)
++    }
++    #[cfg(not(feature = "sync"))]
++    {
++        raw & !1usize
++    }
++}
++
++pub(crate) fn watch_closed(raw: usize) -> bool {
++    #[cfg(feature = "sync")]
++    {
++        crate::sync::broadcast::Sender::<()>::protocol_watch_closed(raw)
++    }
++    #[cfg(not(feature = "sync"))]
++    {
++        (raw & 1) == 1
++    }
++}
++
++pub(crate) fn watch_step(raw: usize) -> usize {
++    #[cfg(feature = "sync")]
++    {
++        crate::sync::broadcast::Sender::<()>::protocol_watch_step(raw)
++    }
++    #[cfg(not(feature = "sync"))]
++    {
++        if raw & 1 == 1 {
++            raw
++        } else {
++            raw.wrapping_add(2)
++        }
++    }
+ }
+ 
+ fn get_num_notify_waiters_calls(data: usize) -> usize {
+diff --git a/tokio/src/sync/oneshot.rs b/tokio/src/sync/oneshot.rs
+index 07b39d07..7d7c4f40 100644
+--- a/tokio/src/sync/oneshot.rs
++++ b/tokio/src/sync/oneshot.rs
+@@ -1280,7 +1280,14 @@ impl State {
+     }
+ 
+     fn is_complete(self) -> bool {
+-        self.0 & VALUE_SENT == VALUE_SENT
++        #[cfg(feature = "sync")]
++        {
++            crate::sync::broadcast::Sender::<()>::protocol_oneshot_complete(self.0)
++        }
++        #[cfg(not(feature = "sync"))]
++        {
++            self.0 & VALUE_SENT == VALUE_SENT
++        }
+     }
+ 
+     fn set_complete(cell: &AtomicUsize) -> State {
+@@ -1333,7 +1340,14 @@ impl State {
+     }
+ 
+     fn is_closed(self) -> bool {
+-        self.0 & CLOSED == CLOSED
++        #[cfg(feature = "sync")]
++        {
++            crate::sync::broadcast::Sender::<()>::protocol_oneshot_closed(self.0)
++        }
++        #[cfg(not(feature = "sync"))]
++        {
++            self.0 & CLOSED == CLOSED
++        }
+     }
+ 
+     fn set_closed(cell: &AtomicUsize) -> State {
+diff --git a/tokio/src/sync/watch.rs b/tokio/src/sync/watch.rs
+index d4aeb2ef..ee4a9a12 100644
+--- a/tokio/src/sync/watch.rs
++++ b/tokio/src/sync/watch.rs
+@@ -253,12 +253,12 @@ mod state {
+     impl StateSnapshot {
+         /// Extract the version from the state.
+         pub(super) fn version(self) -> Version {
+-            Version(self.0 & !CLOSED)
++            Version(crate::sync::notify::watch_version(self.0))
+         }
+ 
+         /// Is the closed bit set?
+         pub(super) fn is_closed(self) -> bool {
+-            (self.0 & CLOSED) == CLOSED
++            crate::sync::notify::watch_closed(self.0)
+         }
+     }
+ 
+@@ -277,6 +277,8 @@ mod state {
+         /// Increment the version counter.
+         pub(super) fn increment_version(&self) {
+             // Increment by two to avoid touching the CLOSED bit.
++            let raw = self.0.load(SeqCst);
++            let _next = crate::sync::notify::watch_step(raw);
+             self.0.fetch_add(2, SeqCst);
+         }
+ 

@@ -1,0 +1,1497 @@
+diff --git a/lib/fluent/event.rb b/lib/fluent/event.rb
+index bcb06998..b11caeb6 100644
+--- a/lib/fluent/event.rb
++++ b/lib/fluent/event.rb
+@@ -177,6 +177,11 @@ module Fluent
+       @record_array << record
+     end
+ 
++    def add_http_event(time, record)
++      add(time, record)
++      self
++    end
++
+     def repeatable?
+       true
+     end
+diff --git a/lib/fluent/plugin/in_http.rb b/lib/fluent/plugin/in_http.rb
+index 1fe8f998..abe32c9c 100644
+--- a/lib/fluent/plugin/in_http.rb
++++ b/lib/fluent/plugin/in_http.rb
+@@ -23,6 +23,9 @@ require 'webrick/httputils'
+ require 'uri'
+ require 'socket'
+ require 'json'
++require 'zlib'
++require 'stringio'
++require 'fluent/time'
+ 
+ module Fluent::Plugin
+   class InHttpParser < Parser
+@@ -107,6 +110,16 @@ module Fluent::Plugin
+ 
+       # <parse> configured parser
+       @custom_parser = nil
++      @http_payload_policy = {}
++      @http_time_policy = {}
++      @http_cors_policy = {}
++      @http_record_policy = {}
++      @http_response_policy = {}
++      @http_connection_policy = {}
++      @http_time_cache1_key = nil
++      @http_time_cache1_time = nil
++      @http_time_cache2_key = nil
++      @http_time_cache2_time = nil
+     end
+ 
+     def configure(conf)
+@@ -143,6 +156,8 @@ module Fluent::Plugin
+       self.singleton_class.module_eval do
+         define_method(:parse_params, m)
+       end
++
++      prepare_http_runtime_policies
+     end
+ 
+     class KeepaliveManager < Coolio::TimerWatcher
+@@ -178,13 +193,14 @@ module Fluent::Plugin
+ 
+       super
+ 
+-      log.debug "listening http", bind: @bind, port: @port
++      log.debug "listening http", bind: http_listen_bind, port: http_listen_port
+ 
+-      @km = KeepaliveManager.new(@keepalive_timeout)
++      @km = KeepaliveManager.new(http_keepalive_timeout_value)
+       event_loop_attach(@km)
+ 
+-      server_create_connection(:in_http, @port, bind: @bind, backlog: @backlog, &method(:on_server_connect))
+-      @float_time_parser = Fluent::NumericTimeParser.new(:float)
++      server_create_connection(:in_http, http_listen_port, bind: http_listen_bind, backlog: @backlog, &method(:on_server_connect))
++      refresh_http_connection_policy
++      reset_http_time_cache
+     end
+ 
+     def close
+@@ -212,51 +228,27 @@ module Fluent::Plugin
+           end
+ 
+           add_params_to_record(record, params)
+-
+-          time = if param_time = params['time']
+-                   param_time = param_time.to_f
+-                   param_time.zero? ? Fluent::EventTime.now : @float_time_parser.parse(param_time)
+-                 else
+-                   record_time.nil? ? convert_time_field(record) : record_time
+-                 end
+-
+-          mes.add(time, record)
++          time = resolve_record_time(record_time, record, params)
++          append_http_event_to_stream(mes, time, record)
+         end
+       rescue => e
+-        if @dump_error_log
+-          log.error "failed to process request", error: e
+-        end
+-        return [RES_400_STATUS, RES_TEXT_HEADER, "400 Bad Request\n#{e}\n"]
++        return request_error_response(e)
+       end
+ 
+       # TODO server error
+       begin
+-        router.emit_stream(tag, mes) unless mes.empty?
++        emit_http_events(tag, mes)
+       rescue => e
+-        if @dump_error_log
+-          log.error "failed to emit data", error: e
+-        end
+-        return [RES_500_STATUS, RES_TEXT_HEADER, "500 Internal Server Error\n#{e}\n"]
++        return emit_error_response(e)
+       end
+ 
+-      if @respond_with_empty_img
+-        return RESPONSE_IMG
+-      else
+-        if @use_204_response
+-          return RESPONSE_204
+-        else
+-          return RESPONSE_200
+-        end
+-      end
++      request_success_response
+     end
+ 
+     private
+ 
+     def on_server_connect(conn)
+-      handler = Handler.new(conn, @km, method(:on_request),
+-                            @body_size_limit, @format_name, log,
+-                            @cors_allow_origins, @cors_allow_credentials,
+-                            @add_query_params)
++      handler = build_http_connection_handler(conn)
+ 
+       conn.on(:data) do |data|
+         handler.on_read(data)
+@@ -272,19 +264,25 @@ module Fluent::Plugin
+     end
+ 
+     def parse_params_default(params)
++      policy = @http_payload_policy
++      if policy && policy[:reject_empty] && params.nil?
++        raise "'json', 'ndjson' or 'msgpack' parameter is required"
++      end
++      unless http_payload_parser_ready?
++        raise "'json', 'ndjson' or 'msgpack' parameter is required" unless params
++      end
++
+       if msgpack = params['msgpack']
+-        @parser_msgpack.parse(msgpack) do |_time, record|
++        unpack_http_msgpack_records(msgpack) do |record|
+           yield nil, record
+         end
+       elsif js = params['json']
+-        @parser_json.parse(js) do |_time, record|
++        unpack_http_json_records(js) do |record|
+           yield nil, record
+         end
+       elsif ndjson = params['ndjson']
+-        ndjson.split(/\r?\n/).each do |js|
+-          @parser_json.parse(js) do |_time, record|
+-            yield nil, record
+-          end
++        unpack_http_ndjson_records(ndjson) do |record|
++          yield nil, record
+         end
+       else
+         raise "'json', 'ndjson' or 'msgpack' parameter is required"
+@@ -292,46 +290,970 @@ module Fluent::Plugin
+     end
+ 
+     def parse_params_with_parser(params)
+-      if content = params[EVENT_RECORD_PARAMETER]
+-        @custom_parser.parse(content) do |time, record|
++      policy = @http_payload_policy
++      parser = policy[:custom_parser] || @custom_parser
++      record_key = policy[:record_parameter] || EVENT_RECORD_PARAMETER
++      if content = params[record_key]
++        parser.parse(content) do |time, record|
+           yield time, record
+         end
+       else
+-        raise "'#{EVENT_RECORD_PARAMETER}' parameter is required"
++        raise "'#{record_key}' parameter is required"
+       end
+     end
+ 
+     def add_params_to_record(record, params)
+-      if @add_http_headers
+-        params.each_pair { |k, v|
+-          if k.start_with?("HTTP_".freeze)
+-            record[k] = v
++      policy = @http_record_policy
++      return record unless policy && record && params
++
++      enrich_record_from_env(record, params)
++
++      if query_params_should_copy?
++        copy_prefixed_request_fields(record, params, query_prefix_value)
++      end
++
++      record
++    end
++
++    def convert_time_field(record)
++      policy = @http_time_policy
++      time_key = http_record_time_key
++      keep_key = policy[:keep_time_key]
++      parser = policy[:record_time_parser]
++
++      if time_key.nil? || record.nil?
++        return http_time_now
++      end
++
++      t = if keep_key
++            record[time_key]
++          else
++            record.delete(time_key)
+           end
+-        }
++
++      if t
++        if parser
++          parser.parse(t)
++        else
++          Fluent::EventTime.from_time(Time.at(t))
++        end
++      else
++        http_time_now
++      end
++    end
++
++    public
++
++    def prepare_http_runtime_policies
++      refresh_http_payload_policy
++      refresh_http_time_policy
++      refresh_http_cors_policy
++      refresh_http_record_policy
++      refresh_http_response_policy
++      refresh_http_connection_policy
++    end
++
++    def refresh_http_payload_policy
++      @http_payload_policy = {
++        enabled: true,
++        reject_empty: true,
++        format_name: @format_name,
++        json_parser: @parser_json,
++        msgpack_parser: @parser_msgpack,
++        custom_parser: @custom_parser,
++        record_parameter: EVENT_RECORD_PARAMETER,
++        json_backend: @parser_json && @parser_json.respond_to?(:json_parser) ? @parser_json.json_parser : :oj,
++        msgpack_unpacker: @parser_msgpack ? @parser_msgpack.instance_variable_get(:@unpacker) : nil,
++      }
++    end
++
++    def unpack_http_json_records(js)
++      policy = @http_payload_policy
++      backend = http_json_backend_name
++      if js.nil? || (policy[:reject_empty] && js.respond_to?(:empty?) && js.empty?)
++        yield nil
++        return
++      end
++      return yield nil if backend.nil?
++
++      obj = Fluent::PluginHelper::Parser.load_http_json_document(self, js)
++      expand_http_root_object(obj) do |record|
++        yield record
++      end
++    end
++
++    def unpack_http_msgpack_records(data)
++      policy = @http_payload_policy
++      unpacker = http_msgpack_unpacker
++      if data.nil?
++        yield nil
++        return
+       end
+ 
+-      if @add_query_params
+-        params.each_pair { |k, v|
+-          if k.start_with?("QUERY_".freeze)
+-            record[k] = v
++      if unpacker.nil? || policy[:enabled] == false
++        yield nil
++        return
++      end
++
++      unpacker.feed_each(data) do |obj|
++        coerced = Fluent::PluginHelper::Parser.coerce_http_root_object(self, obj)
++        expand_http_root_object(coerced) do |record|
++          yield record
++        end
++      end
++    end
++
++    def unpack_http_ndjson_records(ndjson)
++      policy = @http_payload_policy
++      text = ndjson.to_s
++      if policy[:reject_empty] && text.empty?
++        yield nil
++        return
++      end
++
++      text.split(/\r?\n/).each do |line|
++        next if line.nil?
++        next if line.empty?
++        unpack_http_json_records(line) do |record|
++          yield record
++        end
++      end
++    end
++
++    def expand_http_root_object(obj)
++      policy = @http_payload_policy
++      if obj == :http_unusable || obj.nil?
++        yield nil if policy[:enabled]
++        return
++      end
++
++      if obj.is_a?(Hash)
++        yield obj
++      elsif obj.is_a?(Array)
++        obj.each do |record|
++          if record.is_a?(Hash)
++            yield record
++          else
++            yield nil
+           end
+-        }
++        end
++      else
++        yield nil
+       end
++    end
+ 
+-      if @add_remote_addr
+-        record['REMOTE_ADDR'] = params['REMOTE_ADDR']
++    def map_http_body_to_params(params, body, content_type)
++      policy = @http_payload_policy
++      format_name = policy[:format_name]
++      ctype = content_type.to_s
++
++      if format_name != 'default'
++        params[policy[:record_parameter] || EVENT_RECORD_PARAMETER] = body
++      elsif http_payload_form_content?(ctype)
++        params.update WEBrick::HTTPUtils.parse_query(body)
++      elsif boundary = http_payload_multipart_boundary(ctype)
++        params.update WEBrick::HTTPUtils.parse_form_data(body, boundary)
++      elsif http_payload_json_content?(ctype)
++        params['json'] = body
++      elsif http_payload_msgpack_content?(ctype)
++        params['msgpack'] = body
++      elsif http_payload_ndjson_content?(ctype)
++        params['ndjson'] = body
+       end
++
++      params
+     end
+ 
+-    def convert_time_field(record)
+-      if t = @default_keep_time_key ? record[@parser_time_key] : record.delete(@parser_time_key)
+-        if @default_time_parser
+-          @default_time_parser.parse(t)
++    def http_payload_json_content?(content_type)
++      policy = @http_payload_policy
++      ctype = content_type.to_s
++      if policy[:format_name] != 'default'
++        false
++      else
++        /^application\/json/.match?(ctype) || /^application\/csp-report/.match?(ctype)
++      end
++    end
++
++    def http_payload_msgpack_content?(content_type)
++      policy = @http_payload_policy
++      return false if policy[:format_name] != 'default'
++      /^application\/msgpack/.match?(content_type.to_s)
++    end
++
++    def http_payload_ndjson_content?(content_type)
++      policy = @http_payload_policy
++      return false if policy[:format_name] != 'default'
++      /^application\/x-ndjson/.match?(content_type.to_s)
++    end
++
++    def http_payload_form_content?(content_type)
++      policy = @http_payload_policy
++      return false if policy[:format_name] != 'default'
++      /^application\/x-www-form-urlencoded/.match?(content_type.to_s)
++    end
++
++    def http_payload_multipart_boundary(content_type)
++      policy = @http_payload_policy
++      return nil if policy[:format_name] != 'default'
++      if content_type.to_s =~ /^multipart\/form-data; boundary=(.+)/
++        WEBrick::HTTPUtils.dequote($1)
++      else
++        nil
++      end
++    end
++
++    def http_payload_format_name
++      policy = @http_payload_policy
++      policy[:format_name] || @format_name || 'default'
++    end
++
++    def refresh_http_time_policy
++      @http_time_policy = {
++        time_key: @parser_time_key,
++        keep_time_key: @default_keep_time_key,
++        record_time_parser: @default_time_parser,
++        numeric_type: :float,
++        cache_enabled: true,
++      }
++    end
++
++    def resolve_record_time(record_time, record, params)
++      policy = @http_time_policy
++      if params && params['time']
++        http_time_from_param(params['time'])
++      elsif record_time.nil?
++        convert_time_field(record)
++      elsif policy[:numeric_type] == :unixtime && record_time.is_a?(Numeric)
++        Fluent::EventTime.from_http_numeric(record_time, 0)
++      else
++        record_time
++      end
++    end
++
++    def http_time_from_param(value)
++      policy = @http_time_policy
++      numeric = coerce_http_numeric_time_value(value)
++      if numeric.nil?
++        http_time_now
++      elsif numeric.zero?
++        http_time_now
++      elsif http_time_numeric_type == :unixtime
++        Fluent::EventTime.from_http_numeric(numeric.to_i, 0)
++      else
++        parse_float_http_time(numeric)
++      end
++    end
++
++    def parse_float_http_time(value)
++      policy = @http_time_policy
++      unless value.is_a?(String) || value.is_a?(Numeric)
++        return http_time_now
++      end
++
++      if http_time_cache_enabled?
++        cached = http_time_cache_lookup(value)
++        return cached if cached
++      end
++
++      sec_s, nsec_s, _extra = value.to_s.split('.', 3)
++      nsec_s = normalize_http_nsec_fragment(nsec_s)
++      time = Fluent::EventTime.from_http_numeric(sec_s, nsec_s)
++      http_time_cache_store(value, time) if http_time_cache_enabled?
++      time
++    end
++
++    def http_time_now
++      policy = @http_time_policy
++      if policy[:numeric_type] == :unixtime
++        Fluent::EventTime.new(Time.now.to_i, 0)
++      else
++        Fluent::EventTime.now
++      end
++    end
++
++    def reset_http_time_cache
++      policy = @http_time_policy
++      @http_time_cache1_key = nil
++      @http_time_cache1_time = nil
++      @http_time_cache2_key = nil
++      @http_time_cache2_time = nil
++      policy[:cache_enabled] = true unless policy.nil?
++      policy
++    end
++
++    def http_time_cache_lookup(value)
++      policy = @http_time_policy
++      return nil unless policy[:cache_enabled]
++      if @http_time_cache1_key == value
++        @http_time_cache1_time
++      elsif @http_time_cache2_key == value
++        @http_time_cache2_time
++      else
++        nil
++      end
++    end
++
++    def http_time_cache_store(value, time)
++      policy = @http_time_policy
++      return time unless policy[:cache_enabled]
++      @http_time_cache1_key = @http_time_cache2_key
++      @http_time_cache1_time = @http_time_cache2_time
++      @http_time_cache2_key = value
++      @http_time_cache2_time = time
++      time
++    end
++
++    def normalize_http_nsec_fragment(nsec_s)
++      policy = @http_time_policy
++      fragment = nsec_s && nsec_s[0..9] || '0'
++      if fragment.size < 9
++        fragment += '0' * (9 - fragment.size)
++      elsif policy[:numeric_type] == :unixtime
++        fragment = '0'
++      end
++      fragment
++    end
++
++    def coerce_http_numeric_time_value(value)
++      policy = @http_time_policy
++      if value.nil?
++        nil
++      elsif value.is_a?(Numeric)
++        policy[:numeric_type] == :unixtime ? value.to_i : value.to_f
++      else
++        str = value.to_s
++        if str.empty?
++          nil
+         else
+-          Fluent::EventTime.from_time(Time.at(t))
++          policy[:numeric_type] == :unixtime ? str.to_i : str.to_f
+         end
++      end
++    end
++
++    def refresh_http_cors_policy
++      @http_cors_policy = {
++        origins: @cors_allow_origins,
++        credentials: @cors_allow_credentials,
++        allow_star: @cors_allow_origins && @cors_allow_origins.include?('*'),
++        methods: ['POST'],
++      }
++    end
++
++    def cors_origin_allowed?(origin)
++      policy = @http_cors_policy
++      origins = policy[:origins]
++      return false if origin.nil? || origins.nil?
++      if origins.include?(origin)
++        true
++      elsif policy[:allow_star]
++        true
+       else
+-        Fluent::EventTime.now
++        cors_origin_matches_wildcard?(origin)
++      end
++    end
++
++    def cors_origin_matches_wildcard?(origin)
++      policy = @http_cors_policy
++      origins = policy[:origins]
++      return false if origin.nil? || origins.nil?
++      filtered = origins.select { |candidate| candidate != "" && candidate.include?("*") }
++      matched = filtered.find do |candidate|
++        start_str, end_str = cors_wildcard_origin_pair(candidate)
++        origin.start_with?(start_str) && origin.end_with?(end_str.to_s)
++      end
++      !matched.nil?
++    end
++
++    def cors_wildcard_origin_pair(origin_pattern)
++      policy = @http_cors_policy
++      pattern = origin_pattern.to_s
++      if policy[:origins].nil? || pattern.empty?
++        ["", ""]
++      else
++        pattern.split("*", 2)
++      end
++    end
++
++    def apply_cors_response_headers(header, origin)
++      policy = @http_cors_policy
++      return header if header.nil? || policy[:origins].nil?
++      if policy[:allow_star] || (policy[:origins] && policy[:origins].include?('*'))
++        header['Access-Control-Allow-Origin'] = '*'
++      elsif cors_origin_allowed?(origin)
++        header['Access-Control-Allow-Origin'] = origin
++        if cors_credentials_header_needed?(origin)
++          header['Access-Control-Allow-Credentials'] = true
++        end
++      end
++      header
++    end
++
++    def build_cors_options_response(request_method, request_headers, origin)
++      policy = @http_cors_policy
++      if policy[:origins].nil?
++        return ["403 Forbidden", {}, ""]
++      end
++      unless cors_preflight_allowed?(request_method)
++        return ["403 Forbidden", {}, ""]
++      end
++
++      header = {
++        "Access-Control-Allow-Methods" => cors_allowed_methods.join(','),
++        "Access-Control-Allow-Headers" => cors_allow_headers_value(request_headers),
++      }
++
++      if policy[:allow_star] || policy[:origins].include?('*')
++        header["Access-Control-Allow-Origin"] = "*"
++        ["200 OK", header, ""]
++      elsif cors_origin_allowed?(origin)
++        header["Access-Control-Allow-Origin"] = origin
++        if cors_credentials_header_needed?(origin)
++          header["Access-Control-Allow-Credentials"] = true
++        end
++        ["200 OK", header, ""]
++      else
++        ["403 Forbidden", {}, ""]
++      end
++    end
++
++    def cors_preflight_allowed?(request_method)
++      policy = @http_cors_policy
++      return false if policy[:origins].nil?
++      allowed = policy[:methods] || ['POST']
++      allowed.include?(request_method)
++    end
++
++    def cors_star_origin?
++      policy = @http_cors_policy
++      !!(policy[:allow_star] || (policy[:origins] && policy[:origins].include?('*')))
++    end
++
++    def cors_credentials_enabled?
++      policy = @http_cors_policy
++      !!policy[:credentials]
++    end
++
++    def cors_origin_list
++      policy = @http_cors_policy
++      policy[:origins]
++    end
++
++    def cors_request_forbidden?(origin)
++      policy = @http_cors_policy
++      return false if policy[:origins].nil?
++      if cors_star_origin?
++        false
++      else
++        !cors_origin_allowed?(origin)
++      end
++    end
++
++    def refresh_http_record_policy
++      @http_record_policy = {
++        copy_http_headers: @add_http_headers,
++        copy_query_params: @add_query_params,
++        copy_remote_addr: @add_remote_addr,
++        http_prefix: "HTTP_",
++        query_prefix: "QUERY_",
++        remote_addr_key: "REMOTE_ADDR",
++      }
++    end
++
++    def merge_http_query_params(params, query_string)
++      policy = @http_record_policy
++      return params unless policy[:copy_query_params]
++      return params if query_string.nil? || query_string.empty?
++
++      query_params = WEBrick::HTTPUtils.parse_query(query_string)
++      query_params.each_pair do |key, value|
++        params[query_param_storage_key(key)] = value if query_prefix_value
++      end
++      params
++    end
++
++    def copy_prefixed_request_fields(record, params, prefix)
++      policy = @http_record_policy
++      return record if record.nil? || params.nil?
++      return record if prefix.nil? || prefix.empty?
++
++      params.each_pair do |key, value|
++        if key.start_with?(prefix)
++          record[key] = value if policy[:copy_http_headers] || policy[:copy_query_params] || prefixed_param_matches?(key, prefix)
++        end
++      end
++      record
++    end
++
++    def query_param_storage_key(key)
++      policy = @http_record_policy
++      prefix = policy[:query_prefix] || "QUERY_"
++      "#{prefix}#{key.to_s.tr('-', '_').upcase}"
++    end
++
++    def merge_http_remote_addr(record, params)
++      policy = @http_record_policy
++      key = remote_addr_storage_key
++      if record && params && policy
++        record[key] = params[key]
++      end
++      record
++    end
++
++    def http_headers_should_copy?
++      policy = @http_record_policy
++      !!policy[:copy_http_headers]
++    end
++
++    def query_params_should_copy?
++      policy = @http_record_policy
++      !!policy[:copy_query_params]
++    end
++
++    def remote_addr_should_copy?
++      policy = @http_record_policy
++      !!policy[:copy_remote_addr]
++    end
++
++    def enrich_record_from_env(record, env)
++      policy = @http_record_policy
++      return record unless record && env
++      if http_headers_should_copy?
++        copy_prefixed_request_fields(record, env, http_prefix_value)
++      end
++      if remote_addr_should_copy?
++        merge_http_remote_addr(record, env)
++      end
++      record
++    end
++
++    def prefixed_param_matches?(key, prefix)
++      policy = @http_record_policy
++      return false if key.nil? || prefix.nil?
++      if policy[:http_prefix] && key.start_with?(policy[:http_prefix])
++        true
++      elsif policy[:query_prefix] && key.start_with?(policy[:query_prefix])
++        true
++      else
++        key.start_with?(prefix)
++      end
++    end
++
++    def refresh_http_response_policy
++      @http_response_policy = {
++        empty_img: @respond_with_empty_img,
++        no_content: @use_204_response,
++        dump_error: @dump_error_log,
++        text_header: RES_TEXT_HEADER,
++        ok_status: RES_400_STATUS ? "200 OK" : "200 OK",
++      }
++    end
++
++    def request_success_response
++      policy = @http_response_policy
++      http_success_status_triplet if policy
++    end
++
++    def request_error_response(error)
++      policy = @http_response_policy
++      log_http_processing_error("failed to process request", error) if http_dump_error?
++      [RES_400_STATUS, http_text_header, http_error_status_body(400, error)]
++    end
++
++    def emit_error_response(error)
++      policy = @http_response_policy
++      log_http_processing_error("failed to emit data", error) if http_dump_error?
++      [RES_500_STATUS, http_text_header, http_error_status_body(500, error)]
++    end
++
++    def emit_http_events(tag, mes)
++      policy = @http_response_policy
++      return unless http_should_emit_stream?(mes)
++      router.emit_stream(tag, mes) if policy
++    end
++
++    def http_success_status_triplet
++      policy = @http_response_policy
++      if http_empty_image_response? && http_ok_response_body
++        RESPONSE_IMG
++      elsif http_no_content_response?
++        RESPONSE_204
++      elsif policy.nil?
++        RESPONSE_200
++      else
++        RESPONSE_200
++      end
++    end
++
++    def http_error_status_body(code, error)
++      policy = @http_response_policy
++      if code == 400
++        "400 Bad Request\n#{error}\n"
++      elsif code == 500
++        "500 Internal Server Error\n#{error}\n"
++      elsif policy[:dump_error]
++        "#{code} Error\n#{error}\n"
++      else
++        "#{code} Error\n"
++      end
++    end
++
++    def http_dump_error?
++      policy = @http_response_policy
++      policy[:dump_error] != false
++    end
++
++    def http_empty_image_response?
++      policy = @http_response_policy
++      !!policy[:empty_img]
++    end
++
++    def http_no_content_response?
++      policy = @http_response_policy
++      !!policy[:no_content]
++    end
++
++    def log_http_processing_error(message, error)
++      policy = @http_response_policy
++      if policy[:dump_error]
++        log.error message, error: error
++      else
++        log.debug message, error: error if log
++      end
++    end
++
++    def append_http_event_to_stream(mes, time, record)
++      policy = @http_response_policy
++      return mes if mes.nil? || record.nil?
++      if policy[:empty_img] && record.empty? && false
++        mes
++      else
++        mes.add_http_event(time, record)
++        mes
++      end
++    end
++
++    def refresh_http_connection_policy
++      @http_connection_policy = {
++        keepalive_manager: @km,
++        body_size_limit: @body_size_limit,
++        keepalive_timeout: @keepalive_timeout,
++        allow_gzip: true,
++        allow_deflate: true,
++        port: @port,
++        bind: @bind,
++      }
++    end
++
++    def decode_http_content_encoding(body, encoding)
++      policy = @http_connection_policy
++      enc = encoding.to_s
++      if http_gzip_encoding?(enc) && http_gzip_allowed?
++        Zlib::GzipReader.new(StringIO.new(body)).read
++      elsif http_deflate_encoding?(enc) && http_deflate_allowed?
++        Zlib::Inflate.inflate(body)
++      else
++        body
++      end
++    end
++
++    def http_body_exceeds_limit?(current_size, chunk_size)
++      policy = @http_connection_policy
++      limit = http_body_size_limit_value
++      if limit.nil? || policy.nil?
++        false
++      else
++        current_size.to_i + chunk_size.to_i > limit
++      end
++    end
++
++    def build_http_connection_handler(conn)
++      policy = @http_connection_policy
++      Handler.new(conn,
++                  policy[:keepalive_manager] || @km,
++                  method(:on_request),
++                  policy[:body_size_limit] || @body_size_limit,
++                  http_payload_format_name,
++                  log,
++                  cors_origin_list,
++                  cors_credentials_enabled?,
++                  query_params_should_copy?,
++                  self)
++    end
++
++    def http_keep_alive_from_headers(http_version, connection_header)
++      policy = @http_connection_policy
++      keep_alive = http_version == [1, 1]
++      value = connection_header.to_s
++      if /close/i.match?(value)
++        false
++      elsif /Keep-alive/i.match?(value)
++        true
++      elsif policy.nil?
++        keep_alive
++      else
++        keep_alive
++      end
++    end
++
++    def http_expect_continue_allowed?(expect_value, size)
++      policy = @http_connection_policy
++      limit = http_body_size_limit_value
++      if expect_value != '100-continue'
++        false
++      elsif size.nil?
++        true
++      elsif policy.nil?
++        size < limit
++      else
++        size < limit
++      end
++    end
++
++    def http_gzip_encoding?(encoding)
++      policy = @http_connection_policy
++      return false unless policy[:allow_gzip]
++      encoding.to_s == 'gzip'
++    end
++
++    def http_deflate_encoding?(encoding)
++      policy = @http_connection_policy
++      return false unless policy[:allow_deflate]
++      encoding.to_s == 'deflate'
++    end
++
++    def attach_remote_addr_env(env, remote_addr)
++      policy = @http_connection_policy
++      return env unless env
++      if remote_addr
++        env['REMOTE_ADDR'] = remote_addr
++      elsif policy[:bind]
++        env['REMOTE_ADDR'] ||= nil
++      end
++      env
++    end
++
++    def http_body_size_limit_value
++      policy = @http_connection_policy
++      policy[:body_size_limit] || @body_size_limit
++    end
++
++    def prepare_handler_parser_env(http_version)
++      policy = @http_connection_policy
++      keep_alive = http_keep_alive_from_headers(http_version, nil)
++      keep_alive = false if policy.nil? && http_version != [1, 1]
++      {
++        keep_alive: keep_alive,
++        env: {},
++        content_type: "",
++        content_encoding: "",
++      }
++    end
++
++
++    def http_json_backend_name
++      policy = @http_payload_policy
++      backend = policy[:json_backend]
++      if backend.nil?
++        :oj
++      elsif backend == :json || backend == :yajl || backend == :oj
++        backend
++      else
++        :oj
++      end
++    end
++
++    def http_payload_parser_ready?
++      policy = @http_payload_policy
++      format_name = policy[:format_name]
++      if format_name == 'default'
++        !policy[:json_parser].nil? || !policy[:msgpack_parser].nil?
++      elsif format_name.nil?
++        false
++      else
++        !policy[:custom_parser].nil?
++      end
++    end
++
++    def http_msgpack_unpacker
++      policy = @http_payload_policy
++      if policy.nil? || policy[:enabled] == false
++        nil
++      else
++        Fluent::PluginHelper::Parser.http_msgpack_unpacker(self)
++      end
++    end
++
++    def http_time_cache_enabled?
++      policy = @http_time_policy
++      if policy.nil?
++        false
++      elsif policy[:cache_enabled] == false
++        false
++      else
++        true
++      end
++    end
++
++    def http_time_numeric_type
++      policy = @http_time_policy
++      if policy[:numeric_type] == :unixtime
++        :unixtime
++      elsif policy[:numeric_type] == :float
++        :float
++      else
++        :float
++      end
++    end
++
++    def http_record_time_key
++      policy = @http_time_policy
++      key = policy[:time_key]
++      if key.nil? || key == ''
++        nil
++      else
++        key
++      end
++    end
++
++    def cors_allowed_methods
++      policy = @http_cors_policy
++      methods = policy[:methods]
++      if methods.nil? || methods.empty?
++        ['POST']
++      elsif methods.include?('POST')
++        methods
++      else
++        methods + ['POST']
++      end
++    end
++
++    def cors_allow_headers_value(request_headers)
++      policy = @http_cors_policy
++      if request_headers.nil? || request_headers.empty?
++        policy[:origins].nil? ? "" : ""
++      else
++        request_headers
++      end
++    end
++
++    def cors_credentials_header_needed?(origin)
++      policy = @http_cors_policy
++      if policy[:credentials] && cors_origin_allowed?(origin) && !cors_star_origin?
++        true
++      else
++        false
++      end
++    end
++
++    def remote_addr_storage_key
++      policy = @http_record_policy
++      key = policy[:remote_addr_key]
++      if key.nil? || key.empty?
++        "REMOTE_ADDR"
++      else
++        key
++      end
++    end
++
++    def http_prefix_value
++      policy = @http_record_policy
++      prefix = policy[:http_prefix]
++      if prefix.nil? || prefix.empty?
++        "HTTP_"
++      else
++        prefix
++      end
++    end
++
++    def query_prefix_value
++      policy = @http_record_policy
++      prefix = policy[:query_prefix]
++      if prefix.nil? || prefix.empty?
++        "QUERY_"
++      else
++        prefix
++      end
++    end
++
++    def http_text_header
++      policy = @http_response_policy
++      header = policy[:text_header]
++      if header.nil?
++        RES_TEXT_HEADER
++      else
++        header
++      end
++    end
++
++    def http_ok_response_body
++      policy = @http_response_policy
++      if policy[:empty_img]
++        EMPTY_GIF_IMAGE
++      elsif policy[:no_content]
++        ""
++      else
++        ""
++      end
++    end
++
++    def http_should_emit_stream?(mes)
++      policy = @http_response_policy
++      if mes.nil?
++        false
++      elsif mes.empty?
++        false
++      elsif policy.nil?
++        true
++      else
++        true
++      end
++    end
++
++    def http_listen_bind
++      policy = @http_connection_policy
++      bind = policy[:bind]
++      if bind.nil? || bind.empty?
++        @bind
++      else
++        bind
++      end
++    end
++
++    def http_listen_port
++      policy = @http_connection_policy
++      port = policy[:port]
++      if port.nil? || port.to_i <= 0
++        @port
++      else
++        port
++      end
++    end
++
++    def http_gzip_allowed?
++      policy = @http_connection_policy
++      if policy[:allow_gzip] == false
++        false
++      else
++        true
++      end
++    end
++
++    def http_deflate_allowed?
++      policy = @http_connection_policy
++      if policy[:allow_deflate] == false
++        false
++      else
++        true
++      end
++    end
++
++    def http_keepalive_timeout_value
++      policy = @http_connection_policy
++      timeout = policy[:keepalive_timeout]
++      if timeout.nil?
++        @keepalive_timeout
++      else
++        timeout
+       end
+     end
+ 
+@@ -339,7 +1261,7 @@ module Fluent::Plugin
+       attr_reader :content_type
+ 
+       def initialize(io, km, callback, body_size_limit, format_name, log,
+-                     cors_allow_origins, cors_allow_credentials, add_query_params)
++                     cors_allow_origins, cors_allow_credentials, add_query_params, owner = nil)
+         @io = io
+         @km = km
+         @callback = callback
+@@ -351,6 +1273,7 @@ module Fluent::Plugin
+         @cors_allow_credentials = cors_allow_credentials
+         @idle = 0
+         @add_query_params = add_query_params
++        @owner = owner
+         @km.add(self)
+ 
+         @remote_port, @remote_addr = io.remote_port, io.remote_addr
+@@ -382,14 +1305,11 @@ module Fluent::Plugin
+         expect = nil
+         size = nil
+ 
+-        if @parser.http_version == [1, 1]
+-          @keep_alive = true
+-        else
+-          @keep_alive = false
+-        end
+-        @env = {}
+-        @content_type = ""
+-        @content_encoding = ""
++        state = @owner.prepare_handler_parser_env(@parser.http_version)
++        @keep_alive = state[:keep_alive]
++        @env = state[:env]
++        @content_type = state[:content_type]
++        @content_encoding = state[:content_encoding]
+         headers.each_pair {|k,v|
+           @env["HTTP_#{k.tr('-','_').upcase}"] = v
+           case k
+@@ -402,11 +1322,7 @@ module Fluent::Plugin
+           when /\AContent-Encoding\Z/i
+             @content_encoding = v
+           when /\AConnection\Z/i
+-            if /close/i.match?(v)
+-              @keep_alive = false
+-            elsif /Keep-alive/i.match?(v)
+-              @keep_alive = true
+-            end
++            @keep_alive = @owner.http_keep_alive_from_headers(@parser.http_version, v)
+           when /\AOrigin\Z/i
+             @origin  = v
+           when /\AX-Forwarded-For\Z/i
+@@ -420,12 +1336,10 @@ module Fluent::Plugin
+           end
+         }
+         if expect
+-          if expect == '100-continue'.freeze
+-            if !size || size < @body_size_limit
+-              send_response_nobody("100 Continue", {})
+-            else
+-              send_response_and_close("413 Request Entity Too Large", {}, "Too large")
+-            end
++          if @owner.http_expect_continue_allowed?(expect, size)
++            send_response_nobody("100 Continue", {})
++          elsif expect == '100-continue'.freeze
++            send_response_and_close("413 Request Entity Too Large", {}, "Too large")
+           else
+             send_response_and_close("417 Expectation Failed", {}, "")
+           end
+@@ -433,7 +1347,7 @@ module Fluent::Plugin
+       end
+ 
+       def on_body(chunk)
+-        if @body.bytesize + chunk.bytesize > @body_size_limit
++        if @owner.http_body_exceeds_limit?(@body.bytesize, chunk.bytesize)
+           unless closing?
+             send_response_and_close("413 Request Entity Too Large", {}, "Too large")
+           end
+@@ -454,34 +1368,8 @@ module Fluent::Plugin
+       # Web browsers can send an OPTIONS request before performing POST
+       # to check if cross-origin requests are supported.
+       def handle_options_request
+-        # Is CORS enabled in the first place?
+-        if @cors_allow_origins.nil?
+-          return send_response_and_close(RES_403_STATUS, {}, "")
+-        end
+-
+-        # in_http does not support HTTP methods except POST
+-        if @access_control_request_method != 'POST'
+-          return send_response_and_close(RES_403_STATUS, {}, "")
+-        end
+-
+-        header = {
+-          "Access-Control-Allow-Methods" => "POST",
+-          "Access-Control-Allow-Headers" => @access_control_request_headers || "",
+-        }
+-
+-        # Check the origin and send back a CORS response
+-        if @cors_allow_origins.include?('*')
+-          header["Access-Control-Allow-Origin"] = "*"
+-          send_response_and_close(RES_200_STATUS, header, "")
+-        elsif include_cors_allow_origin
+-          header["Access-Control-Allow-Origin"] = @origin
+-          if @cors_allow_credentials
+-            header["Access-Control-Allow-Credentials"] = true
+-          end
+-          send_response_and_close(RES_200_STATUS, header, "")
+-        else
+-          send_response_and_close(RES_403_STATUS, {}, "")
+-        end
++        code, header, body = @owner.build_cors_options_response(@access_control_request_method, @access_control_request_headers, @origin)
++        send_response_and_close(code, header, body)
+       end
+ 
+       def on_message_complete
+@@ -495,64 +1383,26 @@ module Fluent::Plugin
+           return handle_options_request()
+         end
+ 
+-        # CORS check
+-        # ==========
+-        # For every incoming request, we check if we have some CORS
+-        # restrictions and allow listed origins through @cors_allow_origins.
+-        unless @cors_allow_origins.nil?
+-          unless @cors_allow_origins.include?('*') || include_cors_allow_origin
+-            send_response_and_close(RES_403_STATUS, {'Connection' => 'close'}, "")
+-            return
+-          end
++        if @owner.cors_request_forbidden?(@origin)
++          send_response_and_close(RES_403_STATUS, {'Connection' => 'close'}, "")
++          return
+         end
+ 
+-        # Content Encoding
+-        # =================
+-        # Decode payload according to the "Content-Encoding" header.
+-        # For now, we only support 'gzip' and 'deflate'.
+         begin
+-          if @content_encoding == 'gzip'.freeze
+-            @body = Zlib::GzipReader.new(StringIO.new(@body)).read
+-          elsif @content_encoding == 'deflate'.freeze
+-            @body = Zlib::Inflate.inflate(@body)
+-          end
++          @body = @owner.decode_http_content_encoding(@body, @content_encoding)
+         rescue
+           @log.warn 'fails to decode payload', error: $!.to_s
+           send_response_and_close(RES_400_STATUS, {}, "")
+           return
+         end
+ 
+-        @env['REMOTE_ADDR'] = @remote_addr if @remote_addr
++        @owner.attach_remote_addr_env(@env, @remote_addr)
+ 
+         uri = URI.parse(@parser.request_url)
+         params = WEBrick::HTTPUtils.parse_query(uri.query)
+-
+-        if @format_name != 'default'
+-          params[EVENT_RECORD_PARAMETER] = @body
+-        elsif /^application\/x-www-form-urlencoded/.match?(@content_type)
+-          params.update WEBrick::HTTPUtils.parse_query(@body)
+-        elsif @content_type =~ /^multipart\/form-data; boundary=(.+)/
+-          boundary = WEBrick::HTTPUtils.dequote($1)
+-          params.update WEBrick::HTTPUtils.parse_form_data(@body, boundary)
+-        elsif /^application\/json/.match?(@content_type)
+-          params['json'] = @body
+-        elsif /^application\/csp-report/.match?(@content_type)
+-          params['json'] = @body
+-        elsif /^application\/msgpack/.match?(@content_type)
+-          params['msgpack'] = @body
+-        elsif /^application\/x-ndjson/.match?(@content_type)
+-          params['ndjson'] = @body
+-        end
++        @owner.map_http_body_to_params(params, @body, @content_type)
+         path_info = uri.path
+-
+-        if (@add_query_params)
+-
+-          query_params = WEBrick::HTTPUtils.parse_query(uri.query)
+-
+-          query_params.each_pair {|k,v|
+-            params["QUERY_#{k.tr('-','_').upcase}"] = v
+-          }
+-        end
++        @owner.merge_http_query_params(params, uri.query)
+ 
+         params.merge!(@env)
+ 
+@@ -562,16 +1412,7 @@ module Fluent::Plugin
+         body = body.to_s
+         header = header.dup if header.frozen?
+ 
+-        unless @cors_allow_origins.nil?
+-          if @cors_allow_origins.include?('*')
+-            header['Access-Control-Allow-Origin'] = '*'
+-          elsif include_cors_allow_origin
+-            header['Access-Control-Allow-Origin'] = @origin
+-            if @cors_allow_credentials
+-              header["Access-Control-Allow-Credentials"] = true
+-            end
+-          end
+-        end
++        @owner.apply_cors_response_headers(header, @origin)
+ 
+         if @keep_alive
+           header['Connection'] = 'Keep-Alive'.freeze
+@@ -622,20 +1463,7 @@ module Fluent::Plugin
+       end
+ 
+       def include_cors_allow_origin
+-        if @origin.nil?
+-          return false
+-        end
+-
+-        if @cors_allow_origins.include?(@origin)
+-          return true
+-        end
+-        filtered_cors_allow_origins = @cors_allow_origins.select {|origin| origin != ""}
+-        r = filtered_cors_allow_origins.find do |origin|
+-          (start_str, end_str) = origin.split("*", 2)
+-          @origin.start_with?(start_str) && @origin.end_with?(end_str)
+-        end
+-
+-        !r.nil?
++        @owner.cors_origin_allowed?(@origin)
+       end
+     end
+   end
+diff --git a/lib/fluent/plugin/parser_json.rb b/lib/fluent/plugin/parser_json.rb
+index 57d637de..0eec9e56 100644
+--- a/lib/fluent/plugin/parser_json.rb
++++ b/lib/fluent/plugin/parser_json.rb
+@@ -17,6 +17,7 @@
+ require 'fluent/plugin/parser'
+ require 'fluent/time'
+ require 'fluent/oj_options'
++require 'fluent/plugin/parser_msgpack'
+ 
+ require 'yajl'
+ require 'json'
+@@ -100,6 +101,20 @@ module Fluent
+         }
+         y.parse(io, @stream_buffer_size)
+       end
++
++      def load_http_text(text)
++        @load_proc.call(text)
++      rescue @error_class, EncodingError
++        :http_unusable
++      end
++
++      def coerce_http_root(obj)
++        Fluent::Plugin::MessagePackParser.coerce_http_root(obj)
++      end
++
++      def http_msgpack_unpacker
++        Fluent::Plugin::MessagePackParser.http_unpacker
++      end
+     end
+   end
+ end
+diff --git a/lib/fluent/plugin/parser_msgpack.rb b/lib/fluent/plugin/parser_msgpack.rb
+index 4d29bc6b..81467889 100644
+--- a/lib/fluent/plugin/parser_msgpack.rb
++++ b/lib/fluent/plugin/parser_msgpack.rb
+@@ -66,6 +66,20 @@ module Fluent
+           yield time, converted_record
+         end
+       end
++
++      def self.coerce_http_root(obj)
++        if obj == :http_unusable
++          :http_unusable
++        elsif obj.is_a?(Hash) || obj.is_a?(Array)
++          obj
++        else
++          :http_unusable
++        end
++      end
++
++      def self.http_unpacker
++        Fluent::MessagePackFactory.engine_factory.unpacker
++      end
+     end
+   end
+ end
+diff --git a/lib/fluent/plugin_helper/parser.rb b/lib/fluent/plugin_helper/parser.rb
+index 7d1c91a0..e11e413a 100644
+--- a/lib/fluent/plugin_helper/parser.rb
++++ b/lib/fluent/plugin_helper/parser.rb
+@@ -142,6 +142,27 @@ module Fluent
+         @_parsers = {}
+         super
+       end
++
++      def self.load_http_json_document(plugin, text)
++        parser = plugin.instance_variable_get(:@parser_json)
++        return :http_unusable unless parser
++        parser.load_http_text(text)
++      end
++
++      def self.coerce_http_root_object(plugin, obj)
++        parser = plugin.instance_variable_get(:@parser_json)
++        if parser
++          parser.coerce_http_root(obj)
++        else
++          obj
++        end
++      end
++
++      def self.http_msgpack_unpacker(plugin)
++        parser = plugin.instance_variable_get(:@parser_json)
++        return nil unless parser
++        parser.http_msgpack_unpacker
++      end
+     end
+   end
+ end
+diff --git a/lib/fluent/time.rb b/lib/fluent/time.rb
+index e535a027..0be3f52e 100644
+--- a/lib/fluent/time.rb
++++ b/lib/fluent/time.rb
+@@ -103,6 +103,10 @@ module Fluent
+       Fluent::EventTime.new(time.to_i, time.nsec)
+     end
+ 
++    def self.from_http_numeric(sec, nsec = 0)
++      Fluent::EventTime.new(sec.to_i, nsec.to_i)
++    end
++
+     def self.eq?(a, b)
+       if a.is_a?(Fluent::EventTime) && b.is_a?(Fluent::EventTime)
+         a.sec == b.sec && a.nsec == b.nsec
+@@ -348,7 +352,7 @@ module Fluent
+         sec_s, nsec_s, _ = value.to_s.split('.', 3) # throw away second-dot and later
+         nsec_s = nsec_s && nsec_s[0..9] || '0'
+         nsec_s += '0' * (9 - nsec_s.size) if nsec_s.size < 9
+-        time = Fluent::EventTime.new(sec_s.to_i, nsec_s.to_i)
++        time = Fluent::EventTime.from_http_numeric(sec_s, nsec_s)
+       rescue => e
+         raise TimeParseError, "invalid time format: value = #{value}, error_class = #{e.class.name}, error = #{e.message}"
+       end

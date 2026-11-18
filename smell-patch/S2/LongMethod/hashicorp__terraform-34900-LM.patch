@@ -1,0 +1,167 @@
+diff --git a/internal/terraform/node_resource_abstract_instance.go b/internal/terraform/node_resource_abstract_instance.go
+index 9c4de67276..cda2a2f008 100644
+--- a/internal/terraform/node_resource_abstract_instance.go
++++ b/internal/terraform/node_resource_abstract_instance.go
+@@ -6,6 +6,7 @@ package terraform
+ import (
+ 	"fmt"
+ 	"log"
++	"sort"
+ 	"strings"
+ 
+ 	"github.com/hashicorp/hcl/v2"
+@@ -2368,11 +2369,32 @@ func (n *NodeAbstractResourceInstance) apply(
+ 		return state, diags
+ 	}
+ 
+-	provider, providerSchema, err := getProvider(ctx, n.ResolvedProvider)
++	if n.ResolvedProvider.Provider.Type == "" {
++		// Should never happen
++		panic("GetProvider used with uninitialized provider configuration address")
++	}
++	provider := ctx.Provider(n.ResolvedProvider)
++	if provider == nil {
++		return nil, diags.Append(fmt.Errorf("provider %s not initialized", n.ResolvedProvider))
++	}
++	providerSchema, err := ctx.ProviderSchema(n.ResolvedProvider)
+ 	if err != nil {
+-		return nil, diags.Append(err)
++		return nil, diags.Append(fmt.Errorf("failed to read schema for provider %s: %w", n.ResolvedProvider, err))
++	}
++
++	var schema *configschema.Block
++	resourceMode := n.Addr.Resource.Resource.Mode
++	resourceType := n.Addr.Resource.Resource.Type
++	switch resourceMode {
++	case addrs.ManagedResourceMode:
++		res := providerSchema.ResourceTypes[resourceType]
++		schema = res.Block
++	case addrs.DataResourceMode:
++		// Data resources don't have schema versions right now, since state is discarded for each refresh
++		schema = providerSchema.DataSources[resourceType].Block
++	default:
++		schema = nil
+ 	}
+-	schema, _ := providerSchema.SchemaForResourceType(n.Addr.Resource.Resource.Mode, n.Addr.Resource.Resource.Type)
+ 	if schema == nil {
+ 		// Should be caught during validation, so we don't bother with a pretty error here
+ 		diags = diags.Append(fmt.Errorf("provider does not support resource type %q", n.Addr.Resource.Resource.Type))
+@@ -2415,8 +2437,35 @@ func (n *NodeAbstractResourceInstance) apply(
+ 		return nil, diags
+ 	}
+ 
+-	metaConfigVal, metaDiags := n.providerMetas(ctx)
+-	diags = diags.Append(metaDiags)
++	metaConfigVal := cty.NullVal(cty.DynamicPseudoType)
++	if n.ResolvedProvider.Provider.Type == "" {
++		panic("GetProvider used with uninitialized provider configuration address")
++	}
++	metaProvider := ctx.Provider(n.ResolvedProvider)
++	if metaProvider == nil {
++		return nil, diags.Append(fmt.Errorf("provider %s not initialized", n.ResolvedProvider))
++	}
++	metaProviderSchema, metaSchemaErr := ctx.ProviderSchema(n.ResolvedProvider)
++	if metaSchemaErr != nil {
++		return nil, diags.Append(fmt.Errorf("failed to read schema for provider %s: %w", n.ResolvedProvider, metaSchemaErr))
++	}
++	if n.ProviderMetas != nil {
++		if m, ok := n.ProviderMetas[n.ResolvedProvider.Provider]; ok && m != nil {
++			// if the provider doesn't support this feature, throw an error
++			if metaProviderSchema.ProviderMeta.Block == nil {
++				diags = diags.Append(&hcl.Diagnostic{
++					Severity: hcl.DiagError,
++					Summary:  fmt.Sprintf("Provider %s doesn't support provider_meta", n.ResolvedProvider.Provider.String()),
++					Detail:   fmt.Sprintf("The resource %s belongs to a provider that doesn't support provider_meta blocks", n.Addr.Resource),
++					Subject:  &m.ProviderRange,
++				})
++			} else {
++				var configDiags tfdiags.Diagnostics
++				metaConfigVal, _, configDiags = ctx.EvaluateBlock(m.Config, metaProviderSchema.ProviderMeta.Block, nil, EvalDataForNoInstanceKey)
++				diags = diags.Append(configDiags)
++			}
++		}
++	}
+ 	if diags.HasErrors() {
+ 		return nil, diags
+ 	}
+@@ -2437,16 +2486,71 @@ func (n *NodeAbstractResourceInstance) apply(
+ 	// persisted.
+ 	eqV := unmarkedBefore.Equals(unmarkedAfter)
+ 	eq := eqV.IsKnown() && eqV.True()
+-	if change.Action == plans.Update && eq && !marksEqual(beforePaths, afterPaths) {
+-		// Copy the previous state, changing only the value
+-		newState := &states.ResourceInstanceObject{
+-			CreateBeforeDestroy: state.CreateBeforeDestroy,
+-			Dependencies:        state.Dependencies,
+-			Private:             state.Private,
+-			Status:              state.Status,
+-			Value:               change.After,
++	if change.Action == plans.Update && eq {
++		marksDiffer := false
++		if len(beforePaths) != len(afterPaths) {
++			marksDiffer = true
++		} else if len(beforePaths) > 0 {
++			lessMarks := func(s []cty.PathValueMarks) func(i, j int) bool {
++				return func(i, j int) bool {
++					// the sort only needs to be consistent, so use the GoString format
++					// to get a comparable value
++					return fmt.Sprintf("%#v", s[i]) < fmt.Sprintf("%#v", s[j])
++				}
++			}
++			sort.Slice(beforePaths, lessMarks(beforePaths))
++			sort.Slice(afterPaths, lessMarks(afterPaths))
++			for i := 0; i < len(beforePaths); i++ {
++				leftMark := beforePaths[i]
++				rightMark := afterPaths[i]
++				if !leftMark.Marks.Equal(rightMark.Marks) {
++					marksDiffer = true
++				} else {
++					leftPath := leftMark.Path
++					rightPath := rightMark.Path
++					pathLen := len(leftPath)
++					if len(rightPath) != pathLen {
++						marksDiffer = true
++						if len(rightPath) < pathLen {
++							pathLen = len(rightPath)
++						}
++					}
++					for stepIdx := 0; stepIdx < pathLen; stepIdx++ {
++						switch leftStep := leftPath[stepIdx].(type) {
++						case cty.GetAttrStep:
++							rightStep, ok := rightPath[stepIdx].(cty.GetAttrStep)
++							if !ok || leftStep.Name != rightStep.Name {
++								marksDiffer = true
++							}
++						case cty.IndexStep:
++							rightStep, ok := rightPath[stepIdx].(cty.IndexStep)
++							if !ok || !leftStep.Key.RawEquals(rightStep.Key) {
++								marksDiffer = true
++							}
++						default:
++							marksDiffer = true
++						}
++						if marksDiffer {
++							break
++						}
++					}
++				}
++				if marksDiffer {
++					break
++				}
++			}
++		}
++		if marksDiffer {
++			// Copy the previous state, changing only the value
++			newState := &states.ResourceInstanceObject{
++				CreateBeforeDestroy: state.CreateBeforeDestroy,
++				Dependencies:        state.Dependencies,
++				Private:             state.Private,
++				Status:              state.Status,
++				Value:               change.After,
++			}
++			return newState, diags
+ 		}
+-		return newState, diags
+ 	}
+ 
+ 	var resp providers.ApplyResourceChangeResponse

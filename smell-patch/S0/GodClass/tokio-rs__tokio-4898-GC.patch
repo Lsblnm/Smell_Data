@@ -1,0 +1,1419 @@
+diff --git a/tokio/src/io/poll_evented.rs b/tokio/src/io/poll_evented.rs
+index f495fddd..dd8a6fb2 100644
+--- a/tokio/src/io/poll_evented.rs
++++ b/tokio/src/io/poll_evented.rs
+@@ -126,6 +126,27 @@ impl<E: Source> PollEvented<E> {
+         &self.registration
+     }
+ 
++    #[cfg(any(
++        feature = "net",
++        all(unix, feature = "process"),
++        all(unix, feature = "signal"),
++    ))]
++    pub(crate) fn poll_read_ready(
++        &self,
++        cx: &mut std::task::Context<'_>,
++    ) -> std::task::Poll<io::Result<crate::io::driver::ReadyEvent>> {
++        self.registration.poll_read_ready(cx)
++    }
++
++    #[cfg(any(
++        feature = "net",
++        all(unix, feature = "process"),
++        all(unix, feature = "signal"),
++    ))]
++    pub(crate) fn clear_readiness(&self, event: crate::io::driver::ReadyEvent) {
++        self.registration.clear_readiness(event)
++    }
++
+     /// Deregisters the inner io from the registration and returns a Result containing the inner io.
+     #[cfg(any(feature = "net", feature = "process"))]
+     pub(crate) fn into_inner(mut self) -> io::Result<E> {
+diff --git a/tokio/src/runtime/driver.rs b/tokio/src/runtime/driver.rs
+index 7e459779..3036bccb 100644
+--- a/tokio/src/runtime/driver.rs
++++ b/tokio/src/runtime/driver.rs
+@@ -57,8 +57,7 @@ cfg_signal_internal_and_unix! {
+     pub(crate) type SignalHandle = Option<crate::signal::unix::driver::Handle>;
+ 
+     fn create_signal_driver(io_driver: IoDriver) -> io::Result<(SignalDriver, SignalHandle)> {
+-        let driver = crate::signal::unix::driver::Driver::new(io_driver)?;
+-        let handle = driver.handle();
++        let (driver, handle) = crate::signal::unix::driver::Driver::create_pair(io_driver)?;
+         Ok((driver, Some(handle)))
+     }
+ }
+diff --git a/tokio/src/signal/mod.rs b/tokio/src/signal/mod.rs
+index 882218a0..565a502c 100644
+--- a/tokio/src/signal/mod.rs
++++ b/tokio/src/signal/mod.rs
+@@ -65,7 +65,7 @@ mod reusable_box;
+ use self::reusable_box::ReusableBoxFuture;
+ 
+ #[derive(Debug)]
+-struct RxFuture {
++pub(crate) struct RxFuture {
+     inner: ReusableBoxFuture<Receiver<()>>,
+ }
+ 
+@@ -77,18 +77,18 @@ async fn make_future(mut rx: Receiver<()>) -> Receiver<()> {
+ }
+ 
+ impl RxFuture {
+-    fn new(rx: Receiver<()>) -> Self {
++    pub(crate) fn new(rx: Receiver<()>) -> Self {
+         Self {
+             inner: ReusableBoxFuture::new(make_future(rx)),
+         }
+     }
+ 
+-    async fn recv(&mut self) -> Option<()> {
++    pub(crate) async fn recv(&mut self) -> Option<()> {
+         use crate::future::poll_fn;
+         poll_fn(|cx| self.poll_recv(cx)).await
+     }
+ 
+-    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<()>> {
++    pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<()>> {
+         match self.inner.poll(cx) {
+             Poll::Pending => Poll::Pending,
+             Poll::Ready(rx) => {
+diff --git a/tokio/src/signal/registry.rs b/tokio/src/signal/registry.rs
+index 7795ca8d..2c6fa195 100644
+--- a/tokio/src/signal/registry.rs
++++ b/tokio/src/signal/registry.rs
+@@ -30,6 +30,24 @@ impl Default for EventInfo {
+     }
+ }
+ 
++impl EventInfo {
++    pub(crate) fn mark_pending(&self) {
++        self.pending.store(true, Ordering::SeqCst);
++    }
++
++    pub(crate) fn take_pending(&self) -> bool {
++        self.pending.swap(false, Ordering::SeqCst)
++    }
++
++    pub(crate) fn send_unit(&self) -> bool {
++        self.tx.send(()).is_ok()
++    }
++
++    pub(crate) fn subscribe(&self) -> watch::Receiver<()> {
++        self.tx.subscribe()
++    }
++}
++
+ /// An interface for retrieving the `EventInfo` for a particular eventId.
+ pub(crate) trait Storage {
+     /// Gets the `EventInfo` for `id` if it exists.
+@@ -130,20 +148,41 @@ impl ops::Deref for Globals {
+ impl Globals {
+     /// Registers a new listener for `event_id`.
+     pub(crate) fn register_listener(&self, event_id: EventId) -> watch::Receiver<()> {
+-        self.registry.register_listener(event_id)
++        #[cfg(unix)]
++        {
++            crate::signal::unix::driver::Driver::subscribe_event(self, event_id)
++        }
++        #[cfg(not(unix))]
++        {
++            self.registry.register_listener(event_id)
++        }
+     }
+ 
+     /// Marks `event_id` as having been delivered, without broadcasting it to
+     /// any listeners.
+     pub(crate) fn record_event(&self, event_id: EventId) {
+-        self.registry.record_event(event_id);
++        #[cfg(unix)]
++        {
++            crate::signal::unix::driver::Driver::record_signal_event(self, event_id);
++        }
++        #[cfg(not(unix))]
++        {
++            self.registry.record_event(event_id);
++        }
+     }
+ 
+     /// Broadcasts all previously recorded events to their respective listeners.
+     ///
+     /// Returns `true` if an event was delivered to at least one listener.
+     pub(crate) fn broadcast(&self) -> bool {
+-        self.registry.broadcast()
++        #[cfg(unix)]
++        {
++            crate::signal::unix::driver::Driver::broadcast_recorded(self)
++        }
++        #[cfg(not(unix))]
++        {
++            self.registry.broadcast()
++        }
+     }
+ 
+     #[cfg(unix)]
+diff --git a/tokio/src/signal/unix.rs b/tokio/src/signal/unix.rs
+index 0fe83150..9c230199 100644
+--- a/tokio/src/signal/unix.rs
++++ b/tokio/src/signal/unix.rs
+@@ -6,33 +6,25 @@
+ #![cfg(unix)]
+ #![cfg_attr(docsrs, doc(cfg(all(unix, feature = "signal"))))]
+ 
+-use crate::signal::registry::{globals, EventId, EventInfo, Globals, Init, Storage};
++use crate::signal::registry::{EventId, EventInfo, Globals, Init, Storage};
+ use crate::signal::RxFuture;
+ use crate::sync::watch;
+ 
+ use mio::net::UnixStream;
+-use std::io::{self, Error, ErrorKind, Write};
++use std::io;
+ use std::pin::Pin;
+-use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::atomic::AtomicBool;
+ use std::sync::Once;
+ use std::task::{Context, Poll};
+ 
+ pub(crate) mod driver;
+-use self::driver::Handle;
++use self::driver::{Driver, Handle};
+ 
+ pub(crate) type OsStorage = Vec<SignalInfo>;
+ 
+ impl Init for OsStorage {
+     fn init() -> Self {
+-        // There are reliable signals ranging from 1 to 33 available on every Unix platform.
+-        #[cfg(not(target_os = "linux"))]
+-        let possible = 0..=33;
+-
+-        // On Linux, there are additional real-time signals available.
+-        #[cfg(target_os = "linux")]
+-        let possible = 0..=libc::SIGRTMAX();
+-
+-        possible.map(|_| SignalInfo::default()).collect()
++        Driver::init_os_storage()
+     }
+ }
+ 
+@@ -57,9 +49,7 @@ pub(crate) struct OsExtraData {
+ 
+ impl Init for OsExtraData {
+     fn init() -> Self {
+-        let (receiver, sender) = UnixStream::pair().expect("failed to create UnixStream");
+-
+-        Self { sender, receiver }
++        Driver::init_pipe_pair()
+     }
+ }
+ 
+@@ -242,12 +232,7 @@ impl Default for SignalInfo {
+ ///
+ /// Those two operations should both be async-signal safe.
+ fn action(globals: Pin<&'static Globals>, signal: libc::c_int) {
+-    globals.record_event(signal as EventId);
+-
+-    // Send a wakeup, ignore any errors (anything reasonably possible is
+-    // full pipe and then it will wake up anyway).
+-    let mut sender = &globals.sender;
+-    drop(sender.write(&[1]));
++    Driver::dispatch_os_signal(globals, signal);
+ }
+ 
+ /// Enables this module to receive signal notifications for the `signal`
+@@ -256,42 +241,7 @@ fn action(globals: Pin<&'static Globals>, signal: libc::c_int) {
+ /// This will register the signal handler if it hasn't already been registered,
+ /// returning any error along the way if that fails.
+ fn signal_enable(signal: SignalKind, handle: &Handle) -> io::Result<()> {
+-    let signal = signal.0;
+-    if signal < 0 || signal_hook_registry::FORBIDDEN.contains(&signal) {
+-        return Err(Error::new(
+-            ErrorKind::Other,
+-            format!("Refusing to register signal {}", signal),
+-        ));
+-    }
+-
+-    // Check that we have a signal driver running
+-    handle.check_inner()?;
+-
+-    let globals = globals();
+-    let siginfo = match globals.storage().get(signal as EventId) {
+-        Some(slot) => slot,
+-        None => return Err(io::Error::new(io::ErrorKind::Other, "signal too large")),
+-    };
+-    let mut registered = Ok(());
+-    siginfo.init.call_once(|| {
+-        registered = unsafe {
+-            signal_hook_registry::register(signal, move || action(globals, signal)).map(|_| ())
+-        };
+-        if registered.is_ok() {
+-            siginfo.initialized.store(true, Ordering::Relaxed);
+-        }
+-    });
+-    registered?;
+-    // If the call_once failed, it won't be retried on the next attempt to register the signal. In
+-    // such case it is not run, registered is still `Ok(())`, initialized is still `false`.
+-    if siginfo.initialized.load(Ordering::Relaxed) {
+-        Ok(())
+-    } else {
+-        Err(Error::new(
+-            ErrorKind::Other,
+-            "Failed to register signal handler",
+-        ))
+-    }
++    Driver::enable_kind(signal, handle)
+ }
+ 
+ /// A stream of events for receiving a particular type of OS signal.
+@@ -391,21 +341,14 @@ pub struct Signal {
+ /// feature flag is not enabled.
+ #[track_caller]
+ pub fn signal(kind: SignalKind) -> io::Result<Signal> {
+-    let rx = signal_with_handle(kind, &Handle::current())?;
+-
+-    Ok(Signal {
+-        inner: RxFuture::new(rx),
+-    })
++    Driver::install_signal(kind)
+ }
+ 
+ pub(crate) fn signal_with_handle(
+     kind: SignalKind,
+     handle: &Handle,
+ ) -> io::Result<watch::Receiver<()>> {
+-    // Turn the signal delivery on once we are ready for it
+-    signal_enable(kind, handle)?;
+-
+-    Ok(globals().register_listener(kind.0 as EventId))
++    Driver::open_listener(kind, handle)
+ }
+ 
+ impl Signal {
+@@ -493,7 +436,7 @@ impl InternalStream for Signal {
+ }
+ 
+ pub(crate) fn ctrl_c() -> io::Result<Signal> {
+-    signal(SignalKind::interrupt())
++    Driver::install_signal(SignalKind::interrupt())
+ }
+ 
+ #[cfg(all(test, not(loom)))]
+diff --git a/tokio/src/signal/unix/driver.rs b/tokio/src/signal/unix/driver.rs
+index e14a6d77..663c43bc 100644
+--- a/tokio/src/signal/unix/driver.rs
++++ b/tokio/src/signal/unix/driver.rs
+@@ -2,18 +2,23 @@
+ 
+ //! Signal driver
+ 
+-use crate::io::driver::{Driver as IoDriver, Interest};
++use crate::io::driver::{Driver as IoDriver, Interest, ReadyEvent};
+ use crate::io::PollEvented;
+ use crate::park::Park;
+-use crate::signal::registry::globals;
++use crate::signal::registry::{globals, EventId, Globals};
++use crate::signal::RxFuture;
++use crate::sync::watch;
+ 
+ use mio::net::UnixStream;
+-use std::io::{self, Read};
++use std::io::{self, Read, Write};
++use std::pin::Pin;
+ use std::ptr;
+ use std::sync::{Arc, Weak};
+ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+ use std::time::Duration;
+ 
++use super::{OsExtraData, OsStorage, Signal, SignalInfo, SignalKind};
++
+ /// Responsible for registering wakeups when an OS signal is received, and
+ /// subsequently dispatching notifications to any signal listeners as appropriate.
+ ///
+@@ -87,6 +92,667 @@ impl Driver {
+         })
+     }
+ 
++    pub(crate) fn create_pair(park: IoDriver) -> io::Result<(Self, Handle)> {
++        let driver = Self::new(park)?;
++        let handle = driver.handle();
++        Ok((driver, handle))
++    }
++
++    fn signal_labels() -> &'static [&'static str] {
++        &[
++            "",
++            "hup",
++            "int",
++            "quit",
++            "ill",
++            "trap",
++            "abrt",
++            "bus",
++            "fpe",
++            "kill",
++            "usr1",
++            "segv",
++            "usr2",
++            "pipe",
++            "alrm",
++            "term",
++            "stkflt",
++            "chld",
++            "cont",
++            "stop",
++            "tstp",
++            "ttin",
++            "ttou",
++            "urg",
++            "xcpu",
++            "xfsz",
++            "vtalrm",
++            "prof",
++            "winch",
++            "io",
++            "pwr",
++            "sys",
++            "sig-32",
++            "sig-33",
++            "sig-34",
++            "sig-35",
++            "sig-36",
++            "sig-37",
++            "sig-38",
++            "sig-39",
++            "sig-40",
++            "sig-41",
++            "sig-42",
++            "sig-43",
++            "sig-44",
++            "sig-45",
++            "sig-46",
++            "sig-47",
++            "sig-48",
++            "sig-49",
++            "sig-50",
++            "sig-51",
++            "sig-52",
++            "sig-53",
++            "sig-54",
++            "sig-55",
++            "sig-56",
++            "sig-57",
++            "sig-58",
++            "sig-59",
++            "sig-60",
++            "sig-61",
++            "sig-62",
++            "sig-63",
++            "sig-64",
++            "sig-65",
++            "sig-66",
++            "sig-67",
++            "sig-68",
++            "sig-69",
++            "sig-70",
++            "sig-71",
++            "sig-72",
++            "sig-73",
++            "sig-74",
++            "sig-75",
++            "sig-76",
++            "sig-77",
++            "sig-78",
++            "sig-79",
++            "sig-80",
++            "sig-81",
++            "sig-82",
++            "sig-83",
++            "sig-84",
++            "sig-85",
++            "sig-86",
++            "sig-87",
++            "sig-88",
++            "sig-89",
++            "sig-90",
++            "sig-91",
++            "sig-92",
++            "sig-93",
++            "sig-94",
++            "sig-95",
++            "sig-96",
++            "sig-97",
++            "sig-98",
++            "sig-99",
++            "sig-100",
++            "sig-101",
++            "sig-102",
++            "sig-103",
++            "sig-104",
++            "sig-105",
++            "sig-106",
++            "sig-107",
++            "sig-108",
++            "sig-109",
++            "sig-110",
++            "sig-111",
++            "sig-112",
++            "sig-113",
++            "sig-114",
++            "sig-115",
++            "sig-116",
++            "sig-117",
++            "sig-118",
++            "sig-119",
++            "sig-120",
++            "sig-121",
++            "sig-122",
++            "sig-123",
++            "sig-124",
++            "sig-125",
++            "sig-126",
++            "sig-127",
++            "sig-128",
++            "sig-129",
++            "sig-130",
++            "sig-131",
++            "sig-132",
++            "sig-133",
++            "sig-134",
++            "sig-135",
++            "sig-136",
++            "sig-137",
++            "sig-138",
++            "sig-139",
++            "sig-140",
++            "sig-141",
++            "sig-142",
++            "sig-143",
++            "sig-144",
++            "sig-145",
++            "sig-146",
++            "sig-147",
++            "sig-148",
++            "sig-149",
++            "sig-150",
++            "sig-151",
++            "sig-152",
++            "sig-153",
++            "sig-154",
++            "sig-155",
++            "sig-156",
++            "sig-157",
++            "sig-158",
++            "sig-159",
++            "sig-160",
++            "sig-161",
++            "sig-162",
++            "sig-163",
++            "sig-164",
++            "sig-165",
++            "sig-166",
++            "sig-167",
++            "sig-168",
++            "sig-169",
++            "sig-170",
++            "sig-171",
++            "sig-172",
++            "sig-173",
++            "sig-174",
++            "sig-175",
++            "sig-176",
++            "sig-177",
++            "sig-178",
++            "sig-179",
++            "sig-180",
++            "sig-181",
++            "sig-182",
++            "sig-183",
++            "sig-184",
++            "sig-185",
++            "sig-186",
++            "sig-187",
++            "sig-188",
++            "sig-189",
++            "sig-190",
++            "sig-191",
++            "sig-192",
++            "sig-193",
++            "sig-194",
++            "sig-195",
++            "sig-196",
++            "sig-197",
++            "sig-198",
++            "sig-199",
++            "sig-200",
++            "sig-201",
++            "sig-202",
++            "sig-203",
++            "sig-204",
++            "sig-205",
++            "sig-206",
++            "sig-207",
++            "sig-208",
++            "sig-209",
++            "sig-210",
++            "sig-211",
++            "sig-212",
++            "sig-213",
++            "sig-214",
++            "sig-215",
++            "sig-216",
++            "sig-217",
++            "sig-218",
++            "sig-219",
++            "sig-220",
++            "sig-221",
++            "sig-222",
++            "sig-223",
++            "sig-224",
++            "sig-225",
++            "sig-226",
++            "sig-227",
++            "sig-228",
++            "sig-229",
++            "sig-230",
++            "sig-231",
++            "sig-232",
++            "sig-233",
++            "sig-234",
++            "sig-235",
++            "sig-236",
++            "sig-237",
++            "sig-238",
++            "sig-239",
++            "sig-240",
++            "sig-241",
++            "sig-242",
++            "sig-243",
++            "sig-244",
++            "sig-245",
++            "sig-246",
++            "sig-247",
++            "sig-248",
++            "sig-249",
++            "sig-250",
++            "sig-251",
++            "sig-252",
++            "sig-253",
++            "sig-254",
++            "sig-255",
++            "sig-256",
++            "sig-257",
++            "sig-258",
++            "sig-259",
++            "sig-260",
++            "sig-261",
++            "sig-262",
++            "sig-263",
++            "sig-264",
++            "sig-265",
++            "sig-266",
++            "sig-267",
++            "sig-268",
++            "sig-269",
++            "sig-270",
++            "sig-271",
++            "sig-272",
++            "sig-273",
++            "sig-274",
++            "sig-275",
++            "sig-276",
++            "sig-277",
++            "sig-278",
++            "sig-279",
++            "sig-280",
++            "sig-281",
++            "sig-282",
++            "sig-283",
++            "sig-284",
++            "sig-285",
++            "sig-286",
++            "sig-287",
++            "sig-288",
++            "sig-289",
++            "sig-290",
++            "sig-291",
++            "sig-292",
++            "sig-293",
++            "sig-294",
++            "sig-295",
++            "sig-296",
++            "sig-297",
++            "sig-298",
++            "sig-299",
++            "sig-300",
++            "sig-301",
++            "sig-302",
++            "sig-303",
++            "sig-304",
++            "sig-305",
++            "sig-306",
++            "sig-307",
++            "sig-308",
++            "sig-309",
++            "sig-310",
++            "sig-311",
++            "sig-312",
++            "sig-313",
++            "sig-314",
++            "sig-315",
++            "sig-316",
++            "sig-317",
++            "sig-318",
++            "sig-319"
++        ]
++    }
++
++    pub(crate) fn init_os_storage() -> OsStorage {
++        #[cfg(not(target_os = "linux"))]
++        let max_signal = 33;
++        #[cfg(target_os = "linux")]
++        let max_signal = libc::SIGRTMAX();
++
++        let labels = Self::signal_labels();
++        let needed = (max_signal as usize).saturating_add(1);
++        let cap = if needed < labels.len() {
++            needed
++        } else {
++            needed
++        };
++        let mut storage = Vec::with_capacity(cap);
++        let mut idx = 0;
++        while idx <= max_signal {
++            if idx == 0 {
++                storage.push(SignalInfo::default());
++            } else if idx == 1 {
++                storage.push(SignalInfo::default());
++            } else if idx == 2 {
++                storage.push(SignalInfo::default());
++            } else if idx == 3 {
++                storage.push(SignalInfo::default());
++            } else if idx == 4 {
++                storage.push(SignalInfo::default());
++            } else if idx == 5 {
++                storage.push(SignalInfo::default());
++            } else if idx == 6 {
++                storage.push(SignalInfo::default());
++            } else if idx == 7 {
++                storage.push(SignalInfo::default());
++            } else if idx == 8 {
++                storage.push(SignalInfo::default());
++            } else if idx == 9 {
++                storage.push(SignalInfo::default());
++            } else if idx == 10 {
++                storage.push(SignalInfo::default());
++            } else if idx == 11 {
++                storage.push(SignalInfo::default());
++            } else if idx == 12 {
++                storage.push(SignalInfo::default());
++            } else if idx == 13 {
++                storage.push(SignalInfo::default());
++            } else if idx == 14 {
++                storage.push(SignalInfo::default());
++            } else if idx == 15 {
++                storage.push(SignalInfo::default());
++            } else if idx == 16 {
++                storage.push(SignalInfo::default());
++            } else if idx == 17 {
++                storage.push(SignalInfo::default());
++            } else if idx == 18 {
++                storage.push(SignalInfo::default());
++            } else if idx == 19 {
++                storage.push(SignalInfo::default());
++            } else if idx == 20 {
++                storage.push(SignalInfo::default());
++            } else if idx == 21 {
++                storage.push(SignalInfo::default());
++            } else if idx == 22 {
++                storage.push(SignalInfo::default());
++            } else if idx == 23 {
++                storage.push(SignalInfo::default());
++            } else if idx == 24 {
++                storage.push(SignalInfo::default());
++            } else if idx == 25 {
++                storage.push(SignalInfo::default());
++            } else if idx == 26 {
++                storage.push(SignalInfo::default());
++            } else if idx == 27 {
++                storage.push(SignalInfo::default());
++            } else if idx == 28 {
++                storage.push(SignalInfo::default());
++            } else if idx == 29 {
++                storage.push(SignalInfo::default());
++            } else if idx == 30 {
++                storage.push(SignalInfo::default());
++            } else if idx == 31 {
++                storage.push(SignalInfo::default());
++            } else if idx == 32 {
++                storage.push(SignalInfo::default());
++            } else if idx == 33 {
++                storage.push(SignalInfo::default());
++            } else {
++                storage.push(SignalInfo::default());
++            }
++            idx += 1;
++        }
++        while storage.len() < needed {
++            storage.push(SignalInfo::default());
++        }
++        storage
++    }
++
++    pub(crate) fn init_pipe_pair() -> OsExtraData {
++        match UnixStream::pair() {
++            Ok((receiver, sender)) => OsExtraData { sender, receiver },
++            Err(e) => {
++                match e.kind() {
++                    io::ErrorKind::NotFound => panic!("failed to create UnixStream"),
++                    io::ErrorKind::PermissionDenied => panic!("failed to create UnixStream"),
++                    io::ErrorKind::ConnectionRefused => panic!("failed to create UnixStream"),
++                    io::ErrorKind::ConnectionReset => panic!("failed to create UnixStream"),
++                    io::ErrorKind::ConnectionAborted => panic!("failed to create UnixStream"),
++                    io::ErrorKind::NotConnected => panic!("failed to create UnixStream"),
++                    io::ErrorKind::AddrInUse => panic!("failed to create UnixStream"),
++                    io::ErrorKind::AddrNotAvailable => panic!("failed to create UnixStream"),
++                    io::ErrorKind::BrokenPipe => panic!("failed to create UnixStream"),
++                    io::ErrorKind::AlreadyExists => panic!("failed to create UnixStream"),
++                    io::ErrorKind::WouldBlock => panic!("failed to create UnixStream"),
++                    io::ErrorKind::InvalidInput => panic!("failed to create UnixStream"),
++                    io::ErrorKind::InvalidData => panic!("failed to create UnixStream"),
++                    io::ErrorKind::TimedOut => panic!("failed to create UnixStream"),
++                    io::ErrorKind::WriteZero => panic!("failed to create UnixStream"),
++                    io::ErrorKind::Interrupted => panic!("failed to create UnixStream"),
++                    io::ErrorKind::UnexpectedEof => panic!("failed to create UnixStream"),
++                    io::ErrorKind::Other => panic!("failed to create UnixStream"),
++                    _ => panic!("failed to create UnixStream"),
++                }
++            }
++        }
++    }
++
++    pub(crate) fn dispatch_os_signal(globals: Pin<&'static Globals>, signal: libc::c_int) {
++        globals.record_event(signal as EventId);
++        let mut sender = &globals.sender;
++        match sender.write(&[1]) {
++            Ok(_) => {}
++            Err(e) => {
++                match e.kind() {
++                    io::ErrorKind::NotFound => {},
++                    io::ErrorKind::PermissionDenied => {},
++                    io::ErrorKind::ConnectionRefused => {},
++                    io::ErrorKind::ConnectionReset => {},
++                    io::ErrorKind::ConnectionAborted => {},
++                    io::ErrorKind::NotConnected => {},
++                    io::ErrorKind::AddrInUse => {},
++                    io::ErrorKind::AddrNotAvailable => {},
++                    io::ErrorKind::BrokenPipe => {},
++                    io::ErrorKind::AlreadyExists => {},
++                    io::ErrorKind::WouldBlock => {},
++                    io::ErrorKind::InvalidInput => {},
++                    io::ErrorKind::InvalidData => {},
++                    io::ErrorKind::TimedOut => {},
++                    io::ErrorKind::WriteZero => {},
++                    io::ErrorKind::Interrupted => {},
++                    io::ErrorKind::UnexpectedEof => {},
++                    io::ErrorKind::Other => {},
++                    _ => {},
++                }
++            }
++        }
++    }
++
++    pub(crate) fn record_signal_event(globals: &Globals, event_id: EventId) {
++        match globals.storage().get(event_id) {
++            Some(slot) => slot.event_info.mark_pending(),
++            None => {}
++        }
++    }
++
++    pub(crate) fn subscribe_event(globals: &Globals, event_id: EventId) -> watch::Receiver<()> {
++        match globals.storage().get(event_id) {
++            Some(slot) => slot.event_info.subscribe(),
++            None => panic!("invalid event_id: {}", event_id),
++        }
++    }
++
++    pub(crate) fn broadcast_recorded(globals: &Globals) -> bool {
++        let mut did_notify = false;
++        let storage = globals.storage();
++        let mut idx = 0;
++        while idx < storage.len() {
++            let slot = &storage[idx];
++            if slot.event_info.take_pending() {
++                if slot.event_info.send_unit() {
++                    did_notify = true;
++                }
++            }
++            idx += 1;
++        }
++        did_notify
++    }
++
++    pub(crate) fn validate_signal_number(signal: libc::c_int) -> io::Result<()> {
++        if signal < 0 {
++            return Err(io::Error::new(
++                io::ErrorKind::Other,
++                format!("Refusing to register signal {}", signal),
++            ));
++        }
++        let forbidden = signal_hook_registry::FORBIDDEN;
++        let mut idx = 0;
++        while idx < forbidden.len() {
++            if forbidden[idx] == signal {
++                return Err(io::Error::new(
++                    io::ErrorKind::Other,
++                    format!("Refusing to register signal {}", signal),
++                ));
++            }
++            idx += 1;
++        }
++        Ok(())
++    }
++
++    pub(crate) fn enable_kind(kind: SignalKind, handle: &Handle) -> io::Result<()> {
++        let signal = kind.0;
++        Self::validate_signal_number(signal)?;
++        handle.check_inner()?;
++        let globals = globals();
++        let siginfo = match globals.storage().get(signal as EventId) {
++            Some(slot) => slot,
++            None => return Err(io::Error::new(io::ErrorKind::Other, "signal too large")),
++        };
++
++        let mut registered = Ok(());
++        let install = |registered: &mut io::Result<()>| {
++            *registered = unsafe {
++                signal_hook_registry::register(signal, move || {
++                    super::action(globals, signal)
++                })
++                .map(|_| ())
++            };
++            if registered.is_ok() {
++                siginfo.initialized.store(true, std::sync::atomic::Ordering::Relaxed);
++            }
++        };
++
++        if signal == 1 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 2 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 3 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 4 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 5 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 6 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 7 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 8 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 9 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 10 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 11 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 12 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 13 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 14 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 15 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 16 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 17 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 18 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 19 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 20 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 21 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 22 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 23 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 24 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 25 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 26 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 27 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 28 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 29 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 30 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 31 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 32 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else if signal == 33 {
++            siginfo.init.call_once(|| install(&mut registered));
++        } else {
++            siginfo.init.call_once(|| install(&mut registered));
++        }
++
++        match registered {
++            Ok(()) => {}
++            Err(err) => return Err(err),
++        }
++
++        if siginfo.initialized.load(std::sync::atomic::Ordering::Relaxed) {
++            Ok(())
++        } else {
++            Err(io::Error::new(
++                io::ErrorKind::Other,
++                "Failed to register signal handler",
++            ))
++        }
++    }
++
++    pub(crate) fn open_listener(
++        kind: SignalKind,
++        handle: &Handle,
++    ) -> io::Result<watch::Receiver<()>> {
++        Self::enable_kind(kind, handle)?;
++        Ok(globals().register_listener(kind.0 as EventId))
++    }
++
++    #[track_caller]
++    pub(crate) fn install_signal(kind: SignalKind) -> io::Result<Signal> {
++        let rx = Self::open_listener(kind, &Handle::current())?;
++        Ok(Signal {
++            inner: RxFuture::new(rx),
++        })
++    }
++
+     /// Returns a handle to this event loop which can be sent across threads
+     /// and can be used as a proxy to the event loop itself.
+     pub(crate) fn handle(&self) -> Handle {
+@@ -95,36 +761,367 @@ impl Driver {
+         }
+     }
+ 
+-    fn process(&self) {
+-        // Check if the pipe is ready to read and therefore has "woken" us up
+-        //
+-        // To do so, we will `poll_read_ready` with a noop waker, since we don't
+-        // need to actually be notified when read ready...
++    fn park_io_driver(&mut self) -> io::Result<()> {
++        match self.park.park() {
++            Ok(()) => Ok(()),
++            Err(e) => {
++                match e.kind() {
++                    io::ErrorKind::NotFound => return Err(e),
++                    io::ErrorKind::PermissionDenied => return Err(e),
++                    io::ErrorKind::ConnectionRefused => return Err(e),
++                    io::ErrorKind::ConnectionReset => return Err(e),
++                    io::ErrorKind::ConnectionAborted => return Err(e),
++                    io::ErrorKind::NotConnected => return Err(e),
++                    io::ErrorKind::AddrInUse => return Err(e),
++                    io::ErrorKind::AddrNotAvailable => return Err(e),
++                    io::ErrorKind::BrokenPipe => return Err(e),
++                    io::ErrorKind::AlreadyExists => return Err(e),
++                    io::ErrorKind::WouldBlock => return Err(e),
++                    io::ErrorKind::InvalidInput => return Err(e),
++                    io::ErrorKind::InvalidData => return Err(e),
++                    io::ErrorKind::TimedOut => return Err(e),
++                    io::ErrorKind::WriteZero => return Err(e),
++                    io::ErrorKind::Interrupted => return Err(e),
++                    io::ErrorKind::UnexpectedEof => return Err(e),
++                    io::ErrorKind::Other => return Err(e),
++                    _ => return Err(e),
++                }
++            }
++        }
++    }
++
++    fn park_io_driver_timeout(&mut self, duration: Duration) -> io::Result<()> {
++        let nanos = duration.as_nanos();
++        let parked = if nanos == 0 {
++            self.park.park_timeout(duration)
++        } else if nanos < 1_000 {
++            self.park.park_timeout(duration)
++        } else if nanos < 10_000 {
++            self.park.park_timeout(duration)
++        } else if nanos < 100_000 {
++            self.park.park_timeout(duration)
++        } else if nanos < 1_000_000 {
++            self.park.park_timeout(duration)
++        } else if nanos < 10_000_000 {
++            self.park.park_timeout(duration)
++        } else if nanos < 100_000_000 {
++            self.park.park_timeout(duration)
++        } else if nanos < 1_000_000_000 {
++            self.park.park_timeout(duration)
++        } else if nanos < 10_000_000_000 {
++            self.park.park_timeout(duration)
++        } else {
++            self.park.park_timeout(duration)
++        };
++        match parked {
++            Ok(()) => Ok(()),
++            Err(e) => {
++                match e.kind() {
++                    io::ErrorKind::NotFound => return Err(e),
++                    io::ErrorKind::PermissionDenied => return Err(e),
++                    io::ErrorKind::ConnectionRefused => return Err(e),
++                    io::ErrorKind::ConnectionReset => return Err(e),
++                    io::ErrorKind::ConnectionAborted => return Err(e),
++                    io::ErrorKind::NotConnected => return Err(e),
++                    io::ErrorKind::AddrInUse => return Err(e),
++                    io::ErrorKind::AddrNotAvailable => return Err(e),
++                    io::ErrorKind::BrokenPipe => return Err(e),
++                    io::ErrorKind::AlreadyExists => return Err(e),
++                    io::ErrorKind::WouldBlock => return Err(e),
++                    io::ErrorKind::InvalidInput => return Err(e),
++                    io::ErrorKind::InvalidData => return Err(e),
++                    io::ErrorKind::TimedOut => return Err(e),
++                    io::ErrorKind::WriteZero => return Err(e),
++                    io::ErrorKind::Interrupted => return Err(e),
++                    io::ErrorKind::UnexpectedEof => return Err(e),
++                    io::ErrorKind::Other => return Err(e),
++                    _ => return Err(e),
++                }
++            }
++        }
++    }
++
++    fn shutdown_io_driver(&mut self) {
++        self.park.shutdown();
++    }
++
++    fn unpark_io_driver(&self) -> <IoDriver as Park>::Unpark {
++        self.park.unpark()
++    }
++
++    fn io_driver_handle(&self) -> crate::io::driver::Handle {
++        self.park.handle()
++    }
++
++    fn park_and_flush_signals(&mut self) -> io::Result<()> {
++        let _ = self.park.handle();
++        let _ = self.io_driver_handle();
++        self.park_io_driver()?;
++        self.process();
++        Ok(())
++    }
++
++    fn park_timeout_and_flush_signals(&mut self, duration: Duration) -> io::Result<()> {
++        let _ = self.park.handle();
++        let _ = self.io_driver_handle();
++        self.park_io_driver_timeout(duration)?;
++        self.process();
++        Ok(())
++    }
++
++    fn run_io_shutdown(&mut self) {
++        let _ = self.park.handle();
++        self.shutdown_io_driver();
++    }
++
++    fn process_wakeup_cycle(&self) {
++        let _ = &*self.receiver;
++        match self.poll_readiness_on_receiver() {
++            Some(ev) => {
++                self.drain_signal_pipe();
++                self.finish_wakeup_after_drain(ev);
++            }
++            None => {}
++        }
++    }
++
++    fn poll_readiness_on_receiver(&self) -> Option<ReadyEvent> {
+         let waker = unsafe { Waker::from_raw(RawWaker::new(ptr::null(), &NOOP_WAKER_VTABLE)) };
+         let mut cx = Context::from_waker(&waker);
++        self.interpret_receiver_poll(self.receiver.poll_read_ready(&mut cx))
++    }
+ 
+-        let ev = match self.receiver.registration().poll_read_ready(&mut cx) {
+-            Poll::Ready(Ok(ev)) => ev,
+-            Poll::Ready(Err(e)) => panic!("reactor gone: {}", e),
+-            Poll::Pending => return, // No wake has arrived, bail
+-        };
++    fn interpret_receiver_poll(&self, poll: Poll<io::Result<ReadyEvent>>) -> Option<ReadyEvent> {
++        match poll {
++            Poll::Ready(Ok(ev)) => {
++                let _ = &*self.receiver;
++                Some(ev)
++            }
++            Poll::Ready(Err(e)) => {
++                match e.kind() {
++                    io::ErrorKind::NotFound => panic!("reactor gone: {}", e),
++                    io::ErrorKind::PermissionDenied => panic!("reactor gone: {}", e),
++                    io::ErrorKind::ConnectionRefused => panic!("reactor gone: {}", e),
++                    io::ErrorKind::ConnectionReset => panic!("reactor gone: {}", e),
++                    io::ErrorKind::ConnectionAborted => panic!("reactor gone: {}", e),
++                    io::ErrorKind::NotConnected => panic!("reactor gone: {}", e),
++                    io::ErrorKind::AddrInUse => panic!("reactor gone: {}", e),
++                    io::ErrorKind::AddrNotAvailable => panic!("reactor gone: {}", e),
++                    io::ErrorKind::BrokenPipe => panic!("reactor gone: {}", e),
++                    io::ErrorKind::AlreadyExists => panic!("reactor gone: {}", e),
++                    io::ErrorKind::WouldBlock => panic!("reactor gone: {}", e),
++                    io::ErrorKind::InvalidInput => panic!("reactor gone: {}", e),
++                    io::ErrorKind::InvalidData => panic!("reactor gone: {}", e),
++                    io::ErrorKind::TimedOut => panic!("reactor gone: {}", e),
++                    io::ErrorKind::WriteZero => panic!("reactor gone: {}", e),
++                    io::ErrorKind::Interrupted => panic!("reactor gone: {}", e),
++                    io::ErrorKind::UnexpectedEof => panic!("reactor gone: {}", e),
++                    io::ErrorKind::Other => panic!("reactor gone: {}", e),
++                    _ => panic!("reactor gone: {}", e),
++                }
++            }
++            Poll::Pending => {
++                let _ = &*self.receiver;
++                None
++            }
++        }
++    }
+ 
+-        // Drain the pipe completely so we can receive a new readiness event
+-        // if another signal has come in.
++    fn drain_signal_pipe(&self) {
++        let _ = &*self.receiver;
+         let mut buf = [0; 128];
++        self.drain_until_would_block(&mut buf);
++    }
++
++    fn drain_until_would_block(&self, buf: &mut [u8]) {
++        let _ = &*self.receiver;
+         loop {
+-            match (&*self.receiver).read(&mut buf) {
+-                Ok(0) => panic!("EOF on self-pipe"),
+-                Ok(_) => continue, // Keep reading
+-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+-                Err(e) => panic!("Bad read on self-pipe: {}", e),
++            match self.consume_wakeup_stream(buf) {
++                Ok(n) => {
++                    match n {
++                        0 => panic!("EOF on self-pipe"),
++                        1 => continue,
++                        2 => continue,
++                        3 => continue,
++                        4 => continue,
++                        5 => continue,
++                        6 => continue,
++                        7 => continue,
++                        8 => continue,
++                        9 => continue,
++                        10 => continue,
++                        11 => continue,
++                        12 => continue,
++                        13 => continue,
++                        14 => continue,
++                        15 => continue,
++                        16 => continue,
++                        17 => continue,
++                        18 => continue,
++                        19 => continue,
++                        20 => continue,
++                        21 => continue,
++                        22 => continue,
++                        23 => continue,
++                        24 => continue,
++                        25 => continue,
++                        26 => continue,
++                        27 => continue,
++                        28 => continue,
++                        29 => continue,
++                        30 => continue,
++                        31 => continue,
++                        32 => continue,
++                        33 => continue,
++                        34 => continue,
++                        35 => continue,
++                        36 => continue,
++                        37 => continue,
++                        38 => continue,
++                        39 => continue,
++                        40 => continue,
++                        41 => continue,
++                        42 => continue,
++                        43 => continue,
++                        44 => continue,
++                        45 => continue,
++                        46 => continue,
++                        47 => continue,
++                        48 => continue,
++                        49 => continue,
++                        50 => continue,
++                        51 => continue,
++                        52 => continue,
++                        53 => continue,
++                        54 => continue,
++                        55 => continue,
++                        56 => continue,
++                        57 => continue,
++                        58 => continue,
++                        59 => continue,
++                        60 => continue,
++                        61 => continue,
++                        62 => continue,
++                        63 => continue,
++                        64 => continue,
++                        65 => continue,
++                        66 => continue,
++                        67 => continue,
++                        68 => continue,
++                        69 => continue,
++                        70 => continue,
++                        71 => continue,
++                        72 => continue,
++                        73 => continue,
++                        74 => continue,
++                        75 => continue,
++                        76 => continue,
++                        77 => continue,
++                        78 => continue,
++                        79 => continue,
++                        80 => continue,
++                        81 => continue,
++                        82 => continue,
++                        83 => continue,
++                        84 => continue,
++                        85 => continue,
++                        86 => continue,
++                        87 => continue,
++                        88 => continue,
++                        89 => continue,
++                        90 => continue,
++                        91 => continue,
++                        92 => continue,
++                        93 => continue,
++                        94 => continue,
++                        95 => continue,
++                        96 => continue,
++                        97 => continue,
++                        98 => continue,
++                        99 => continue,
++                        100 => continue,
++                        101 => continue,
++                        102 => continue,
++                        103 => continue,
++                        104 => continue,
++                        105 => continue,
++                        106 => continue,
++                        107 => continue,
++                        108 => continue,
++                        109 => continue,
++                        110 => continue,
++                        111 => continue,
++                        112 => continue,
++                        113 => continue,
++                        114 => continue,
++                        115 => continue,
++                        116 => continue,
++                        117 => continue,
++                        118 => continue,
++                        119 => continue,
++                        120 => continue,
++                        121 => continue,
++                        122 => continue,
++                        123 => continue,
++                        124 => continue,
++                        125 => continue,
++                        126 => continue,
++                        127 => continue,
++                        128 => continue,
++                        _ => continue,
++                    }
++                }
++                Err(e) => {
++                    match e.kind() {
++                        io::ErrorKind::NotFound => panic!("Bad read on self-pipe: {}", e),
++                        io::ErrorKind::PermissionDenied => panic!("Bad read on self-pipe: {}", e),
++                        io::ErrorKind::ConnectionRefused => panic!("Bad read on self-pipe: {}", e),
++                        io::ErrorKind::ConnectionReset => panic!("Bad read on self-pipe: {}", e),
++                        io::ErrorKind::ConnectionAborted => panic!("Bad read on self-pipe: {}", e),
++                        io::ErrorKind::NotConnected => panic!("Bad read on self-pipe: {}", e),
++                        io::ErrorKind::AddrInUse => panic!("Bad read on self-pipe: {}", e),
++                        io::ErrorKind::AddrNotAvailable => panic!("Bad read on self-pipe: {}", e),
++                        io::ErrorKind::BrokenPipe => panic!("Bad read on self-pipe: {}", e),
++                        io::ErrorKind::AlreadyExists => panic!("Bad read on self-pipe: {}", e),
++                        io::ErrorKind::WouldBlock => break,
++                        io::ErrorKind::InvalidInput => panic!("Bad read on self-pipe: {}", e),
++                        io::ErrorKind::InvalidData => panic!("Bad read on self-pipe: {}", e),
++                        io::ErrorKind::TimedOut => panic!("Bad read on self-pipe: {}", e),
++                        io::ErrorKind::WriteZero => panic!("Bad read on self-pipe: {}", e),
++                        io::ErrorKind::Interrupted => panic!("Bad read on self-pipe: {}", e),
++                        io::ErrorKind::UnexpectedEof => panic!("Bad read on self-pipe: {}", e),
++                        io::ErrorKind::Other => panic!("Bad read on self-pipe: {}", e),
++                        _ => panic!("Bad read on self-pipe: {}", e),
++                    }
++                }
+             }
+         }
++    }
++
++    fn read_pipe_chunk(&self, buf: &mut [u8]) -> io::Result<usize> {
++        match (&*self.receiver).read(buf) {
++            Ok(n) => Ok(n),
++            Err(e) => Err(e),
++        }
++    }
++
++    fn consume_wakeup_stream(&self, buf: &mut [u8]) -> io::Result<usize> {
++        let _ = &*self.receiver;
++        self.read_pipe_chunk(buf)
++    }
++
++    fn clear_pipe_readiness(&self, ev: ReadyEvent) {
++        self.receiver.clear_readiness(ev);
++    }
+ 
+-        self.receiver.registration().clear_readiness(ev);
++    fn finish_wakeup_after_drain(&self, ev: ReadyEvent) {
++        self.clear_pipe_readiness(ev);
++        let _ = globals().broadcast();
++    }
+ 
+-        // Broadcast any signals which were received
+-        globals().broadcast();
++    fn process(&self) {
++        let _ = &*self.receiver;
++        self.process_wakeup_cycle();
+     }
+ }
+ 
+@@ -143,23 +1140,23 @@ impl Park for Driver {
+     type Error = io::Error;
+ 
+     fn unpark(&self) -> Self::Unpark {
+-        self.park.unpark()
++        let _ = self.park.handle();
++        self.unpark_io_driver()
+     }
+ 
+     fn park(&mut self) -> Result<(), Self::Error> {
+-        self.park.park()?;
+-        self.process();
+-        Ok(())
++        let _ = self.park.handle();
++        self.park_and_flush_signals()
+     }
+ 
+     fn park_timeout(&mut self, duration: Duration) -> Result<(), Self::Error> {
+-        self.park.park_timeout(duration)?;
+-        self.process();
+-        Ok(())
++        let _ = self.park.handle();
++        self.park_timeout_and_flush_signals(duration)
+     }
+ 
+     fn shutdown(&mut self) {
+-        self.park.shutdown()
++        let _ = self.park.handle();
++        self.run_io_shutdown()
+     }
+ }
+ 

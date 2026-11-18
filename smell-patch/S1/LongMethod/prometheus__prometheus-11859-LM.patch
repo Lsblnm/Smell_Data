@@ -1,0 +1,293 @@
+diff --git a/tsdb/head.go b/tsdb/head.go
+index 833aa8c5f..4e638256c 100644
+--- a/tsdb/head.go
++++ b/tsdb/head.go
+@@ -17,7 +17,11 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"math"
++	"os"
+ 	"path/filepath"
++	"sort"
++	"strconv"
++	"strings"
+ 	"sync"
+ 	"time"
+ 
+@@ -605,127 +609,170 @@ func (h *Head) Init(minValidTime int64) error {
+ 	}
+ 
+ 	level.Info(h.logger).Log("msg", "On-disk memory mappable chunks replay completed", "duration", time.Since(mmapChunkReplayStart).String())
+-	if h.wal == nil {
+-		level.Info(h.logger).Log("msg", "WAL not found")
+-		return nil
+-	}
+-
+-	level.Info(h.logger).Log("msg", "Replaying WAL, this may take a while")
++	if h.wal != nil {
++		level.Info(h.logger).Log("msg", "Replaying WAL, this may take a while")
++
++		checkpointReplayStart := time.Now()
++		walDir := h.wal.Dir()
++		dir := ""
++		startFrom := 0
++		endAt := -1
++		maxCheckpointIdx := -1
++		maxCheckpointName := ""
++		var segmentRefs []struct {
++			name  string
++			index int
++		}
+ 
+-	checkpointReplayStart := time.Now()
+-	// Backfill the checkpoint first if it exists.
+-	dir, startFrom, err := wlog.LastCheckpoint(h.wal.Dir())
+-	if err != nil && err != record.ErrNotFound {
+-		return errors.Wrap(err, "find last checkpoint")
+-	}
++		files, dirErr := os.ReadDir(walDir)
++		if dirErr == nil {
++			for i := 0; i < len(files); i++ {
++				fi := files[i]
++				name := fi.Name()
++				if strings.HasPrefix(name, "checkpoint.") {
++					if !fi.IsDir() {
++						return errors.Wrap(errors.Errorf("checkpoint %s is not a directory", name), "find last checkpoint")
++					}
++					idx, convErr := strconv.Atoi(name[len("checkpoint."):])
++					if convErr == nil {
++						if idx > maxCheckpointIdx {
++							maxCheckpointIdx = idx
++							maxCheckpointName = name
++						}
++					}
++				} else {
++					segIdx, convErr := strconv.Atoi(name)
++					if convErr == nil {
++						segmentRefs = append(segmentRefs, struct {
++							name  string
++							index int
++						}{name: name, index: segIdx})
++					}
++				}
++			}
++			if maxCheckpointName != "" {
++				dir = filepath.Join(walDir, maxCheckpointName)
++				startFrom = maxCheckpointIdx
++			}
++			if len(segmentRefs) > 0 {
++				sort.Slice(segmentRefs, func(i, j int) bool {
++					return segmentRefs[i].index < segmentRefs[j].index
++				})
++				for i := 0; i < len(segmentRefs)-1; i++ {
++					if segmentRefs[i].index+1 != segmentRefs[i+1].index {
++						return errors.Wrap(errors.New("segments are not sequential"), "finding WAL segments")
++					}
++				}
++				endAt = segmentRefs[len(segmentRefs)-1].index
++			}
+ 
+-	// Find the last segment.
+-	_, endAt, e := wlog.Segments(h.wal.Dir())
+-	if e != nil {
+-		return errors.Wrap(e, "finding WAL segments")
+-	}
++			h.startWALReplayStatus(startFrom, endAt)
+ 
+-	h.startWALReplayStatus(startFrom, endAt)
++			multiRef := map[chunks.HeadSeriesRef]chunks.HeadSeriesRef{}
++			if maxCheckpointName != "" && startFrom >= snapIdx {
++				sr, err := wlog.NewSegmentsReader(dir)
++				if err != nil {
++					return errors.Wrap(err, "open checkpoint")
++				}
++				defer func() {
++					if err := sr.Close(); err != nil {
++						level.Warn(h.logger).Log("msg", "Error while closing the wal segments reader", "err", err)
++					}
++				}()
+ 
+-	multiRef := map[chunks.HeadSeriesRef]chunks.HeadSeriesRef{}
+-	if err == nil && startFrom >= snapIdx {
+-		sr, err := wlog.NewSegmentsReader(dir)
+-		if err != nil {
+-			return errors.Wrap(err, "open checkpoint")
+-		}
+-		defer func() {
+-			if err := sr.Close(); err != nil {
+-				level.Warn(h.logger).Log("msg", "Error while closing the wal segments reader", "err", err)
++				// A corrupted checkpoint is a hard error for now and requires user
++				// intervention. There's likely little data that can be recovered anyway.
++				if err := h.loadWAL(wlog.NewReader(sr), multiRef, mmappedChunks, oooMmappedChunks); err != nil {
++					return errors.Wrap(err, "backfill checkpoint")
++				}
++				h.updateWALReplayStatusRead(startFrom)
++				startFrom++
++				level.Info(h.logger).Log("msg", "WAL checkpoint loaded")
+ 			}
+-		}()
+-
+-		// A corrupted checkpoint is a hard error for now and requires user
+-		// intervention. There's likely little data that can be recovered anyway.
+-		if err := h.loadWAL(wlog.NewReader(sr), multiRef, mmappedChunks, oooMmappedChunks); err != nil {
+-			return errors.Wrap(err, "backfill checkpoint")
+-		}
+-		h.updateWALReplayStatusRead(startFrom)
+-		startFrom++
+-		level.Info(h.logger).Log("msg", "WAL checkpoint loaded")
+-	}
+-	checkpointReplayDuration := time.Since(checkpointReplayStart)
++			checkpointReplayDuration := time.Since(checkpointReplayStart)
+ 
+-	walReplayStart := time.Now()
++			walReplayStart := time.Now()
+ 
+-	if snapIdx > startFrom {
+-		startFrom = snapIdx
+-	}
+-	// Backfill segments from the most recent checkpoint onwards.
+-	for i := startFrom; i <= endAt; i++ {
+-		s, err := wlog.OpenReadSegment(wlog.SegmentName(h.wal.Dir(), i))
+-		if err != nil {
+-			return errors.Wrap(err, fmt.Sprintf("open WAL segment: %d", i))
+-		}
++			if snapIdx > startFrom {
++				startFrom = snapIdx
++			}
++			// Backfill segments from the most recent checkpoint onwards.
++			for i := startFrom; i <= endAt; i++ {
++				s, err := wlog.OpenReadSegment(wlog.SegmentName(walDir, i))
++				if err != nil {
++					return errors.Wrap(err, fmt.Sprintf("open WAL segment: %d", i))
++				}
+ 
+-		offset := 0
+-		if i == snapIdx {
+-			offset = snapOffset
+-		}
+-		sr, err := wlog.NewSegmentBufReaderWithOffset(offset, s)
+-		if errors.Is(err, io.EOF) {
+-			// File does not exist.
+-			continue
+-		}
+-		if err != nil {
+-			return errors.Wrapf(err, "segment reader (offset=%d)", offset)
+-		}
+-		err = h.loadWAL(wlog.NewReader(sr), multiRef, mmappedChunks, oooMmappedChunks)
+-		if err := sr.Close(); err != nil {
+-			level.Warn(h.logger).Log("msg", "Error while closing the wal segments reader", "err", err)
+-		}
+-		if err != nil {
+-			return err
+-		}
+-		level.Info(h.logger).Log("msg", "WAL segment loaded", "segment", i, "maxSegment", endAt)
+-		h.updateWALReplayStatusRead(i)
+-	}
+-	walReplayDuration := time.Since(walReplayStart)
++				offset := 0
++				if i == snapIdx {
++					offset = snapOffset
++				}
++				sr, err := wlog.NewSegmentBufReaderWithOffset(offset, s)
++				if errors.Is(err, io.EOF) {
++					// File does not exist.
++					continue
++				}
++				if err != nil {
++					return errors.Wrapf(err, "segment reader (offset=%d)", offset)
++				}
++				err = h.loadWAL(wlog.NewReader(sr), multiRef, mmappedChunks, oooMmappedChunks)
++				if err := sr.Close(); err != nil {
++					level.Warn(h.logger).Log("msg", "Error while closing the wal segments reader", "err", err)
++				}
++				if err != nil {
++					return err
++				}
++				level.Info(h.logger).Log("msg", "WAL segment loaded", "segment", i, "maxSegment", endAt)
++				h.updateWALReplayStatusRead(i)
++			}
++			walReplayDuration := time.Since(walReplayStart)
++
++			wblReplayStart := time.Now()
++			if h.wbl != nil {
++				// Replay OOO WAL.
++				startFrom, endAt, e := wlog.Segments(h.wbl.Dir())
++				if e != nil {
++					return errors.Wrap(e, "finding OOO WAL segments")
++				}
++				h.startWALReplayStatus(startFrom, endAt)
+ 
+-	wblReplayStart := time.Now()
+-	if h.wbl != nil {
+-		// Replay OOO WAL.
+-		startFrom, endAt, e = wlog.Segments(h.wbl.Dir())
+-		if e != nil {
+-			return errors.Wrap(e, "finding OOO WAL segments")
+-		}
+-		h.startWALReplayStatus(startFrom, endAt)
++				for i := startFrom; i <= endAt; i++ {
++					s, err := wlog.OpenReadSegment(wlog.SegmentName(h.wbl.Dir(), i))
++					if err != nil {
++						return errors.Wrap(err, fmt.Sprintf("open WBL segment: %d", i))
++					}
+ 
+-		for i := startFrom; i <= endAt; i++ {
+-			s, err := wlog.OpenReadSegment(wlog.SegmentName(h.wbl.Dir(), i))
+-			if err != nil {
+-				return errors.Wrap(err, fmt.Sprintf("open WBL segment: %d", i))
++					sr := wlog.NewSegmentBufReader(s)
++					err = h.loadWBL(wlog.NewReader(sr), multiRef, lastMmapRef)
++					if err := sr.Close(); err != nil {
++						level.Warn(h.logger).Log("msg", "Error while closing the wbl segments reader", "err", err)
++					}
++					if err != nil {
++						return err
++					}
++					level.Info(h.logger).Log("msg", "WBL segment loaded", "segment", i, "maxSegment", endAt)
++					h.updateWALReplayStatusRead(i)
++				}
+ 			}
+ 
+-			sr := wlog.NewSegmentBufReader(s)
+-			err = h.loadWBL(wlog.NewReader(sr), multiRef, lastMmapRef)
+-			if err := sr.Close(); err != nil {
+-				level.Warn(h.logger).Log("msg", "Error while closing the wbl segments reader", "err", err)
+-			}
+-			if err != nil {
+-				return err
+-			}
+-			level.Info(h.logger).Log("msg", "WBL segment loaded", "segment", i, "maxSegment", endAt)
+-			h.updateWALReplayStatusRead(i)
+-		}
+-	}
++			wblReplayDuration := time.Since(wblReplayStart)
+ 
+-	wblReplayDuration := time.Since(wblReplayStart)
++			totalReplayDuration := time.Since(start)
++			h.metrics.dataTotalReplayDuration.Set(totalReplayDuration.Seconds())
++			level.Info(h.logger).Log(
++				"msg", "WAL replay completed",
++				"checkpoint_replay_duration", checkpointReplayDuration.String(),
++				"wal_replay_duration", walReplayDuration.String(),
++				"wbl_replay_duration", wblReplayDuration.String(),
++				"total_replay_duration", totalReplayDuration.String(),
++			)
+ 
+-	totalReplayDuration := time.Since(start)
+-	h.metrics.dataTotalReplayDuration.Set(totalReplayDuration.Seconds())
+-	level.Info(h.logger).Log(
+-		"msg", "WAL replay completed",
+-		"checkpoint_replay_duration", checkpointReplayDuration.String(),
+-		"wal_replay_duration", walReplayDuration.String(),
+-		"wbl_replay_duration", wblReplayDuration.String(),
+-		"total_replay_duration", totalReplayDuration.String(),
+-	)
++			return nil
++		}
++		return errors.Wrap(dirErr, "find last checkpoint")
++	}
+ 
++	level.Info(h.logger).Log("msg", "WAL not found")
+ 	return nil
+ }
+ 

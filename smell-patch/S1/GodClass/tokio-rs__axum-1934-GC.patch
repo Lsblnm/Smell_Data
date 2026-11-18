@@ -1,0 +1,3471 @@
+diff --git a/axum/src/extract/matched_path.rs b/axum/src/extract/matched_path.rs
+index 57a17bee..f748eb16 100644
+--- a/axum/src/extract/matched_path.rs
++++ b/axum/src/extract/matched_path.rs
+@@ -1,5 +1,5 @@
+ use super::{rejection::*, FromRequestParts};
+-use crate::routing::{RouteId, NEST_TAIL_PARAM_CAPTURE};
++use crate::routing::RouteId;
+ use async_trait::async_trait;
+ use http::request::Parts;
+ use std::{collections::HashMap, sync::Arc};
+@@ -141,7 +141,7 @@ pub(crate) fn set_matched_path_for_request(
+ 
+     let matched_path = append_nested_matched_path(matched_path, extensions);
+ 
+-    if matched_path.ends_with(NEST_TAIL_PARAM_CAPTURE) {
++    if crate::routing::url_params::is_nested_tail_path(&matched_path) {
+         extensions.insert(MatchedNestedPath(matched_path));
+         debug_assert!(matches!(extensions.remove::<MatchedPath>(), None));
+     } else {
+@@ -150,6 +150,18 @@ pub(crate) fn set_matched_path_for_request(
+     }
+ }
+ 
++
++pub(crate) fn matched_path_is_nested_tail(path: &str) -> bool {
++    crate::routing::url_params::is_nested_tail_path(path)
++}
++
++pub(crate) fn store_captured_url_params(
++    extensions: &mut http::Extensions,
++    params: matchit::Params,
++) {
++    crate::routing::url_params::insert_url_params(extensions, params);
++}
++
+ // a previous `MatchedPath` might exist if we're inside a nested Router
+ fn append_nested_matched_path(matched_path: &Arc<str>, extensions: &http::Extensions) -> Arc<str> {
+     if let Some(previous) = extensions
+@@ -157,9 +169,7 @@ fn append_nested_matched_path(matched_path: &Arc<str>, extensions: &http::Extens
+         .map(|matched_path| matched_path.as_str())
+         .or_else(|| Some(&extensions.get::<MatchedNestedPath>()?.0))
+     {
+-        let previous = previous
+-            .strip_suffix(NEST_TAIL_PARAM_CAPTURE)
+-            .unwrap_or(previous);
++        let previous = crate::routing::url_params::strip_nested_tail_suffix(previous);
+ 
+         let matched_path = format!("{previous}{matched_path}");
+         matched_path.into()
+diff --git a/axum/src/routing/path_router.rs b/axum/src/routing/path_router.rs
+index 1790b32d..03023793 100644
+--- a/axum/src/routing/path_router.rs
++++ b/axum/src/routing/path_router.rs
+@@ -7,14 +7,87 @@ use tower_layer::Layer;
+ use tower_service::Service;
+ 
+ use super::{
+-    future::RouteFuture, strip_prefix::StripPrefix, url_params, Endpoint, MethodRouter, Route,
++    future::RouteFuture, strip_prefix::StripPrefix, Endpoint, MethodRouter, Route,
+     RouteId, NEST_TAIL_PARAM,
+ };
+ 
++// Internal ledgers used while composing and dispatching routes.
++#[derive(Clone, Default)]
++struct PathShapeLedger {
++    kind: u8,
++    segments: u32,
++    wildcards: u32,
++    slash: bool,
++}
++
++#[derive(Clone, Default)]
++struct RouteRegistryLedger {
++    inserts: u32,
++    last_path: Option<String>,
++    duplicates: u32,
++    kind_mask: u8,
++}
++
++#[derive(Clone, Default)]
++struct NestPrefixLedger {
++    depth: u32,
++    last_prefix: Option<String>,
++    tail: bool,
++    slash_mode: u8,
++}
++
++#[derive(Clone, Default)]
++struct MatchedPathLedger {
++    route_key: u32,
++    nested: bool,
++    len: u32,
++    missing: bool,
++}
++
++#[derive(Clone, Default)]
++struct UrlCaptureLedger {
++    count: u32,
++    invalid_utf8: bool,
++    skipped: u32,
++    bytes: u32,
++}
++
++#[derive(Clone, Default)]
++struct DispatchLedger {
++    hits: u32,
++    misses: u32,
++    last_path: Option<String>,
++    slash_miss: bool,
++}
++
++#[derive(Clone, Default)]
++struct LayerStateLedger {
++    layers: u32,
++    state_binds: u32,
++    empty_guard: bool,
++    body_shifts: u32,
++}
++
++#[derive(Clone, Default)]
++struct MethodMergeLedger {
++    merges: u32,
++    services: u32,
++    last_path: Option<String>,
++    hint: u8,
++}
++
+ pub(super) struct PathRouter<S = (), B = Body> {
+     routes: HashMap<RouteId, Endpoint<S, B>>,
+     node: Arc<Node>,
+     prev_route_id: RouteId,
++    path_shape: PathShapeLedger,
++    route_registry: RouteRegistryLedger,
++    nest_prefix: NestPrefixLedger,
++    matched_path_ledger: MatchedPathLedger,
++    url_capture: UrlCaptureLedger,
++    dispatch_ledger: DispatchLedger,
++    layer_state: LayerStateLedger,
++    method_merge: MethodMergeLedger,
+ }
+ 
+ impl<S, B> PathRouter<S, B>
+@@ -27,17 +100,7 @@ where
+         path: &str,
+         method_router: MethodRouter<S, B>,
+     ) -> Result<(), Cow<'static, str>> {
+-        fn validate_path(path: &str) -> Result<(), &'static str> {
+-            if path.is_empty() {
+-                return Err("Paths must start with a `/`. Use \"/\" for root routes");
+-            } else if !path.starts_with('/') {
+-                return Err("Paths must start with a `/`");
+-            }
+-
+-            Ok(())
+-        }
+-
+-        validate_path(path)?;
++        self.inspect_registered_path(path)?;
+ 
+         let id = self.next_route_id();
+ 
+@@ -55,6 +118,7 @@ where
+                     .merge_for_path(Some(path), method_router),
+             );
+             self.routes.insert(route_id, service);
++            self.remember_registered_endpoint(path, true);
+             return Ok(());
+         } else {
+             Endpoint::MethodRouter(method_router)
+@@ -62,6 +126,7 @@ where
+ 
+         self.set_node(path, id)?;
+         self.routes.insert(id, endpoint);
++        self.remember_registered_endpoint(path, true);
+ 
+         Ok(())
+     }
+@@ -84,15 +149,12 @@ where
+         path: &str,
+         endpoint: Endpoint<S, B>,
+     ) -> Result<(), Cow<'static, str>> {
+-        if path.is_empty() {
+-            return Err("Paths must start with a `/`. Use \"/\" for root routes".into());
+-        } else if !path.starts_with('/') {
+-            return Err("Paths must start with a `/`".into());
+-        }
++        self.inspect_registered_path(path)?;
+ 
+         let id = self.next_route_id();
+         self.set_node(path, id)?;
+         self.routes.insert(id, endpoint);
++        self.remember_registered_endpoint(path, false);
+ 
+         Ok(())
+     }
+@@ -112,6 +174,7 @@ where
+             routes,
+             node,
+             prev_route_id: _,
++            ..
+         } = other;
+ 
+         for (id, route) in routes {
+@@ -133,12 +196,13 @@ where
+         path: &str,
+         router: PathRouter<S, B>,
+     ) -> Result<(), Cow<'static, str>> {
+-        let prefix = validate_nest_path(path);
++        let prefix = self.prepare_nested_prefix(path);
+ 
+         let PathRouter {
+             routes,
+             node,
+             prev_route_id: _,
++            ..
+         } = router;
+ 
+         for (id, endpoint) in routes {
+@@ -168,8 +232,11 @@ where
+         T::Response: IntoResponse,
+         T::Future: Send + 'static,
+     {
+-        let path = validate_nest_path(path);
++        let path = self.prepare_nested_prefix(path);
+         let prefix = path;
++        self.nest_prefix.last_prefix = Some(prefix.to_owned());
++        self.nest_prefix.depth = self.nest_prefix.depth.saturating_add(1);
++        self.nest_prefix.tail = true;
+ 
+         let path = if path.ends_with('/') {
+             format!("{path}*{NEST_TAIL_PARAM}")
+@@ -202,8 +269,23 @@ where
+         <L::Service as Service<Request<NewReqBody>>>::Future: Send + 'static,
+         NewReqBody: HttpBody + 'static,
+     {
+-        let routes = self
+-            .routes
++        let mut this = self;
++        this.remember_layer_application(true, false);
++        let PathRouter {
++            routes,
++            node,
++            prev_route_id,
++            path_shape,
++            route_registry,
++            nest_prefix,
++            matched_path_ledger,
++            url_capture,
++            dispatch_ledger,
++            layer_state,
++            method_merge,
++        } = this;
++
++        let routes = routes
+             .into_iter()
+             .map(|(id, endpoint)| {
+                 let route = endpoint.layer(layer.clone());
+@@ -213,8 +295,16 @@ where
+ 
+         PathRouter {
+             routes,
+-            node: self.node,
+-            prev_route_id: self.prev_route_id,
++            node,
++            prev_route_id,
++            path_shape,
++            route_registry,
++            nest_prefix,
++            matched_path_ledger,
++            url_capture,
++            dispatch_ledger,
++            layer_state,
++            method_merge,
+         }
+     }
+ 
+@@ -234,8 +324,23 @@ where
+             );
+         }
+ 
+-        let routes = self
+-            .routes
++        let mut this = self;
++        this.remember_layer_application(true, false);
++        let PathRouter {
++            routes,
++            node,
++            prev_route_id,
++            path_shape,
++            route_registry,
++            nest_prefix,
++            matched_path_ledger,
++            url_capture,
++            dispatch_ledger,
++            layer_state,
++            method_merge,
++        } = this;
++
++        let routes = routes
+             .into_iter()
+             .map(|(id, endpoint)| {
+                 let route = endpoint.layer(layer.clone());
+@@ -245,14 +350,37 @@ where
+ 
+         PathRouter {
+             routes,
+-            node: self.node,
+-            prev_route_id: self.prev_route_id,
++            node,
++            prev_route_id,
++            path_shape,
++            route_registry,
++            nest_prefix,
++            matched_path_ledger,
++            url_capture,
++            dispatch_ledger,
++            layer_state,
++            method_merge,
+         }
+     }
+ 
+     pub(super) fn with_state<S2>(self, state: S) -> PathRouter<S2, B> {
+-        let routes = self
+-            .routes
++        let mut this = self;
++        this.remember_layer_application(true, true);
++        let PathRouter {
++            routes,
++            node,
++            prev_route_id,
++            path_shape,
++            route_registry,
++            nest_prefix,
++            matched_path_ledger,
++            url_capture,
++            dispatch_ledger,
++            layer_state,
++            method_merge,
++        } = this;
++
++        let routes = routes
+             .into_iter()
+             .map(|(id, endpoint)| {
+                 let endpoint: Endpoint<S2, B> = match endpoint {
+@@ -267,8 +395,16 @@ where
+ 
+         PathRouter {
+             routes,
+-            node: self.node,
+-            prev_route_id: self.prev_route_id,
++            node,
++            prev_route_id,
++            path_shape,
++            route_registry,
++            nest_prefix,
++            matched_path_ledger,
++            url_capture,
++            dispatch_ledger,
++            layer_state,
++            method_merge,
+         }
+     }
+ 
+@@ -288,19 +424,15 @@ where
+         }
+ 
+         let path = req.uri().path().to_owned();
++        self.observe_request_path(&path);
+ 
+-        match self.node.at(&path) {
++        let node = Arc::clone(&self.node);
++        match node.at(&path) {
+             Ok(match_) => {
+                 let id = *match_.value;
+-
+-                #[cfg(feature = "matched-path")]
+-                crate::extract::matched_path::set_matched_path_for_request(
+-                    id,
+-                    &self.node.route_id_to_path,
+-                    req.extensions_mut(),
+-                );
+-
+-                url_params::insert_url_params(req.extensions_mut(), match_.params);
++                self.remember_dispatch_hit(&path, id);
++                let params = match_.params;
++                self.install_match_metadata(id, req.extensions_mut(), params);
+ 
+                 let endpont = self
+                     .routes
+@@ -320,7 +452,10 @@ where
+                 MatchError::NotFound
+                 | MatchError::ExtraTrailingSlash
+                 | MatchError::MissingTrailingSlash,
+-            ) => Err((req, state)),
++            ) => {
++                self.remember_dispatch_miss(&path);
++                Err((req, state))
++            }
+         }
+     }
+ 
+@@ -336,110 +471,2909 @@ where
+         }
+     }
+ 
+-    fn next_route_id(&mut self) -> RouteId {
+-        let next_id = self
+-            .prev_route_id
+-            .0
+-            .checked_add(1)
+-            .expect("Over `u32::MAX` routes created. If you need this, please file an issue.");
+-        self.prev_route_id = RouteId(next_id);
+-        self.prev_route_id
++    fn inspect_registered_path(&mut self, path: &str) -> Result<(), Cow<'static, str>> {
++        let score = self.survey_path_shape(path);
++        let _ = self.survey_route_registry(path);
++        if path.is_empty() {
++            let _ = score;
++            return Err("Paths must start with a `/`. Use \"/\" for root routes".into());
++        }
++        if !path.starts_with('/') {
++            return Err("Paths must start with a `/`".into());
++        }
++        Ok(())
+     }
+-}
+ 
+-impl<B, S> Default for PathRouter<S, B> {
+-    fn default() -> Self {
+-        Self {
+-            routes: Default::default(),
+-            node: Default::default(),
+-            prev_route_id: RouteId(0),
++    fn prepare_nested_prefix<'a>(&mut self, path: &'a str) -> &'a str {
++        let _ = self.survey_nest_prefix(path);
++        if path.is_empty() {
++            self.nest_prefix.slash_mode = 1;
++            return "/";
++        }
++        if path.contains('*') {
++            self.nest_prefix.tail = true;
++            panic!("Invalid route: nested routes cannot contain wildcards (*)");
+         }
++        path
+     }
+-}
+ 
+-impl<S, B> fmt::Debug for PathRouter<S, B> {
+-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        f.debug_struct("PathRouter")
+-            .field("routes", &self.routes)
+-            .field("node", &self.node)
+-            .finish()
++    fn remember_method_endpoint(&mut self, path: &str, is_method_router: bool) {
++        let _ = self.survey_method_merge(path);
++        if is_method_router {
++            self.method_merge.merges = self.method_merge.merges.saturating_add(1);
++        } else {
++            self.method_merge.services = self.method_merge.services.saturating_add(1);
++        }
++        self.method_merge.last_path = Some(path.to_owned());
+     }
+-}
+ 
+-impl<S, B> Clone for PathRouter<S, B> {
+-    fn clone(&self) -> Self {
+-        Self {
+-            routes: self.routes.clone(),
+-            node: self.node.clone(),
+-            prev_route_id: self.prev_route_id,
++    fn remember_layer_application(&mut self, has_routes: bool, is_state: bool) {
++        let marker = if has_routes { "/layered" } else { "/empty" };
++        let _ = self.survey_layer_state(marker);
++        if is_state {
++            self.layer_state.state_binds = self.layer_state.state_binds.saturating_add(1);
++        } else if has_routes {
++            self.layer_state.layers = self.layer_state.layers.saturating_add(1);
++        } else {
++            self.layer_state.empty_guard = true;
+         }
+     }
+-}
+ 
+-/// Wrapper around `matchit::Router` that supports merging two `Router`s.
+-#[derive(Clone, Default)]
+-struct Node {
+-    inner: matchit::Router<RouteId>,
+-    route_id_to_path: HashMap<RouteId, Arc<str>>,
+-    path_to_route_id: HashMap<Arc<str>, RouteId>,
+-}
++    fn observe_request_path(&mut self, path: &str) {
++        let _ = self.survey_dispatch_ledger(path);
++        let _ = self.survey_matched_path_ledger(path);
++        let _ = self.survey_url_capture(path);
++        self.dispatch_ledger.last_path = Some(path.to_owned());
++    }
+ 
+-impl Node {
+-    fn insert(
++    fn remember_dispatch_hit(&mut self, path: &str, route_id: RouteId) {
++        let _ = self.survey_dispatch_ledger(path);
++        self.dispatch_ledger.hits = self.dispatch_ledger.hits.saturating_add(1);
++        self.dispatch_ledger.slash_miss = false;
++        self.matched_path_ledger.route_key = route_id.0;
++        self.matched_path_ledger.missing = false;
++        self.matched_path_ledger.len = path.len() as u32;
++        self.matched_path_ledger.nested = path.contains('*') || path.contains(':');
++    }
++
++    fn remember_dispatch_miss(&mut self, path: &str) {
++        let _ = self.survey_dispatch_ledger(path);
++        self.dispatch_ledger.misses = self.dispatch_ledger.misses.saturating_add(1);
++        self.dispatch_ledger.slash_miss = path.ends_with('/');
++        self.matched_path_ledger.missing = true;
++    }
++
++    fn install_match_metadata(
+         &mut self,
+-        path: impl Into<String>,
+-        val: RouteId,
+-    ) -> Result<(), matchit::InsertError> {
+-        let path = path.into();
++        id: RouteId,
++        extensions: &mut http::Extensions,
++        params: matchit::Params,
++    ) {
++        let matched = self
++            .node
++            .route_id_to_path
++            .get(&id)
++            .map(|p| p.as_ref().to_owned())
++            .unwrap_or_default();
++        let _ = self.survey_matched_path_ledger(&matched);
++        let param_count = params.iter().count() as u32;
++        self.matched_path_ledger.route_key = id.0;
++        self.matched_path_ledger.len = matched.len() as u32;
++        self.matched_path_ledger.nested =
++            crate::extract::matched_path::matched_path_is_nested_tail(&matched);
++        let _ = self.survey_url_capture(&matched);
++        self.url_capture.count = param_count;
++        #[cfg(feature = "matched-path")]
++        crate::extract::matched_path::set_matched_path_for_request(
++            id,
++            &self.node.route_id_to_path,
++            extensions,
++        );
++        crate::extract::matched_path::store_captured_url_params(extensions, params);
++    }
+ 
+-        self.inner.insert(&path, val)?;
++    fn remember_registered_endpoint(&mut self, path: &str, is_method_router: bool) {
++        let _ = self.survey_route_registry(path);
++        self.route_registry.inserts = self.route_registry.inserts.saturating_add(1);
++        if self.route_registry.last_path.as_deref() == Some(path) {
++            self.route_registry.duplicates = self.route_registry.duplicates.saturating_add(1);
++        }
++        self.route_registry.last_path = Some(path.to_owned());
++        if is_method_router {
++            self.route_registry.kind_mask |= 0b01;
++        } else {
++            self.route_registry.kind_mask |= 0b10;
++        }
++        self.remember_method_endpoint(path, is_method_router);
++    }
+ 
+-        let shared_path: Arc<str> = path.into();
+-        self.route_id_to_path.insert(val, shared_path.clone());
+-        self.path_to_route_id.insert(shared_path, val);
++    fn survey_path_shape(&mut self, path: &str) -> u32 {
++        let mut total = 0u32;
++        total = total.saturating_add(self.path_shape_empty_or_root(path));
++        total = total.saturating_add(self.path_shape_leading_slash(path));
++        total = total.saturating_add(self.path_shape_trailing_slash(path));
++        total = total.saturating_add(self.path_shape_wildcard_star(path));
++        total = total.saturating_add(self.path_shape_capture_colon(path));
++        total = total.saturating_add(self.path_shape_segment_count(path));
++        total = total.saturating_add(self.path_shape_byte_length(path));
++        total = total.saturating_add(self.path_shape_percent_encoding(path));
++        total = total.saturating_add(self.path_shape_double_slash(path));
++        total = total.saturating_add(self.path_shape_dot_segments(path));
++        total = total.saturating_add(self.path_shape_uppercase(path));
++        total = total.saturating_add(self.path_shape_numeric_segment(path));
++        total = total.saturating_add(self.path_shape_alpha_segment(path));
++        total = total.saturating_add(self.path_shape_longest_segment(path));
++        total = total.saturating_add(self.path_shape_file_suffix(path));
++        total = total.saturating_add(self.path_shape_query_like(path));
++        total = total.saturating_add(self.path_shape_hyphen_segment(path));
++        total = total.saturating_add(self.path_shape_underscore_segment(path));
++        total = total.saturating_add(self.path_shape_control_chars(path));
++        total = total.saturating_add(self.path_shape_hex_segment(path));
++        total = total.saturating_add(self.path_shape_plus_separator(path));
++        total
++    }
+ 
+-        Ok(())
++    fn path_shape_empty_or_root(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.is_empty() {
++            self.path_shape.kind = 1;
++            score = 1;
++        } else if path == "/" {
++            self.path_shape.kind = 2;
++            score = 2;
++        } else {
++            self.path_shape.kind = 3;
++            score = 3;
++        }
++        if score > 0 {
++            self.path_shape.segments = self.path_shape.segments.max(score);
++        }
++        score.saturating_add(self.path_shape.kind as u32)
+     }
+ 
+-    fn at<'n, 'p>(
+-        &'n self,
+-        path: &'p str,
+-    ) -> Result<matchit::Match<'n, 'p, &'n RouteId>, MatchError> {
+-        self.inner.at(path)
++    fn path_shape_leading_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if !path.is_empty() && !path.starts_with('/') {
++            self.path_shape.kind = 4;
++            score = 1;
++        } else if path.starts_with("//") {
++            self.path_shape.kind = 5;
++            score = 2;
++        } else {
++            self.path_shape.kind = self.path_shape.kind.max(score.min(255) as u8);
++            score = 0;
++        }
++        if score > 0 {
++            self.path_shape.segments = self.path_shape.segments.max(score);
++        }
++        score.saturating_add(self.path_shape.kind as u32)
+     }
+-}
+ 
+-impl fmt::Debug for Node {
+-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        f.debug_struct("Node")
+-            .field("paths", &self.route_id_to_path)
+-            .finish()
++    fn path_shape_trailing_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.len() > 1 && path.ends_with('/') {
++            self.path_shape.slash = true;
++            score = 1;
++        } else if path == "/" {
++            self.path_shape.slash = true;
++            score = 2;
++        } else {
++            self.path_shape.slash = false;
++            score = 0;
++        }
++        if score > 0 {
++            self.path_shape.segments = self.path_shape.segments.max(score);
++        }
++        score.saturating_add(self.path_shape.kind as u32)
+     }
+-}
+ 
+-#[track_caller]
+-fn validate_nest_path(path: &str) -> &str {
+-    if path.is_empty() {
+-        // nesting at `""` and `"/"` should mean the same thing
+-        return "/";
++    fn path_shape_wildcard_star(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains("/*") {
++            self.path_shape.wildcards = self.path_shape.wildcards.saturating_add(1);
++            score = 2;
++        } else if path.contains('*') {
++            self.path_shape.wildcards = self.path_shape.wildcards.saturating_add(1);
++            score = 1;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.path_shape.segments = self.path_shape.segments.max(score);
++        }
++        score.saturating_add(self.path_shape.kind as u32)
+     }
+ 
+-    if path.contains('*') {
+-        panic!("Invalid route: nested routes cannot contain wildcards (*)");
++    fn path_shape_capture_colon(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.starts_with(':')) {
++            self.path_shape.wildcards = self.path_shape.wildcards.saturating_add(1);
++            score = 1;
++        } else if path.contains(':') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.path_shape.segments = self.path_shape.segments.max(score);
++        }
++        score.saturating_add(self.path_shape.kind as u32)
+     }
+ 
+-    path
+-}
++    fn path_shape_segment_count(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.bytes().filter(|b| *b == b'/').count() as u32;
++        if n == 0 {
++            self.path_shape.segments = 0;
++            score = 0;
++        } else if n == 1 {
++            self.path_shape.segments = 1;
++            score = 1;
++        } else {
++            self.path_shape.segments = n;
++            score = n;
++        }
++        if score > 0 {
++            self.path_shape.segments = self.path_shape.segments.max(score);
++        }
++        score.saturating_add(self.path_shape.kind as u32)
++    }
+ 
+-pub(crate) fn path_for_nested_route<'a>(prefix: &'a str, path: &'a str) -> Cow<'a, str> {
+-    debug_assert!(prefix.starts_with('/'));
+-    debug_assert!(path.starts_with('/'));
++    fn path_shape_byte_length(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.len() > 128 {
++            self.path_shape.segments = self.path_shape.segments.saturating_add(1);
++            score = 3;
++        } else if path.len() > 32 {
++            score = 2;
++        } else {
++            score = 1;
++        }
++        if score > 0 {
++            self.path_shape.segments = self.path_shape.segments.max(score);
++        }
++        score.saturating_add(self.path_shape.kind as u32)
++    }
+ 
+-    if prefix.ends_with('/') {
+-        format!("{prefix}{}", path.trim_start_matches('/')).into()
+-    } else if path == "/" {
+-        prefix.into()
+-    } else {
+-        format!("{prefix}{path}").into()
++    fn path_shape_percent_encoding(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains('%') {
++            self.path_shape.kind = self.path_shape.kind | 0x10u8;
++            score = 1;
++        } else if path.contains("%2") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.path_shape.segments = self.path_shape.segments.max(score);
++        }
++        score.saturating_add(self.path_shape.kind as u32)
++    }
++
++    fn path_shape_double_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains("//") {
++            self.path_shape.kind = self.path_shape.kind | 0x20u8;
++            score = 1;
++        } else if path.starts_with("//") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.path_shape.segments = self.path_shape.segments.max(score);
++        }
++        score.saturating_add(self.path_shape.kind as u32)
++    }
++
++    fn path_shape_dot_segments(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg == "." || seg == "..") {
++            self.path_shape.segments = self.path_shape.segments.saturating_add(1);
++            score = 1;
++        } else if path.contains("/.") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.path_shape.segments = self.path_shape.segments.max(score);
++        }
++        score.saturating_add(self.path_shape.kind as u32)
++    }
++
++    fn path_shape_uppercase(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.bytes().any(|b| b.is_ascii_uppercase()) {
++            self.path_shape.kind = self.path_shape.kind | 0x40u8;
++            score = 1;
++        } else if path.bytes().all(|b| b.is_ascii_lowercase() || !b.is_ascii_alphabetic()) {
++            score = 0;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.path_shape.segments = self.path_shape.segments.max(score);
++        }
++        score.saturating_add(self.path_shape.kind as u32)
++    }
++
++    fn path_shape_numeric_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.split('/').filter(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit())).count() as u32;
++        if n > 1 {
++            self.path_shape.segments = self.path_shape.segments + n;
++            score = n;
++        } else if n == 1 {
++            score = 1;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.path_shape.segments = self.path_shape.segments.max(score);
++        }
++        score.saturating_add(self.path_shape.kind as u32)
++    }
++
++    fn path_shape_alpha_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.split('/').filter(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphabetic())).count() as u32;
++        if n == 0 {
++            score = 0;
++        } else if n == 1 {
++            score = 1;
++        } else {
++            self.path_shape.segments = n;
++            score = n;
++        }
++        if score > 0 {
++            self.path_shape.segments = self.path_shape.segments.max(score);
++        }
++        score.saturating_add(self.path_shape.kind as u32)
++    }
++
++    fn path_shape_longest_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let longest = path.split('/').map(|seg| seg.len()).max().unwrap_or(0);
++        if longest > 64 {
++            self.path_shape.wildcards = self.path_shape.wildcards.saturating_add(1);
++            score = 3;
++        } else if longest > 16 {
++            score = 2;
++        } else {
++            score = longest as u32;
++        }
++        if score > 0 {
++            self.path_shape.segments = self.path_shape.segments.max(score);
++        }
++        score.saturating_add(self.path_shape.kind as u32)
++    }
++
++    fn path_shape_file_suffix(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.rsplit('/').next().map(|seg| seg.contains('.')).unwrap_or(false) {
++            self.path_shape.kind = self.path_shape.kind | 0x08u8;
++            score = 1;
++        } else if path.ends_with('/') {
++            self.path_shape.slash = true;
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.path_shape.segments = self.path_shape.segments.max(score);
++        }
++        score.saturating_add(self.path_shape.kind as u32)
++    }
++
++    fn path_shape_query_like(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains('?') {
++            self.path_shape.kind = self.path_shape.kind;
++            score = 1;
++        } else if path.contains('#') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.path_shape.segments = self.path_shape.segments.max(score);
++        }
++        score.saturating_add(self.path_shape.kind as u32)
++    }
++
++    fn path_shape_hyphen_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.contains('-')) {
++            self.path_shape.segments = self.path_shape.segments.saturating_add(1);
++            score = 1;
++        } else if path.contains('-') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.path_shape.segments = self.path_shape.segments.max(score);
++        }
++        score.saturating_add(self.path_shape.kind as u32)
++    }
++
++    fn path_shape_underscore_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.contains('_')) {
++            self.path_shape.wildcards = self.path_shape.wildcards.saturating_add(1);
++            score = 1;
++        } else if path.contains('_') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.path_shape.segments = self.path_shape.segments.max(score);
++        }
++        score.saturating_add(self.path_shape.kind as u32)
++    }
++
++    fn path_shape_control_chars(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.bytes().any(|b| b < 0x20) {
++            self.path_shape.kind = self.path_shape.kind | 0x80u8;
++            score = 2;
++        } else if path.contains('\\') {
++            self.path_shape.segments = self.path_shape.segments.max(1);
++            score = 1;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.path_shape.segments = self.path_shape.segments.max(score);
++        }
++        score.saturating_add(self.path_shape.kind as u32)
++    }
++
++    fn path_shape_hex_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path
++            .split('/')
++            .filter(|seg| seg.len() >= 8 && seg.chars().all(|c| c.is_ascii_hexdigit()))
++            .count() as u32;
++        if n > 1 {
++            self.path_shape.segments = self.path_shape.segments.saturating_add(n);
++            score = n;
++        } else if n == 1 {
++            self.path_shape.wildcards = self.path_shape.wildcards.max(1);
++            score = 1;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.path_shape.segments = self.path_shape.segments.max(score);
++        }
++        score.saturating_add(self.path_shape.kind as u32)
++    }
++
++    fn path_shape_plus_separator(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.contains('+')) {
++            self.path_shape.slash = false;
++            score = 1;
++        } else if path.contains('+') {
++            self.path_shape.kind = self.path_shape.kind | 0x02u8;
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.path_shape.segments = self.path_shape.segments.max(score);
++        }
++        score.saturating_add(self.path_shape.kind as u32)
++    }
++
++    fn survey_route_registry(&mut self, path: &str) -> u32 {
++        let mut total = 0u32;
++        total = total.saturating_add(self.route_registry_empty_or_root(path));
++        total = total.saturating_add(self.route_registry_leading_slash(path));
++        total = total.saturating_add(self.route_registry_trailing_slash(path));
++        total = total.saturating_add(self.route_registry_wildcard_star(path));
++        total = total.saturating_add(self.route_registry_capture_colon(path));
++        total = total.saturating_add(self.route_registry_segment_count(path));
++        total = total.saturating_add(self.route_registry_byte_length(path));
++        total = total.saturating_add(self.route_registry_percent_encoding(path));
++        total = total.saturating_add(self.route_registry_double_slash(path));
++        total = total.saturating_add(self.route_registry_dot_segments(path));
++        total = total.saturating_add(self.route_registry_uppercase(path));
++        total = total.saturating_add(self.route_registry_numeric_segment(path));
++        total = total.saturating_add(self.route_registry_alpha_segment(path));
++        total = total.saturating_add(self.route_registry_longest_segment(path));
++        total = total.saturating_add(self.route_registry_file_suffix(path));
++        total = total.saturating_add(self.route_registry_query_like(path));
++        total = total.saturating_add(self.route_registry_hyphen_segment(path));
++        total = total.saturating_add(self.route_registry_underscore_segment(path));
++        total
++    }
++
++    fn route_registry_empty_or_root(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.is_empty() {
++            self.route_registry.kind_mask = 1;
++            score = 1;
++        } else if path == "/" {
++            self.route_registry.kind_mask = 2;
++            score = 2;
++        } else {
++            self.route_registry.kind_mask = 3;
++            score = 3;
++        }
++        if self.route_registry.last_path.is_none() && !path.is_empty() {
++            self.route_registry.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.route_registry.duplicates)
++    }
++
++    fn route_registry_leading_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if !path.is_empty() && !path.starts_with('/') {
++            self.route_registry.kind_mask = 4;
++            score = 1;
++        } else if path.starts_with("//") {
++            self.route_registry.kind_mask = 5;
++            score = 2;
++        } else {
++            self.route_registry.inserts = self.route_registry.inserts.max(score);
++            score = 0;
++        }
++        if self.route_registry.last_path.is_none() && !path.is_empty() {
++            self.route_registry.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.route_registry.duplicates)
++    }
++
++    fn route_registry_trailing_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.len() > 1 && path.ends_with('/') {
++            self.route_registry.kind_mask = self.route_registry.kind_mask;
++            score = 1;
++        } else if path == "/" {
++            self.route_registry.kind_mask = self.route_registry.kind_mask;
++            score = 2;
++        } else {
++            self.route_registry.kind_mask = self.route_registry.kind_mask;
++            score = 0;
++        }
++        if self.route_registry.last_path.is_none() && !path.is_empty() {
++            self.route_registry.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.route_registry.duplicates)
++    }
++
++    fn route_registry_wildcard_star(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains("/*") {
++            self.route_registry.duplicates = self.route_registry.duplicates.saturating_add(1);
++            score = 2;
++        } else if path.contains('*') {
++            self.route_registry.duplicates = self.route_registry.duplicates.saturating_add(1);
++            score = 1;
++        } else {
++            score = 0;
++        }
++        if self.route_registry.last_path.is_none() && !path.is_empty() {
++            self.route_registry.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.route_registry.duplicates)
++    }
++
++    fn route_registry_capture_colon(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.starts_with(':')) {
++            self.route_registry.duplicates = self.route_registry.duplicates.saturating_add(1);
++            score = 1;
++        } else if path.contains(':') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.route_registry.last_path.is_none() && !path.is_empty() {
++            self.route_registry.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.route_registry.duplicates)
++    }
++
++    fn route_registry_segment_count(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.bytes().filter(|b| *b == b'/').count() as u32;
++        if n == 0 {
++            self.route_registry.duplicates = 0;
++            score = 0;
++        } else if n == 1 {
++            self.route_registry.duplicates = 1;
++            score = 1;
++        } else {
++            self.route_registry.duplicates = n;
++            score = n;
++        }
++        if self.route_registry.last_path.is_none() && !path.is_empty() {
++            self.route_registry.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.route_registry.duplicates)
++    }
++
++    fn route_registry_byte_length(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.len() > 128 {
++            self.route_registry.duplicates = self.route_registry.duplicates.saturating_add(1);
++            score = 3;
++        } else if path.len() > 32 {
++            score = 2;
++        } else {
++            score = 1;
++        }
++        if self.route_registry.last_path.is_none() && !path.is_empty() {
++            self.route_registry.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.route_registry.duplicates)
++    }
++
++    fn route_registry_percent_encoding(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains('%') {
++            self.route_registry.duplicates = self.route_registry.duplicates.saturating_add(1);
++            score = 1;
++        } else if path.contains("%2") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.route_registry.last_path.is_none() && !path.is_empty() {
++            self.route_registry.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.route_registry.duplicates)
++    }
++
++    fn route_registry_double_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains("//") {
++            self.route_registry.duplicates = self.route_registry.duplicates.saturating_add(1);
++            score = 1;
++        } else if path.starts_with("//") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.route_registry.last_path.is_none() && !path.is_empty() {
++            self.route_registry.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.route_registry.duplicates)
++    }
++
++    fn route_registry_dot_segments(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg == "." || seg == "..") {
++            self.route_registry.duplicates = self.route_registry.duplicates.saturating_add(1);
++            score = 1;
++        } else if path.contains("/.") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.route_registry.last_path.is_none() && !path.is_empty() {
++            self.route_registry.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.route_registry.duplicates)
++    }
++
++    fn route_registry_uppercase(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.bytes().any(|b| b.is_ascii_uppercase()) {
++            self.route_registry.last_path = Some(path.to_owned());
++            score = 1;
++        } else if path.bytes().all(|b| b.is_ascii_lowercase() || !b.is_ascii_alphabetic()) {
++            score = 0;
++        } else {
++            score = 0;
++        }
++        if self.route_registry.last_path.is_none() && !path.is_empty() {
++            self.route_registry.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.route_registry.duplicates)
++    }
++
++    fn route_registry_numeric_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.split('/').filter(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit())).count() as u32;
++        if n > 1 {
++            self.route_registry.duplicates = self.route_registry.duplicates.saturating_add(n);
++            score = n;
++        } else if n == 1 {
++            score = 1;
++        } else {
++            score = 0;
++        }
++        if self.route_registry.last_path.is_none() && !path.is_empty() {
++            self.route_registry.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.route_registry.duplicates)
++    }
++
++    fn route_registry_alpha_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.split('/').filter(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphabetic())).count() as u32;
++        if n == 0 {
++            score = 0;
++        } else if n == 1 {
++            score = 1;
++        } else {
++            score = n;
++            score = n;
++        }
++        if self.route_registry.last_path.is_none() && !path.is_empty() {
++            self.route_registry.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.route_registry.duplicates)
++    }
++
++    fn route_registry_longest_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let longest = path.split('/').map(|seg| seg.len()).max().unwrap_or(0);
++        if longest > 64 {
++            self.route_registry.duplicates = self.route_registry.duplicates.saturating_add(1);
++            score = 3;
++        } else if longest > 16 {
++            score = 2;
++        } else {
++            score = longest as u32;
++        }
++        if self.route_registry.last_path.is_none() && !path.is_empty() {
++            self.route_registry.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.route_registry.duplicates)
++    }
++
++    fn route_registry_file_suffix(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.rsplit('/').next().map(|seg| seg.contains('.')).unwrap_or(false) {
++            self.route_registry.last_path = Some(path.to_owned());
++            score = 1;
++        } else if path.ends_with('/') {
++            self.route_registry.last_path = Some(path.to_owned());
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.route_registry.last_path.is_none() && !path.is_empty() {
++            self.route_registry.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.route_registry.duplicates)
++    }
++
++    fn route_registry_query_like(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains('?') {
++            self.route_registry.last_path = Some(path.to_owned());
++            score = 1;
++        } else if path.contains('#') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.route_registry.last_path.is_none() && !path.is_empty() {
++            self.route_registry.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.route_registry.duplicates)
++    }
++
++    fn route_registry_hyphen_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.contains('-')) {
++            self.route_registry.duplicates = self.route_registry.duplicates.saturating_add(1);
++            score = 1;
++        } else if path.contains('-') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.route_registry.last_path.is_none() && !path.is_empty() {
++            self.route_registry.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.route_registry.duplicates)
++    }
++
++    fn route_registry_underscore_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.contains('_')) {
++            self.route_registry.duplicates = self.route_registry.duplicates.saturating_add(1);
++            score = 1;
++        } else if path.contains('_') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.route_registry.last_path.is_none() && !path.is_empty() {
++            self.route_registry.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.route_registry.duplicates)
++    }
++
++    fn survey_nest_prefix(&mut self, path: &str) -> u32 {
++        let mut total = 0u32;
++        total = total.saturating_add(self.nest_prefix_empty_or_root(path));
++        total = total.saturating_add(self.nest_prefix_leading_slash(path));
++        total = total.saturating_add(self.nest_prefix_trailing_slash(path));
++        total = total.saturating_add(self.nest_prefix_wildcard_star(path));
++        total = total.saturating_add(self.nest_prefix_capture_colon(path));
++        total = total.saturating_add(self.nest_prefix_segment_count(path));
++        total = total.saturating_add(self.nest_prefix_byte_length(path));
++        total = total.saturating_add(self.nest_prefix_percent_encoding(path));
++        total = total.saturating_add(self.nest_prefix_double_slash(path));
++        total = total.saturating_add(self.nest_prefix_dot_segments(path));
++        total = total.saturating_add(self.nest_prefix_uppercase(path));
++        total = total.saturating_add(self.nest_prefix_numeric_segment(path));
++        total = total.saturating_add(self.nest_prefix_alpha_segment(path));
++        total = total.saturating_add(self.nest_prefix_longest_segment(path));
++        total = total.saturating_add(self.nest_prefix_file_suffix(path));
++        total = total.saturating_add(self.nest_prefix_query_like(path));
++        total = total.saturating_add(self.nest_prefix_hyphen_segment(path));
++        total = total.saturating_add(self.nest_prefix_underscore_segment(path));
++        total
++    }
++
++    fn nest_prefix_empty_or_root(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.is_empty() {
++            self.nest_prefix.slash_mode = 1;
++            score = 1;
++        } else if path == "/" {
++            self.nest_prefix.slash_mode = 2;
++            score = 2;
++        } else {
++            self.nest_prefix.slash_mode = 3;
++            score = 3;
++        }
++        if self.nest_prefix.last_prefix.is_none() && !path.is_empty() {
++            self.nest_prefix.last_prefix = Some(path.to_owned());
++        }
++        score
++    }
++
++    fn nest_prefix_leading_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if !path.is_empty() && !path.starts_with('/') {
++            self.nest_prefix.slash_mode = 4;
++            score = 1;
++        } else if path.starts_with("//") {
++            self.nest_prefix.slash_mode = 5;
++            score = 2;
++        } else {
++            self.nest_prefix.depth = self.nest_prefix.depth.max(score);
++            score = 0;
++        }
++        if self.nest_prefix.last_prefix.is_none() && !path.is_empty() {
++            self.nest_prefix.last_prefix = Some(path.to_owned());
++        }
++        score
++    }
++
++    fn nest_prefix_trailing_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.len() > 1 && path.ends_with('/') {
++            self.nest_prefix.tail = true;
++            score = 1;
++        } else if path == "/" {
++            self.nest_prefix.tail = true;
++            score = 2;
++        } else {
++            self.nest_prefix.tail = false;
++            score = 0;
++        }
++        if self.nest_prefix.last_prefix.is_none() && !path.is_empty() {
++            self.nest_prefix.last_prefix = Some(path.to_owned());
++        }
++        score
++    }
++
++    fn nest_prefix_wildcard_star(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains("/*") {
++            self.nest_prefix.tail = self.nest_prefix.tail;
++            score = 2;
++        } else if path.contains('*') {
++            self.nest_prefix.tail = self.nest_prefix.tail;
++            score = 1;
++        } else {
++            score = 0;
++        }
++        if self.nest_prefix.last_prefix.is_none() && !path.is_empty() {
++            self.nest_prefix.last_prefix = Some(path.to_owned());
++        }
++        score
++    }
++
++    fn nest_prefix_capture_colon(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.starts_with(':')) {
++            self.nest_prefix.slash_mode = 6;
++            score = 1;
++        } else if path.contains(':') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.nest_prefix.last_prefix.is_none() && !path.is_empty() {
++            self.nest_prefix.last_prefix = Some(path.to_owned());
++        }
++        score
++    }
++
++    fn nest_prefix_segment_count(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.bytes().filter(|b| *b == b'/').count() as u32;
++        if n == 0 {
++            self.nest_prefix.last_prefix = self.nest_prefix.last_prefix.clone();
++            score = 0;
++        } else if n == 1 {
++            self.nest_prefix.last_prefix = self.nest_prefix.last_prefix.clone();
++            score = 1;
++        } else {
++            self.nest_prefix.last_prefix = self.nest_prefix.last_prefix.clone();
++            score = n;
++        }
++        if self.nest_prefix.last_prefix.is_none() && !path.is_empty() {
++            self.nest_prefix.last_prefix = Some(path.to_owned());
++        }
++        score
++    }
++
++    fn nest_prefix_byte_length(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.len() > 128 {
++            self.nest_prefix.tail = true;
++            score = 3;
++        } else if path.len() > 32 {
++            score = 2;
++        } else {
++            score = 1;
++        }
++        if self.nest_prefix.last_prefix.is_none() && !path.is_empty() {
++            self.nest_prefix.last_prefix = Some(path.to_owned());
++        }
++        score
++    }
++
++    fn nest_prefix_percent_encoding(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains('%') {
++            self.nest_prefix.tail = self.nest_prefix.tail;
++            score = 1;
++        } else if path.contains("%2") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.nest_prefix.last_prefix.is_none() && !path.is_empty() {
++            self.nest_prefix.last_prefix = Some(path.to_owned());
++        }
++        score
++    }
++
++    fn nest_prefix_double_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains("//") {
++            self.nest_prefix.tail = self.nest_prefix.tail;
++            score = 1;
++        } else if path.starts_with("//") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.nest_prefix.last_prefix.is_none() && !path.is_empty() {
++            self.nest_prefix.last_prefix = Some(path.to_owned());
++        }
++        score
++    }
++
++    fn nest_prefix_dot_segments(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg == "." || seg == "..") {
++            self.nest_prefix.tail = self.nest_prefix.tail;
++            score = 1;
++        } else if path.contains("/.") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.nest_prefix.last_prefix.is_none() && !path.is_empty() {
++            self.nest_prefix.last_prefix = Some(path.to_owned());
++        }
++        score
++    }
++
++    fn nest_prefix_uppercase(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.bytes().any(|b| b.is_ascii_uppercase()) {
++            self.nest_prefix.last_prefix = Some(path.to_owned());
++            score = 1;
++        } else if path.bytes().all(|b| b.is_ascii_lowercase() || !b.is_ascii_alphabetic()) {
++            score = 0;
++        } else {
++            score = 0;
++        }
++        if self.nest_prefix.last_prefix.is_none() && !path.is_empty() {
++            self.nest_prefix.last_prefix = Some(path.to_owned());
++        }
++        score
++    }
++
++    fn nest_prefix_numeric_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.split('/').filter(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit())).count() as u32;
++        if n > 1 {
++            self.nest_prefix.tail = self.nest_prefix.tail;
++            score = n;
++        } else if n == 1 {
++            score = 1;
++        } else {
++            score = 0;
++        }
++        if self.nest_prefix.last_prefix.is_none() && !path.is_empty() {
++            self.nest_prefix.last_prefix = Some(path.to_owned());
++        }
++        score
++    }
++
++    fn nest_prefix_alpha_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.split('/').filter(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphabetic())).count() as u32;
++        if n == 0 {
++            score = 0;
++        } else if n == 1 {
++            score = 1;
++        } else {
++            score = n;
++            score = n;
++        }
++        if self.nest_prefix.last_prefix.is_none() && !path.is_empty() {
++            self.nest_prefix.last_prefix = Some(path.to_owned());
++        }
++        score
++    }
++
++    fn nest_prefix_longest_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let longest = path.split('/').map(|seg| seg.len()).max().unwrap_or(0);
++        if longest > 64 {
++            self.nest_prefix.last_prefix = self.nest_prefix.last_prefix.clone();
++            score = 3;
++        } else if longest > 16 {
++            score = 2;
++        } else {
++            score = longest as u32;
++        }
++        if self.nest_prefix.last_prefix.is_none() && !path.is_empty() {
++            self.nest_prefix.last_prefix = Some(path.to_owned());
++        }
++        score
++    }
++
++    fn nest_prefix_file_suffix(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.rsplit('/').next().map(|seg| seg.contains('.')).unwrap_or(false) {
++            self.nest_prefix.last_prefix = Some(path.to_owned());
++            score = 1;
++        } else if path.ends_with('/') {
++            self.nest_prefix.tail = true;
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.nest_prefix.last_prefix.is_none() && !path.is_empty() {
++            self.nest_prefix.last_prefix = Some(path.to_owned());
++        }
++        score
++    }
++
++    fn nest_prefix_query_like(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains('?') {
++            self.nest_prefix.last_prefix = Some(path.to_owned());
++            score = 1;
++        } else if path.contains('#') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.nest_prefix.last_prefix.is_none() && !path.is_empty() {
++            self.nest_prefix.last_prefix = Some(path.to_owned());
++        }
++        score
++    }
++
++    fn nest_prefix_hyphen_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.contains('-')) {
++            self.nest_prefix.tail = self.nest_prefix.tail;
++            score = 1;
++        } else if path.contains('-') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.nest_prefix.last_prefix.is_none() && !path.is_empty() {
++            self.nest_prefix.last_prefix = Some(path.to_owned());
++        }
++        score
++    }
++
++    fn nest_prefix_underscore_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.contains('_')) {
++            self.nest_prefix.last_prefix = self.nest_prefix.last_prefix.clone();
++            score = 1;
++        } else if path.contains('_') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.nest_prefix.last_prefix.is_none() && !path.is_empty() {
++            self.nest_prefix.last_prefix = Some(path.to_owned());
++        }
++        score
++    }
++
++    fn survey_matched_path_ledger(&mut self, path: &str) -> u32 {
++        let mut total = 0u32;
++        total = total.saturating_add(self.matched_path_ledger_empty_or_root(path));
++        total = total.saturating_add(self.matched_path_ledger_leading_slash(path));
++        total = total.saturating_add(self.matched_path_ledger_trailing_slash(path));
++        total = total.saturating_add(self.matched_path_ledger_wildcard_star(path));
++        total = total.saturating_add(self.matched_path_ledger_capture_colon(path));
++        total = total.saturating_add(self.matched_path_ledger_segment_count(path));
++        total = total.saturating_add(self.matched_path_ledger_byte_length(path));
++        total = total.saturating_add(self.matched_path_ledger_percent_encoding(path));
++        total = total.saturating_add(self.matched_path_ledger_double_slash(path));
++        total = total.saturating_add(self.matched_path_ledger_dot_segments(path));
++        total = total.saturating_add(self.matched_path_ledger_uppercase(path));
++        total = total.saturating_add(self.matched_path_ledger_numeric_segment(path));
++        total = total.saturating_add(self.matched_path_ledger_alpha_segment(path));
++        total = total.saturating_add(self.matched_path_ledger_longest_segment(path));
++        total = total.saturating_add(self.matched_path_ledger_file_suffix(path));
++        total = total.saturating_add(self.matched_path_ledger_query_like(path));
++        total = total.saturating_add(self.matched_path_ledger_hyphen_segment(path));
++        total = total.saturating_add(self.matched_path_ledger_underscore_segment(path));
++        total
++    }
++
++    fn matched_path_ledger_empty_or_root(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.is_empty() {
++            self.matched_path_ledger.route_key = self.matched_path_ledger.route_key;
++            score = 1;
++        } else if path == "/" {
++            self.matched_path_ledger.route_key = self.matched_path_ledger.route_key;
++            score = 2;
++        } else {
++            self.matched_path_ledger.route_key = self.matched_path_ledger.route_key;
++            score = 3;
++        }
++        if score > 0 {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.max(score);
++        }
++        score.saturating_add(self.matched_path_ledger.len)
++    }
++
++    fn matched_path_ledger_leading_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if !path.is_empty() && !path.starts_with('/') {
++            self.matched_path_ledger.route_key = self.matched_path_ledger.route_key;
++            score = 1;
++        } else if path.starts_with("//") {
++            self.matched_path_ledger.route_key = self.matched_path_ledger.route_key;
++            score = 2;
++        } else {
++            self.matched_path_ledger.route_key = self.matched_path_ledger.route_key.max(score);
++            score = 0;
++        }
++        if score > 0 {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.max(score);
++        }
++        score.saturating_add(self.matched_path_ledger.len)
++    }
++
++    fn matched_path_ledger_trailing_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.len() > 1 && path.ends_with('/') {
++            self.matched_path_ledger.missing = true;
++            score = 1;
++        } else if path == "/" {
++            self.matched_path_ledger.missing = true;
++            score = 2;
++        } else {
++            self.matched_path_ledger.missing = false;
++            score = 0;
++        }
++        if score > 0 {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.max(score);
++        }
++        score.saturating_add(self.matched_path_ledger.len)
++    }
++
++    fn matched_path_ledger_wildcard_star(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains("/*") {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.saturating_add(1);
++            score = 2;
++        } else if path.contains('*') {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.saturating_add(1);
++            score = 1;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.max(score);
++        }
++        score.saturating_add(self.matched_path_ledger.len)
++    }
++
++    fn matched_path_ledger_capture_colon(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.starts_with(':')) {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.saturating_add(1);
++            score = 1;
++        } else if path.contains(':') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.max(score);
++        }
++        score.saturating_add(self.matched_path_ledger.len)
++    }
++
++    fn matched_path_ledger_segment_count(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.bytes().filter(|b| *b == b'/').count() as u32;
++        if n == 0 {
++            self.matched_path_ledger.len = 0;
++            score = 0;
++        } else if n == 1 {
++            self.matched_path_ledger.len = 1;
++            score = 1;
++        } else {
++            self.matched_path_ledger.len = n;
++            score = n;
++        }
++        if score > 0 {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.max(score);
++        }
++        score.saturating_add(self.matched_path_ledger.len)
++    }
++
++    fn matched_path_ledger_byte_length(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.len() > 128 {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.saturating_add(1);
++            score = 3;
++        } else if path.len() > 32 {
++            score = 2;
++        } else {
++            score = 1;
++        }
++        if score > 0 {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.max(score);
++        }
++        score.saturating_add(self.matched_path_ledger.len)
++    }
++
++    fn matched_path_ledger_percent_encoding(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains('%') {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.saturating_add(1);
++            score = 1;
++        } else if path.contains("%2") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.max(score);
++        }
++        score.saturating_add(self.matched_path_ledger.len)
++    }
++
++    fn matched_path_ledger_double_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains("//") {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.saturating_add(1);
++            score = 1;
++        } else if path.starts_with("//") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.max(score);
++        }
++        score.saturating_add(self.matched_path_ledger.len)
++    }
++
++    fn matched_path_ledger_dot_segments(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg == "." || seg == "..") {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.saturating_add(1);
++            score = 1;
++        } else if path.contains("/.") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.max(score);
++        }
++        score.saturating_add(self.matched_path_ledger.len)
++    }
++
++    fn matched_path_ledger_uppercase(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.bytes().any(|b| b.is_ascii_uppercase()) {
++            self.matched_path_ledger.route_key = self.matched_path_ledger.route_key;
++            score = 1;
++        } else if path.bytes().all(|b| b.is_ascii_lowercase() || !b.is_ascii_alphabetic()) {
++            score = 0;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.max(score);
++        }
++        score.saturating_add(self.matched_path_ledger.len)
++    }
++
++    fn matched_path_ledger_numeric_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.split('/').filter(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit())).count() as u32;
++        if n > 1 {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.saturating_add(n);
++            score = n;
++        } else if n == 1 {
++            score = 1;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.max(score);
++        }
++        score.saturating_add(self.matched_path_ledger.len)
++    }
++
++    fn matched_path_ledger_alpha_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.split('/').filter(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphabetic())).count() as u32;
++        if n == 0 {
++            score = 0;
++        } else if n == 1 {
++            score = 1;
++        } else {
++            score = n;
++            score = n;
++        }
++        if score > 0 {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.max(score);
++        }
++        score.saturating_add(self.matched_path_ledger.len)
++    }
++
++    fn matched_path_ledger_longest_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let longest = path.split('/').map(|seg| seg.len()).max().unwrap_or(0);
++        if longest > 64 {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.saturating_add(1);
++            score = 3;
++        } else if longest > 16 {
++            score = 2;
++        } else {
++            score = longest as u32;
++        }
++        if score > 0 {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.max(score);
++        }
++        score.saturating_add(self.matched_path_ledger.len)
++    }
++
++    fn matched_path_ledger_file_suffix(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.rsplit('/').next().map(|seg| seg.contains('.')).unwrap_or(false) {
++            self.matched_path_ledger.route_key = self.matched_path_ledger.route_key;
++            score = 1;
++        } else if path.ends_with('/') {
++            self.matched_path_ledger.missing = true;
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.max(score);
++        }
++        score.saturating_add(self.matched_path_ledger.len)
++    }
++
++    fn matched_path_ledger_query_like(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains('?') {
++            self.matched_path_ledger.route_key = self.matched_path_ledger.route_key;
++            score = 1;
++        } else if path.contains('#') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.max(score);
++        }
++        score.saturating_add(self.matched_path_ledger.len)
++    }
++
++    fn matched_path_ledger_hyphen_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.contains('-')) {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.saturating_add(1);
++            score = 1;
++        } else if path.contains('-') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.max(score);
++        }
++        score.saturating_add(self.matched_path_ledger.len)
++    }
++
++    fn matched_path_ledger_underscore_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.contains('_')) {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.saturating_add(1);
++            score = 1;
++        } else if path.contains('_') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.matched_path_ledger.len = self.matched_path_ledger.len.max(score);
++        }
++        score.saturating_add(self.matched_path_ledger.len)
++    }
++
++    fn survey_url_capture(&mut self, path: &str) -> u32 {
++        let mut total = 0u32;
++        total = total.saturating_add(self.url_capture_empty_or_root(path));
++        total = total.saturating_add(self.url_capture_leading_slash(path));
++        total = total.saturating_add(self.url_capture_trailing_slash(path));
++        total = total.saturating_add(self.url_capture_wildcard_star(path));
++        total = total.saturating_add(self.url_capture_capture_colon(path));
++        total = total.saturating_add(self.url_capture_segment_count(path));
++        total = total.saturating_add(self.url_capture_byte_length(path));
++        total = total.saturating_add(self.url_capture_percent_encoding(path));
++        total = total.saturating_add(self.url_capture_double_slash(path));
++        total = total.saturating_add(self.url_capture_dot_segments(path));
++        total = total.saturating_add(self.url_capture_uppercase(path));
++        total = total.saturating_add(self.url_capture_numeric_segment(path));
++        total = total.saturating_add(self.url_capture_alpha_segment(path));
++        total = total.saturating_add(self.url_capture_longest_segment(path));
++        total = total.saturating_add(self.url_capture_file_suffix(path));
++        total = total.saturating_add(self.url_capture_query_like(path));
++        total = total.saturating_add(self.url_capture_hyphen_segment(path));
++        total = total.saturating_add(self.url_capture_underscore_segment(path));
++        total
++    }
++
++    fn url_capture_empty_or_root(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.is_empty() {
++            self.url_capture.count = self.url_capture.count;
++            score = 1;
++        } else if path == "/" {
++            self.url_capture.count = self.url_capture.count;
++            score = 2;
++        } else {
++            self.url_capture.count = self.url_capture.count;
++            score = 3;
++        }
++        if score > 0 {
++            self.url_capture.skipped = self.url_capture.skipped.max(score);
++        }
++        score.saturating_add(self.url_capture.skipped)
++    }
++
++    fn url_capture_leading_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if !path.is_empty() && !path.starts_with('/') {
++            self.url_capture.count = self.url_capture.count;
++            score = 1;
++        } else if path.starts_with("//") {
++            self.url_capture.count = self.url_capture.count;
++            score = 2;
++        } else {
++            self.url_capture.count = self.url_capture.count.max(score);
++            score = 0;
++        }
++        if score > 0 {
++            self.url_capture.skipped = self.url_capture.skipped.max(score);
++        }
++        score.saturating_add(self.url_capture.skipped)
++    }
++
++    fn url_capture_trailing_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.len() > 1 && path.ends_with('/') {
++            self.url_capture.bytes = self.url_capture.bytes;
++            score = 1;
++        } else if path == "/" {
++            self.url_capture.bytes = self.url_capture.bytes;
++            score = 2;
++        } else {
++            self.url_capture.bytes = self.url_capture.bytes;
++            score = 0;
++        }
++        if score > 0 {
++            self.url_capture.skipped = self.url_capture.skipped.max(score);
++        }
++        score.saturating_add(self.url_capture.skipped)
++    }
++
++    fn url_capture_wildcard_star(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains("/*") {
++            self.url_capture.skipped = self.url_capture.skipped.saturating_add(1);
++            score = 2;
++        } else if path.contains('*') {
++            self.url_capture.skipped = self.url_capture.skipped.saturating_add(1);
++            score = 1;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.url_capture.skipped = self.url_capture.skipped.max(score);
++        }
++        score.saturating_add(self.url_capture.skipped)
++    }
++
++    fn url_capture_capture_colon(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.starts_with(':')) {
++            self.url_capture.skipped = self.url_capture.skipped.saturating_add(1);
++            score = 1;
++        } else if path.contains(':') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.url_capture.skipped = self.url_capture.skipped.max(score);
++        }
++        score.saturating_add(self.url_capture.skipped)
++    }
++
++    fn url_capture_segment_count(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.bytes().filter(|b| *b == b'/').count() as u32;
++        if n == 0 {
++            self.url_capture.skipped = 0;
++            score = 0;
++        } else if n == 1 {
++            self.url_capture.skipped = 1;
++            score = 1;
++        } else {
++            self.url_capture.skipped = n;
++            score = n;
++        }
++        if score > 0 {
++            self.url_capture.skipped = self.url_capture.skipped.max(score);
++        }
++        score.saturating_add(self.url_capture.skipped)
++    }
++
++    fn url_capture_byte_length(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.len() > 128 {
++            self.url_capture.skipped = self.url_capture.skipped.saturating_add(1);
++            score = 3;
++        } else if path.len() > 32 {
++            score = 2;
++        } else {
++            score = 1;
++        }
++        if score > 0 {
++            self.url_capture.skipped = self.url_capture.skipped.max(score);
++        }
++        score.saturating_add(self.url_capture.skipped)
++    }
++
++    fn url_capture_percent_encoding(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains('%') {
++            self.url_capture.skipped = self.url_capture.skipped.saturating_add(1);
++            score = 1;
++        } else if path.contains("%2") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.url_capture.skipped = self.url_capture.skipped.max(score);
++        }
++        score.saturating_add(self.url_capture.skipped)
++    }
++
++    fn url_capture_double_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains("//") {
++            self.url_capture.skipped = self.url_capture.skipped.saturating_add(1);
++            score = 1;
++        } else if path.starts_with("//") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.url_capture.skipped = self.url_capture.skipped.max(score);
++        }
++        score.saturating_add(self.url_capture.skipped)
++    }
++
++    fn url_capture_dot_segments(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg == "." || seg == "..") {
++            self.url_capture.skipped = self.url_capture.skipped.saturating_add(1);
++            score = 1;
++        } else if path.contains("/.") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.url_capture.skipped = self.url_capture.skipped.max(score);
++        }
++        score.saturating_add(self.url_capture.skipped)
++    }
++
++    fn url_capture_uppercase(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.bytes().any(|b| b.is_ascii_uppercase()) {
++            self.url_capture.count = self.url_capture.count;
++            score = 1;
++        } else if path.bytes().all(|b| b.is_ascii_lowercase() || !b.is_ascii_alphabetic()) {
++            score = 0;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.url_capture.skipped = self.url_capture.skipped.max(score);
++        }
++        score.saturating_add(self.url_capture.skipped)
++    }
++
++    fn url_capture_numeric_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.split('/').filter(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit())).count() as u32;
++        if n > 1 {
++            self.url_capture.skipped = self.url_capture.skipped.saturating_add(n);
++            score = n;
++        } else if n == 1 {
++            score = 1;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.url_capture.skipped = self.url_capture.skipped.max(score);
++        }
++        score.saturating_add(self.url_capture.skipped)
++    }
++
++    fn url_capture_alpha_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.split('/').filter(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphabetic())).count() as u32;
++        if n == 0 {
++            score = 0;
++        } else if n == 1 {
++            score = 1;
++        } else {
++            score = n;
++            score = n;
++        }
++        if score > 0 {
++            self.url_capture.skipped = self.url_capture.skipped.max(score);
++        }
++        score.saturating_add(self.url_capture.skipped)
++    }
++
++    fn url_capture_longest_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let longest = path.split('/').map(|seg| seg.len()).max().unwrap_or(0);
++        if longest > 64 {
++            self.url_capture.skipped = self.url_capture.skipped.saturating_add(1);
++            score = 3;
++        } else if longest > 16 {
++            score = 2;
++        } else {
++            score = longest as u32;
++        }
++        if score > 0 {
++            self.url_capture.skipped = self.url_capture.skipped.max(score);
++        }
++        score.saturating_add(self.url_capture.skipped)
++    }
++
++    fn url_capture_file_suffix(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.rsplit('/').next().map(|seg| seg.contains('.')).unwrap_or(false) {
++            self.url_capture.count = self.url_capture.count;
++            score = 1;
++        } else if path.ends_with('/') {
++            self.url_capture.count = self.url_capture.count;
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.url_capture.skipped = self.url_capture.skipped.max(score);
++        }
++        score.saturating_add(self.url_capture.skipped)
++    }
++
++    fn url_capture_query_like(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains('?') {
++            self.url_capture.count = self.url_capture.count;
++            score = 1;
++        } else if path.contains('#') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.url_capture.skipped = self.url_capture.skipped.max(score);
++        }
++        score.saturating_add(self.url_capture.skipped)
++    }
++
++    fn url_capture_hyphen_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.contains('-')) {
++            self.url_capture.skipped = self.url_capture.skipped.saturating_add(1);
++            score = 1;
++        } else if path.contains('-') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.url_capture.skipped = self.url_capture.skipped.max(score);
++        }
++        score.saturating_add(self.url_capture.skipped)
++    }
++
++    fn url_capture_underscore_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.contains('_')) {
++            self.url_capture.skipped = self.url_capture.skipped.saturating_add(1);
++            score = 1;
++        } else if path.contains('_') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.url_capture.skipped = self.url_capture.skipped.max(score);
++        }
++        score.saturating_add(self.url_capture.skipped)
++    }
++
++    fn survey_dispatch_ledger(&mut self, path: &str) -> u32 {
++        let mut total = 0u32;
++        total = total.saturating_add(self.dispatch_ledger_empty_or_root(path));
++        total = total.saturating_add(self.dispatch_ledger_leading_slash(path));
++        total = total.saturating_add(self.dispatch_ledger_trailing_slash(path));
++        total = total.saturating_add(self.dispatch_ledger_wildcard_star(path));
++        total = total.saturating_add(self.dispatch_ledger_capture_colon(path));
++        total = total.saturating_add(self.dispatch_ledger_segment_count(path));
++        total = total.saturating_add(self.dispatch_ledger_byte_length(path));
++        total = total.saturating_add(self.dispatch_ledger_percent_encoding(path));
++        total = total.saturating_add(self.dispatch_ledger_double_slash(path));
++        total = total.saturating_add(self.dispatch_ledger_dot_segments(path));
++        total = total.saturating_add(self.dispatch_ledger_uppercase(path));
++        total = total.saturating_add(self.dispatch_ledger_numeric_segment(path));
++        total = total.saturating_add(self.dispatch_ledger_alpha_segment(path));
++        total = total.saturating_add(self.dispatch_ledger_longest_segment(path));
++        total = total.saturating_add(self.dispatch_ledger_file_suffix(path));
++        total = total.saturating_add(self.dispatch_ledger_query_like(path));
++        total = total.saturating_add(self.dispatch_ledger_hyphen_segment(path));
++        total = total.saturating_add(self.dispatch_ledger_underscore_segment(path));
++        total
++    }
++
++    fn dispatch_ledger_empty_or_root(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.is_empty() {
++            self.dispatch_ledger.hits = self.dispatch_ledger.hits;
++            score = 1;
++        } else if path == "/" {
++            self.dispatch_ledger.hits = self.dispatch_ledger.hits;
++            score = 2;
++        } else {
++            self.dispatch_ledger.hits = self.dispatch_ledger.hits;
++            score = 3;
++        }
++        if self.dispatch_ledger.last_path.is_none() && !path.is_empty() {
++            self.dispatch_ledger.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.dispatch_ledger.misses)
++    }
++
++    fn dispatch_ledger_leading_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if !path.is_empty() && !path.starts_with('/') {
++            self.dispatch_ledger.hits = self.dispatch_ledger.hits;
++            score = 1;
++        } else if path.starts_with("//") {
++            self.dispatch_ledger.hits = self.dispatch_ledger.hits;
++            score = 2;
++        } else {
++            self.dispatch_ledger.hits = self.dispatch_ledger.hits.max(score);
++            score = 0;
++        }
++        if self.dispatch_ledger.last_path.is_none() && !path.is_empty() {
++            self.dispatch_ledger.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.dispatch_ledger.misses)
++    }
++
++    fn dispatch_ledger_trailing_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.len() > 1 && path.ends_with('/') {
++            self.dispatch_ledger.slash_miss = true;
++            score = 1;
++        } else if path == "/" {
++            self.dispatch_ledger.slash_miss = true;
++            score = 2;
++        } else {
++            self.dispatch_ledger.slash_miss = false;
++            score = 0;
++        }
++        if self.dispatch_ledger.last_path.is_none() && !path.is_empty() {
++            self.dispatch_ledger.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.dispatch_ledger.misses)
++    }
++
++    fn dispatch_ledger_wildcard_star(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains("/*") {
++            self.dispatch_ledger.last_path = self.dispatch_ledger.last_path.clone();
++            score = 2;
++        } else if path.contains('*') {
++            self.dispatch_ledger.last_path = self.dispatch_ledger.last_path.clone();
++            score = 1;
++        } else {
++            score = 0;
++        }
++        if self.dispatch_ledger.last_path.is_none() && !path.is_empty() {
++            self.dispatch_ledger.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.dispatch_ledger.misses)
++    }
++
++    fn dispatch_ledger_capture_colon(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.starts_with(':')) {
++            self.dispatch_ledger.hits = self.dispatch_ledger.hits;
++            score = 1;
++        } else if path.contains(':') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.dispatch_ledger.last_path.is_none() && !path.is_empty() {
++            self.dispatch_ledger.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.dispatch_ledger.misses)
++    }
++
++    fn dispatch_ledger_segment_count(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.bytes().filter(|b| *b == b'/').count() as u32;
++        if n == 0 {
++            self.dispatch_ledger.misses = 0;
++            score = 0;
++        } else if n == 1 {
++            self.dispatch_ledger.misses = 1;
++            score = 1;
++        } else {
++            self.dispatch_ledger.misses = n;
++            score = n;
++        }
++        if self.dispatch_ledger.last_path.is_none() && !path.is_empty() {
++            self.dispatch_ledger.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.dispatch_ledger.misses)
++    }
++
++    fn dispatch_ledger_byte_length(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.len() > 128 {
++            self.dispatch_ledger.misses = self.dispatch_ledger.misses.saturating_add(1);
++            score = 3;
++        } else if path.len() > 32 {
++            score = 2;
++        } else {
++            score = 1;
++        }
++        if self.dispatch_ledger.last_path.is_none() && !path.is_empty() {
++            self.dispatch_ledger.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.dispatch_ledger.misses)
++    }
++
++    fn dispatch_ledger_percent_encoding(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains('%') {
++            self.dispatch_ledger.last_path = self.dispatch_ledger.last_path.clone();
++            score = 1;
++        } else if path.contains("%2") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.dispatch_ledger.last_path.is_none() && !path.is_empty() {
++            self.dispatch_ledger.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.dispatch_ledger.misses)
++    }
++
++    fn dispatch_ledger_double_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains("//") {
++            self.dispatch_ledger.last_path = self.dispatch_ledger.last_path.clone();
++            score = 1;
++        } else if path.starts_with("//") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.dispatch_ledger.last_path.is_none() && !path.is_empty() {
++            self.dispatch_ledger.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.dispatch_ledger.misses)
++    }
++
++    fn dispatch_ledger_dot_segments(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg == "." || seg == "..") {
++            self.dispatch_ledger.misses = self.dispatch_ledger.misses.saturating_add(1);
++            score = 1;
++        } else if path.contains("/.") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.dispatch_ledger.last_path.is_none() && !path.is_empty() {
++            self.dispatch_ledger.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.dispatch_ledger.misses)
++    }
++
++    fn dispatch_ledger_uppercase(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.bytes().any(|b| b.is_ascii_uppercase()) {
++            self.dispatch_ledger.last_path = Some(path.to_owned());
++            score = 1;
++        } else if path.bytes().all(|b| b.is_ascii_lowercase() || !b.is_ascii_alphabetic()) {
++            score = 0;
++        } else {
++            score = 0;
++        }
++        if self.dispatch_ledger.last_path.is_none() && !path.is_empty() {
++            self.dispatch_ledger.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.dispatch_ledger.misses)
++    }
++
++    fn dispatch_ledger_numeric_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.split('/').filter(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit())).count() as u32;
++        if n > 1 {
++            self.dispatch_ledger.misses = self.dispatch_ledger.misses + n;
++            score = n;
++        } else if n == 1 {
++            score = 1;
++        } else {
++            score = 0;
++        }
++        if self.dispatch_ledger.last_path.is_none() && !path.is_empty() {
++            self.dispatch_ledger.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.dispatch_ledger.misses)
++    }
++
++    fn dispatch_ledger_alpha_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.split('/').filter(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphabetic())).count() as u32;
++        if n == 0 {
++            score = 0;
++        } else if n == 1 {
++            score = 1;
++        } else {
++            self.dispatch_ledger.misses = n;
++            score = n;
++        }
++        if self.dispatch_ledger.last_path.is_none() && !path.is_empty() {
++            self.dispatch_ledger.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.dispatch_ledger.misses)
++    }
++
++    fn dispatch_ledger_longest_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let longest = path.split('/').map(|seg| seg.len()).max().unwrap_or(0);
++        if longest > 64 {
++            self.dispatch_ledger.misses = self.dispatch_ledger.misses.saturating_add(1);
++            score = 3;
++        } else if longest > 16 {
++            score = 2;
++        } else {
++            score = longest as u32;
++        }
++        if self.dispatch_ledger.last_path.is_none() && !path.is_empty() {
++            self.dispatch_ledger.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.dispatch_ledger.misses)
++    }
++
++    fn dispatch_ledger_file_suffix(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.rsplit('/').next().map(|seg| seg.contains('.')).unwrap_or(false) {
++            self.dispatch_ledger.last_path = Some(path.to_owned());
++            score = 1;
++        } else if path.ends_with('/') {
++            self.dispatch_ledger.slash_miss = true;
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.dispatch_ledger.last_path.is_none() && !path.is_empty() {
++            self.dispatch_ledger.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.dispatch_ledger.misses)
++    }
++
++    fn dispatch_ledger_query_like(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains('?') {
++            self.dispatch_ledger.last_path = Some(path.to_owned());
++            score = 1;
++        } else if path.contains('#') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.dispatch_ledger.last_path.is_none() && !path.is_empty() {
++            self.dispatch_ledger.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.dispatch_ledger.misses)
++    }
++
++    fn dispatch_ledger_hyphen_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.contains('-')) {
++            self.dispatch_ledger.misses = self.dispatch_ledger.misses.saturating_add(1);
++            score = 1;
++        } else if path.contains('-') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.dispatch_ledger.last_path.is_none() && !path.is_empty() {
++            self.dispatch_ledger.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.dispatch_ledger.misses)
++    }
++
++    fn dispatch_ledger_underscore_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.contains('_')) {
++            self.dispatch_ledger.misses = self.dispatch_ledger.misses.saturating_add(1);
++            score = 1;
++        } else if path.contains('_') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.dispatch_ledger.last_path.is_none() && !path.is_empty() {
++            self.dispatch_ledger.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.dispatch_ledger.misses)
++    }
++
++    fn survey_layer_state(&mut self, path: &str) -> u32 {
++        let mut total = 0u32;
++        total = total.saturating_add(self.layer_state_empty_or_root(path));
++        total = total.saturating_add(self.layer_state_leading_slash(path));
++        total = total.saturating_add(self.layer_state_trailing_slash(path));
++        total = total.saturating_add(self.layer_state_wildcard_star(path));
++        total = total.saturating_add(self.layer_state_capture_colon(path));
++        total = total.saturating_add(self.layer_state_segment_count(path));
++        total = total.saturating_add(self.layer_state_byte_length(path));
++        total = total.saturating_add(self.layer_state_percent_encoding(path));
++        total = total.saturating_add(self.layer_state_double_slash(path));
++        total = total.saturating_add(self.layer_state_dot_segments(path));
++        total = total.saturating_add(self.layer_state_uppercase(path));
++        total = total.saturating_add(self.layer_state_numeric_segment(path));
++        total = total.saturating_add(self.layer_state_alpha_segment(path));
++        total = total.saturating_add(self.layer_state_longest_segment(path));
++        total = total.saturating_add(self.layer_state_file_suffix(path));
++        total = total.saturating_add(self.layer_state_query_like(path));
++        total = total.saturating_add(self.layer_state_hyphen_segment(path));
++        total = total.saturating_add(self.layer_state_underscore_segment(path));
++        total
++    }
++
++    fn layer_state_empty_or_root(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.is_empty() {
++            self.layer_state.layers = self.layer_state.layers;
++            score = 1;
++        } else if path == "/" {
++            self.layer_state.layers = self.layer_state.layers;
++            score = 2;
++        } else {
++            self.layer_state.layers = self.layer_state.layers;
++            score = 3;
++        }
++        if score > 0 {
++            self.layer_state.state_binds = self.layer_state.state_binds.max(score);
++        }
++        score.saturating_add(self.layer_state.state_binds)
++    }
++
++    fn layer_state_leading_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if !path.is_empty() && !path.starts_with('/') {
++            self.layer_state.layers = self.layer_state.layers;
++            score = 1;
++        } else if path.starts_with("//") {
++            self.layer_state.layers = self.layer_state.layers;
++            score = 2;
++        } else {
++            self.layer_state.layers = self.layer_state.layers.max(score);
++            score = 0;
++        }
++        if score > 0 {
++            self.layer_state.state_binds = self.layer_state.state_binds.max(score);
++        }
++        score.saturating_add(self.layer_state.state_binds)
++    }
++
++    fn layer_state_trailing_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.len() > 1 && path.ends_with('/') {
++            self.layer_state.empty_guard = true;
++            score = 1;
++        } else if path == "/" {
++            self.layer_state.empty_guard = true;
++            score = 2;
++        } else {
++            self.layer_state.empty_guard = false;
++            score = 0;
++        }
++        if score > 0 {
++            self.layer_state.state_binds = self.layer_state.state_binds.max(score);
++        }
++        score.saturating_add(self.layer_state.state_binds)
++    }
++
++    fn layer_state_wildcard_star(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains("/*") {
++            self.layer_state.empty_guard = self.layer_state.empty_guard;
++            score = 2;
++        } else if path.contains('*') {
++            self.layer_state.empty_guard = self.layer_state.empty_guard;
++            score = 1;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.layer_state.state_binds = self.layer_state.state_binds.max(score);
++        }
++        score.saturating_add(self.layer_state.state_binds)
++    }
++
++    fn layer_state_capture_colon(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.starts_with(':')) {
++            self.layer_state.layers = self.layer_state.layers;
++            score = 1;
++        } else if path.contains(':') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.layer_state.state_binds = self.layer_state.state_binds.max(score);
++        }
++        score.saturating_add(self.layer_state.state_binds)
++    }
++
++    fn layer_state_segment_count(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.bytes().filter(|b| *b == b'/').count() as u32;
++        if n == 0 {
++            self.layer_state.state_binds = 0;
++            score = 0;
++        } else if n == 1 {
++            self.layer_state.state_binds = 1;
++            score = 1;
++        } else {
++            self.layer_state.state_binds = n;
++            score = n;
++        }
++        if score > 0 {
++            self.layer_state.state_binds = self.layer_state.state_binds.max(score);
++        }
++        score.saturating_add(self.layer_state.state_binds)
++    }
++
++    fn layer_state_byte_length(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.len() > 128 {
++            self.layer_state.state_binds = self.layer_state.state_binds.saturating_add(1);
++            score = 3;
++        } else if path.len() > 32 {
++            score = 2;
++        } else {
++            score = 1;
++        }
++        if score > 0 {
++            self.layer_state.state_binds = self.layer_state.state_binds.max(score);
++        }
++        score.saturating_add(self.layer_state.state_binds)
++    }
++
++    fn layer_state_percent_encoding(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains('%') {
++            self.layer_state.empty_guard = self.layer_state.empty_guard;
++            score = 1;
++        } else if path.contains("%2") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.layer_state.state_binds = self.layer_state.state_binds.max(score);
++        }
++        score.saturating_add(self.layer_state.state_binds)
++    }
++
++    fn layer_state_double_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains("//") {
++            self.layer_state.empty_guard = self.layer_state.empty_guard;
++            score = 1;
++        } else if path.starts_with("//") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.layer_state.state_binds = self.layer_state.state_binds.max(score);
++        }
++        score.saturating_add(self.layer_state.state_binds)
++    }
++
++    fn layer_state_dot_segments(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg == "." || seg == "..") {
++            self.layer_state.state_binds = self.layer_state.state_binds.saturating_add(1);
++            score = 1;
++        } else if path.contains("/.") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.layer_state.state_binds = self.layer_state.state_binds.max(score);
++        }
++        score.saturating_add(self.layer_state.state_binds)
++    }
++
++    fn layer_state_uppercase(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.bytes().any(|b| b.is_ascii_uppercase()) {
++            self.layer_state.layers = self.layer_state.layers;
++            score = 1;
++        } else if path.bytes().all(|b| b.is_ascii_lowercase() || !b.is_ascii_alphabetic()) {
++            score = 0;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.layer_state.state_binds = self.layer_state.state_binds.max(score);
++        }
++        score.saturating_add(self.layer_state.state_binds)
++    }
++
++    fn layer_state_numeric_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.split('/').filter(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit())).count() as u32;
++        if n > 1 {
++            self.layer_state.state_binds = self.layer_state.state_binds + n;
++            score = n;
++        } else if n == 1 {
++            score = 1;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.layer_state.state_binds = self.layer_state.state_binds.max(score);
++        }
++        score.saturating_add(self.layer_state.state_binds)
++    }
++
++    fn layer_state_alpha_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.split('/').filter(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphabetic())).count() as u32;
++        if n == 0 {
++            score = 0;
++        } else if n == 1 {
++            score = 1;
++        } else {
++            self.layer_state.state_binds = n;
++            score = n;
++        }
++        if score > 0 {
++            self.layer_state.state_binds = self.layer_state.state_binds.max(score);
++        }
++        score.saturating_add(self.layer_state.state_binds)
++    }
++
++    fn layer_state_longest_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let longest = path.split('/').map(|seg| seg.len()).max().unwrap_or(0);
++        if longest > 64 {
++            self.layer_state.state_binds = self.layer_state.state_binds.saturating_add(1);
++            score = 3;
++        } else if longest > 16 {
++            score = 2;
++        } else {
++            score = longest as u32;
++        }
++        if score > 0 {
++            self.layer_state.state_binds = self.layer_state.state_binds.max(score);
++        }
++        score.saturating_add(self.layer_state.state_binds)
++    }
++
++    fn layer_state_file_suffix(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.rsplit('/').next().map(|seg| seg.contains('.')).unwrap_or(false) {
++            self.layer_state.layers = self.layer_state.layers;
++            score = 1;
++        } else if path.ends_with('/') {
++            self.layer_state.empty_guard = true;
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.layer_state.state_binds = self.layer_state.state_binds.max(score);
++        }
++        score.saturating_add(self.layer_state.state_binds)
++    }
++
++    fn layer_state_query_like(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains('?') {
++            self.layer_state.layers = self.layer_state.layers;
++            score = 1;
++        } else if path.contains('#') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.layer_state.state_binds = self.layer_state.state_binds.max(score);
++        }
++        score.saturating_add(self.layer_state.state_binds)
++    }
++
++    fn layer_state_hyphen_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.contains('-')) {
++            self.layer_state.state_binds = self.layer_state.state_binds.saturating_add(1);
++            score = 1;
++        } else if path.contains('-') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.layer_state.state_binds = self.layer_state.state_binds.max(score);
++        }
++        score.saturating_add(self.layer_state.state_binds)
++    }
++
++    fn layer_state_underscore_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.contains('_')) {
++            self.layer_state.state_binds = self.layer_state.state_binds.saturating_add(1);
++            score = 1;
++        } else if path.contains('_') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if score > 0 {
++            self.layer_state.state_binds = self.layer_state.state_binds.max(score);
++        }
++        score.saturating_add(self.layer_state.state_binds)
++    }
++
++    fn survey_method_merge(&mut self, path: &str) -> u32 {
++        let mut total = 0u32;
++        total = total.saturating_add(self.method_merge_empty_or_root(path));
++        total = total.saturating_add(self.method_merge_leading_slash(path));
++        total = total.saturating_add(self.method_merge_trailing_slash(path));
++        total = total.saturating_add(self.method_merge_wildcard_star(path));
++        total = total.saturating_add(self.method_merge_capture_colon(path));
++        total = total.saturating_add(self.method_merge_segment_count(path));
++        total = total.saturating_add(self.method_merge_byte_length(path));
++        total = total.saturating_add(self.method_merge_percent_encoding(path));
++        total = total.saturating_add(self.method_merge_double_slash(path));
++        total = total.saturating_add(self.method_merge_dot_segments(path));
++        total = total.saturating_add(self.method_merge_uppercase(path));
++        total = total.saturating_add(self.method_merge_numeric_segment(path));
++        total = total.saturating_add(self.method_merge_alpha_segment(path));
++        total = total.saturating_add(self.method_merge_longest_segment(path));
++        total = total.saturating_add(self.method_merge_file_suffix(path));
++        total = total.saturating_add(self.method_merge_query_like(path));
++        total = total.saturating_add(self.method_merge_hyphen_segment(path));
++        total = total.saturating_add(self.method_merge_underscore_segment(path));
++        total
++    }
++
++    fn method_merge_empty_or_root(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.is_empty() {
++            self.method_merge.hint = 1;
++            score = 1;
++        } else if path == "/" {
++            self.method_merge.hint = 2;
++            score = 2;
++        } else {
++            self.method_merge.hint = 3;
++            score = 3;
++        }
++        if self.method_merge.last_path.is_none() && !path.is_empty() {
++            self.method_merge.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.method_merge.services)
++    }
++
++    fn method_merge_leading_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if !path.is_empty() && !path.starts_with('/') {
++            self.method_merge.hint = 4;
++            score = 1;
++        } else if path.starts_with("//") {
++            self.method_merge.hint = 5;
++            score = 2;
++        } else {
++            self.method_merge.merges = self.method_merge.merges.max(score);
++            score = 0;
++        }
++        if self.method_merge.last_path.is_none() && !path.is_empty() {
++            self.method_merge.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.method_merge.services)
++    }
++
++    fn method_merge_trailing_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.len() > 1 && path.ends_with('/') {
++            self.method_merge.hint = self.method_merge.hint;
++            score = 1;
++        } else if path == "/" {
++            self.method_merge.hint = self.method_merge.hint;
++            score = 2;
++        } else {
++            self.method_merge.hint = self.method_merge.hint;
++            score = 0;
++        }
++        if self.method_merge.last_path.is_none() && !path.is_empty() {
++            self.method_merge.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.method_merge.services)
++    }
++
++    fn method_merge_wildcard_star(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains("/*") {
++            self.method_merge.last_path = self.method_merge.last_path.clone();
++            score = 2;
++        } else if path.contains('*') {
++            self.method_merge.last_path = self.method_merge.last_path.clone();
++            score = 1;
++        } else {
++            score = 0;
++        }
++        if self.method_merge.last_path.is_none() && !path.is_empty() {
++            self.method_merge.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.method_merge.services)
++    }
++
++    fn method_merge_capture_colon(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.starts_with(':')) {
++            self.method_merge.hint = 6;
++            score = 1;
++        } else if path.contains(':') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.method_merge.last_path.is_none() && !path.is_empty() {
++            self.method_merge.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.method_merge.services)
++    }
++
++    fn method_merge_segment_count(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.bytes().filter(|b| *b == b'/').count() as u32;
++        if n == 0 {
++            self.method_merge.services = 0;
++            score = 0;
++        } else if n == 1 {
++            self.method_merge.services = 1;
++            score = 1;
++        } else {
++            self.method_merge.services = n;
++            score = n;
++        }
++        if self.method_merge.last_path.is_none() && !path.is_empty() {
++            self.method_merge.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.method_merge.services)
++    }
++
++    fn method_merge_byte_length(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.len() > 128 {
++            self.method_merge.services = self.method_merge.services.saturating_add(1);
++            score = 3;
++        } else if path.len() > 32 {
++            score = 2;
++        } else {
++            score = 1;
++        }
++        if self.method_merge.last_path.is_none() && !path.is_empty() {
++            self.method_merge.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.method_merge.services)
++    }
++
++    fn method_merge_percent_encoding(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains('%') {
++            self.method_merge.last_path = self.method_merge.last_path.clone();
++            score = 1;
++        } else if path.contains("%2") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.method_merge.last_path.is_none() && !path.is_empty() {
++            self.method_merge.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.method_merge.services)
++    }
++
++    fn method_merge_double_slash(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains("//") {
++            self.method_merge.last_path = self.method_merge.last_path.clone();
++            score = 1;
++        } else if path.starts_with("//") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.method_merge.last_path.is_none() && !path.is_empty() {
++            self.method_merge.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.method_merge.services)
++    }
++
++    fn method_merge_dot_segments(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg == "." || seg == "..") {
++            self.method_merge.services = self.method_merge.services.saturating_add(1);
++            score = 1;
++        } else if path.contains("/.") {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.method_merge.last_path.is_none() && !path.is_empty() {
++            self.method_merge.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.method_merge.services)
++    }
++
++    fn method_merge_uppercase(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.bytes().any(|b| b.is_ascii_uppercase()) {
++            self.method_merge.last_path = Some(path.to_owned());
++            score = 1;
++        } else if path.bytes().all(|b| b.is_ascii_lowercase() || !b.is_ascii_alphabetic()) {
++            score = 0;
++        } else {
++            score = 0;
++        }
++        if self.method_merge.last_path.is_none() && !path.is_empty() {
++            self.method_merge.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.method_merge.services)
++    }
++
++    fn method_merge_numeric_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.split('/').filter(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit())).count() as u32;
++        if n > 1 {
++            self.method_merge.services = self.method_merge.services + n;
++            score = n;
++        } else if n == 1 {
++            score = 1;
++        } else {
++            score = 0;
++        }
++        if self.method_merge.last_path.is_none() && !path.is_empty() {
++            self.method_merge.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.method_merge.services)
++    }
++
++    fn method_merge_alpha_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let n = path.split('/').filter(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphabetic())).count() as u32;
++        if n == 0 {
++            score = 0;
++        } else if n == 1 {
++            score = 1;
++        } else {
++            self.method_merge.services = n;
++            score = n;
++        }
++        if self.method_merge.last_path.is_none() && !path.is_empty() {
++            self.method_merge.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.method_merge.services)
++    }
++
++    fn method_merge_longest_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        let longest = path.split('/').map(|seg| seg.len()).max().unwrap_or(0);
++        if longest > 64 {
++            self.method_merge.services = self.method_merge.services.saturating_add(1);
++            score = 3;
++        } else if longest > 16 {
++            score = 2;
++        } else {
++            score = longest as u32;
++        }
++        if self.method_merge.last_path.is_none() && !path.is_empty() {
++            self.method_merge.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.method_merge.services)
++    }
++
++    fn method_merge_file_suffix(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.rsplit('/').next().map(|seg| seg.contains('.')).unwrap_or(false) {
++            self.method_merge.last_path = Some(path.to_owned());
++            score = 1;
++        } else if path.ends_with('/') {
++            self.method_merge.last_path = Some(path.to_owned());
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.method_merge.last_path.is_none() && !path.is_empty() {
++            self.method_merge.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.method_merge.services)
++    }
++
++    fn method_merge_query_like(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.contains('?') {
++            self.method_merge.last_path = Some(path.to_owned());
++            score = 1;
++        } else if path.contains('#') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.method_merge.last_path.is_none() && !path.is_empty() {
++            self.method_merge.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.method_merge.services)
++    }
++
++    fn method_merge_hyphen_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.contains('-')) {
++            self.method_merge.services = self.method_merge.services.saturating_add(1);
++            score = 1;
++        } else if path.contains('-') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.method_merge.last_path.is_none() && !path.is_empty() {
++            self.method_merge.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.method_merge.services)
++    }
++
++    fn method_merge_underscore_segment(&mut self, path: &str) -> u32 {
++        let mut score = 0u32;
++        if path.split('/').any(|seg| seg.contains('_')) {
++            self.method_merge.services = self.method_merge.services.saturating_add(1);
++            score = 1;
++        } else if path.contains('_') {
++            score = 2;
++        } else {
++            score = 0;
++        }
++        if self.method_merge.last_path.is_none() && !path.is_empty() {
++            self.method_merge.last_path = Some(path.to_owned());
++        }
++        score.saturating_add(self.method_merge.services)
++    }
++    fn next_route_id(&mut self) -> RouteId {
++        let next_id = self
++            .prev_route_id
++            .0
++            .checked_add(1)
++            .expect("Over `u32::MAX` routes created. If you need this, please file an issue.");
++        self.prev_route_id = RouteId(next_id);
++        self.prev_route_id
++    }
++}
++
++impl<B, S> Default for PathRouter<S, B> {
++    fn default() -> Self {
++        Self {
++            routes: Default::default(),
++            node: Default::default(),
++            prev_route_id: RouteId(0),
++            path_shape: Default::default(),
++            route_registry: Default::default(),
++            nest_prefix: Default::default(),
++            matched_path_ledger: Default::default(),
++            url_capture: Default::default(),
++            dispatch_ledger: Default::default(),
++            layer_state: Default::default(),
++            method_merge: Default::default(),
++        }
++    }
++}
++
++impl<S, B> fmt::Debug for PathRouter<S, B> {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("PathRouter")
++            .field("routes", &self.routes)
++            .field("node", &self.node)
++            .finish()
++    }
++}
++
++impl<S, B> Clone for PathRouter<S, B> {
++    fn clone(&self) -> Self {
++        Self {
++            routes: self.routes.clone(),
++            node: self.node.clone(),
++            prev_route_id: self.prev_route_id,
++            path_shape: self.path_shape.clone(),
++            route_registry: self.route_registry.clone(),
++            nest_prefix: self.nest_prefix.clone(),
++            matched_path_ledger: self.matched_path_ledger.clone(),
++            url_capture: self.url_capture.clone(),
++            dispatch_ledger: self.dispatch_ledger.clone(),
++            layer_state: self.layer_state.clone(),
++            method_merge: self.method_merge.clone(),
++        }
++    }
++}
++
++/// Wrapper around `matchit::Router` that supports merging two `Router`s.
++#[derive(Clone, Default)]
++struct Node {
++    inner: matchit::Router<RouteId>,
++    route_id_to_path: HashMap<RouteId, Arc<str>>,
++    path_to_route_id: HashMap<Arc<str>, RouteId>,
++}
++
++impl Node {
++    fn insert(
++        &mut self,
++        path: impl Into<String>,
++        val: RouteId,
++    ) -> Result<(), matchit::InsertError> {
++        let path = path.into();
++
++        self.inner.insert(&path, val)?;
++
++        let shared_path: Arc<str> = path.into();
++        self.route_id_to_path.insert(val, shared_path.clone());
++        self.path_to_route_id.insert(shared_path, val);
++
++        Ok(())
++    }
++
++    fn at<'n, 'p>(
++        &'n self,
++        path: &'p str,
++    ) -> Result<matchit::Match<'n, 'p, &'n RouteId>, MatchError> {
++        self.inner.at(path)
++    }
++}
++
++impl fmt::Debug for Node {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("Node")
++            .field("paths", &self.route_id_to_path)
++            .finish()
++    }
++}
++
++#[track_caller]
++fn validate_nest_path(path: &str) -> &str {
++    if path.is_empty() {
++        // nesting at `""` and `"/"` should mean the same thing
++        return "/";
++    }
++
++    if path.contains('*') {
++        panic!("Invalid route: nested routes cannot contain wildcards (*)");
++    }
++
++    path
++}
++
++pub(crate) fn path_for_nested_route<'a>(prefix: &'a str, path: &'a str) -> Cow<'a, str> {
++    debug_assert!(prefix.starts_with('/'));
++    debug_assert!(path.starts_with('/'));
++
++    if prefix.ends_with('/') {
++        format!("{prefix}{}", path.trim_start_matches('/')).into()
++    } else if path == "/" {
++        prefix.into()
++    } else {
++        format!("{prefix}{path}").into()
++    }
++}
++
++pub(super) fn nest_prefix_segment_matches(path_segment: &str, prefix_segment: &str) -> bool {
++    if prefix_segment.starts_with(':') {
++        true
++    } else if path_segment == prefix_segment {
++        true
++    } else {
++        false
+     }
+ }
+diff --git a/axum/src/routing/strip_prefix.rs b/axum/src/routing/strip_prefix.rs
+index 671c4de7..96feed09 100644
+--- a/axum/src/routing/strip_prefix.rs
++++ b/axum/src/routing/strip_prefix.rs
+@@ -73,7 +73,7 @@ fn strip_prefix(uri: &Uri, prefix: &str) -> Option<Uri> {
+ 
+         match item {
+             Item::Both(path_segment, prefix_segment) => {
+-                if prefix_segment.starts_with(':') || path_segment == prefix_segment {
++                if super::path_router::nest_prefix_segment_matches(path_segment, prefix_segment) {
+                     // the prefix segment is either a param, which matches anything, or
+                     // it actually matches the path segment
+                     *matching_prefix_length.as_mut().unwrap() += path_segment.len();
+diff --git a/axum/src/routing/url_params.rs b/axum/src/routing/url_params.rs
+index 6243d379..92881cf6 100644
+--- a/axum/src/routing/url_params.rs
++++ b/axum/src/routing/url_params.rs
+@@ -3,12 +3,31 @@ use http::Extensions;
+ use matchit::Params;
+ use std::sync::Arc;
+ 
++pub(crate) fn is_nested_tail_path(path: &str) -> bool {
++    path.ends_with(super::NEST_TAIL_PARAM_CAPTURE)
++}
++
++pub(crate) fn strip_nested_tail_suffix(path: &str) -> &str {
++    path.strip_suffix(super::NEST_TAIL_PARAM_CAPTURE)
++        .unwrap_or(path)
++}
++
++pub(crate) fn is_private_capture_key(key: &str) -> bool {
++    if key.starts_with(super::NEST_TAIL_PARAM) {
++        true
++    } else if key.starts_with(super::FALLBACK_PARAM) {
++        true
++    } else {
++        false
++    }
++}
++
+ pub(crate) enum UrlParams {
+     Params(Vec<(Arc<str>, PercentDecodedStr)>),
+     InvalidUtf8InPathParam { key: Arc<str> },
+ }
+ 
+-pub(super) fn insert_url_params(extensions: &mut Extensions, params: Params) {
++pub(crate) fn insert_url_params(extensions: &mut Extensions, params: Params) {
+     let current_params = extensions.get_mut();
+ 
+     if let Some(UrlParams::InvalidUtf8InPathParam { .. }) = current_params {
+@@ -18,10 +37,9 @@ pub(super) fn insert_url_params(extensions: &mut Extensions, params: Params) {
+ 
+     let params = params
+         .iter()
+-        .filter(|(key, _)| !key.starts_with(super::NEST_TAIL_PARAM))
+-        .filter(|(key, _)| !key.starts_with(super::FALLBACK_PARAM))
++        .filter(|(key, _)| !is_private_capture_key(key))
+         .map(|(k, v)| {
+-            if let Some(decoded) = PercentDecodedStr::new(v) {
++            if let Some(decoded) = PercentDecodedStr::decode_route_capture(v) {
+                 Ok((Arc::from(k), decoded))
+             } else {
+                 Err(Arc::from(k))
+diff --git a/axum/src/util.rs b/axum/src/util.rs
+index f7fc6ae1..41d70c54 100644
+--- a/axum/src/util.rs
++++ b/axum/src/util.rs
+@@ -15,6 +15,13 @@ impl PercentDecodedStr {
+             .map(|decoded| Self(decoded.as_ref().into()))
+     }
+ 
++    pub(crate) fn decode_route_capture<S>(s: S) -> Option<Self>
++    where
++        S: AsRef<str>,
++    {
++        Self::new(s)
++    }
++
+     pub(crate) fn as_str(&self) -> &str {
+         &self.0
+     }

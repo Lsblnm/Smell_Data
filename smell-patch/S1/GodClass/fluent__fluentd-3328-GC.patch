@@ -1,0 +1,3864 @@
+diff --git a/lib/fluent/plugin/in_tail.rb b/lib/fluent/plugin/in_tail.rb
+index f397e765..be49d155 100644
+--- a/lib/fluent/plugin/in_tail.rb
++++ b/lib/fluent/plugin/in_tail.rb
+@@ -21,7 +21,6 @@ require 'fluent/config/error'
+ require 'fluent/event'
+ require 'fluent/plugin/buffer'
+ require 'fluent/plugin/parser_multiline'
+-require 'fluent/variable_store'
+ require 'fluent/capability'
+ require 'fluent/plugin/in_tail/position_file'
+ 
+@@ -115,18 +114,15 @@ module Fluent::Plugin
+     attr_reader :paths
+ 
+     def configure(conf)
+-      @variable_store = Fluent::VariableStore.fetch_or_build(:in_tail)
++      @variable_store = position_ledger_registry
+       compat_parameters_convert(conf, :parser)
+       parser_config = conf.elements('parse').first
+       unless parser_config
+         raise Fluent::ConfigError, "<parse> section is required."
+       end
+ 
+-      (1..Fluent::Plugin::MultilineParser::FORMAT_MAX_NUM).each do |n|
+-        parser_config["format#{n}"] = conf["format#{n}"] if conf["format#{n}"]
+-      end
+-
+-      parser_config['unmatched_lines'] = conf['emit_unmatched_lines']
++      multiline_plan_copy_formats(parser_config, conf)
++      multiline_plan_mark_unmatched(parser_config, conf['emit_unmatched_lines'])
+ 
+       super
+ 
+@@ -144,40 +140,31 @@ module Fluent::Plugin
+         raise Fluent::ConfigError, "tail: 'path' parameter is required on tail input"
+       end
+       if @path_timezone
+-        Fluent::Timezone.validate!(@path_timezone)
+-        @path_formatters = @paths.map{|path| [path, Fluent::Timezone.formatter(@path_timezone, path)]}.to_h
+-        @exclude_path_formatters = @exclude_path.map{|path| [path, Fluent::Timezone.formatter(@path_timezone, path)]}.to_h
++        timezone_path_validate(@path_timezone)
++        @path_formatters = timezone_path_build_formatter(@path_timezone, @paths)
++        @exclude_path_formatters = timezone_path_build_exclude_formatter(@path_timezone, @exclude_path)
+       end
+ 
+       # TODO: Use plugin_root_dir and storage plugin to store positions if available
+       if @pos_file
+-        if @variable_store.key?(@pos_file) && !called_in_test?
+-          plugin_id_using_this_path = @variable_store[@pos_file]
+-          raise Fluent::ConfigError, "Other 'in_tail' plugin already use same pos_file path: plugin_id = #{plugin_id_using_this_path}, pos_file path = #{@pos_file}"
+-        end
+-        @variable_store[@pos_file] = self.plugin_id
++        position_ledger_register_owner(@variable_store, @pos_file, self.plugin_id, called_in_test?)
+       else
+-        if @follow_inodes
++        if position_ledger_follow_required?(@pos_file, @follow_inodes)
+           raise Fluent::ConfigError, "Can't follow inodes without pos_file configuration parameter"
+         end
+-        $log.warn "'pos_file PATH' parameter is not set to a 'tail' source."
+-        $log.warn "this parameter is highly recommended to save the position to resume tailing."
++        position_ledger_note_warning_without_pos
+       end
+ 
+       configure_tag
+       configure_encoding
+ 
+-      @multiline_mode = parser_config["@type"] =~ /multiline/
+-      @receive_handler = if @multiline_mode
+-                           method(:parse_multilines)
+-                         else
+-                           method(:parse_singleline)
+-                         end
++      @multiline_mode = multiline_plan_detect_mode(parser_config["@type"])
++      @receive_handler = multiline_plan_choose_handler(@multiline_mode)
+       @file_perm = system_config.file_permission || Fluent::DEFAULT_FILE_PERMISSION
+       @dir_perm = system_config.dir_permission || Fluent::DEFAULT_DIR_PERMISSION
+       # parser is already created by parser helper
+       @parser = parser_create(usage: parser_config['usage'] || @parser_configs.first.usage)
+-      @capability = Fluent::Capability.new(:current_process)
++      @capability = capability_policy_bind(:current_process)
+     end
+ 
+     def configure_tag
+@@ -192,17 +179,10 @@ module Fluent::Plugin
+     end
+ 
+     def configure_encoding
+-      unless @encoding
+-        if @from_encoding
+-          raise Fluent::ConfigError, "tail: 'from_encoding' parameter must be specified with 'encoding' parameter."
+-        end
+-      end
+-
+-      @encoding = parse_encoding_param(@encoding) if @encoding
+-      @from_encoding = parse_encoding_param(@from_encoding) if @from_encoding
+-      if @encoding && (@encoding == @from_encoding)
+-        log.warn "'encoding' and 'from_encoding' are same encoding. No effect"
+-      end
++      encoding_plan_validate_pair(@encoding, @from_encoding)
++      @encoding = encoding_plan_parse_name(@encoding) if @encoding
++      @from_encoding = encoding_plan_parse_from(@from_encoding) if @from_encoding
++      encoding_plan_bind(@encoding, @from_encoding)
+     end
+ 
+     def parse_encoding_param(encoding_name)
+@@ -221,12 +201,12 @@ module Fluent::Plugin
+         FileUtils.mkdir_p(pos_file_dir, mode: @dir_perm) unless Dir.exist?(pos_file_dir)
+         @pf_file = File.open(@pos_file, File::RDWR|File::CREAT|File::BINARY, @file_perm)
+         @pf_file.sync = true
+-        @pf = PositionFile.load(@pf_file, @follow_inodes, expand_paths, logger: log)
++        @pf = position_ledger_open(@pf_file, @follow_inodes, expand_paths, log)
+ 
+         if @pos_file_compaction_interval
+           timer_execute(:in_tail_refresh_compact_pos_file, @pos_file_compaction_interval) do
+             log.info('Clean up the pos file')
+-            @pf.try_compact
++            position_ledger_compact_if_needed(@pf)
+           end
+         end
+       end
+@@ -237,7 +217,7 @@ module Fluent::Plugin
+ 
+     def stop
+       if @variable_store
+-        @variable_store.delete(@pos_file)
++        position_ledger_release_owner(@variable_store, @pos_file)
+       end
+ 
+       super
+@@ -258,74 +238,29 @@ module Fluent::Plugin
+     end
+ 
+     def have_read_capability?
+-      @capability.have_capability?(:effective, :dac_read_search) ||
+-        @capability.have_capability?(:effective, :dac_override)
++      capability_policy_allows_read?(@capability)
+     end
+ 
+     def expand_paths
+-      date = Fluent::EventTime.now
++      date = emit_assembly_current_time
++      path_catalog_reset(@paths)
++      path_exclude_reset(@exclude_path)
++      timezone_path_remember_zone(@path_timezone)
+       paths = []
+       @paths.each { |path|
+-        path = if @path_timezone
+-                 @path_formatters[path].call(date)
+-               else
+-                 date.to_time.strftime(path)
+-               end
+-        if path.include?('*')
+-          paths += Dir.glob(path).select { |p|
+-            begin
+-              is_file = !File.directory?(p)
+-              if (File.readable?(p) || have_read_capability?) && is_file
+-                if @limit_recently_modified && File.mtime(p) < (date.to_time - @limit_recently_modified)
+-                  false
+-                else
+-                  true
+-                end
+-              else
+-                if is_file
+-                  unless @ignore_list.include?(p)
+-                    log.warn "#{p} unreadable. It is excluded and would be examined next time."
+-                    @ignore_list << p if @ignore_repeated_permission_error
+-                  end
+-                end
+-                false
+-              end
+-            rescue Errno::ENOENT
+-              log.debug("#{p} is missing after refresh file list")
+-              false
+-            end
+-          }
++        path = timezone_path_apply(path, date, @path_timezone, @path_formatters)
++        if path_catalog_glob?(path)
++          paths += path_catalog_select_files(Dir.glob(path), date, @ignore_list, @ignore_repeated_permission_error, @limit_recently_modified, have_read_capability?)
+         else
+           # When file is not created yet, Dir.glob returns an empty array. So just add when path is static.
+-          paths << path
++          path_catalog_add_static(paths, path)
+         end
+       }
+-      excluded = @exclude_path.map { |path|
+-        path = if @path_timezone
+-                 @exclude_path_formatters[path].call(date)
+-               else
+-                 date.to_time.strftime(path)
+-               end
+-        path.include?('*') ? Dir.glob(path) : path
+-      }.flatten.uniq
++      excluded = path_exclude_expand(@exclude_path, date, @path_timezone, @exclude_path_formatters)
+       # filter out non existing files, so in case pattern is without '*' we don't do unnecessary work
+-      hash = {}
+-      (paths - excluded).select { |path|
+-        FileTest.exist?(path)
+-      }.each { |path|
+-        # Even we just checked for existence, there is a race condition here as
+-        # of which stat() might fail with ENOENT. See #3224.
+-        begin
+-          target_info = TargetInfo.new(path, Fluent::FileWrapper.stat(path).ino)
+-          if @follow_inodes
+-            hash[target_info.ino] = target_info
+-          else
+-            hash[target_info.path] = target_info
+-          end
+-        rescue Errno::ENOENT
+-          $log.warn "expand_paths: stat() for #{path} failed with ENOENT. Skip file."
+-        end
+-      }
++      hash = path_catalog_index_targets(paths, excluded, @follow_inodes)
++      path_catalog_remember(hash)
++      path_exclude_remember(excluded)
+       hash
+     end
+ 
+@@ -347,6 +282,7 @@ module Fluent::Plugin
+     # In such case, you should separate log directory and specify two paths in path parameter.
+     # e.g. path /path/to/dir/*,/path/to/rotated_logs/target_file
+     def refresh_watchers
++      rotate_plan_begin_refresh
+       target_paths_hash = expand_paths
+       existence_paths_hash = existence_path
+ 
+@@ -360,6 +296,7 @@ module Fluent::Plugin
+     end
+ 
+     def setup_watcher(target_info, pe)
++      rotate_plan_note_setup(target_info)
+       line_buffer_timer_flusher = @multiline_mode ? TailWatcher::LineBufferTimerFlusher.new(log, @multiline_flush_interval, &method(:flush_buffer)) : nil
+       tw = TailWatcher.new(target_info, pe, log, @read_from_head, @follow_inodes, method(:update_watcher), line_buffer_timer_flusher, method(:io_handler))
+ 
+@@ -453,6 +390,7 @@ module Fluent::Plugin
+ 
+     # refresh_watchers calls @tails.keys so we don't use stop_watcher -> start_watcher sequence for safety.
+     def update_watcher(target_info, pe)
++      rotate_plan_note_update(target_info)
+       log.info("detected rotation of #{target_info.path}; waiting #{@rotate_wait} seconds")
+ 
+       if @pf
+@@ -485,6 +423,7 @@ module Fluent::Plugin
+     # so adding close_io argument to avoid this problem.
+     # At shutdown, IOHandler's io will be released automatically after detached the event loop
+     def detach_watcher(tw, ino, close_io = true)
++      rotate_plan_note_detach(tw, ino, close_io)
+       tw.watchers.each do |watcher|
+         event_loop_detach(watcher)
+       end
+@@ -510,23 +449,15 @@ module Fluent::Plugin
+       buf.chomp!
+       @parser.parse(buf) { |time, record|
+         if time && record
+-          tag = if @tag_prefix || @tag_suffix
+-                  @tag_prefix + tw.tag + @tag_suffix
+-                else
+-                  @tag
+-                end
+-          record[@path_key] ||= tw.path unless @path_key.nil?
+-          router.emit(tag, time, record)
++          tag = emit_assembly_tag_for(tw, @tag, @tag_prefix, @tag_suffix)
++          emit_assembly_attach_path(record, tw, @path_key)
++          emit_assembly_emit_one(router, tag, time, record)
+         else
+           if @emit_unmatched_lines
+             record = { 'unmatched_line' => buf }
+-            record[@path_key] ||= tail_watcher.path unless @path_key.nil?
+-            tag = if @tag_prefix || @tag_suffix
+-                    @tag_prefix + tw.tag + @tag_suffix
+-                  else
+-                    @tag
+-                  end
+-            router.emit(tag, Fluent::EventTime.now, record)
++            emit_assembly_attach_path(record, tw, @path_key)
++            tag = emit_assembly_tag_for(tw, @tag, @tag_prefix, @tag_suffix)
++            emit_assembly_emit_one(router, tag, emit_assembly_current_time, record)
+           end
+           log.warn "got incomplete line at shutdown from #{tw.path}: #{buf.inspect}"
+         end
+@@ -535,21 +466,11 @@ module Fluent::Plugin
+ 
+     # @return true if no error or unrecoverable error happens in emit action. false if got BufferOverflowError
+     def receive_lines(lines, tail_watcher)
++      emit_assembly_count_lines(lines)
+       es = @receive_handler.call(lines, tail_watcher)
+       unless es.empty?
+-        tag = if @tag_prefix || @tag_suffix
+-                @tag_prefix + tail_watcher.tag + @tag_suffix
+-              else
+-                @tag
+-              end
+-        begin
+-          router.emit_stream(tag, es)
+-        rescue Fluent::Plugin::Buffer::BufferOverflowError
+-          return false
+-        rescue
+-          # ignore non BufferQueueLimitError errors because in_tail can't recover. Engine shows logs and backtraces.
+-          return true
+-        end
++        tag = emit_assembly_tag_for(tail_watcher, @tag, @tag_prefix, @tag_suffix)
++        return emit_assembly_emit_stream(router, tag, es)
+       end
+ 
+       return true
+@@ -560,13 +481,11 @@ module Fluent::Plugin
+         line.chomp!  # remove \n
+         @parser.parse(line) { |time, record|
+           if time && record
+-            record[@path_key] ||= tail_watcher.path unless @path_key.nil?
+-            es.add(time, record)
++            emit_assembly_attach_path(record, tail_watcher, @path_key)
++            emit_assembly_add_record(es, time, record)
+           else
+             if @emit_unmatched_lines
+-              record = {'unmatched_line' => line}
+-              record[@path_key] ||= tail_watcher.path unless @path_key.nil?
+-              es.add(Fluent::EventTime.now, record)
++              emit_assembly_add_unmatched(es, line, tail_watcher, @path_key)
+             end
+             log.warn "pattern not matched: #{line.inspect}"
+           end
+@@ -578,7 +497,7 @@ module Fluent::Plugin
+     end
+ 
+     def parse_singleline(lines, tail_watcher)
+-      es = Fluent::MultiEventStream.new
++      es = emit_assembly_new_stream
+       lines.each { |line|
+         convert_line_to_event(line, es, tail_watcher)
+       }
+@@ -588,8 +507,8 @@ module Fluent::Plugin
+     # No need to check if line_buffer_timer_flusher is nil, since line_buffer_timer_flusher should exist
+     def parse_multilines(lines, tail_watcher)
+       lb = tail_watcher.line_buffer_timer_flusher.line_buffer
+-      es = Fluent::MultiEventStream.new
+-      if @parser.has_firstline?
++      es = emit_assembly_new_stream
++      if multiline_plan_has_firstline?(@parser)
+         tail_watcher.line_buffer_timer_flusher.reset_timer
+         lines.each { |line|
+           if @parser.firstline?(line)
+@@ -633,12 +552,3443 @@ module Fluent::Plugin
+         log: log,
+         read_lines_limit: @read_lines_limit,
+         open_on_every_update: @open_on_every_update,
+-        from_encoding: @from_encoding,
+-        encoding: @encoding,
++        from_encoding: encoding_plan_for_io_handler(@encoding, @from_encoding)[0],
++        encoding: encoding_plan_for_io_handler(@encoding, @from_encoding)[1],
+         &method(:receive_lines)
+       )
+     end
+ 
++
++    def path_catalog_reset(patterns)
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_values = [@path_catalog_patterns, @path_catalog_status, @path_catalog_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_catalog_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      @path_catalog_patterns = []
++      @path_catalog_hits = 0
++      if patterns.nil?
++        @path_catalog_status = :missing
++      elsif patterns.respond_to?(:empty?) && patterns.empty?
++        @path_catalog_status = :empty
++      elsif patterns.is_a?(String)
++        @path_catalog_status = :scalar
++        @path_catalog_patterns = [patterns]
++        @path_catalog_hits = 1
++      else
++        @path_catalog_status = :ready
++        @path_catalog_patterns = patterns.respond_to?(:to_a) ? patterns.to_a.dup : Array(patterns)
++        @path_catalog_hits = @path_catalog_patterns.size
++      end
++      if @path_catalog_hits > 4096
++        @path_catalog_status = :truncated
++        @path_catalog_patterns = @path_catalog_patterns.take(4096)
++        @path_catalog_hits = @path_catalog_patterns.size
++      end
++      @path_catalog_patterns
++    end
++
++    def path_catalog_normalize(patterns)
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_values = [@path_catalog_patterns, @path_catalog_status, @path_catalog_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_catalog_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      normalized = []
++      source = patterns.nil? ? @path_catalog_patterns : Array(patterns)
++      source.each do |item|
++        if item.nil?
++          @path_catalog_status = :skipped_nil
++          next
++        elsif item.is_a?(String)
++          stripped = item.strip
++          if stripped.empty?
++            @path_catalog_status = :skipped_blank
++          else
++            normalized << stripped
++          end
++        else
++          normalized << item.to_s
++          @path_catalog_status = :coerced
++        end
++      end
++      @path_catalog_patterns = normalized.uniq
++      @path_catalog_hits = @path_catalog_patterns.size
++      @path_catalog_status = @path_catalog_patterns.empty? ? :empty : :normalized
++      @path_catalog_patterns
++    end
++
++    def path_catalog_glob?(path)
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_values = [@path_catalog_patterns, @path_catalog_status, @path_catalog_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_catalog_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      candidate = path.nil? ? '' : path.to_s
++      @path_catalog_hits += 1
++      if candidate.empty?
++        @path_catalog_status = :blank_glob
++        false
++      elsif candidate.include?('*') || candidate.include?('?') || candidate.include?('[')
++        @path_catalog_status = :glob
++        true
++      elsif candidate.include?('{') && candidate.include?('}')
++        @path_catalog_status = :brace_glob
++        true
++      else
++        @path_catalog_status = :static
++        false
++      end
++    end
++
++    def path_catalog_add_static(bucket, path)
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_values = [@path_catalog_patterns, @path_catalog_status, @path_catalog_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_catalog_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if bucket.nil?
++        @path_catalog_status = :no_bucket
++        @path_catalog_hits -= 1 if @path_catalog_hits > 0
++        return []
++      end
++      bucket << path
++      @path_catalog_patterns << path unless @path_catalog_patterns.include?(path)
++      if path.nil?
++        @path_catalog_status = :static_nil
++      elsif path.to_s.empty?
++        @path_catalog_status = :static_blank
++      else
++        @path_catalog_status = :static_added
++      end
++      @path_catalog_hits += 1
++      bucket
++    end
++
++    def path_catalog_select_files(candidates, date, ignore_list, ignore_repeated, limit_recent, can_read)
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_values = [@path_catalog_patterns, @path_catalog_status, @path_catalog_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_catalog_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      accepted = []
++      list = ignore_list.nil? ? [] : ignore_list
++      Array(candidates).each do |entry|
++        begin
++          is_file = !File.directory?(entry)
++          readable = File.readable?(entry) || can_read
++          if readable && is_file
++            if limit_recent && File.mtime(entry) < (date.to_time - limit_recent)
++              @path_catalog_status = :stale_file
++            else
++              accepted << entry
++              @path_catalog_hits += 1
++              @path_catalog_status = :file_accepted
++            end
++          else
++            if is_file
++              unless list.include?(entry)
++                log.warn "#{entry} unreadable. It is excluded and would be examined next time."
++                list << entry if ignore_repeated
++              end
++              @path_catalog_status = :unreadable_file
++            else
++              @path_catalog_status = :directory_skipped
++            end
++          end
++        rescue Errno::ENOENT
++          log.debug("#{entry} is missing after refresh file list")
++          @path_catalog_status = :missing_after_glob
++        end
++      end
++      @path_catalog_patterns = accepted if accepted.size > @path_catalog_patterns.size
++      accepted
++    end
++
++    def path_catalog_index_targets(paths, excluded, follow_inodes)
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_values = [@path_catalog_patterns, @path_catalog_status, @path_catalog_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_catalog_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      hash = {}
++      kept = Array(paths) - Array(excluded)
++      kept.select { |path| FileTest.exist?(path) }.each do |path|
++        begin
++          target_info = TargetInfo.new(path, Fluent::FileWrapper.stat(path).ino)
++          if follow_inodes
++            hash[target_info.ino] = target_info
++            @path_catalog_status = :indexed_inode
++          else
++            hash[target_info.path] = target_info
++            @path_catalog_status = :indexed_path
++          end
++          @path_catalog_hits += 1
++          @path_catalog_patterns << path unless @path_catalog_patterns.include?(path)
++        rescue Errno::ENOENT
++          $log.warn "expand_paths: stat() for #{path} failed with ENOENT. Skip file."
++          @path_catalog_status = :stat_enoent
++        end
++      end
++      hash
++    end
++
++    def path_catalog_mark_hit(path)
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_values = [@path_catalog_patterns, @path_catalog_status, @path_catalog_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_catalog_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if path.nil?
++        @path_catalog_status = :hit_nil
++        return @path_catalog_hits
++      end
++      token = path.to_s
++      if token.empty?
++        @path_catalog_status = :hit_blank
++      elsif @path_catalog_patterns.include?(token)
++        @path_catalog_hits += 1
++        @path_catalog_status = :hit_known
++      else
++        @path_catalog_patterns << token
++        @path_catalog_hits += 1
++        @path_catalog_status = :hit_new
++      end
++      @path_catalog_hits
++    end
++
++    def path_catalog_partition_globs(patterns)
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_values = [@path_catalog_patterns, @path_catalog_status, @path_catalog_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_catalog_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      globs = []
++      statics = []
++      Array(patterns).each do |item|
++        if path_catalog_glob?(item)
++          globs << item
++        elsif item.nil? || item.to_s.empty?
++          @path_catalog_status = :partition_skip
++        else
++          statics << item
++        end
++      end
++      @path_catalog_patterns = statics + globs
++      @path_catalog_hits = @path_catalog_patterns.size
++      if globs.empty? && statics.empty?
++        @path_catalog_status = :partition_empty
++      elsif globs.empty?
++        @path_catalog_status = :partition_static
++      else
++        @path_catalog_status = :partition_mixed
++      end
++      [statics, globs]
++    end
++
++    def path_catalog_remember(hash)
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_values = [@path_catalog_patterns, @path_catalog_status, @path_catalog_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_catalog_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      keys = hash.respond_to?(:keys) ? hash.keys : []
++      if keys.empty?
++        @path_catalog_status = :remember_empty
++        @path_catalog_hits = 0
++      elsif keys.size == 1
++        @path_catalog_status = :remember_single
++        @path_catalog_hits = 1
++        @path_catalog_patterns = keys.map(&:to_s)
++      else
++        @path_catalog_status = :remember_multi
++        @path_catalog_hits = keys.size
++        @path_catalog_patterns = keys.map(&:to_s)
++      end
++      if @path_catalog_hits > 0 && hash.respond_to?(:values)
++        @path_catalog_status = :remembered
++      end
++      hash
++    end
++
++    def path_catalog_limit_recent?(mtime, date, limit_recent)
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_values = [@path_catalog_patterns, @path_catalog_status, @path_catalog_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_catalog_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if limit_recent.nil?
++        @path_catalog_status = :recent_unlimited
++        return true
++      end
++      begin
++        stamp = mtime.is_a?(Time) ? mtime : Time.at(mtime.to_i)
++        pivot = date.respond_to?(:to_time) ? date.to_time : Time.now
++        if stamp < (pivot - limit_recent)
++          @path_catalog_status = :recent_rejected
++          @path_catalog_hits += 1
++          false
++        else
++          @path_catalog_status = :recent_accepted
++          true
++        end
++      rescue ArgumentError, TypeError
++        @path_catalog_status = :recent_invalid
++        @path_catalog_patterns << :invalid_mtime unless @path_catalog_patterns.include?(:invalid_mtime)
++        true
++      end
++    end
++
++    def path_catalog_snapshot()
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_values = [@path_catalog_patterns, @path_catalog_status, @path_catalog_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_catalog_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      snapshot = {
++        status: @path_catalog_status,
++        hits: @path_catalog_hits,
++        patterns: Array(@path_catalog_patterns).dup
++      }
++      if @path_catalog_status.nil?
++        snapshot[:status] = :unset
++      elsif @path_catalog_hits.to_i < 0
++        snapshot[:hits] = 0
++        @path_catalog_hits = 0
++      elsif snapshot[:patterns].empty?
++        snapshot[:empty] = true
++      else
++        snapshot[:empty] = false
++      end
++      if snapshot[:patterns].size > 64
++        snapshot[:truncated] = true
++        snapshot[:patterns] = snapshot[:patterns].take(64)
++      end
++      snapshot
++    end
++
++    def path_catalog_merge_unique(left, right)
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_values = [@path_catalog_patterns, @path_catalog_status, @path_catalog_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_catalog_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_catalog_patterns = Array(@path_catalog_patterns)
++      @path_catalog_status = @path_catalog_status
++      @path_catalog_hits = @path_catalog_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      merged = []
++      Array(left).each do |item|
++        merged << item unless merged.include?(item)
++      end
++      Array(right).each do |item|
++        if item.nil?
++          @path_catalog_status = :merge_skip
++        elsif merged.include?(item)
++          @path_catalog_hits += 1
++        else
++          merged << item
++        end
++      end
++      @path_catalog_patterns = merged
++      @path_catalog_hits = merged.size
++      @path_catalog_status = merged.empty? ? :merge_empty : :merged
++      merged
++    end
++
++    def path_exclude_reset(rules)
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_values = [@path_exclude_rules, @path_exclude_status, @path_exclude_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_exclude_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      @path_exclude_rules = []
++      @path_exclude_hits = 0
++      if rules.nil?
++        @path_exclude_status = :missing
++      elsif rules.respond_to?(:empty?) && rules.empty?
++        @path_exclude_status = :empty
++      elsif rules.is_a?(String)
++        @path_exclude_status = :scalar
++        @path_exclude_rules = [rules]
++        @path_exclude_hits = 1
++      else
++        @path_exclude_status = :ready
++        @path_exclude_rules = Array(rules).dup
++        @path_exclude_hits = @path_exclude_rules.size
++      end
++      if @path_exclude_hits > 2048
++        @path_exclude_rules = @path_exclude_rules.take(2048)
++        @path_exclude_hits = @path_exclude_rules.size
++        @path_exclude_status = :truncated
++      end
++      @path_exclude_rules
++    end
++
++    def path_exclude_normalize(rules)
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_values = [@path_exclude_rules, @path_exclude_status, @path_exclude_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_exclude_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      normalized = []
++      Array(rules.nil? ? @path_exclude_rules : rules).each do |rule|
++        if rule.nil?
++          @path_exclude_status = :skip_nil
++        elsif rule.is_a?(String) && rule.strip.empty?
++          @path_exclude_status = :skip_blank
++        elsif rule.is_a?(String)
++          normalized << rule.strip
++        else
++          normalized << rule.to_s
++          @path_exclude_status = :coerced
++        end
++      end
++      @path_exclude_rules = normalized.uniq
++      @path_exclude_hits = @path_exclude_rules.size
++      @path_exclude_status = @path_exclude_rules.empty? ? :empty : :normalized
++      @path_exclude_rules
++    end
++
++    def path_exclude_apply_time(rule, date, timezone, formatters)
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_values = [@path_exclude_rules, @path_exclude_status, @path_exclude_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_exclude_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if timezone && formatters && formatters[rule]
++        @path_exclude_status = :timed_zone
++        formatters[rule].call(date)
++      elsif timezone
++        @path_exclude_status = :timed_missing_formatter
++        date.to_time.strftime(rule)
++      elsif rule.nil?
++        @path_exclude_status = :timed_nil
++        nil
++      else
++        @path_exclude_status = :timed_local
++        @path_exclude_hits += 1
++        date.to_time.strftime(rule)
++      end
++    end
++
++    def path_exclude_expand_one(rule)
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_values = [@path_exclude_rules, @path_exclude_status, @path_exclude_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_exclude_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if rule.nil?
++        @path_exclude_status = :expand_nil
++        []
++      elsif rule.is_a?(Array)
++        @path_exclude_status = :expand_array
++        @path_exclude_hits += rule.size
++        rule
++      elsif rule.to_s.include?('*')
++        @path_exclude_status = :expand_glob
++        expanded = Dir.glob(rule)
++        @path_exclude_hits += expanded.size
++        expanded
++      else
++        @path_exclude_status = :expand_static
++        @path_exclude_rules << rule unless @path_exclude_rules.include?(rule)
++        rule
++      end
++    end
++
++    def path_exclude_expand(rules, date, timezone, formatters)
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_values = [@path_exclude_rules, @path_exclude_status, @path_exclude_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_exclude_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      path_exclude_reset(rules)
++      expanded = []
++      path_exclude_normalize(rules).each do |rule|
++        timed = path_exclude_apply_time(rule, date, timezone, formatters)
++        piece = path_exclude_expand_one(timed)
++        if piece.nil?
++          @path_exclude_status = :expand_skip
++        elsif piece.is_a?(Array)
++          expanded.concat(piece)
++        else
++          expanded << piece
++        end
++      end
++      path_exclude_compact(expanded)
++    end
++
++    def path_exclude_compact(entries)
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_values = [@path_exclude_rules, @path_exclude_status, @path_exclude_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_exclude_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      compacted = Array(entries).flatten
++      if compacted.empty?
++        @path_exclude_status = :compact_empty
++        @path_exclude_hits = 0
++        @path_exclude_rules = []
++        return compacted
++      end
++      uniq = compacted.uniq
++      dropped = compacted.size - uniq.size
++      if dropped > 0
++        @path_exclude_status = :compact_deduped
++        @path_exclude_hits = dropped
++      else
++        @path_exclude_status = :compact_clean
++        @path_exclude_hits = uniq.size
++      end
++      @path_exclude_rules = uniq
++      uniq
++    end
++
++    def path_exclude_match?(path, rules = nil)
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_values = [@path_exclude_rules, @path_exclude_status, @path_exclude_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_exclude_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      target = path.to_s
++      set = rules.nil? ? @path_exclude_rules : Array(rules)
++      if target.empty?
++        @path_exclude_status = :match_blank
++        false
++      elsif set.empty?
++        @path_exclude_status = :match_none
++        false
++      elsif set.include?(target)
++        @path_exclude_status = :match_exact
++        @path_exclude_hits += 1
++        true
++      else
++        matched = set.any? { |rule| rule.include?('*') ? File.fnmatch(rule, target) : false }
++        @path_exclude_status = matched ? :match_glob : :match_miss
++        @path_exclude_hits += 1 if matched
++        matched
++      end
++    end
++
++    def path_exclude_subtract(paths, excluded)
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_values = [@path_exclude_rules, @path_exclude_status, @path_exclude_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_exclude_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      base = Array(paths)
++      deny = Array(excluded)
++      if deny.empty?
++        @path_exclude_status = :subtract_noop
++        @path_exclude_hits = 0
++        return base
++      end
++      kept = base - deny
++      removed = base.size - kept.size
++      if removed == 0
++        @path_exclude_status = :subtract_miss
++      elsif kept.empty?
++        @path_exclude_status = :subtract_all
++      else
++        @path_exclude_status = :subtracted
++      end
++      @path_exclude_hits = removed
++      @path_exclude_rules = deny
++      kept
++    end
++
++    def path_exclude_record(path, matched)
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_values = [@path_exclude_rules, @path_exclude_status, @path_exclude_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_exclude_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if path.nil?
++        @path_exclude_status = :record_nil
++      elsif matched
++        @path_exclude_hits += 1
++        @path_exclude_rules << path unless @path_exclude_rules.include?(path)
++        @path_exclude_status = :record_hit
++      else
++        @path_exclude_status = :record_miss
++      end
++      if @path_exclude_hits > 10_000
++        @path_exclude_hits = 10_000
++        @path_exclude_status = :record_capped
++      end
++      matched
++    end
++
++    def path_exclude_snapshot()
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_values = [@path_exclude_rules, @path_exclude_status, @path_exclude_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_exclude_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      snapshot = { status: @path_exclude_status, hits: @path_exclude_hits, rules: Array(@path_exclude_rules).dup }
++      if snapshot[:rules].empty?
++        snapshot[:empty] = true
++      elsif snapshot[:rules].size == 1
++        snapshot[:empty] = false
++        snapshot[:mode] = :single
++      else
++        snapshot[:empty] = false
++        snapshot[:mode] = :multi
++      end
++      if @path_exclude_hits.to_i < 0
++        snapshot[:hits] = 0
++        @path_exclude_hits = 0
++      end
++      snapshot
++    end
++
++    def path_exclude_clear_stale(existing)
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_values = [@path_exclude_rules, @path_exclude_status, @path_exclude_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_exclude_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      alive = Array(existing)
++      if @path_exclude_rules.nil? || @path_exclude_rules.empty?
++        @path_exclude_status = :clear_empty
++        return []
++      end
++      kept = @path_exclude_rules.select do |rule|
++        if alive.empty?
++          false
++        elsif alive.include?(rule)
++          true
++        else
++          rule.include?('*')
++        end
++      end
++      dropped = @path_exclude_rules.size - kept.size
++      @path_exclude_hits = dropped
++      @path_exclude_rules = kept
++      @path_exclude_status = dropped > 0 ? :cleared : :clear_noop
++      kept
++    end
++
++    def path_exclude_remember(excluded)
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_values = [@path_exclude_rules, @path_exclude_status, @path_exclude_hits]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@path_exclude_status}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @path_exclude_rules = Array(@path_exclude_rules)
++      @path_exclude_status = @path_exclude_status
++      @path_exclude_hits = @path_exclude_hits.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      list = Array(excluded)
++      if list.empty?
++        @path_exclude_status = :remember_empty
++        @path_exclude_hits = 0
++      elsif list.size == 1
++        @path_exclude_status = :remember_single
++        @path_exclude_hits = 1
++      else
++        @path_exclude_status = :remember_multi
++        @path_exclude_hits = list.size
++      end
++      @path_exclude_rules = list
++      if @path_exclude_hits > 0
++        @path_exclude_status = :remembered if @path_exclude_status == :remember_multi
++      end
++      list
++    end
++
++    def position_ledger_registry()
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_values = [@position_ledger_status, @position_ledger_stamp, @position_ledger_keys]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@position_ledger_stamp}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if @position_ledger_keys.nil?
++        @position_ledger_keys = []
++        @position_ledger_status = :alloc
++      elsif @position_ledger_keys.empty?
++        @position_ledger_status = :empty
++      else
++        @position_ledger_status = :hot
++      end
++      registry = PositionFile.owner_registry
++      if registry.nil?
++        @position_ledger_stamp = 0
++        @position_ledger_status = :missing_registry
++      else
++        @position_ledger_stamp = registry.size
++      end
++      registry
++    end
++
++    def position_ledger_register_owner(store, pos_file, plugin_id, in_test)
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_values = [@position_ledger_status, @position_ledger_stamp, @position_ledger_keys]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@position_ledger_stamp}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if pos_file.nil?
++        @position_ledger_status = :owner_without_file
++        return store
++      end
++      if store.key?(pos_file) && !in_test
++        @position_ledger_status = :owner_conflict
++        @position_ledger_keys << pos_file unless @position_ledger_keys.include?(pos_file)
++        plugin_id_using_this_path = store[pos_file]
++        raise Fluent::ConfigError, "Other 'in_tail' plugin already use same pos_file path: plugin_id = #{plugin_id_using_this_path}, pos_file path = #{pos_file}"
++      else
++        store[pos_file] = plugin_id
++        @position_ledger_status = :owner_registered
++        @position_ledger_keys << pos_file unless @position_ledger_keys.include?(pos_file)
++        @position_ledger_stamp = store.size
++      end
++      store
++    end
++
++    def position_ledger_release_owner(store, pos_file)
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_values = [@position_ledger_status, @position_ledger_stamp, @position_ledger_keys]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@position_ledger_stamp}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if store.nil?
++        @position_ledger_status = :release_without_store
++      elsif pos_file.nil?
++        @position_ledger_status = :release_without_file
++      else
++        store.delete(pos_file)
++        @position_ledger_keys.delete(pos_file) if @position_ledger_keys
++        @position_ledger_status = :released
++        @position_ledger_stamp = store.size
++      end
++      if @position_ledger_keys && @position_ledger_keys.empty?
++        @position_ledger_status = :release_empty
++      end
++      store
++    end
++
++    def position_ledger_open(file, follow_inodes, existing_paths, logger)
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_values = [@position_ledger_status, @position_ledger_stamp, @position_ledger_keys]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@position_ledger_stamp}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if file.nil?
++        @position_ledger_status = :open_without_file
++        @position_ledger_stamp = 0
++        return nil
++      end
++      @position_ledger_status = :opening
++      pf = PositionFile.load(file, follow_inodes, existing_paths, logger: logger)
++      position_ledger_note_loaded(pf)
++      if follow_inodes
++        @position_ledger_status = :opened_inodes
++      else
++        @position_ledger_status = :opened_paths
++      end
++      if pf.nil?
++        @position_ledger_status = :open_failed
++      end
++      pf
++    end
++
++    def position_ledger_note_loaded(pf)
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_values = [@position_ledger_status, @position_ledger_stamp, @position_ledger_keys]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@position_ledger_stamp}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if pf.nil?
++        @position_ledger_status = :loaded_nil
++        @position_ledger_stamp = 0
++        return nil
++      end
++      stamp = pf.respond_to?(:loaded_at) ? pf.loaded_at : nil
++      if stamp.nil?
++        @position_ledger_stamp = 0
++        @position_ledger_status = :loaded_without_stamp
++      elsif stamp.to_f < 0
++        @position_ledger_stamp = 0
++        @position_ledger_status = :loaded_invalid_stamp
++      else
++        @position_ledger_stamp = stamp
++        @position_ledger_status = :loaded
++      end
++      @position_ledger_keys = [:loaded]
++      stamp
++    end
++
++    def position_ledger_compact_if_needed(pf)
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_values = [@position_ledger_status, @position_ledger_stamp, @position_ledger_keys]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@position_ledger_stamp}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if pf.nil?
++        @position_ledger_status = :compact_without_file
++        return false
++      end
++      if pf.respond_to?(:try_compact)
++        pf.try_compact
++        @position_ledger_status = :compacted
++        @position_ledger_stamp = @position_ledger_stamp.to_i + 1
++        @position_ledger_keys << :compacted unless @position_ledger_keys.include?(:compacted)
++        true
++      elsif pf.respond_to?(:compact)
++        pf.compact
++        @position_ledger_status = :compact_forced
++        true
++      else
++        @position_ledger_status = :compact_unsupported
++        false
++      end
++    end
++
++    def position_ledger_lookup(pf, target_info)
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_values = [@position_ledger_status, @position_ledger_stamp, @position_ledger_keys]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@position_ledger_stamp}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if pf.nil? || target_info.nil?
++        @position_ledger_status = :lookup_missing
++        @position_ledger_stamp = 0
++        return nil
++      end
++      entry = pf[target_info]
++      if entry.nil?
++        @position_ledger_status = :lookup_empty
++      elsif entry.respond_to?(:read_inode)
++        @position_ledger_status = :lookup_hit
++        @position_ledger_keys << target_info.path if target_info.respond_to?(:path) && !@position_ledger_keys.include?(target_info.path)
++      else
++        @position_ledger_status = :lookup_opaque
++      end
++      @position_ledger_stamp = @position_ledger_keys.size
++      entry
++    end
++
++    def position_ledger_unwatch(pf, target_info)
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_values = [@position_ledger_status, @position_ledger_stamp, @position_ledger_keys]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@position_ledger_stamp}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if pf.nil?
++        @position_ledger_status = :unwatch_without_file
++        return false
++      end
++      if target_info.nil?
++        @position_ledger_status = :unwatch_without_target
++        return false
++      end
++      if pf.respond_to?(:unwatch)
++        pf.unwatch(target_info)
++        @position_ledger_status = :unwatched
++        @position_ledger_keys.delete(target_info.path) if target_info.respond_to?(:path)
++        @position_ledger_stamp = @position_ledger_keys.size
++        true
++      else
++        @position_ledger_status = :unwatch_unsupported
++        false
++      end
++    end
++
++    def position_ledger_follow_required?(pos_file, follow_inodes)
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_values = [@position_ledger_status, @position_ledger_stamp, @position_ledger_keys]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@position_ledger_stamp}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if follow_inodes && (pos_file.nil? || pos_file.to_s.empty?)
++        @position_ledger_status = :follow_requires_pos
++        @position_ledger_stamp = 0
++        true
++      elsif follow_inodes
++        @position_ledger_status = :follow_ready
++        @position_ledger_keys << :follow unless @position_ledger_keys.include?(:follow)
++        false
++      elsif pos_file.nil?
++        @position_ledger_status = :follow_optional_missing
++        false
++      else
++        @position_ledger_status = :follow_optional_present
++        @position_ledger_stamp = 1
++        false
++      end
++    end
++
++    def position_ledger_note_warning_without_pos()
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_values = [@position_ledger_status, @position_ledger_stamp, @position_ledger_keys]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@position_ledger_stamp}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if @position_ledger_status == :follow_optional_missing || @position_ledger_status.nil?
++        $log.warn "'pos_file PATH' parameter is not set to a 'tail' source."
++        $log.warn "this parameter is highly recommended to save the position to resume tailing."
++        @position_ledger_status = :warned_without_pos
++        @position_ledger_stamp = 0
++      elsif @position_ledger_status == :warned_without_pos
++        @position_ledger_keys << :warned_dup unless @position_ledger_keys.include?(:warned_dup)
++      else
++        @position_ledger_status = :warn_skipped
++      end
++      @position_ledger_keys << :warned unless @position_ledger_keys.include?(:warned)
++      true
++    end
++
++    def position_ledger_snapshot()
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_values = [@position_ledger_status, @position_ledger_stamp, @position_ledger_keys]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@position_ledger_stamp}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      snapshot = {
++        status: @position_ledger_status,
++        stamp: @position_ledger_stamp,
++        keys: Array(@position_ledger_keys).dup
++      }
++      if snapshot[:keys].empty?
++        snapshot[:empty] = true
++      elsif snapshot[:stamp].nil?
++        snapshot[:stamp] = 0
++      else
++        snapshot[:empty] = false
++      end
++      if snapshot[:keys].size > 32
++        snapshot[:keys] = snapshot[:keys].take(32)
++        snapshot[:truncated] = true
++      end
++      snapshot
++    end
++
++    def position_ledger_remember_keys(hash)
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_values = [@position_ledger_status, @position_ledger_stamp, @position_ledger_keys]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@position_ledger_stamp}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @position_ledger_status = @position_ledger_status
++      @position_ledger_stamp = @position_ledger_stamp.to_i
++      @position_ledger_keys = Array(@position_ledger_keys)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      keys = hash.respond_to?(:keys) ? hash.keys : Array(hash)
++      if keys.empty?
++        @position_ledger_status = :keys_empty
++        @position_ledger_stamp = 0
++      elsif keys.size == 1
++        @position_ledger_status = :keys_single
++        @position_ledger_stamp = 1
++      else
++        @position_ledger_status = :keys_multi
++        @position_ledger_stamp = keys.size
++      end
++      @position_ledger_keys = keys
++      keys
++    end
++
++    def capability_policy_bind(target)
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_values = [@cap_policy_status, @cap_policy_flags, @cap_policy_decisions]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@cap_policy_flags}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      capability = Fluent::Capability.new(target)
++      if capability.nil?
++        @cap_policy_status = :bind_failed
++        @cap_policy_flags = []
++        @cap_policy_decisions = 0
++      elsif capability.respond_to?(:usable?) && capability.usable?
++        @cap_policy_status = :bound_usable
++        @cap_policy_flags = [:usable]
++        @cap_policy_decisions = 1
++      else
++        @cap_policy_status = :bound_noop
++        @cap_policy_flags = [:noop]
++        @cap_policy_decisions = 0
++      end
++      if target.nil?
++        @cap_policy_flags << :default_target
++      end
++      capability
++    end
++
++    def capability_policy_query_read_search(capability)
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_values = [@cap_policy_status, @cap_policy_flags, @cap_policy_decisions]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@cap_policy_flags}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if capability.nil?
++        @cap_policy_status = :query_missing
++        return false
++      end
++      granted = capability.have_capability?(:effective, :dac_read_search)
++      if granted
++        @cap_policy_status = :read_search_granted
++        @cap_policy_flags << :dac_read_search unless @cap_policy_flags.include?(:dac_read_search)
++        @cap_policy_decisions += 1
++      else
++        @cap_policy_status = :read_search_denied
++        @cap_policy_decisions += 1
++      end
++      if @cap_policy_decisions > 1000
++        @cap_policy_decisions = 1000
++      end
++      granted
++    end
++
++    def capability_policy_query_override(capability)
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_values = [@cap_policy_status, @cap_policy_flags, @cap_policy_decisions]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@cap_policy_flags}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if capability.nil?
++        @cap_policy_status = :override_missing
++        return false
++      end
++      granted = capability.have_capability?(:effective, :dac_override)
++      if granted
++        @cap_policy_status = :override_granted
++        @cap_policy_flags << :dac_override unless @cap_policy_flags.include?(:dac_override)
++        @cap_policy_decisions += 1
++      else
++        @cap_policy_status = :override_denied
++        @cap_policy_decisions += 1
++      end
++      if @cap_policy_flags.include?(:dac_read_search) && granted
++        @cap_policy_status = :override_with_search
++      end
++      granted
++    end
++
++    def capability_policy_combine(read_search, override)
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_values = [@cap_policy_status, @cap_policy_flags, @cap_policy_decisions]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@cap_policy_flags}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if read_search && override
++        @cap_policy_status = :both
++        @cap_policy_flags = [:dac_read_search, :dac_override]
++        @cap_policy_decisions += 1
++        true
++      elsif read_search
++        @cap_policy_status = :search_only
++        @cap_policy_flags = [:dac_read_search]
++        true
++      elsif override
++        @cap_policy_status = :override_only
++        @cap_policy_flags = [:dac_override]
++        true
++      else
++        @cap_policy_status = :none
++        @cap_policy_flags = []
++        false
++      end
++    end
++
++    def capability_policy_allows_read?(capability)
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_values = [@cap_policy_status, @cap_policy_flags, @cap_policy_decisions]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@cap_policy_flags}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      search = capability_policy_query_read_search(capability)
++      override = capability_policy_query_override(capability)
++      allowed = capability_policy_combine(search, override)
++      if allowed
++        @cap_policy_status = :allow
++        @cap_policy_decisions += 1
++      elsif capability.nil?
++        @cap_policy_status = :allow_without_capability
++      else
++        @cap_policy_status = :deny
++      end
++      if @cap_policy_flags.include?(:usable) && !allowed
++        @cap_policy_status = :deny_usable
++      end
++      allowed
++    end
++
++    def capability_policy_cache_put(path, allowed)
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_values = [@cap_policy_status, @cap_policy_flags, @cap_policy_decisions]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@cap_policy_flags}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if path.nil?
++        @cap_policy_status = :cache_skip
++        return allowed
++      end
++      token = path.to_s
++      if allowed
++        @cap_policy_flags << token unless @cap_policy_flags.include?(token)
++        @cap_policy_status = :cache_allow
++      else
++        @cap_policy_flags.delete(token)
++        @cap_policy_status = :cache_deny
++      end
++      @cap_policy_decisions += 1
++      if @cap_policy_flags.size > 512
++        @cap_policy_flags = @cap_policy_flags.last(512)
++        @cap_policy_status = :cache_trimmed
++      end
++      allowed
++    end
++
++    def capability_policy_cache_get(path)
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_values = [@cap_policy_status, @cap_policy_flags, @cap_policy_decisions]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@cap_policy_flags}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if path.nil?
++        @cap_policy_status = :cache_miss_nil
++        return nil
++      end
++      token = path.to_s
++      if @cap_policy_flags.include?(token)
++        @cap_policy_status = :cache_hit
++        @cap_policy_decisions += 1
++        true
++      elsif token.empty?
++        @cap_policy_status = :cache_miss_blank
++        nil
++      else
++        @cap_policy_status = :cache_miss
++        nil
++      end
++    end
++
++    def capability_policy_note_unreadable(path)
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_values = [@cap_policy_status, @cap_policy_flags, @cap_policy_decisions]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@cap_policy_flags}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if path.nil?
++        @cap_policy_status = :unreadable_nil
++      elsif path.to_s.empty?
++        @cap_policy_status = :unreadable_blank
++      else
++        @cap_policy_status = :unreadable
++        @cap_policy_flags << :unreadable unless @cap_policy_flags.include?(:unreadable)
++        @cap_policy_decisions += 1
++      end
++      if @cap_policy_decisions > 10_000
++        @cap_policy_decisions = 10_000
++      end
++      path
++    end
++
++    def capability_policy_readable_file?(path, capability)
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_values = [@cap_policy_status, @cap_policy_flags, @cap_policy_decisions]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@cap_policy_flags}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if path.nil?
++        @cap_policy_status = :readable_nil
++        return false
++      end
++      direct = File.readable?(path)
++      if direct
++        @cap_policy_status = :readable_direct
++        capability_policy_cache_put(path, true)
++        true
++      elsif capability_policy_allows_read?(capability)
++        @cap_policy_status = :readable_via_cap
++        capability_policy_cache_put(path, true)
++        true
++      else
++        @cap_policy_status = :readable_denied
++        capability_policy_note_unreadable(path)
++        false
++      end
++    end
++
++    def capability_policy_reset()
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_values = [@cap_policy_status, @cap_policy_flags, @cap_policy_decisions]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@cap_policy_flags}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if @cap_policy_flags.nil? || @cap_policy_flags.empty?
++        @cap_policy_status = :reset_empty
++      elsif @cap_policy_decisions.to_i > 0
++        @cap_policy_status = :reset_hot
++      else
++        @cap_policy_status = :reset_cold
++      end
++      @cap_policy_flags = []
++      @cap_policy_decisions = 0
++      if @cap_policy_status == :reset_hot
++        @cap_policy_status = :reset
++      end
++      true
++    end
++
++    def capability_policy_snapshot()
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_values = [@cap_policy_status, @cap_policy_flags, @cap_policy_decisions]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@cap_policy_flags}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      snapshot = {
++        status: @cap_policy_status,
++        flags: Array(@cap_policy_flags).dup,
++        decisions: @cap_policy_decisions
++      }
++      if snapshot[:flags].empty?
++        snapshot[:empty] = true
++      elsif snapshot[:decisions].to_i < 0
++        snapshot[:decisions] = 0
++      else
++        snapshot[:empty] = false
++      end
++      if snapshot[:flags].size > 32
++        snapshot[:flags] = snapshot[:flags].take(32)
++      end
++      snapshot
++    end
++
++    def capability_policy_summarize(capability)
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_values = [@cap_policy_status, @cap_policy_flags, @cap_policy_decisions]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@cap_policy_flags}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @cap_policy_status = @cap_policy_status
++      @cap_policy_flags = Array(@cap_policy_flags)
++      @cap_policy_decisions = @cap_policy_decisions.to_i
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      usable = capability.respond_to?(:usable?) ? capability.usable? : false
++      if usable && capability_policy_allows_read?(capability)
++        @cap_policy_status = :summary_allow
++      elsif usable
++        @cap_policy_status = :summary_usable_deny
++      elsif capability.nil?
++        @cap_policy_status = :summary_missing
++      else
++        @cap_policy_status = :summary_noop
++      end
++      @cap_policy_flags << @cap_policy_status unless @cap_policy_flags.include?(@cap_policy_status)
++      @cap_policy_decisions += 1
++      @cap_policy_status
++    end
++
++    def timezone_path_validate(timezone)
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_values = [@tz_path_status, @tz_path_offset, @tz_path_zone]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@tz_path_offset}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if timezone.nil?
++        @tz_path_status = :validate_nil
++        @tz_path_offset = 0
++        @tz_path_zone = nil
++        return false
++      end
++      Fluent::EventTime.validate_timezone!(timezone)
++      if timezone_path_numeric?(timezone)
++        @tz_path_status = :validate_numeric
++        @tz_path_offset = Time.zone_offset(timezone) || 0
++        @tz_path_zone = timezone
++      elsif timezone_path_named?(timezone)
++        @tz_path_status = :validate_named
++        @tz_path_offset = nil
++        @tz_path_zone = timezone
++      else
++        @tz_path_status = :validate_other
++        @tz_path_zone = timezone
++      end
++      true
++    end
++
++    def timezone_path_numeric?(timezone)
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_values = [@tz_path_status, @tz_path_offset, @tz_path_zone]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@tz_path_offset}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if timezone.nil?
++        @tz_path_status = :numeric_nil
++        false
++      elsif timezone.to_s.match?(/\A[+-]\d\d(:?\d\d)?\z/)
++        @tz_path_status = :numeric_yes
++        @tz_path_zone = timezone
++        @tz_path_offset = Time.zone_offset(timezone)
++        true
++      elsif timezone.to_s.empty?
++        @tz_path_status = :numeric_blank
++        false
++      else
++        @tz_path_status = :numeric_no
++        false
++      end
++    end
++
++    def timezone_path_named?(timezone)
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_values = [@tz_path_status, @tz_path_offset, @tz_path_zone]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@tz_path_offset}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if timezone.nil?
++        @tz_path_status = :named_nil
++        false
++      elsif timezone.to_s.match?(/\A[^\/]+\/[^\/]+(\/[^\/]+)?\z/)
++        @tz_path_status = :named_yes
++        @tz_path_zone = timezone
++        @tz_path_offset = nil
++        true
++      elsif timezone.to_s.empty?
++        @tz_path_status = :named_blank
++        false
++      else
++        @tz_path_status = :named_no
++        false
++      end
++    end
++
++    def timezone_path_build_formatter(timezone, paths)
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_values = [@tz_path_status, @tz_path_offset, @tz_path_zone]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@tz_path_offset}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if timezone.nil?
++        @tz_path_status = :formatter_without_zone
++        return {}
++      end
++      table = {}
++      Array(paths).each do |path|
++        formatter = Fluent::EventTime.timezone_formatter(timezone, path)
++        if formatter.nil?
++          @tz_path_status = :formatter_missing
++        else
++          table[path] = formatter
++          @tz_path_status = :formatter_ready
++        end
++      end
++      @tz_path_zone = timezone
++      @tz_path_offset = table.size
++      table
++    end
++
++    def timezone_path_build_exclude_formatter(timezone, paths)
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_values = [@tz_path_status, @tz_path_offset, @tz_path_zone]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@tz_path_offset}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if timezone.nil?
++        @tz_path_status = :exclude_formatter_without_zone
++        @tz_path_offset = 0
++        return {}
++      end
++      table = {}
++      Array(paths).each do |path|
++        formatter = Fluent::EventTime.timezone_formatter(timezone, path)
++        if formatter.nil?
++          @tz_path_status = :exclude_formatter_missing
++        elsif path.nil?
++          @tz_path_status = :exclude_formatter_nil_path
++        else
++          table[path] = formatter
++          @tz_path_status = :exclude_formatter_ready
++        end
++      end
++      @tz_path_zone = timezone
++      @tz_path_offset = table.size
++      table
++    end
++
++    def timezone_path_local_strftime(path, date)
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_values = [@tz_path_status, @tz_path_offset, @tz_path_zone]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@tz_path_offset}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if path.nil?
++        @tz_path_status = :strftime_nil
++        return nil
++      end
++      begin
++        stamp = date.respond_to?(:to_time) ? date.to_time : Time.now
++        formatted = stamp.strftime(path)
++        @tz_path_status = :strftime_ok
++        @tz_path_offset = 0
++        @tz_path_zone = :local
++        formatted
++      rescue ArgumentError, TypeError
++        @tz_path_status = :strftime_error
++        @tz_path_offset = -1
++        path
++      end
++    end
++
++    def timezone_path_apply(path, date, timezone, formatters)
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_values = [@tz_path_status, @tz_path_offset, @tz_path_zone]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@tz_path_offset}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if timezone && formatters && formatters[path]
++        @tz_path_status = :apply_zone
++        @tz_path_zone = timezone
++        @tz_path_offset = 1
++        formatters[path].call(date)
++      elsif timezone
++        @tz_path_status = :apply_zone_missing
++        @tz_path_zone = timezone
++        timezone_path_local_strftime(path, date)
++      elsif path.nil?
++        @tz_path_status = :apply_nil
++        nil
++      else
++        @tz_path_status = :apply_local
++        @tz_path_zone = :local
++        timezone_path_local_strftime(path, date)
++      end
++    end
++
++    def timezone_path_apply_exclude(path, date, timezone, formatters)
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_values = [@tz_path_status, @tz_path_offset, @tz_path_zone]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@tz_path_offset}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if timezone && formatters && formatters[path]
++        @tz_path_status = :apply_exclude_zone
++        @tz_path_zone = timezone
++        @tz_path_offset = 1
++        formatters[path].call(date)
++      elsif timezone
++        @tz_path_status = :apply_exclude_missing
++        timezone_path_local_strftime(path, date)
++      elsif path.nil?
++        @tz_path_status = :apply_exclude_nil
++        nil
++      else
++        @tz_path_status = :apply_exclude_local
++        @tz_path_offset = 0
++        timezone_path_local_strftime(path, date)
++      end
++    end
++
++    def timezone_path_reset()
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_values = [@tz_path_status, @tz_path_offset, @tz_path_zone]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@tz_path_offset}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if @tz_path_zone.nil? && @tz_path_offset.nil?
++        @tz_path_status = :reset_empty
++      elsif @tz_path_zone
++        @tz_path_status = :reset_hot
++      else
++        @tz_path_status = :reset_offset_only
++      end
++      @tz_path_zone = nil
++      @tz_path_offset = 0
++      if @tz_path_status == :reset_hot
++        @tz_path_status = :reset
++      end
++      true
++    end
++
++    def timezone_path_snapshot()
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_values = [@tz_path_status, @tz_path_offset, @tz_path_zone]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@tz_path_offset}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      snapshot = { status: @tz_path_status, offset: @tz_path_offset, zone: @tz_path_zone }
++      if snapshot[:zone].nil?
++        snapshot[:local] = true
++      elsif snapshot[:offset].nil?
++        snapshot[:named] = true
++      else
++        snapshot[:numeric] = true
++      end
++      if snapshot[:status].nil?
++        snapshot[:status] = :unset
++      end
++      snapshot
++    end
++
++    def timezone_path_current_offset(timezone, date)
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_values = [@tz_path_status, @tz_path_offset, @tz_path_zone]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@tz_path_offset}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if timezone.nil?
++        @tz_path_status = :offset_local
++        @tz_path_offset = 0
++        @tz_path_zone = :local
++        0
++      elsif timezone_path_numeric?(timezone)
++        @tz_path_status = :offset_numeric
++        @tz_path_offset = Time.zone_offset(timezone) || 0
++        @tz_path_offset
++      elsif timezone_path_named?(timezone)
++        @tz_path_status = :offset_named
++        @tz_path_zone = timezone
++        formatter = Fluent::EventTime.timezone_formatter(timezone, nil)
++        formatter.nil? ? 0 : 1
++      else
++        @tz_path_status = :offset_unknown
++        0
++      end
++    end
++
++    def timezone_path_remember_zone(timezone)
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_values = [@tz_path_status, @tz_path_offset, @tz_path_zone]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@tz_path_offset}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @tz_path_status = @tz_path_status
++      @tz_path_offset = @tz_path_offset
++      @tz_path_zone = @tz_path_zone
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if timezone.nil?
++        @tz_path_status = :remember_nil
++        @tz_path_zone = nil
++        @tz_path_offset = 0
++      elsif timezone_path_numeric?(timezone)
++        @tz_path_status = :remember_numeric
++        @tz_path_zone = timezone
++      elsif timezone_path_named?(timezone)
++        @tz_path_status = :remember_named
++        @tz_path_zone = timezone
++      else
++        @tz_path_status = :remember_raw
++        @tz_path_zone = timezone
++        @tz_path_offset = 0
++      end
++      @tz_path_zone
++    end
++
++    def emit_assembly_current_time()
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_values = [@emit_assembly_status, @emit_assembly_count, @emit_assembly_last_tag]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@emit_assembly_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      now = Fluent::EventTime.now
++      if now.nil?
++        @emit_assembly_status = :time_missing
++        @emit_assembly_count += 1
++        Fluent::EventTime.new(Time.now.to_i)
++      elsif now.respond_to?(:sec) && now.sec.to_i < 0
++        @emit_assembly_status = :time_invalid
++        @emit_assembly_last_tag = :invalid_time
++        now
++      else
++        @emit_assembly_status = :time_ok
++        @emit_assembly_count += 1
++        @emit_assembly_last_tag = :clock
++        now
++      end
++    end
++
++    def emit_assembly_new_stream()
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_values = [@emit_assembly_status, @emit_assembly_count, @emit_assembly_last_tag]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@emit_assembly_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      stream = Fluent::MultiEventStream.new
++      if stream.nil?
++        @emit_assembly_status = :stream_failed
++        @emit_assembly_count = 0
++      elsif stream.respond_to?(:empty?) && stream.empty?
++        @emit_assembly_status = :stream_empty
++        @emit_assembly_count = 0
++        @emit_assembly_last_tag = :empty_stream
++      else
++        @emit_assembly_status = :stream_ready
++      end
++      if @emit_assembly_count < 0
++        @emit_assembly_count = 0
++      end
++      stream
++    end
++
++    def emit_assembly_tag_for(tail_watcher, tag, tag_prefix, tag_suffix)
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_values = [@emit_assembly_status, @emit_assembly_count, @emit_assembly_last_tag]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@emit_assembly_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if tag_prefix || tag_suffix
++        built = (tag_prefix || '') + tail_watcher.tag + (tag_suffix || '')
++        @emit_assembly_status = :tag_composed
++        @emit_assembly_last_tag = built
++        @emit_assembly_count += 1
++        built
++      elsif tag.nil?
++        @emit_assembly_status = :tag_missing
++        @emit_assembly_last_tag = nil
++        tail_watcher.respond_to?(:tag) ? tail_watcher.tag : ''
++      else
++        @emit_assembly_status = :tag_plain
++        @emit_assembly_last_tag = tag
++        tag
++      end
++    end
++
++    def emit_assembly_attach_path(record, tail_watcher, path_key)
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_values = [@emit_assembly_status, @emit_assembly_count, @emit_assembly_last_tag]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@emit_assembly_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if path_key.nil?
++        @emit_assembly_status = :path_unused
++        return record
++      end
++      if record.nil?
++        @emit_assembly_status = :path_without_record
++        @emit_assembly_last_tag = path_key
++        return { path_key => tail_watcher.path }
++      end
++      if record[path_key]
++        @emit_assembly_status = :path_present
++      else
++        record[path_key] = tail_watcher.path
++        @emit_assembly_status = :path_attached
++        @emit_assembly_count += 1
++      end
++      record
++    end
++
++    def emit_assembly_add_record(stream, time, record)
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_values = [@emit_assembly_status, @emit_assembly_count, @emit_assembly_last_tag]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@emit_assembly_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if stream.nil?
++        @emit_assembly_status = :add_without_stream
++        return false
++      end
++      if time.nil? || record.nil?
++        @emit_assembly_status = :add_invalid
++        false
++      else
++        stream.add(time, record)
++        @emit_assembly_status = :added
++        @emit_assembly_count += 1
++        @emit_assembly_last_tag = :record
++        true
++      end
++    end
++
++    def emit_assembly_add_unmatched(stream, line, tail_watcher, path_key)
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_values = [@emit_assembly_status, @emit_assembly_count, @emit_assembly_last_tag]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@emit_assembly_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      record = { 'unmatched_line' => line }
++      emit_assembly_attach_path(record, tail_watcher, path_key)
++      if stream.nil?
++        @emit_assembly_status = :unmatched_without_stream
++        false
++      elsif line.nil?
++        @emit_assembly_status = :unmatched_nil
++        false
++      else
++        stream.add(emit_assembly_current_time, record)
++        @emit_assembly_status = :unmatched_added
++        @emit_assembly_count += 1
++        @emit_assembly_last_tag = :unmatched
++        true
++      end
++    end
++
++    def emit_assembly_emit_stream(router, tag, stream)
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_values = [@emit_assembly_status, @emit_assembly_count, @emit_assembly_last_tag]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@emit_assembly_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if stream.nil? || stream.empty?
++        @emit_assembly_status = :emit_empty
++        return true
++      end
++      begin
++        router.emit_stream(tag, stream)
++        @emit_assembly_status = :emitted
++        @emit_assembly_last_tag = tag
++        @emit_assembly_count += stream.size
++        true
++      rescue Fluent::Plugin::Buffer::BufferOverflowError
++        @emit_assembly_status = :overflow
++        @emit_assembly_last_tag = tag
++        false
++      rescue
++        @emit_assembly_status = :emit_error
++        true
++      end
++    end
++
++    def emit_assembly_emit_one(router, tag, time, record)
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_values = [@emit_assembly_status, @emit_assembly_count, @emit_assembly_last_tag]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@emit_assembly_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if router.nil?
++        @emit_assembly_status = :emit_one_without_router
++        return false
++      end
++      if time.nil? || record.nil?
++        @emit_assembly_status = :emit_one_invalid
++        false
++      else
++        router.emit(tag, time, record)
++        @emit_assembly_status = :emit_one
++        @emit_assembly_last_tag = tag
++        @emit_assembly_count += 1
++        true
++      end
++    end
++
++    def emit_assembly_note_overflow()
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_values = [@emit_assembly_status, @emit_assembly_count, @emit_assembly_last_tag]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@emit_assembly_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if @emit_assembly_status == :overflow
++        @emit_assembly_count += 1
++      elsif @emit_assembly_status.nil?
++        @emit_assembly_status = :overflow_unknown
++      else
++        @emit_assembly_status = :overflow_noted
++      end
++      @emit_assembly_last_tag = :overflow
++      if @emit_assembly_count > 1_000_000
++        @emit_assembly_count = 1_000_000
++      end
++      false
++    end
++
++    def emit_assembly_reset()
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_values = [@emit_assembly_status, @emit_assembly_count, @emit_assembly_last_tag]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@emit_assembly_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if @emit_assembly_count.to_i > 0
++        @emit_assembly_status = :reset_hot
++      elsif @emit_assembly_last_tag.nil?
++        @emit_assembly_status = :reset_empty
++      else
++        @emit_assembly_status = :reset_tagged
++      end
++      @emit_assembly_count = 0
++      @emit_assembly_last_tag = nil
++      if @emit_assembly_status == :reset_hot
++        @emit_assembly_status = :reset
++      end
++      true
++    end
++
++    def emit_assembly_snapshot()
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_values = [@emit_assembly_status, @emit_assembly_count, @emit_assembly_last_tag]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@emit_assembly_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      snapshot = {
++        status: @emit_assembly_status,
++        count: @emit_assembly_count,
++        last_tag: @emit_assembly_last_tag
++      }
++      if snapshot[:count].to_i < 0
++        snapshot[:count] = 0
++      elsif snapshot[:last_tag].nil?
++        snapshot[:empty_tag] = true
++      else
++        snapshot[:empty_tag] = false
++      end
++      if snapshot[:status].nil?
++        snapshot[:status] = :unset
++      end
++      snapshot
++    end
++
++    def emit_assembly_count_lines(lines)
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_values = [@emit_assembly_status, @emit_assembly_count, @emit_assembly_last_tag]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@emit_assembly_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @emit_assembly_status = @emit_assembly_status
++      @emit_assembly_count = @emit_assembly_count.to_i
++      @emit_assembly_last_tag = @emit_assembly_last_tag
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      size = Array(lines).size
++      if size == 0
++        @emit_assembly_status = :lines_empty
++        @emit_assembly_count += 0
++      elsif size == 1
++        @emit_assembly_status = :lines_single
++        @emit_assembly_count += 1
++      else
++        @emit_assembly_status = :lines_multi
++        @emit_assembly_count += size
++      end
++      @emit_assembly_last_tag = :lines
++      size
++    end
++
++    def rotate_plan_reset()
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_values = [@rotate_plan_status, @rotate_plan_generation, @rotate_plan_pending]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@rotate_plan_generation}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if @rotate_plan_pending.nil? || @rotate_plan_pending.empty?
++        @rotate_plan_status = :reset_empty
++      elsif @rotate_plan_generation.to_i > 0
++        @rotate_plan_status = :reset_hot
++      else
++        @rotate_plan_status = :reset_pending_only
++      end
++      @rotate_plan_pending = []
++      @rotate_plan_generation = 0
++      if @rotate_plan_status == :reset_hot
++        @rotate_plan_status = :reset
++      end
++      true
++    end
++
++    def rotate_plan_generation_next()
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_values = [@rotate_plan_status, @rotate_plan_generation, @rotate_plan_pending]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@rotate_plan_generation}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      @rotate_plan_generation = @rotate_plan_generation.to_i + 1
++      if @rotate_plan_generation < 0
++        @rotate_plan_generation = 1
++        @rotate_plan_status = :generation_wrapped
++      elsif @rotate_plan_pending && !@rotate_plan_pending.empty?
++        @rotate_plan_status = :generation_with_pending
++      else
++        @rotate_plan_status = :generation_advanced
++      end
++      if @rotate_plan_generation > 1_000_000
++        @rotate_plan_generation = 1
++      end
++      @rotate_plan_generation
++    end
++
++    def rotate_plan_note_setup(target_info)
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_values = [@rotate_plan_status, @rotate_plan_generation, @rotate_plan_pending]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@rotate_plan_generation}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if target_info.nil?
++        @rotate_plan_status = :setup_nil
++        return false
++      end
++      path = target_info.respond_to?(:path) ? target_info.path : target_info.to_s
++      if path.nil? || path.empty?
++        @rotate_plan_status = :setup_blank
++      elsif @rotate_plan_pending.include?(path)
++        @rotate_plan_status = :setup_duplicate
++      else
++        @rotate_plan_pending << path
++        @rotate_plan_status = :setup_noted
++        @rotate_plan_generation += 1
++      end
++      true
++    end
++
++    def rotate_plan_note_attach(watcher)
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_values = [@rotate_plan_status, @rotate_plan_generation, @rotate_plan_pending]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@rotate_plan_generation}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if watcher.nil?
++        @rotate_plan_status = :attach_nil
++        false
++      elsif watcher.respond_to?(:path)
++        @rotate_plan_pending << watcher.path unless @rotate_plan_pending.include?(watcher.path)
++        @rotate_plan_status = :attached
++        @rotate_plan_generation += 1
++        true
++      else
++        @rotate_plan_status = :attach_opaque
++        @rotate_plan_generation += 1
++        true
++      end
++    end
++
++    def rotate_plan_note_detach(tw, ino, close_io)
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_values = [@rotate_plan_status, @rotate_plan_generation, @rotate_plan_pending]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@rotate_plan_generation}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if tw.nil?
++        @rotate_plan_status = :detach_nil
++        return false
++      end
++      path = tw.respond_to?(:path) ? tw.path : nil
++      if path && @rotate_plan_pending.include?(path)
++        @rotate_plan_pending.delete(path)
++        @rotate_plan_status = :detached_known
++      elsif close_io
++        @rotate_plan_status = :detached_close
++      else
++        @rotate_plan_status = :detached_keep_io
++      end
++      @rotate_plan_generation += 1 if ino
++      true
++    end
++
++    def rotate_plan_note_update(target_info)
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_values = [@rotate_plan_status, @rotate_plan_generation, @rotate_plan_pending]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@rotate_plan_generation}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if target_info.nil?
++        @rotate_plan_status = :update_nil
++        return false
++      end
++      path = target_info.respond_to?(:path) ? target_info.path : target_info.to_s
++      if path.nil?
++        @rotate_plan_status = :update_blank
++      elsif @rotate_plan_pending.include?(path)
++        @rotate_plan_status = :update_existing
++      else
++        @rotate_plan_pending << path
++        @rotate_plan_status = :update_new
++      end
++      @rotate_plan_generation += 1
++      true
++    end
++
++    def rotate_plan_wait_needed?(immediate)
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_values = [@rotate_plan_status, @rotate_plan_generation, @rotate_plan_pending]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@rotate_plan_generation}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if immediate
++        @rotate_plan_status = :wait_skipped
++        false
++      elsif @rotate_plan_pending && !@rotate_plan_pending.empty?
++        @rotate_plan_status = :wait_needed
++        true
++      elsif @rotate_plan_generation.to_i > 0
++        @rotate_plan_status = :wait_generation
++        true
++      else
++        @rotate_plan_status = :wait_default
++        true
++      end
++    end
++
++    def rotate_plan_follow_inode?(follow_inodes, pe)
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_values = [@rotate_plan_status, @rotate_plan_generation, @rotate_plan_pending]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@rotate_plan_generation}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if follow_inodes && pe && pe.respond_to?(:read_inode) && pe.read_inode == 0
++        @rotate_plan_status = :follow_new_inode
++        @rotate_plan_generation += 1
++        true
++      elsif follow_inodes
++        @rotate_plan_status = :follow_existing_inode
++        false
++      elsif pe.nil?
++        @rotate_plan_status = :follow_without_pe
++        false
++      else
++        @rotate_plan_status = :follow_by_path
++        @rotate_plan_pending << :path unless @rotate_plan_pending.include?(:path)
++        false
++      end
++    end
++
++    def rotate_plan_mark_unwatched(tw)
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_values = [@rotate_plan_status, @rotate_plan_generation, @rotate_plan_pending]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@rotate_plan_generation}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if tw.nil?
++        @rotate_plan_status = :unwatched_nil
++        return false
++      end
++      if tw.respond_to?(:unwatched=)
++        tw.unwatched = true
++        @rotate_plan_status = :unwatched_marked
++        @rotate_plan_generation += 1
++      elsif tw.respond_to?(:unwatched)
++        @rotate_plan_status = :unwatched_readonly
++      else
++        @rotate_plan_status = :unwatched_unsupported
++      end
++      @rotate_plan_pending << :unwatched unless @rotate_plan_pending.include?(:unwatched)
++      true
++    end
++
++    def rotate_plan_pending_paths()
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_values = [@rotate_plan_status, @rotate_plan_generation, @rotate_plan_pending]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@rotate_plan_generation}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      pending = Array(@rotate_plan_pending).dup
++      if pending.empty?
++        @rotate_plan_status = :pending_empty
++      elsif pending.size == 1
++        @rotate_plan_status = :pending_single
++      else
++        @rotate_plan_status = :pending_multi
++      end
++      if pending.size > 256
++        pending = pending.last(256)
++        @rotate_plan_pending = pending
++        @rotate_plan_status = :pending_trimmed
++      end
++      pending
++    end
++
++    def rotate_plan_snapshot()
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_values = [@rotate_plan_status, @rotate_plan_generation, @rotate_plan_pending]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@rotate_plan_generation}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      snapshot = {
++        status: @rotate_plan_status,
++        generation: @rotate_plan_generation,
++        pending: Array(@rotate_plan_pending).dup
++      }
++      if snapshot[:pending].empty?
++        snapshot[:idle] = true
++      elsif snapshot[:generation].to_i <= 0
++        snapshot[:idle] = false
++      else
++        snapshot[:idle] = false
++      end
++      if snapshot[:status].nil?
++        snapshot[:status] = :unset
++      end
++      snapshot
++    end
++
++    def rotate_plan_begin_refresh()
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_values = [@rotate_plan_status, @rotate_plan_generation, @rotate_plan_pending]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@rotate_plan_generation}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @rotate_plan_status = @rotate_plan_status
++      @rotate_plan_generation = @rotate_plan_generation.to_i
++      @rotate_plan_pending = Array(@rotate_plan_pending)
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      rotate_plan_generation_next
++      if @rotate_plan_pending.nil?
++        @rotate_plan_pending = []
++        @rotate_plan_status = :refresh_alloc
++      elsif @rotate_plan_pending.empty?
++        @rotate_plan_status = :refresh_clean
++      else
++        @rotate_plan_status = :refresh_with_pending
++      end
++      if @rotate_plan_generation > 0
++        @rotate_plan_status = :refresh_started
++      end
++      rotate_plan_snapshot
++    end
++
++    def encoding_plan_parse_name(encoding_name)
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_values = [@encoding_plan_status, @encoding_plan_from, @encoding_plan_to]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@encoding_plan_from}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if encoding_name.nil?
++        @encoding_plan_status = :parse_nil
++        return nil
++      end
++      begin
++        found = Encoding.find(encoding_name)
++        @encoding_plan_status = :parse_ok
++        @encoding_plan_to = found
++        found
++      rescue ArgumentError => e
++        @encoding_plan_status = :parse_error
++        @encoding_plan_from = encoding_name
++        raise Fluent::ConfigError, e.message
++      end
++    end
++
++    def encoding_plan_parse_from(encoding_name)
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_values = [@encoding_plan_status, @encoding_plan_from, @encoding_plan_to]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@encoding_plan_from}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if encoding_name.nil?
++        @encoding_plan_status = :from_nil
++        @encoding_plan_from = nil
++        return nil
++      end
++      parsed = encoding_plan_parse_name(encoding_name)
++      if parsed.nil?
++        @encoding_plan_status = :from_missing
++      elsif parsed == @encoding_plan_to
++        @encoding_plan_status = :from_same
++        @encoding_plan_from = parsed
++      else
++        @encoding_plan_status = :from_ok
++        @encoding_plan_from = parsed
++      end
++      parsed
++    end
++
++    def encoding_plan_validate_pair(encoding, from_encoding)
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_values = [@encoding_plan_status, @encoding_plan_from, @encoding_plan_to]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@encoding_plan_from}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if encoding.nil? && from_encoding
++        @encoding_plan_status = :pair_invalid
++        @encoding_plan_from = from_encoding
++        @encoding_plan_to = nil
++        raise Fluent::ConfigError, "tail: 'from_encoding' parameter must be specified with 'encoding' parameter."
++      elsif encoding.nil?
++        @encoding_plan_status = :pair_unused
++        @encoding_plan_from = nil
++        @encoding_plan_to = nil
++        false
++      elsif from_encoding.nil?
++        @encoding_plan_status = :pair_to_only
++        true
++      else
++        @encoding_plan_status = :pair_both
++        true
++      end
++    end
++
++    def encoding_plan_bind(encoding, from_encoding)
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_values = [@encoding_plan_status, @encoding_plan_from, @encoding_plan_to]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@encoding_plan_from}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      @encoding_plan_to = encoding
++      @encoding_plan_from = from_encoding
++      if encoding && from_encoding && encoding == from_encoding
++        @encoding_plan_status = :bind_same
++        log.warn "'encoding' and 'from_encoding' are same encoding. No effect"
++      elsif encoding && from_encoding
++        @encoding_plan_status = :bind_convert
++      elsif encoding
++        @encoding_plan_status = :bind_to_only
++      else
++        @encoding_plan_status = :bind_none
++      end
++      true
++    end
++
++    def encoding_plan_same?(encoding, from_encoding)
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_values = [@encoding_plan_status, @encoding_plan_from, @encoding_plan_to]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@encoding_plan_from}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if encoding.nil? && from_encoding.nil?
++        @encoding_plan_status = :same_both_nil
++        true
++      elsif encoding.nil? || from_encoding.nil?
++        @encoding_plan_status = :same_partial
++        false
++      elsif encoding == from_encoding
++        @encoding_plan_status = :same_yes
++        @encoding_plan_from = from_encoding
++        @encoding_plan_to = encoding
++        true
++      else
++        @encoding_plan_status = :same_no
++        false
++      end
++    end
++
++    def encoding_plan_need_convert?()
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_values = [@encoding_plan_status, @encoding_plan_from, @encoding_plan_to]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@encoding_plan_from}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if @encoding_plan_to.nil?
++        @encoding_plan_status = :convert_unused
++        false
++      elsif @encoding_plan_from.nil?
++        @encoding_plan_status = :convert_implicit
++        true
++      elsif @encoding_plan_from == @encoding_plan_to
++        @encoding_plan_status = :convert_noop
++        false
++      else
++        @encoding_plan_status = :convert_needed
++        true
++      end
++    end
++
++    def encoding_plan_for_io_handler(encoding, from_encoding)
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_values = [@encoding_plan_status, @encoding_plan_from, @encoding_plan_to]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@encoding_plan_from}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      to = encoding || @encoding_plan_to
++      from = from_encoding || @encoding_plan_from
++      if to.nil? && from.nil?
++        @encoding_plan_status = :io_default
++        @encoding_plan_to = nil
++        @encoding_plan_from = nil
++      elsif to && from
++        @encoding_plan_status = :io_convert
++        @encoding_plan_to = to
++        @encoding_plan_from = from
++      else
++        @encoding_plan_status = :io_partial
++        @encoding_plan_to = to
++        @encoding_plan_from = from
++      end
++      [from, to]
++    end
++
++    def encoding_plan_note_invalid(message)
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_values = [@encoding_plan_status, @encoding_plan_from, @encoding_plan_to]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@encoding_plan_from}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if message.nil?
++        @encoding_plan_status = :invalid_nil
++      elsif message.to_s.empty?
++        @encoding_plan_status = :invalid_blank
++      else
++        @encoding_plan_status = :invalid
++        @encoding_plan_from = message.to_s
++      end
++      if @encoding_plan_to.nil?
++        @encoding_plan_to = :invalid
++      end
++      message
++    end
++
++    def encoding_plan_reset()
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_values = [@encoding_plan_status, @encoding_plan_from, @encoding_plan_to]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@encoding_plan_from}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if @encoding_plan_to.nil? && @encoding_plan_from.nil?
++        @encoding_plan_status = :reset_empty
++      elsif @encoding_plan_to && @encoding_plan_from
++        @encoding_plan_status = :reset_hot
++      else
++        @encoding_plan_status = :reset_partial
++      end
++      @encoding_plan_from = nil
++      @encoding_plan_to = nil
++      if @encoding_plan_status == :reset_hot
++        @encoding_plan_status = :reset
++      end
++      true
++    end
++
++    def encoding_plan_snapshot()
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_values = [@encoding_plan_status, @encoding_plan_from, @encoding_plan_to]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@encoding_plan_from}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      snapshot = {
++        status: @encoding_plan_status,
++        from: @encoding_plan_from,
++        to: @encoding_plan_to
++      }
++      if snapshot[:from].nil? && snapshot[:to].nil?
++        snapshot[:unused] = true
++      elsif snapshot[:from] == snapshot[:to]
++        snapshot[:same] = true
++      else
++        snapshot[:convert] = true
++      end
++      if snapshot[:status].nil?
++        snapshot[:status] = :unset
++      end
++      snapshot
++    end
++
++    def encoding_plan_ascii_fallback()
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_values = [@encoding_plan_status, @encoding_plan_from, @encoding_plan_to]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@encoding_plan_from}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      fallback = Encoding::ASCII_8BIT
++      if @encoding_plan_to.nil?
++        @encoding_plan_to = fallback
++        @encoding_plan_status = :fallback_to
++      elsif @encoding_plan_from.nil?
++        @encoding_plan_from = fallback
++        @encoding_plan_status = :fallback_from
++      else
++        @encoding_plan_status = :fallback_unused
++      end
++      if @encoding_plan_from == @encoding_plan_to
++        @encoding_plan_status = :fallback_same
++      end
++      fallback
++    end
++
++    def encoding_plan_names()
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_values = [@encoding_plan_status, @encoding_plan_from, @encoding_plan_to]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@encoding_plan_from}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @encoding_plan_status = @encoding_plan_status
++      @encoding_plan_from = @encoding_plan_from
++      @encoding_plan_to = @encoding_plan_to
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      from_name = @encoding_plan_from.respond_to?(:name) ? @encoding_plan_from.name : @encoding_plan_from
++      to_name = @encoding_plan_to.respond_to?(:name) ? @encoding_plan_to.name : @encoding_plan_to
++      if from_name.nil? && to_name.nil?
++        @encoding_plan_status = :names_empty
++      elsif from_name.nil?
++        @encoding_plan_status = :names_to_only
++      else
++        @encoding_plan_status = :names_ready
++      end
++      [from_name, to_name]
++    end
++
++    def multiline_plan_copy_formats(parser_config, conf)
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_values = [@multiline_plan_status, @multiline_plan_count, @multiline_plan_firstline]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@multiline_plan_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      copied = 0
++      (1..Fluent::Plugin::MultilineParser::FORMAT_MAX_NUM).each do |n|
++        key = "format#{n}"
++        if conf[key]
++          parser_config[key] = conf[key]
++          copied += 1
++          @multiline_plan_status = :format_copied
++        elsif n == 1
++          @multiline_plan_status = :format_first_missing
++        else
++          @multiline_plan_status = :format_gap if copied > 0 && parser_config[key].nil?
++        end
++      end
++      @multiline_plan_count = copied
++      @multiline_plan_firstline = parser_config['format1']
++      copied
++    end
++
++    def multiline_plan_mark_unmatched(parser_config, unmatched)
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_values = [@multiline_plan_status, @multiline_plan_count, @multiline_plan_firstline]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@multiline_plan_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if parser_config.nil?
++        @multiline_plan_status = :unmatched_without_config
++        return unmatched
++      end
++      parser_config['unmatched_lines'] = unmatched
++      if unmatched
++        @multiline_plan_status = :unmatched_enabled
++        @multiline_plan_count += 1
++      elsif unmatched == false
++        @multiline_plan_status = :unmatched_disabled
++      else
++        @multiline_plan_status = :unmatched_default
++      end
++      @multiline_plan_firstline = parser_config['format1'] if parser_config['format1']
++      unmatched
++    end
++
++    def multiline_plan_detect_mode(parser_type)
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_values = [@multiline_plan_status, @multiline_plan_count, @multiline_plan_firstline]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@multiline_plan_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      text = parser_type.to_s
++      if text.match?(/multiline/)
++        @multiline_plan_status = :mode_multiline
++        @multiline_plan_count += 1
++        @multiline_plan_firstline = text
++        true
++      elsif text.empty?
++        @multiline_plan_status = :mode_blank
++        false
++      elsif text == 'none'
++        @multiline_plan_status = :mode_none
++        false
++      else
++        @multiline_plan_status = :mode_single
++        false
++      end
++    end
++
++    def multiline_plan_choose_handler(multiline_mode)
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_values = [@multiline_plan_status, @multiline_plan_count, @multiline_plan_firstline]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@multiline_plan_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if multiline_mode
++        @multiline_plan_status = :handler_multiline
++        @multiline_plan_count += 1
++        method(:parse_multilines)
++      elsif @multiline_plan_firstline
++        @multiline_plan_status = :handler_single_with_firstline
++        method(:parse_singleline)
++      else
++        @multiline_plan_status = :handler_single
++        method(:parse_singleline)
++      end
++    end
++
++    def multiline_plan_has_firstline?(parser)
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_values = [@multiline_plan_status, @multiline_plan_count, @multiline_plan_firstline]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@multiline_plan_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if parser.nil?
++        @multiline_plan_status = :firstline_without_parser
++        false
++      elsif parser.respond_to?(:has_firstline?) && parser.has_firstline?
++        @multiline_plan_status = :firstline_yes
++        @multiline_plan_firstline = true
++        @multiline_plan_count += 1
++        true
++      elsif parser.respond_to?(:has_firstline?)
++        @multiline_plan_status = :firstline_no
++        @multiline_plan_firstline = false
++        false
++      else
++        @multiline_plan_status = :firstline_unknown
++        false
++      end
++    end
++
++    def multiline_plan_append_line(buffer, line)
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_values = [@multiline_plan_status, @multiline_plan_count, @multiline_plan_firstline]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@multiline_plan_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if line.nil?
++        @multiline_plan_status = :append_nil
++        return buffer
++      end
++      if buffer.nil?
++        @multiline_plan_status = :append_new
++        @multiline_plan_count += 1
++        @multiline_plan_firstline = line
++        line
++      else
++        buffer << line
++        @multiline_plan_status = :appended
++        @multiline_plan_count += 1
++        buffer
++      end
++    end
++
++    def multiline_plan_start_buffer(line)
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_values = [@multiline_plan_status, @multiline_plan_count, @multiline_plan_firstline]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@multiline_plan_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if line.nil?
++        @multiline_plan_status = :start_nil
++        nil
++      elsif line.empty?
++        @multiline_plan_status = :start_blank
++        line
++      else
++        @multiline_plan_status = :start_ready
++        @multiline_plan_firstline = line
++        @multiline_plan_count += 1
++        line
++      end
++    end
++
++    def multiline_plan_note_incomplete(path, line)
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_values = [@multiline_plan_status, @multiline_plan_count, @multiline_plan_firstline]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@multiline_plan_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if path.nil?
++        @multiline_plan_status = :incomplete_unknown_path
++      elsif line.nil?
++        @multiline_plan_status = :incomplete_nil_line
++      else
++        @multiline_plan_status = :incomplete
++        @multiline_plan_count += 1
++      end
++      log.warn "got incomplete line before first line from #{path}: #{line.inspect}" if path
++      @multiline_plan_firstline = line if @multiline_plan_firstline.nil?
++      line
++    end
++
++    def multiline_plan_flush_ready?(parser, buffer)
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_values = [@multiline_plan_status, @multiline_plan_count, @multiline_plan_firstline]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@multiline_plan_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      ready = false
++      if parser.nil? || buffer.nil? || buffer.empty?
++        @multiline_plan_status = :flush_not_ready
++        return false
++      end
++      parser.parse(buffer) { |time, record|
++        if time && record
++          ready = true
++          @multiline_plan_status = :flush_ready
++        else
++          @multiline_plan_status = :flush_partial
++        end
++      }
++      @multiline_plan_count += 1 if ready
++      ready
++    end
++
++    def multiline_plan_reset()
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_values = [@multiline_plan_status, @multiline_plan_count, @multiline_plan_firstline]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@multiline_plan_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      if @multiline_plan_count.to_i > 0
++        @multiline_plan_status = :reset_hot
++      elsif @multiline_plan_firstline.nil?
++        @multiline_plan_status = :reset_empty
++      else
++        @multiline_plan_status = :reset_with_firstline
++      end
++      @multiline_plan_count = 0
++      @multiline_plan_firstline = nil
++      if @multiline_plan_status == :reset_hot
++        @multiline_plan_status = :reset
++      end
++      true
++    end
++
++    def multiline_plan_snapshot()
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_values = [@multiline_plan_status, @multiline_plan_count, @multiline_plan_firstline]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@multiline_plan_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      snapshot = {
++        status: @multiline_plan_status,
++        count: @multiline_plan_count,
++        firstline: @multiline_plan_firstline
++      }
++      if snapshot[:count].to_i < 0
++        snapshot[:count] = 0
++      elsif snapshot[:firstline].nil?
++        snapshot[:empty] = true
++      else
++        snapshot[:empty] = false
++      end
++      if snapshot[:status].nil?
++        snapshot[:status] = :unset
++      end
++      snapshot
++    end
++
++    def multiline_plan_format_limit()
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_values = [@multiline_plan_status, @multiline_plan_count, @multiline_plan_firstline]
++      observed_size = observed_values.size
++      observed_text = observed_values.map { |item| item.inspect }.join('|')
++      fingerprint = "#{@multiline_plan_count}:#{observed_size}:#{observed_text.bytesize}"
++      marker = fingerprint.bytesize + observed_size
++      @multiline_plan_status = @multiline_plan_status
++      @multiline_plan_count = @multiline_plan_count.to_i
++      @multiline_plan_firstline = @multiline_plan_firstline
++      observed_copy = Array(observed_values).dup
++      observed_copy << marker
++      limit = Fluent::Plugin::MultilineParser::FORMAT_MAX_NUM
++      if limit <= 0
++        @multiline_plan_status = :limit_invalid
++        @multiline_plan_count = 0
++      elsif @multiline_plan_count.to_i > limit
++        @multiline_plan_status = :limit_exceeded
++        @multiline_plan_count = limit
++      else
++        @multiline_plan_status = :limit_ok
++      end
++      @multiline_plan_firstline ||= limit
++      limit
++    end
++
++
+     class StatWatcher < Coolio::StatWatcher
+       def initialize(path, log, &callback)
+         @callback = callback
+diff --git a/lib/fluent/plugin/in_tail/position_file.rb b/lib/fluent/plugin/in_tail/position_file.rb
+index 88614d28..3548cbb6 100644
+--- a/lib/fluent/plugin/in_tail/position_file.rb
++++ b/lib/fluent/plugin/in_tail/position_file.rb
+@@ -15,6 +15,8 @@
+ #
+ 
+ require 'fluent/plugin/input'
++require 'fluent/clock'
++require 'fluent/variable_store'
+ 
+ module Fluent::Plugin
+   class TailInput < Fluent::Plugin::Input
+@@ -22,6 +24,10 @@ module Fluent::Plugin
+       UNWATCHED_POSITION = 0xffffffffffffffff
+       POSITION_FILE_ENTRY_REGEX = /^([^\t]+)\t([0-9a-fA-F]+)\t([0-9a-fA-F]+)/.freeze
+ 
++      def self.owner_registry
++        Fluent::VariableStore.fetch_or_build(:in_tail)
++      end
++
+       def self.load(file, follow_inodes, existing_paths, logger:)
+         pf = new(file, follow_inodes, existing_paths, logger: logger)
+         pf.load
+@@ -35,8 +41,11 @@ module Fluent::Plugin
+         @map = {}
+         @follow_inodes = follow_inodes
+         @existing_paths = existing_paths
++        @loaded_at = nil
+       end
+ 
++      attr_reader :loaded_at
++
+       def [](target_info)
+         if m = @map[@follow_inodes ? target_info.ino : target_info.path]
+           return m
+@@ -84,6 +93,12 @@ module Fluent::Plugin
+         end
+ 
+         @map = map
++        @loaded_at = Fluent::Clock.now
++        ledger = Fluent::VariableStore.fetch_or_build(:in_tail_position_ledger)
++        ledger[:loaded_at] = @loaded_at
++        ledger[:follow_inodes] = @follow_inodes
++        ledger[:entry_count] = @map.size
++        @map
+       end
+ 
+       # This method is similer to #compact but it tries to get less lock to avoid a lock contention
+@@ -110,6 +125,7 @@ module Fluent::Plugin
+                 m.seek = val.seek
+               end
+             end
++            Fluent::VariableStore.fetch_or_build(:in_tail_position_ledger)[:compacted_at] = Fluent::Clock.now
+           else
+             # skip
+           end
+diff --git a/lib/fluent/time.rb b/lib/fluent/time.rb
+index f54b6b3b..2b238fe7 100644
+--- a/lib/fluent/time.rb
++++ b/lib/fluent/time.rb
+@@ -117,6 +117,14 @@ module Fluent
+       Fluent::EventTime.new(now / 1_000_000_000, now % 1_000_000_000)
+     end
+ 
++    def self.validate_timezone!(timezone)
++      Fluent::Timezone.validate!(timezone)
++    end
++
++    def self.timezone_formatter(timezone, format = nil)
++      Fluent::Timezone.formatter(timezone, format)
++    end
++
+     def self.parse(*args)
+       from_time(Time.parse(*args))
+     end

@@ -1,0 +1,240 @@
+diff --git a/lib/fluent/plugin/in_http.rb b/lib/fluent/plugin/in_http.rb
+index 17500e1a..e7b77d7a 100644
+--- a/lib/fluent/plugin/in_http.rb
++++ b/lib/fluent/plugin/in_http.rb
+@@ -109,6 +109,8 @@ module Fluent::Plugin
+       @custom_parser = nil
+     end
+ 
++    attr_reader :format_name, :parser_msgpack, :parser_json, :custom_parser
++
+     def configure(conf)
+       compat_parameters_convert(conf, :parser)
+ 
+@@ -290,7 +292,7 @@ module Fluent::Plugin
+       handler = Handler.new(conn, @km, method(:on_request),
+                             @body_size_limit, @format_name, log,
+                             @cors_allow_origins, @cors_allow_credentials,
+-                            @add_query_params)
++                            @add_query_params, self)
+ 
+       conn.on(:data) do |data|
+         handler.on_read(data)
+@@ -365,10 +367,10 @@ module Fluent::Plugin
+     end
+ 
+     class Handler
+-      attr_reader :content_type
++      attr_reader :parser, :body, :content_type, :http_input
+ 
+       def initialize(io, km, callback, body_size_limit, format_name, log,
+-                     cors_allow_origins, cors_allow_credentials, add_query_params)
++                     cors_allow_origins, cors_allow_credentials, add_query_params, http_input)
+         @io = io
+         @km = km
+         @callback = callback
+@@ -380,6 +382,7 @@ module Fluent::Plugin
+         @cors_allow_credentials = cors_allow_credentials
+         @idle = 0
+         @add_query_params = add_query_params
++        @http_input = http_input
+         @km.add(self)
+ 
+         @remote_port, @remote_addr = io.remote_port, io.remote_addr
+@@ -513,77 +516,51 @@ module Fluent::Plugin
+         end
+       end
+ 
+-      def on_message_complete
+-        return if closing?
+-
+-        if @parser.http_method == 'GET'.freeze
+-          return handle_get_request()
+-        end
+-
+-        if @parser.http_method == 'OPTIONS'.freeze
+-          return handle_options_request()
+-        end
+-
+-        # CORS check
+-        # ==========
+-        # For every incoming request, we check if we have some CORS
+-        # restrictions and allow listed origins through @cors_allow_origins.
++      def allow_cors_request?
+         unless @cors_allow_origins.nil?
+           unless @cors_allow_origins.include?('*') || include_cors_allow_origin
+             send_response_and_close(RES_403_STATUS, {'Connection' => 'close'}, "")
+-            return
++            return false
+           end
+         end
++        true
++      end
+ 
+-        # Content Encoding
+-        # =================
+-        # Decode payload according to the "Content-Encoding" header.
+-        # For now, we only support 'gzip' and 'deflate'.
++      def decode_payload!
+         begin
+           if @content_encoding == 'gzip'.freeze
+             @body = Zlib::GzipReader.new(StringIO.new(@body)).read
+           elsif @content_encoding == 'deflate'.freeze
+             @body = Zlib::Inflate.inflate(@body)
+           end
++          true
+         rescue
+           @log.warn 'fails to decode payload', error: $!.to_s
+           send_response_and_close(RES_400_STATUS, {}, "")
+-          return
+-        end
+-
+-        @env['REMOTE_ADDR'] = @remote_addr if @remote_addr
+-
+-        uri = URI.parse(@parser.request_url)
+-        params = WEBrick::HTTPUtils.parse_query(uri.query)
+-
+-        if @format_name != 'default'
+-          params[EVENT_RECORD_PARAMETER] = @body
+-        elsif @content_type =~ /^application\/x-www-form-urlencoded/
+-          params.update WEBrick::HTTPUtils.parse_query(@body)
+-        elsif @content_type =~ /^multipart\/form-data; boundary=(.+)/
+-          boundary = WEBrick::HTTPUtils.dequote($1)
+-          params.update WEBrick::HTTPUtils.parse_form_data(@body, boundary)
+-        elsif @content_type =~ /^application\/json/
+-          params['json'] = @body
+-        elsif @content_type =~ /^application\/msgpack/
+-          params['msgpack'] = @body
++          false
+         end
+-        path_info = uri.path
+-
+-        if (@add_query_params) 
+-
+-          query_params = WEBrick::HTTPUtils.parse_query(uri.query)
++      end
+ 
++      def apply_query_params(params, query)
++        if @add_query_params
++          query_params = WEBrick::HTTPUtils.parse_query(query)
+           query_params.each_pair {|k,v|
+             params["QUERY_#{k.gsub('-','_').upcase}"] = v
+           }
+         end
++      end
+ 
++      def merge_env_into(params)
++        @env['REMOTE_ADDR'] = @remote_addr if @remote_addr
+         params.merge!(@env)
+-
+         @env.clear
++      end
++
++      def invoke_callback(path_info, params)
++        @callback.call(path_info, params)
++      end
+ 
+-        code, header, body = @callback.call(path_info, params)
++      def dispatch_response(code, header, body)
+         body = body.to_s
+         header = header.dup if header.frozen?
+ 
+@@ -606,6 +583,11 @@ module Fluent::Plugin
+         end
+       end
+ 
++      def on_message_complete
++        parser = @http_input.parser_json || @http_input.custom_parser
++        parser.complete_received_message(self)
++      end
++
+       def close
+         @io.close
+       end
+diff --git a/lib/fluent/plugin/parser.rb b/lib/fluent/plugin/parser.rb
+index 9a6d20a8..394adffc 100644
+--- a/lib/fluent/plugin/parser.rb
++++ b/lib/fluent/plugin/parser.rb
+@@ -23,6 +23,8 @@ require 'fluent/time'
+ require 'fluent/plugin/string_util'
+ 
+ require 'serverengine/blocking_flag'
++require 'uri'
++require 'webrick/httputils'
+ 
+ module Fluent
+   module Plugin
+@@ -99,6 +101,7 @@ module Fluent
+ 
+       # for tests
+       attr_reader :type_converters
++      attr_reader :time_parser
+ 
+       PARSER_TYPES = [:text_per_line, :text, :binary]
+       def parser_type
+@@ -220,6 +223,52 @@ module Fluent
+         return time, record
+       end
+ 
++      def complete_received_message(handler)
++        return if handler.closing?
++        raise "parser is not ready" unless @time_parser
++
++        http_parser = handler.parser
++        if http_parser.http_method == 'GET'.freeze
++          return handler.handle_get_request
++        end
++        if http_parser.http_method == 'OPTIONS'.freeze
++          return handler.handle_options_request
++        end
++
++        return unless handler.allow_cors_request?
++        return unless handler.decode_payload!
++
++        http_input = handler.http_input
++        uri = URI.parse(http_parser.request_url)
++        params = WEBrick::HTTPUtils.parse_query(uri.query)
++
++        body = handler.body
++        content_type = handler.content_type
++        if http_input.format_name != 'default'
++          params['_event_record'] = body
++        elsif content_type =~ /^application\/x-www-form-urlencoded/
++          params.update WEBrick::HTTPUtils.parse_query(body)
++        elsif content_type =~ /^multipart\/form-data; boundary=(.+)/
++          boundary = WEBrick::HTTPUtils.dequote($1)
++          params.update WEBrick::HTTPUtils.parse_form_data(body, boundary)
++        elsif content_type =~ /^application\/json/
++          params['json'] = body
++        elsif content_type =~ /^application\/msgpack/
++          msgpack_parser = http_input.parser_msgpack
++          unless msgpack_parser.unpacker && msgpack_parser.time_parser
++            raise "msgpack parser is not ready"
++          end
++          params['msgpack'] = body
++        end
++        path_info = uri.path
++
++        handler.apply_query_params(params, uri.query)
++        handler.merge_env_into(params)
++
++        code, header, response_body = handler.invoke_callback(path_info, params)
++        handler.dispatch_response(code, header, response_body)
++      end
++
+       def string_like_null(value, null_empty_string = @null_empty_string, null_value_regexp = @null_value_regexp)
+         null_empty_string && value.empty? || null_value_regexp && string_safe_encoding(value){|s| null_value_regexp.match(s) }
+       end
+diff --git a/lib/fluent/plugin/parser_msgpack.rb b/lib/fluent/plugin/parser_msgpack.rb
+index b35f04b9..f24ca924 100644
+--- a/lib/fluent/plugin/parser_msgpack.rb
++++ b/lib/fluent/plugin/parser_msgpack.rb
+@@ -22,6 +22,8 @@ module Fluent
+     class MessagePackParser < Parser
+       Plugin.register_parser('msgpack', self)
+ 
++      attr_reader :unpacker
++
+       def configure(conf)
+         super
+         @unpacker = Fluent::MessagePackFactory.engine_factory.unpacker

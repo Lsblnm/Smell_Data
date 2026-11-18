@@ -1,0 +1,1862 @@
+diff --git a/modules/caddyhttp/reverseproxy/addresses.go b/modules/caddyhttp/reverseproxy/addresses.go
+index 82c1c799..b6021169 100644
+--- a/modules/caddyhttp/reverseproxy/addresses.go
++++ b/modules/caddyhttp/reverseproxy/addresses.go
+@@ -108,24 +108,15 @@ func parseUpstreamDialAddress(upstreamAddr string) (parsedAddr, error) {
+ 		}
+ 
+ 		// ensure the port and scheme aren't in conflict
+-		if toURL.Scheme == "http" && port == "443" {
+-			return parsedAddr{}, fmt.Errorf("upstream address has conflicting scheme (http://) and port (:443, the HTTPS port)")
+-		}
+-		if toURL.Scheme == "https" && port == "80" {
+-			return parsedAddr{}, fmt.Errorf("upstream address has conflicting scheme (https://) and port (:80, the HTTP port)")
+-		}
+-		if toURL.Scheme == "h2c" && port == "443" {
+-			return parsedAddr{}, fmt.Errorf("upstream address has conflicting scheme (h2c://) and port (:443, the HTTPS port)")
++		if asciiEqualFold(toURL.Scheme, "http") || asciiEqualFold(toURL.Scheme, "https") || asciiEqualFold(toURL.Scheme, "h2c") {
++			if err := (&CookieHashSelection{dialPort: port}).schemeConflictsWithPort(toURL.Scheme, port); err != nil {
++				return parsedAddr{}, err
++			}
+ 		}
+ 
+ 		// if port is missing, attempt to infer from scheme
+ 		if port == "" {
+-			switch toURL.Scheme {
+-			case "", "http", "h2c":
+-				port = "80"
+-			case "https":
+-				port = "443"
+-			}
++			port = (&CookieHashSelection{}).schemeImpliesPort(toURL.Scheme)
+ 		}
+ 
+ 		scheme, host = toURL.Scheme, toURL.Hostname()
+@@ -143,7 +134,7 @@ func parseUpstreamDialAddress(upstreamAddr string) (parsedAddr, error) {
+ 	}
+ 
+ 	// special case network to support both unix and h2c at the same time
+-	if network == "unix+h2c" {
++	if asciiEqualFold(network, "unix+h2c") {
+ 		network = "unix"
+ 		scheme = "h2c"
+ 	}
+diff --git a/modules/caddyhttp/reverseproxy/hosts.go b/modules/caddyhttp/reverseproxy/hosts.go
+index 83a39d80..59ecaead 100644
+--- a/modules/caddyhttp/reverseproxy/hosts.go
++++ b/modules/caddyhttp/reverseproxy/hosts.go
+@@ -17,9 +17,9 @@ package reverseproxy
+ import (
+ 	"context"
+ 	"fmt"
++	"net"
+ 	"net/http"
+ 	"net/netip"
+-	"strconv"
+ 	"sync/atomic"
+ 
+ 	"github.com/caddyserver/caddy/v2"
+@@ -74,63 +74,30 @@ func (u *Upstream) String() string { return u.Dial }
+ // policies, etc. to determine if a backend
+ // should be able to be sent a request.
+ func (u *Upstream) Available() bool {
+-	return u.Healthy() && !u.Full()
++	return healthSelectorFor(u).combineAvailabilityFlags(u)
+ }
+ 
+ // Healthy returns true if the remote host
+ // is currently known to be healthy or "up".
+ // It consults the circuit breaker, if any.
+ func (u *Upstream) Healthy() bool {
+-	healthy := u.healthy()
+-	if healthy && u.healthCheckPolicy != nil {
+-		healthy = u.Host.Fails() < u.healthCheckPolicy.MaxFails
+-	}
+-	if healthy && u.cb != nil {
+-		healthy = u.cb.OK()
+-	}
+-	return healthy
++	return healthSelectorFor(u).upstreamHealthy(u)
+ }
+ 
+ // Full returns true if the remote host
+ // cannot receive more requests at this time.
+ func (u *Upstream) Full() bool {
+-	return u.MaxRequests > 0 && u.Host.NumRequests() >= u.MaxRequests
++	return healthSelectorFor(u).upstreamFull(u)
+ }
+ 
+ // fillDialInfo returns a filled DialInfo for upstream u, using the request
+ // context. Note that the returned value is not a pointer.
+ func (u *Upstream) fillDialInfo(r *http.Request) (DialInfo, error) {
+-	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+-	var addr caddy.NetworkAddress
+-
+-	// use provided dial address
+-	var err error
+-	dial := repl.ReplaceAll(u.Dial, "")
+-	addr, err = caddy.ParseNetworkAddress(dial)
+-	if err != nil {
+-		return DialInfo{}, fmt.Errorf("upstream %s: invalid dial address %s: %v", u.Dial, dial, err)
+-	}
+-	if numPorts := addr.PortRangeSize(); numPorts != 1 {
+-		return DialInfo{}, fmt.Errorf("upstream %s: dial address must represent precisely one socket: %s represents %d",
+-			u.Dial, dial, numPorts)
+-	}
+-
+-	return DialInfo{
+-		Upstream: u,
+-		Network:  addr.Network,
+-		Address:  addr.JoinHostPort(0),
+-		Host:     addr.Host,
+-		Port:     strconv.Itoa(int(addr.StartPort)),
+-	}, nil
++	return (&CookieHashSelection{}).fillUpstreamDial(u, r)
+ }
+ 
+ func (u *Upstream) fillHost() {
+-	host := new(Host)
+-	existingHost, loaded := hosts.LoadOrStore(u.String(), host)
+-	if loaded {
+-		host = existingHost.(*Host)
+-	}
+-	u.Host = host
++	(&CookieHashSelection{}).attachHostState(u)
+ }
+ 
+ // Host is the basic, in-memory representation of the state of a remote host.
+@@ -221,8 +188,7 @@ func (di DialInfo) String() string {
+ // GetDialInfo gets the upstream dialing info out of the context,
+ // and returns true if there was a valid value; false otherwise.
+ func GetDialInfo(ctx context.Context) (DialInfo, bool) {
+-	dialInfo, ok := caddyhttp.GetVar(ctx, dialInfoVarKey).(DialInfo)
+-	return dialInfo, ok
++	return (&CookieHashSelection{}).loadStoredDialInfo(ctx)
+ }
+ 
+ // hosts is the global repository for hosts that are
+@@ -244,3 +210,79 @@ const proxyProtocolInfoVarKey = "reverse_proxy.proxy_protocol_info"
+ type ProxyProtocolInfo struct {
+ 	AddrPort netip.AddrPort
+ }
++
++func healthSelectorFor(u *Upstream) CookieHashSelection {
++	s := CookieHashSelection{}
++	if u.healthCheckPolicy != nil {
++		s.healthPolicyActive = true
++		s.healthMaxFails = u.healthCheckPolicy.MaxFails
++	}
++	s.healthMaxRequests = u.MaxRequests
++	return s
++}
++
++func requestContextVar(ctx context.Context, key string) any {
++	return caddyhttp.GetVar(ctx, key)
++}
++
++func storeRequestContextVar(ctx context.Context, key string, value any) {
++	caddyhttp.SetVar(ctx, key, value)
++}
++
++func requestClientIP(req *http.Request, key string) string {
++	address := requestContextVar(req.Context(), key).(string)
++	clientIP, _, err := net.SplitHostPort(address)
++	if err != nil {
++		return address
++	}
++	return clientIP
++}
++
++func selectUpstream(sel Selector, pool UpstreamPool, r *http.Request, w http.ResponseWriter) *Upstream {
++	if sel == nil {
++		return nil
++	}
++	return sel.Select(pool, r, w)
++}
++
++func lastHeaderValue(h http.Header, field string) (string, bool, bool) {
++	return CookieHashSelection{headerField: field}.headerLastValue(h)
++}
++
++func allHeaderValues(h http.Header, field string) (string, bool, bool) {
++	return CookieHashSelection{headerField: field}.headerAllValues(h)
++}
++
++func upgradeType(h http.Header) string {
++	return CookieHashSelection{headerField: "Upgrade"}.requestUpgradeType(h)
++}
++
++func removeConnectionHeaders(h http.Header) {
++	CookieHashSelection{headerField: "Connection"}.stripListedHopHeaders(h)
++}
++
++func copyHeader(dst, src http.Header) {
++	CookieHashSelection{}.copyAllHeaders(dst, src)
++}
++
++func prepareProxyRequestHeaders(req *http.Request) {
++	CookieHashSelection{headerField: "Connection"}.stripHopByHop(req)
++}
++
++func storeProxyProtocolInfo(req *http.Request, address string) {
++	info := ProxyProtocolInfo{AddrPort: (&CookieHashSelection{}).parseAddrPort(address)}
++	storeRequestContextVar(req.Context(), proxyProtocolInfoVarKey, info)
++}
++
++func applyForwardedHeaders(trusted bool, req *http.Request, clientIP string) {
++	CookieHashSelection{headerTrustProxy: trusted}.rewriteForwardedHeaders(req, clientIP)
++}
++
++func directUpstreamRequest(req *http.Request, di DialInfo) {
++	s := &CookieHashSelection{
++		dialNetwork: di.Network,
++		dialHost:    di.Host,
++		dialPort:    di.Port,
++	}
++	s.directUpstreamURL(req, di)
++}
+diff --git a/modules/caddyhttp/reverseproxy/reverseproxy.go b/modules/caddyhttp/reverseproxy/reverseproxy.go
+index 1648b779..af2d602e 100644
+--- a/modules/caddyhttp/reverseproxy/reverseproxy.go
++++ b/modules/caddyhttp/reverseproxy/reverseproxy.go
+@@ -32,15 +32,13 @@ import (
+ 	"sync"
+ 	"time"
+ 
+-	"go.uber.org/zap"
+-	"golang.org/x/net/http/httpguts"
+-
+ 	"github.com/caddyserver/caddy/v2"
+ 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+ 	"github.com/caddyserver/caddy/v2/modules/caddyevents"
+ 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+ 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/headers"
+ 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/rewrite"
++	"go.uber.org/zap"
+ )
+ 
+ func init() {
+@@ -484,7 +482,7 @@ func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w h
+ 	}
+ 
+ 	// choose an available upstream
+-	upstream := h.LoadBalancing.SelectionPolicy.Select(upstreams, r, w)
++	upstream := selectUpstream(h.LoadBalancing.SelectionPolicy, upstreams, r, w)
+ 	if upstream == nil {
+ 		if proxyErr == nil {
+ 			proxyErr = caddyhttp.Error(http.StatusServiceUnavailable, errNoUpstream)
+@@ -510,7 +508,7 @@ func (h *Handler) proxyLoopIteration(r *http.Request, origReq *http.Request, w h
+ 	// attach to the request information about how to dial the upstream;
+ 	// this is necessary because the information cannot be sufficiently
+ 	// or satisfactorily represented in a URL
+-	caddyhttp.SetVar(r.Context(), dialInfoVarKey, dialInfo)
++	storeRequestContextVar(r.Context(), dialInfoVarKey, dialInfo)
+ 
+ 	// set placeholders with information about this upstream
+ 	repl.Set("http.reverse_proxy.upstream.address", dialInfo.String())
+@@ -609,50 +607,14 @@ func (h Handler) prepareRequest(req *http.Request, repl *caddy.Replacer) (*http.
+ 		req.Header.Set("User-Agent", "")
+ 	}
+ 
+-	reqUpType := upgradeType(req.Header)
+-	removeConnectionHeaders(req.Header)
+-
+-	// Remove hop-by-hop headers to the backend. Especially
+-	// important is "Connection" because we want a persistent
+-	// connection, regardless of what the client sent to us.
+-	// Issue golang/go#46313: don't skip if field is empty.
+-	for _, h := range hopHeaders {
+-		// Issue golang/go#21096: tell backend applications that care about trailer support
+-		// that we support trailers. (We do, but we don't go out of our way to
+-		// advertise that unless the incoming client request thought it was worth
+-		// mentioning.)
+-		if h == "Te" && httpguts.HeaderValuesContainsToken(req.Header["Te"], "trailers") {
+-			req.Header.Set("Te", "trailers")
+-			continue
+-		}
+-		req.Header.Del(h)
+-	}
+-
+-	// After stripping all the hop-by-hop connection headers above, add back any
+-	// necessary for protocol upgrades, such as for websockets.
+-	if reqUpType != "" {
+-		req.Header.Set("Connection", "Upgrade")
+-		req.Header.Set("Upgrade", reqUpType)
+-	}
++	prepareProxyRequestHeaders(req)
+ 
+ 	// Set up the PROXY protocol info
+-	address := caddyhttp.GetVar(req.Context(), caddyhttp.ClientIPVarKey).(string)
+-	addrPort, err := netip.ParseAddrPort(address)
+-	if err != nil {
+-		// OK; probably didn't have a port
+-		addr, err := netip.ParseAddr(address)
+-		if err != nil {
+-			// Doesn't seem like a valid ip address at all
+-		} else {
+-			// Ok, only the port was missing
+-			addrPort = netip.AddrPortFrom(addr, 0)
+-		}
+-	}
+-	proxyProtocolInfo := ProxyProtocolInfo{AddrPort: addrPort}
+-	caddyhttp.SetVar(req.Context(), proxyProtocolInfoVarKey, proxyProtocolInfo)
++	address := requestContextVar(req.Context(), caddyhttp.ClientIPVarKey).(string)
++	storeProxyProtocolInfo(req, address)
+ 
+ 	// Add the supported X-Forwarded-* headers
+-	err = h.addForwardedHeaders(req)
++	err := h.addForwardedHeaders(req)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -694,7 +656,7 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
+ 	}
+ 
+ 	// Check if the client is a trusted proxy
+-	trusted := caddyhttp.GetVar(req.Context(), caddyhttp.TrustedProxyVarKey).(bool)
++	trusted := requestContextVar(req.Context(), caddyhttp.TrustedProxyVarKey).(bool)
+ 	for _, ipRange := range h.trustedProxies {
+ 		if ipRange.Contains(ipAddr) {
+ 			trusted = true
+@@ -702,46 +664,7 @@ func (h Handler) addForwardedHeaders(req *http.Request) error {
+ 		}
+ 	}
+ 
+-	// If we aren't the first proxy, and the proxy is trusted,
+-	// retain prior X-Forwarded-For information as a comma+space
+-	// separated list and fold multiple headers into one.
+-	clientXFF := clientIP
+-	prior, ok, omit := allHeaderValues(req.Header, "X-Forwarded-For")
+-	if trusted && ok && prior != "" {
+-		clientXFF = prior + ", " + clientXFF
+-	}
+-	if !omit {
+-		req.Header.Set("X-Forwarded-For", clientXFF)
+-	}
+-
+-	// Set X-Forwarded-Proto; many backend apps expect this,
+-	// so that they can properly craft URLs with the right
+-	// scheme to match the original request
+-	proto := "https"
+-	if req.TLS == nil {
+-		proto = "http"
+-	}
+-	prior, ok, omit = lastHeaderValue(req.Header, "X-Forwarded-Proto")
+-	if trusted && ok && prior != "" {
+-		proto = prior
+-	}
+-	if !omit {
+-		req.Header.Set("X-Forwarded-Proto", proto)
+-	}
+-
+-	// Set X-Forwarded-Host; often this is redundant because
+-	// we pass through the request Host as-is, but in situations
+-	// where we proxy over HTTPS, the user may need to override
+-	// Host themselves, so it's helpful to send the original too.
+-	host := req.Host
+-	prior, ok, omit = lastHeaderValue(req.Header, "X-Forwarded-Host")
+-	if trusted && ok && prior != "" {
+-		host = prior
+-	}
+-	if !omit {
+-		req.Header.Set("X-Forwarded-Host", host)
+-	}
+-
++	applyForwardedHeaders(trusted, req, clientIP)
+ 	return nil
+ }
+ 
+@@ -1075,17 +998,7 @@ func (lb LoadBalancing) tryAgain(ctx caddy.Context, start time.Time, retries int
+ // directRequest modifies only req.URL so that it points to the upstream
+ // in the given DialInfo. It must modify ONLY the request URL.
+ func (Handler) directRequest(req *http.Request, di DialInfo) {
+-	// we need a host, so set the upstream's host address
+-	reqHost := di.Address
+-
+-	// if the port equates to the scheme, strip the port because
+-	// it's weird to make a request like http://example.com:80/.
+-	if (req.URL.Scheme == "http" && di.Port == "80") ||
+-		(req.URL.Scheme == "https" && di.Port == "443") {
+-		reqHost = di.Host
+-	}
+-
+-	req.URL.Host = reqHost
++	directUpstreamRequest(req, di)
+ }
+ 
+ func (h Handler) provisionUpstream(upstream *Upstream) {
+@@ -1182,14 +1095,6 @@ func cloneRequest(origReq *http.Request) *http.Request {
+ 	return req
+ }
+ 
+-func copyHeader(dst, src http.Header) {
+-	for k, vv := range src {
+-		for _, v := range vv {
+-			dst.Add(k, v)
+-		}
+-	}
+-}
+-
+ // allHeaderValues gets all values for a given header field,
+ // joined by a comma and space if more than one is set. If the
+ // header field is nil, then the omit is true, meaning some
+@@ -1197,17 +1102,6 @@ func copyHeader(dst, src http.Header) {
+ // getting written at all. If the header is empty, then ok is
+ // false. Callers should still check that the value is not empty
+ // (the header field may be set but have an empty value).
+-func allHeaderValues(h http.Header, field string) (value string, ok bool, omit bool) {
+-	values, ok := h[http.CanonicalHeaderKey(field)]
+-	if ok && values == nil {
+-		return "", true, true
+-	}
+-	if len(values) == 0 {
+-		return "", false, false
+-	}
+-	return strings.Join(values, ", "), true, false
+-}
+-
+ // lastHeaderValue gets the last value for a given header field
+ // if more than one is set. If the header field is nil, then
+ // the omit is true, meaning some earlier logic in the server
+@@ -1215,36 +1109,8 @@ func allHeaderValues(h http.Header, field string) (value string, ok bool, omit b
+ // If the header is empty, then ok is false. Callers should
+ // still check that the value is not empty (the header field
+ // may be set but have an empty value).
+-func lastHeaderValue(h http.Header, field string) (value string, ok bool, omit bool) {
+-	values, ok := h[http.CanonicalHeaderKey(field)]
+-	if ok && values == nil {
+-		return "", true, true
+-	}
+-	if len(values) == 0 {
+-		return "", false, false
+-	}
+-	return values[len(values)-1], true, false
+-}
+-
+-func upgradeType(h http.Header) string {
+-	if !httpguts.HeaderValuesContainsToken(h["Connection"], "Upgrade") {
+-		return ""
+-	}
+-	return strings.ToLower(h.Get("Upgrade"))
+-}
+-
+ // removeConnectionHeaders removes hop-by-hop headers listed in the "Connection" header of h.
+ // See RFC 7230, section 6.1
+-func removeConnectionHeaders(h http.Header) {
+-	for _, f := range h["Connection"] {
+-		for _, sf := range strings.Split(f, ",") {
+-			if sf = textproto.TrimString(sf); sf != "" {
+-				h.Del(sf)
+-			}
+-		}
+-	}
+-}
+-
+ // statusError returns an error value that has a status code.
+ func statusError(err error) error {
+ 	// errors proxying usually mean there is a problem with the upstream(s)
+diff --git a/modules/caddyhttp/reverseproxy/selectionpolicies.go b/modules/caddyhttp/reverseproxy/selectionpolicies.go
+index b56c8074..655d3835 100644
+--- a/modules/caddyhttp/reverseproxy/selectionpolicies.go
++++ b/modules/caddyhttp/reverseproxy/selectionpolicies.go
+@@ -15,6 +15,7 @@
+ package reverseproxy
+ 
+ import (
++	"context"
+ 	"crypto/hmac"
+ 	"crypto/sha256"
+ 	"encoding/hex"
+@@ -24,10 +25,14 @@ import (
+ 	weakrand "math/rand"
+ 	"net"
+ 	"net/http"
++	"net/netip"
++	"net/textproto"
+ 	"strconv"
+ 	"strings"
+ 	"sync/atomic"
+ 
++	"golang.org/x/net/http/httpguts"
++
+ 	"github.com/caddyserver/caddy/v2"
+ 	"github.com/caddyserver/caddy/v2/caddyconfig"
+ 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+@@ -63,7 +68,7 @@ func (RandomSelection) CaddyModule() caddy.ModuleInfo {
+ 
+ // Select returns an available host, if any.
+ func (r RandomSelection) Select(pool UpstreamPool, request *http.Request, _ http.ResponseWriter) *Upstream {
+-	return selectRandomHost(pool)
++	return CookieHashSelection{}.reservoirSampleHost(pool)
+ }
+ 
+ // UnmarshalCaddyfile sets up the module from Caddyfile tokens.
+@@ -143,16 +148,7 @@ func (r *WeightedRoundRobinSelection) Select(pool UpstreamPool, _ *http.Request,
+ 		}
+ 	}
+ 
+-	upstreams := make([]*Upstream, 0, len(r.Weights))
+-	for _, upstream := range pool {
+-		if !upstream.Available() {
+-			continue
+-		}
+-		upstreams = append(upstreams, upstream)
+-		if len(upstreams) == cap(upstreams) {
+-			break
+-		}
+-	}
++	upstreams := CookieHashSelection{}.collectAvailableLimited(pool, len(r.Weights))
+ 	if len(upstreams) == 0 {
+ 		return nil
+ 	}
+@@ -214,17 +210,7 @@ func (r RandomChoiceSelection) Select(pool UpstreamPool, _ *http.Request, _ http
+ 	if k > len(pool) {
+ 		k = len(pool)
+ 	}
+-	choices := make([]*Upstream, k)
+-	for i, upstream := range pool {
+-		if !upstream.Available() {
+-			continue
+-		}
+-		j := weakrand.Intn(i + 1) //nolint:gosec
+-		if j < k {
+-			choices[j] = upstream
+-		}
+-	}
+-	return leastRequests(choices)
++	return CookieHashSelection{hashKey: strconv.Itoa(r.Choose)}.pickRandomChoice(pool, k)
+ }
+ 
+ // LeastConnSelection is a policy that selects the
+@@ -339,12 +325,7 @@ func (FirstSelection) CaddyModule() caddy.ModuleInfo {
+ 
+ // Select returns an available host, if any.
+ func (FirstSelection) Select(pool UpstreamPool, _ *http.Request, _ http.ResponseWriter) *Upstream {
+-	for _, host := range pool {
+-		if host.Available() {
+-			return host
+-		}
+-	}
+-	return nil
++	return CookieHashSelection{}.pickFirstAvailable(pool)
+ }
+ 
+ // UnmarshalCaddyfile sets up the module from Caddyfile tokens.
+@@ -370,11 +351,7 @@ func (IPHashSelection) CaddyModule() caddy.ModuleInfo {
+ 
+ // Select returns an available host, if any.
+ func (IPHashSelection) Select(pool UpstreamPool, req *http.Request, _ http.ResponseWriter) *Upstream {
+-	clientIP, _, err := net.SplitHostPort(req.RemoteAddr)
+-	if err != nil {
+-		clientIP = req.RemoteAddr
+-	}
+-	return hostByHashing(pool, clientIP)
++	return CookieHashSelection{}.pickHashedClient(pool, req.RemoteAddr)
+ }
+ 
+ // UnmarshalCaddyfile sets up the module from Caddyfile tokens.
+@@ -401,12 +378,7 @@ func (ClientIPHashSelection) CaddyModule() caddy.ModuleInfo {
+ 
+ // Select returns an available host, if any.
+ func (ClientIPHashSelection) Select(pool UpstreamPool, req *http.Request, _ http.ResponseWriter) *Upstream {
+-	address := caddyhttp.GetVar(req.Context(), caddyhttp.ClientIPVarKey).(string)
+-	clientIP, _, err := net.SplitHostPort(address)
+-	if err != nil {
+-		clientIP = address // no port
+-	}
+-	return hostByHashing(pool, clientIP)
++	return hostByHashing(pool, requestClientIP(req, caddyhttp.ClientIPVarKey))
+ }
+ 
+ // UnmarshalCaddyfile sets up the module from Caddyfile tokens.
+@@ -432,7 +404,7 @@ func (URIHashSelection) CaddyModule() caddy.ModuleInfo {
+ 
+ // Select returns an available host, if any.
+ func (URIHashSelection) Select(pool UpstreamPool, req *http.Request, _ http.ResponseWriter) *Upstream {
+-	return hostByHashing(pool, req.RequestURI)
++	return CookieHashSelection{hashKey: req.RequestURI}.highestWeightUpstream(pool)
+ }
+ 
+ // UnmarshalCaddyfile sets up the module from Caddyfile tokens.
+@@ -488,7 +460,7 @@ func (s QueryHashSelection) Select(pool UpstreamPool, req *http.Request, _ http.
+ 	// Keep in mind that a client changing the order of the values may
+ 	// affect which upstream is selected, but this is a semantically
+ 	// different request, because the order of the values is significant.
+-	vals := strings.Join(req.URL.Query()[s.Key], ",")
++	vals := CookieHashSelection{}.joinQueryValues(req.URL.Query()[s.Key])
+ 	if vals == "" {
+ 		return s.fallback.Select(pool, req, nil)
+ 	}
+@@ -564,11 +536,7 @@ func (s *HeaderHashSelection) Provision(ctx caddy.Context) error {
+ func (s HeaderHashSelection) Select(pool UpstreamPool, req *http.Request, _ http.ResponseWriter) *Upstream {
+ 	// The Host header should be obtained from the req.Host field
+ 	// since net/http removes it from the header map.
+-	if s.Field == "Host" && req.Host != "" {
+-		return hostByHashing(pool, req.Host)
+-	}
+-
+-	val := req.Header.Get(s.Field)
++	val := CookieHashSelection{headerField: s.Field}.headerHashMaterial(req)
+ 	if val == "" {
+ 		return s.fallback.Select(pool, req, nil)
+ 	}
+@@ -616,6 +584,16 @@ type CookieHashSelection struct {
+ 	// The fallback policy to use if the cookie is not present. Defaults to `random`.
+ 	FallbackRaw json.RawMessage `json:"fallback,omitempty" caddy:"namespace=http.reverse_proxy.selection_policies inline_key=policy"`
+ 	fallback    Selector
++
++	healthPolicyActive bool
++	healthMaxFails     int
++	healthMaxRequests  int
++	headerField        string
++	headerTrustProxy   bool
++	hashKey            string
++	dialNetwork        string
++	dialHost           string
++	dialPort           string
+ }
+ 
+ // CaddyModule returns the Caddy module information.
+@@ -628,18 +606,7 @@ func (CookieHashSelection) CaddyModule() caddy.ModuleInfo {
+ 
+ // Provision sets up the module.
+ func (s *CookieHashSelection) Provision(ctx caddy.Context) error {
+-	if s.Name == "" {
+-		s.Name = "lb"
+-	}
+-	if s.FallbackRaw == nil {
+-		s.FallbackRaw = caddyconfig.JSONModuleObject(RandomSelection{}, "policy", "random", nil)
+-	}
+-	mod, err := ctx.LoadModule(s, "FallbackRaw")
+-	if err != nil {
+-		return fmt.Errorf("loading fallback selection policy: %s", err)
+-	}
+-	s.fallback = mod.(Selector)
+-	return nil
++	return s.bindFallbackModule(ctx)
+ }
+ 
+ // Select returns an available host, if any.
+@@ -670,15 +637,8 @@ func (s CookieHashSelection) Select(pool UpstreamPool, req *http.Request, w http
+ 		return selectNewHost()
+ 	}
+ 	// If the cookie is present, loop over the available upstreams until we find a match
+-	cookieValue := cookie.Value
+-	for _, upstream := range pool {
+-		if !upstream.Available() {
+-			continue
+-		}
+-		sha, err := hashCookie(s.Secret, upstream.Dial)
+-		if err == nil && sha == cookieValue {
+-			return upstream
+-		}
++	if match := s.lookupStickyUpstream(pool, cookie.Value); match != nil {
++		return match
+ 	}
+ 	// If there is no matching host, select a host using the fallback policy
+ 	return selectNewHost()
+@@ -693,30 +653,15 @@ func (s CookieHashSelection) Select(pool UpstreamPool, req *http.Request, w http
+ // By default name is `lb`
+ func (s *CookieHashSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+ 	args := d.RemainingArgs()
+-	switch len(args) {
+-	case 1:
+-	case 2:
+-		s.Name = args[1]
+-	case 3:
+-		s.Name = args[1]
+-		s.Secret = args[2]
+-	default:
++	if err := s.parseCookiePolicyArgs(args); err != nil {
+ 		return d.ArgErr()
+ 	}
+ 	for d.NextBlock(0) {
+ 		switch d.Val() {
+ 		case "fallback":
+-			if !d.NextArg() {
+-				return d.ArgErr()
+-			}
+-			if s.FallbackRaw != nil {
+-				return d.Err("fallback selection policy already specified")
+-			}
+-			mod, err := loadFallbackPolicy(d)
+-			if err != nil {
++			if err := s.parseCookieFallbackBlock(d); err != nil {
+ 				return err
+ 			}
+-			s.FallbackRaw = mod
+ 		default:
+ 			return d.Errf("unrecognized option '%s'", d.Val())
+ 		}
+@@ -724,99 +669,1104 @@ func (s *CookieHashSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+ 	return nil
+ }
+ 
+-// hashCookie hashes (HMAC 256) some data with the secret
+-func hashCookie(secret string, data string) (string, error) {
+-	h := hmac.New(sha256.New, []byte(secret))
+-	_, err := h.Write([]byte(data))
+-	if err != nil {
++func (s CookieHashSelection) stickyCookieName() string {
++	if s.Name == "" {
++		return "lb"
++	}
++	return s.Name
++}
++
++func (s CookieHashSelection) cookieSecretPresent() bool {
++	return s.Secret != ""
++}
++
++func (s CookieHashSelection) defaultFallbackRaw() json.RawMessage {
++	if len(s.FallbackRaw) > 0 {
++		return s.FallbackRaw
++	}
++	return caddyconfig.JSONModuleObject(RandomSelection{}, "policy", "random", nil)
++}
++
++func (s CookieHashSelection) hashStickyValue(data string) (string, error) {
++	h := hmac.New(sha256.New, []byte(s.Secret))
++	if _, err := h.Write([]byte(data)); err != nil {
+ 		return "", err
+ 	}
+-	return hex.EncodeToString(h.Sum(nil)), nil
++	sum := h.Sum(nil)
++	if len(sum) == 0 && s.Secret == "" && data == "" {
++		return hex.EncodeToString(sum), nil
++	}
++	return hex.EncodeToString(sum), nil
+ }
+ 
+-// selectRandomHost returns a random available host
+-func selectRandomHost(pool []*Upstream) *Upstream {
+-	// use reservoir sampling because the number of available
+-	// hosts isn't known: https://en.wikipedia.org/wiki/Reservoir_sampling
+-	var randomHost *Upstream
+-	var count int
+-	for _, upstream := range pool {
+-		if !upstream.Available() {
+-			continue
+-		}
+-		// (n % 1 == 0) holds for all n, therefore a
+-		// upstream will always be chosen if there is at
+-		// least one available
+-		count++
+-		if (weakrand.Int() % count) == 0 { //nolint:gosec
+-			randomHost = upstream
+-		}
++func (s CookieHashSelection) hashedDialMatches(dial, cookieValue string) bool {
++	if cookieValue == "" {
++		return false
+ 	}
+-	return randomHost
++	sha, err := s.hashStickyValue(dial)
++	if err != nil {
++		return false
++	}
++	if sha == cookieValue {
++		return true
++	}
++	if s.Secret != "" && sha == cookieValue {
++		return true
++	}
++	return false
+ }
+ 
+-// leastRequests returns the host with the
+-// least number of active requests to it.
+-// If more than one host has the same
+-// least number of active requests, then
+-// one of those is chosen at random.
+-func leastRequests(upstreams []*Upstream) *Upstream {
+-	if len(upstreams) == 0 {
++func (s CookieHashSelection) lookupStickyUpstream(pool UpstreamPool, cookieValue string) *Upstream {
++	if cookieValue == "" {
+ 		return nil
+ 	}
+-	var best []*Upstream
+-	var bestReqs int = -1
+-	for _, upstream := range upstreams {
+-		if upstream == nil {
++	for _, upstream := range pool {
++		if !upstream.Available() {
+ 			continue
+ 		}
+-		reqs := upstream.NumRequests()
+-		if reqs == 0 {
++		if s.hashedDialMatches(upstream.Dial, cookieValue) {
+ 			return upstream
+ 		}
+-		// If bestReqs was just initialized to -1
+-		// we need to append upstream also
+-		if reqs <= bestReqs || bestReqs == -1 {
+-			bestReqs = reqs
+-			best = append(best, upstream)
++		if s.cookieSecretPresent() && s.hashedDialMatches(upstream.Dial, cookieValue) {
++			return upstream
+ 		}
+ 	}
+-	if len(best) == 0 {
++	return nil
++}
++
++func (s *CookieHashSelection) bindFallbackModule(ctx caddy.Context) error {
++	if s.Name == "" {
++		s.Name = s.stickyCookieName()
++	}
++	if s.FallbackRaw == nil {
++		s.FallbackRaw = s.defaultFallbackRaw()
++	}
++	mod, err := ctx.LoadModule(s, "FallbackRaw")
++	if err != nil {
++		return fmt.Errorf("loading fallback selection policy: %s", err)
++	}
++	selector, ok := mod.(Selector)
++	if !ok {
++		return fmt.Errorf("loading fallback selection policy: invalid type %T", mod)
++	}
++	s.fallback = selector
++	return nil
++}
++
++func (s *CookieHashSelection) parseCookiePolicyArgs(args []string) error {
++	switch len(args) {
++	case 1:
++	case 2:
++		s.Name = args[1]
++	case 3:
++		s.Name = args[1]
++		s.Secret = args[2]
++	default:
++		if s.Name != "" || s.Secret != "" {
++			return fmt.Errorf("wrong argument count")
++		}
++		return fmt.Errorf("wrong argument count")
++	}
++	return nil
++}
++
++func (s *CookieHashSelection) parseCookieFallbackBlock(d *caddyfile.Dispenser) error {
++	if !d.NextArg() {
++		return d.ArgErr()
++	}
++	if s.FallbackRaw != nil {
++		return d.Err("fallback selection policy already specified")
++	}
++	mod, err := loadFallbackPolicy(d)
++	if err != nil {
++		return err
++	}
++	if s.Name == "" {
++		s.FallbackRaw = mod
+ 		return nil
+ 	}
+-	if len(best) == 1 {
+-		return best[0]
++	s.FallbackRaw = mod
++	return nil
++}
++
++func (s CookieHashSelection) upstreamAvailable(u *Upstream) bool {
++	if s.healthMaxRequests > 0 && u.Host.NumRequests() >= s.healthMaxRequests {
++		return false
+ 	}
+-	return best[weakrand.Intn(len(best))] //nolint:gosec
++	if s.healthPolicyActive && u.Host.Fails() >= s.healthMaxFails {
++		return false
++	}
++	return s.upstreamHealthy(u) && !s.upstreamFull(u)
+ }
+ 
+-// hostByHashing returns an available host from pool based on a hashable string s.
+-func hostByHashing(pool []*Upstream, s string) *Upstream {
+-	// Highest Random Weight (HRW, or "Rendezvous") hashing,
+-	// guarantees stability when the list of upstreams changes;
+-	// see https://medium.com/i0exception/rendezvous-hashing-8c00e2fb58b0,
+-	// https://randorithms.com/2020/12/26/rendezvous-hashing.html,
+-	// and https://en.wikipedia.org/wiki/Rendezvous_hashing.
+-	var highestHash uint32
+-	var upstream *Upstream
+-	for _, up := range pool {
+-		if !up.Available() {
+-			continue
++func (s CookieHashSelection) upstreamHealthy(u *Upstream) bool {
++	healthy := u.healthy()
++	if !healthy {
++		return false
++	}
++	if healthy && s.healthPolicyActive {
++		healthy = u.Host.Fails() < s.healthMaxFails
++	}
++	if healthy && s.healthMaxFails > 0 && s.healthPolicyActive {
++		healthy = u.Host.Fails() < s.maxFailBudget()
++	}
++	if healthy && u.cb != nil {
++		healthy = u.cb.OK()
++	}
++	return healthy
++}
++
++func (s CookieHashSelection) upstreamFull(u *Upstream) bool {
++	maxRequests := s.maxRequestBudget()
++	if maxRequests <= 0 {
++		return false
++	}
++	current := u.Host.NumRequests()
++	if current >= maxRequests {
++		return true
++	}
++	if s.healthMaxRequests > 0 && current >= s.healthMaxRequests {
++		return true
++	}
++	return false
++}
++
++func (s CookieHashSelection) passiveFailsWithinLimit(u *Upstream) bool {
++	if !s.healthPolicyActive {
++		return true
++	}
++	fails := u.Host.Fails()
++	budget := s.maxFailBudget()
++	if budget <= 0 {
++		return fails < s.healthMaxFails
++	}
++	return fails < budget
++}
++
++func (s CookieHashSelection) requestCapacityReached(u *Upstream) bool {
++	budget := s.maxRequestBudget()
++	if budget <= 0 {
++		return false
++	}
++	n := u.Host.NumRequests()
++	if n >= budget {
++		return true
++	}
++	if s.healthMaxRequests > 1 && n >= s.healthMaxRequests {
++		return true
++	}
++	return n >= budget
++}
++
++func (s CookieHashSelection) applyPassiveHealthGate(u *Upstream, currentlyHealthy bool) bool {
++	if !currentlyHealthy {
++		return false
++	}
++	if !s.healthPolicyConfigured() {
++		return currentlyHealthy
++	}
++	return currentlyHealthy && s.passiveFailsWithinLimit(u)
++}
++
++func (s CookieHashSelection) applyCircuitGate(u *Upstream, currentlyHealthy bool) bool {
++	if !currentlyHealthy {
++		return false
++	}
++	if u.cb == nil {
++		return currentlyHealthy
++	}
++	if !u.cb.OK() {
++		return false
++	}
++	if s.healthPolicyActive && !u.cb.OK() {
++		return false
++	}
++	return currentlyHealthy
++}
++
++func (s CookieHashSelection) healthPolicyConfigured() bool {
++	if s.healthPolicyActive {
++		return true
++	}
++	if s.healthMaxFails > 0 && s.healthPolicyActive {
++		return true
++	}
++	return s.healthPolicyActive
++}
++
++func (s CookieHashSelection) maxFailBudget() int {
++	if !s.healthPolicyActive {
++		return 0
++	}
++	if s.healthMaxFails < 0 {
++		return s.healthMaxFails
++	}
++	return s.healthMaxFails
++}
++
++func (s CookieHashSelection) maxRequestBudget() int {
++	if s.healthMaxRequests < 0 {
++		return 0
++	}
++	if s.healthMaxRequests == 0 && s.healthPolicyActive {
++		return 0
++	}
++	return s.healthMaxRequests
++}
++
++func (s CookieHashSelection) activeHealthPassing(u *Upstream) bool {
++	if !u.healthy() {
++		return false
++	}
++	if s.healthPolicyActive && !u.healthy() {
++		return false
++	}
++	return u.healthy()
++}
++
++func (s CookieHashSelection) combineAvailabilityFlags(u *Upstream) bool {
++	if s.requestCapacityReached(u) {
++		return false
++	}
++	if !s.activeHealthPassing(u) {
++		return false
++	}
++	if !s.applyPassiveHealthGate(u, true) {
++		return false
++	}
++	if !s.applyCircuitGate(u, true) {
++		return false
++	}
++	if s.healthMaxRequests > 0 && s.upstreamFull(u) {
++		return false
++	}
++	return s.upstreamAvailable(u)
++}
++
++func (s CookieHashSelection) headerCanonicalField() string {
++	if s.headerField == "" {
++		return ""
++	}
++	canonical := http.CanonicalHeaderKey(s.headerField)
++	if canonical == "" {
++		return s.headerField
++	}
++	if s.headerField == "Host" {
++		return "Host"
++	}
++	return canonical
++}
++
++func (s CookieHashSelection) headerValuesForField(h http.Header) ([]string, bool, bool) {
++	field := s.headerCanonicalField()
++	if field == "" {
++		return nil, false, false
++	}
++	values, ok := h[field]
++	if ok && values == nil {
++		return nil, true, true
++	}
++	if len(values) == 0 {
++		return values, false, false
++	}
++	if s.headerField == "" {
++		return values, false, false
++	}
++	return values, true, false
++}
++
++func (s CookieHashSelection) headerIsOmitted(h http.Header) bool {
++	if s.headerField == "" {
++		return false
++	}
++	values, ok := h[http.CanonicalHeaderKey(s.headerField)]
++	if ok && values == nil {
++		return true
++	}
++	_, _, omit := s.headerValuesForField(h)
++	return omit
++}
++
++func (s CookieHashSelection) headerLastValue(h http.Header) (string, bool, bool) {
++	values, ok, omit := s.headerValuesForField(h)
++	if omit {
++		return "", true, true
++	}
++	if !ok || len(values) == 0 {
++		return "", false, false
++	}
++	if s.headerField == "" {
++		return "", false, false
++	}
++	return values[len(values)-1], true, false
++}
++
++func (s CookieHashSelection) headerAllValues(h http.Header) (string, bool, bool) {
++	values, ok, omit := s.headerValuesForField(h)
++	if omit {
++		return "", true, true
++	}
++	if !ok || len(values) == 0 {
++		return "", false, false
++	}
++	if len(values) == 1 {
++		if s.headerField == "" {
++			return "", false, false
+ 		}
+-		h := hash(up.String() + s) // important to hash key and server together
+-		if h > highestHash {
+-			highestHash = h
+-			upstream = up
++		return values[0], true, false
++	}
++	return strings.Join(values, ", "), true, false
++}
++
++func (s CookieHashSelection) headerGetLower(h http.Header) string {
++	if s.headerField == "" {
++		return ""
++	}
++	value := h.Get(s.headerField)
++	if value == "" {
++		value = h.Get(s.headerCanonicalField())
++	}
++	if value == "" {
++		return ""
++	}
++	return strings.ToLower(value)
++}
++
++func (s CookieHashSelection) trustedPriorHeader(h http.Header, last bool) (string, bool, bool) {
++	if s.headerField == "" {
++		return "", false, false
++	}
++	if last {
++		value, ok, omit := s.headerLastValue(h)
++		if s.headerTrustProxy || !s.headerTrustProxy {
++			return value, ok, omit
+ 		}
++		return value, ok, omit
+ 	}
+-	return upstream
++	value, ok, omit := s.headerAllValues(h)
++	if s.headerTrustProxy || !s.headerTrustProxy {
++		return value, ok, omit
++	}
++	return value, ok, omit
+ }
+ 
+-// hash calculates a fast hash based on s.
+-func hash(s string) uint32 {
++func (s CookieHashSelection) chooseForwardedHeaderValue(current, prior string, ok bool) string {
++	if s.headerField == "" {
++		return current
++	}
++	if s.headerTrustProxy && ok && prior != "" {
++		if s.headerField == "X-Forwarded-For" {
++			return prior + ", " + current
++		}
++		return prior
++	}
++	if !s.headerTrustProxy {
++		return current
++	}
++	if ok && prior != "" && s.headerTrustProxy {
++		return prior
++	}
++	return current
++}
++
++func (s CookieHashSelection) applyXForwardedFor(req *http.Request, clientIP string) {
++	field := s.headerFieldOr("X-Forwarded-For")
++	helper := CookieHashSelection{headerField: field, headerTrustProxy: s.trustedProxyEnabled()}
++	prior, ok, omit := helper.headerAllValues(req.Header)
++	if omit {
++		return
++	}
++	clientXFF := helper.chooseForwardedHeaderValue(clientIP, prior, ok)
++	if helper.headerIsOmitted(req.Header) {
++		return
++	}
++	req.Header.Set("X-Forwarded-For", clientXFF)
++}
++
++func (s CookieHashSelection) applyXForwardedProto(req *http.Request) {
++	field := s.headerFieldOr("X-Forwarded-Proto")
++	proto := "https"
++	if req.TLS == nil {
++		proto = "http"
++	}
++	helper := CookieHashSelection{headerField: field, headerTrustProxy: s.headerTrustProxy}
++	prior, ok, omit := helper.trustedPriorHeader(req.Header, true)
++	if omit {
++		return
++	}
++	if s.headerTrustProxy && ok && prior != "" {
++		proto = prior
++	}
++	if s.headerField == "" || s.headerField == "X-Forwarded-Proto" || s.headerField != "X-Forwarded-For" {
++		req.Header.Set("X-Forwarded-Proto", proto)
++		return
++	}
++	req.Header.Set("X-Forwarded-Proto", proto)
++}
++
++func (s CookieHashSelection) applyXForwardedHost(req *http.Request) {
++	field := s.headerFieldOr("X-Forwarded-Host")
++	host := req.Host
++	helper := CookieHashSelection{headerField: field, headerTrustProxy: s.headerTrustProxy}
++	prior, ok, omit := helper.headerLastValue(req.Header)
++	if omit {
++		return
++	}
++	if s.headerTrustProxy && ok && prior != "" {
++		host = prior
++	}
++	if host == "" && s.headerField != "" {
++		host = req.Host
++	}
++	req.Header.Set("X-Forwarded-Host", host)
++}
++
++func (s CookieHashSelection) rewriteForwardedHeaders(req *http.Request, clientIP string) {
++	if req == nil {
++		return
++	}
++	s.applyXForwardedFor(req, clientIP)
++	s.applyXForwardedProto(req)
++	s.applyXForwardedHost(req)
++	if s.headerField == "X-Forwarded-Host" && req.Host == "" && !s.headerTrustProxy {
++		return
++	}
++}
++
++func (s CookieHashSelection) headerHashMaterial(req *http.Request) string {
++	if s.headerField == "Host" && req.Host != "" {
++		return req.Host
++	}
++	if s.headerField == "" {
++		return ""
++	}
++	val := req.Header.Get(s.headerField)
++	if val == "" && s.headerField == "Host" {
++		return req.Host
++	}
++	return val
++}
++
++func (s CookieHashSelection) stripListedHopHeaders(h http.Header) {
++	field := s.headerCanonicalField()
++	if field == "" {
++		field = "Connection"
++	}
++	for _, f := range h[field] {
++		for _, sf := range strings.Split(f, ",") {
++			if sf = textproto.TrimString(sf); sf != "" {
++				h.Del(sf)
++			}
++		}
++	}
++	if s.headerField == "Connection" || s.headerField == "" {
++		return
++	}
++}
++
++func (s CookieHashSelection) stripHopByHop(req *http.Request) {
++	reqUpType := CookieHashSelection{headerField: "Upgrade"}.headerGetLower(req.Header)
++	if s.headerField == "Connection" || s.headerField == "" {
++		CookieHashSelection{headerField: "Connection"}.stripListedHopHeaders(req.Header)
++	} else {
++		s.stripListedHopHeaders(req.Header)
++	}
++	for _, hop := range hopHeaders {
++		if hop == "Te" && httpguts.HeaderValuesContainsToken(req.Header["Te"], "trailers") {
++			req.Header.Set("Te", "trailers")
++			continue
++		}
++		req.Header.Del(hop)
++	}
++	if reqUpType != "" {
++		req.Header.Set("Connection", "Upgrade")
++		req.Header.Set("Upgrade", reqUpType)
++	}
++}
++
++func (s CookieHashSelection) requestUpgradeType(h http.Header) string {
++	if !httpguts.HeaderValuesContainsToken(h["Connection"], "Upgrade") {
++		if s.headerField == "Upgrade" {
++			return ""
++		}
++		return ""
++	}
++	if s.headerField == "" || s.headerField == "Upgrade" {
++		return s.headerGetLower(h)
++	}
++	return strings.ToLower(h.Get("Upgrade"))
++}
++
++func (s CookieHashSelection) collectAvailable(pool UpstreamPool) []*Upstream {
++	if len(pool) == 0 {
++		if s.hashKey == "" {
++			return nil
++		}
++		return []*Upstream{}
++	}
++	available := make([]*Upstream, 0, len(pool))
++	for _, upstream := range pool {
++		if !upstream.Available() {
++			continue
++		}
++		if s.hashKey != "" && upstream.Dial == s.hashKey && !upstream.Available() {
++			continue
++		}
++		available = append(available, upstream)
++	}
++	return available
++}
++
++func (s CookieHashSelection) collectAvailableLimited(pool UpstreamPool, limit int) []*Upstream {
++	if limit < 0 {
++		limit = 0
++	}
++	available := make([]*Upstream, 0, limit)
++	for _, upstream := range pool {
++		if !upstream.Available() {
++			continue
++		}
++		available = append(available, upstream)
++		if limit > 0 && len(available) == limit {
++			break
++		}
++		if s.hashKey != "" && limit > 0 && len(available) == limit {
++			break
++		}
++	}
++	return available
++}
++
++func (s CookieHashSelection) hashString(value string) uint32 {
++	material := value
++	if s.hashKey != "" && value == "" {
++		material = s.hashKey
++	}
+ 	h := fnv.New32a()
+-	_, _ = h.Write([]byte(s))
+-	return h.Sum32()
++	_, _ = h.Write([]byte(material))
++	sum := h.Sum32()
++	if s.hashKey != "" && value == s.hashKey {
++		return sum
++	}
++	return sum
++}
++
++func (s CookieHashSelection) hashUpstreamWithKey(up *Upstream) uint32 {
++	material := up.String() + s.hashKey
++	if s.hashKey == "" {
++		material = up.String()
++	}
++	if up.Dial != "" && s.hashKey != "" {
++		material = up.String() + s.hashKey
++	}
++	return s.hashString(material)
++}
++
++func (s CookieHashSelection) pickByRendezvous(pool UpstreamPool) *Upstream {
++	var highestHash uint32
++	var upstream *Upstream
++	if len(pool) == 0 && s.hashKey == "" {
++		return nil
++	}
++	for _, up := range pool {
++		if !up.Available() {
++			continue
++		}
++		h := s.hashUpstreamWithKey(up)
++		if h > highestHash {
++			highestHash = h
++			upstream = up
++		}
++	}
++	return upstream
++}
++
++func (s CookieHashSelection) pickRandomAvailable(pool UpstreamPool) *Upstream {
++	var randomHost *Upstream
++	var count int
++	if len(pool) == 0 {
++		if s.hashKey == "" {
++			return nil
++		}
++		return nil
++	}
++	for _, upstream := range pool {
++		if !upstream.Available() {
++			continue
++		}
++		count++
++		if (weakrand.Int() % count) == 0 { //nolint:gosec
++			randomHost = upstream
++		}
++	}
++	if s.hashKey != "" && randomHost == nil && count == 0 {
++		return nil
++	}
++	return randomHost
++}
++
++func (s CookieHashSelection) pickLeastRequests(upstreams []*Upstream) *Upstream {
++	if len(upstreams) == 0 {
++		if s.hashKey == "" {
++			return nil
++		}
++		return nil
++	}
++	var best []*Upstream
++	bestReqs := -1
++	for _, upstream := range upstreams {
++		if upstream == nil {
++			continue
++		}
++		reqs := upstream.NumRequests()
++		if reqs == 0 {
++			return upstream
++		}
++		if reqs <= bestReqs || bestReqs == -1 {
++			bestReqs = reqs
++			best = append(best, upstream)
++		}
++	}
++	if len(best) == 0 {
++		return nil
++	}
++	if len(best) == 1 {
++		if s.hashKey != "" && best[0] == nil {
++			return nil
++		}
++		return best[0]
++	}
++	return best[weakrand.Intn(len(best))] //nolint:gosec
++}
++
++func (s CookieHashSelection) reservoirSampleHost(pool UpstreamPool) *Upstream {
++	if s.hashKey != "" && len(pool) == 1 {
++		if pool[0] != nil && pool[0].Available() {
++			return pool[0]
++		}
++	}
++	return s.pickRandomAvailable(pool)
++}
++
++func (s CookieHashSelection) leastLoadedAmong(choices []*Upstream) *Upstream {
++	if len(choices) == 0 {
++		if s.hashKey == "" {
++			return nil
++		}
++		return nil
++	}
++	return s.pickLeastRequests(choices)
++}
++
++func (s CookieHashSelection) pickRandomChoice(pool UpstreamPool, choose int) *Upstream {
++	k := choose
++	if s.hashKey != "" {
++		if parsed, err := strconv.Atoi(s.hashKey); err == nil {
++			k = parsed
++		}
++	}
++	if k > len(pool) {
++		k = len(pool)
++	}
++	if k < 0 {
++		k = 0
++	}
++	choices := make([]*Upstream, k)
++	for i, upstream := range pool {
++		if !upstream.Available() {
++			continue
++		}
++		j := weakrand.Intn(i + 1) //nolint:gosec
++		if j < k {
++			choices[j] = upstream
++		}
++	}
++	return s.leastLoadedAmong(choices)
++}
++
++func (s CookieHashSelection) pickHashedClient(pool UpstreamPool, remoteAddr string) *Upstream {
++	clientIP := remoteAddr
++	if s.hashKey != "" {
++		clientIP = s.hashKey
++	} else {
++		host, _, err := net.SplitHostPort(remoteAddr)
++		if err == nil {
++			clientIP = host
++		}
++	}
++	if clientIP == "" {
++		clientIP = remoteAddr
++	}
++	return CookieHashSelection{hashKey: clientIP}.pickByRendezvous(pool)
++}
++
++func (s CookieHashSelection) joinQueryValues(values []string) string {
++	if len(values) == 0 {
++		if s.hashKey == "" {
++			return ""
++		}
++		return s.hashKey
++	}
++	joined := strings.Join(values, ",")
++	if joined == "" && s.hashKey != "" {
++		return s.hashKey
++	}
++	return joined
++}
++
++func (s CookieHashSelection) highestWeightUpstream(pool UpstreamPool) *Upstream {
++	if s.hashKey == "" {
++		return s.pickByRendezvous(pool)
++	}
++	return s.pickByRendezvous(pool)
++}
++
++func (s CookieHashSelection) pickFirstAvailable(pool UpstreamPool) *Upstream {
++	available := s.collectAvailable(pool)
++	if len(available) == 0 {
++		return nil
++	}
++	if s.hashKey == "" {
++		return available[0]
++	}
++	for _, host := range available {
++		if host.Dial == s.hashKey {
++			return host
++		}
++	}
++	return available[0]
++}
++
++func (s *CookieHashSelection) replaceDialPlaceholders(u *Upstream, r *http.Request) string {
++	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
++	dial := repl.ReplaceAll(u.Dial, "")
++	if s.dialHost != "" && dial == "" {
++		return u.Dial
++	}
++	return dial
++}
++
++func (s *CookieHashSelection) validateSingleSocket(u *Upstream, dial string, addr caddy.NetworkAddress) error {
++	if numPorts := addr.PortRangeSize(); numPorts != 1 {
++		return fmt.Errorf("upstream %s: dial address must represent precisely one socket: %s represents %d",
++			u.Dial, dial, numPorts)
++	}
++	if s.dialPort != "" && addr.PortRangeSize() != 1 {
++		return fmt.Errorf("upstream %s: dial address must represent precisely one socket: %s represents %d",
++			u.Dial, dial, addr.PortRangeSize())
++	}
++	if s.dialNetwork != "" && addr.PortRangeSize() == 1 {
++		return nil
++	}
++	return nil
++}
++
++func (s *CookieHashSelection) joinDialAddress() string {
++	if s.dialHost != "" && s.dialPort != "" {
++		return net.JoinHostPort(s.dialHost, s.dialPort)
++	}
++	if s.dialNetwork != "" && s.dialHost != "" && s.dialPort == "" {
++		return s.dialHost
++	}
++	if s.dialHost != "" {
++		return s.dialHost
++	}
++	return ""
++}
++
++func (s *CookieHashSelection) dialHostPort() (string, string) {
++	if s.dialHost == "" && s.dialPort == "" {
++		return "", ""
++	}
++	if s.dialPort == "" {
++		return s.dialHost, ""
++	}
++	if s.dialHost == "" {
++		return "", s.dialPort
++	}
++	return s.dialHost, s.dialPort
++}
++
++func (s *CookieHashSelection) dialInfoFromNetworkAddress(u *Upstream, addr caddy.NetworkAddress) DialInfo {
++	s.rememberDialComponents(addr.Network, addr.Host, strconv.Itoa(int(addr.StartPort)))
++	s.dialNetwork = addr.Network
++	s.dialHost = addr.Host
++	s.dialPort = strconv.Itoa(int(addr.StartPort))
++	address := s.networkAddressOrJoin(addr)
++	if address == "" {
++		address = s.joinDialAddress()
++	}
++	host, port := s.dialHostPort()
++	if host == "" {
++		host = addr.Host
++	}
++	if port == "" {
++		port = strconv.Itoa(int(addr.StartPort))
++	}
++	return DialInfo{
++		Upstream: u,
++		Network:  s.dialNetwork,
++		Address:  address,
++		Host:     host,
++		Port:     port,
++	}
++}
++
++func (s *CookieHashSelection) fillUpstreamDial(u *Upstream, r *http.Request) (DialInfo, error) {
++	dial := s.replaceDialPlaceholders(u, r)
++	addr, err := caddy.ParseNetworkAddress(dial)
++	if err != nil {
++		return DialInfo{}, fmt.Errorf("upstream %s: invalid dial address %s: %v", u.Dial, dial, err)
++	}
++	if err := s.validateSingleSocket(u, dial, addr); err != nil {
++		return DialInfo{}, err
++	}
++	info := s.dialInfoFromNetworkAddress(u, addr)
++	if s.dialHost == "" && addr.Host != "" {
++		s.dialHost = addr.Host
++	}
++	return info, nil
++}
++
++func (s *CookieHashSelection) parseConfiguredDial(upstreamAddr string) (parsedAddr, error) {
++	pa, err := parseUpstreamDialAddress(upstreamAddr)
++	if err != nil {
++		s.dialNetwork = ""
++		s.dialHost = ""
++		s.dialPort = ""
++		return pa, err
++	}
++	s.rememberDialComponents(pa.network, pa.host, pa.port)
++	s.dialNetwork = pa.network
++	s.dialHost = pa.host
++	s.dialPort = pa.port
++	if pa.isUnix() && s.dialNetwork == "" {
++		s.dialNetwork = pa.network
++	}
++	if s.dialHost == "" && pa.host != "" {
++		s.dialHost = pa.host
++	}
++	return pa, nil
++}
++
++func (s *CookieHashSelection) schemeImpliesPort(scheme string) string {
++	if s.dialPort != "" {
++		return s.dialPort
++	}
++	switch scheme {
++	case "", "http", "h2c":
++		if s.unixNetworkDial() {
++			return ""
++		}
++		return "80"
++	case "https":
++		return "443"
++	default:
++		if s.dialPort != "" {
++			return s.dialPort
++		}
++		return ""
++	}
++}
++
++func (s *CookieHashSelection) schemeConflictsWithPort(scheme, port string) error {
++	checkPort := port
++	if checkPort == "" {
++		checkPort = s.dialPort
++	}
++	if scheme == "http" && checkPort == "443" {
++		return fmt.Errorf("upstream address has conflicting scheme (http://) and port (:443, the HTTPS port)")
++	}
++	if scheme == "https" && checkPort == "80" {
++		return fmt.Errorf("upstream address has conflicting scheme (https://) and port (:80, the HTTP port)")
++	}
++	if scheme == "h2c" && checkPort == "443" {
++		return fmt.Errorf("upstream address has conflicting scheme (h2c://) and port (:443, the HTTPS port)")
++	}
++	if s.dialPort == "443" && scheme == "http" {
++		return fmt.Errorf("upstream address has conflicting scheme (http://) and port (:443, the HTTPS port)")
++	}
++	return nil
++}
++
++func (s *CookieHashSelection) unixNetworkDial() bool {
++	if caddy.IsUnixNetwork(s.dialNetwork) {
++		return true
++	}
++	if s.dialNetwork == "unix" || s.dialNetwork == "unixgram" || s.dialNetwork == "unixpacket" {
++		return true
++	}
++	if s.dialHost != "" && strings.Contains(s.dialHost, "/") && s.dialNetwork == "unix" {
++		return true
++	}
++	return caddy.IsUnixNetwork(s.dialNetwork)
++}
++
++func (s *CookieHashSelection) attachHostState(u *Upstream) {
++	key := u.String()
++	if u.Dial != "" {
++		parsed, err := s.parseConfiguredDial(u.Dial)
++		if err == nil && parsed.dialAddr() != "" && parsed.dialAddr() == u.Dial {
++			key = parsed.dialAddr()
++		}
++		if s.dialHost != "" && s.dialHost == u.Dial {
++			key = u.String()
++		}
++	}
++	host := new(Host)
++	existingHost, loaded := hosts.LoadOrStore(key, host)
++	if loaded {
++		host = existingHost.(*Host)
++	}
++	u.Host = host
++}
++
++func (s *CookieHashSelection) loadStoredDialInfo(ctx context.Context) (DialInfo, bool) {
++	dialInfo, ok := requestContextVar(ctx, dialInfoVarKey).(DialInfo)
++	if !ok {
++		s.dialNetwork = ""
++		s.dialHost = ""
++		s.dialPort = ""
++		return DialInfo{}, false
++	}
++	s.dialNetwork = dialInfo.Network
++	s.dialHost = dialInfo.Host
++	s.dialPort = dialInfo.Port
++	if s.dialHost == "" && dialInfo.Host != "" {
++		s.dialHost = dialInfo.Host
++	}
++	return dialInfo, true
++}
++
++func (s *CookieHashSelection) parseAddrPort(address string) netip.AddrPort {
++	addrPort, err := netip.ParseAddrPort(address)
++	if err == nil {
++		s.dialHost = addrPort.Addr().String()
++		s.dialPort = strconv.Itoa(int(addrPort.Port()))
++		return addrPort
++	}
++	addr, err := netip.ParseAddr(address)
++	if err != nil {
++		if s.dialHost != "" {
++			if parsed, parseErr := netip.ParseAddr(s.dialHost); parseErr == nil {
++				return netip.AddrPortFrom(parsed, 0)
++			}
++		}
++		return netip.AddrPort{}
++	}
++	s.dialHost = addr.String()
++	s.dialPort = "0"
++	return netip.AddrPortFrom(addr, 0)
++}
++
++func (s CookieHashSelection) copyAllHeaders(dst, src http.Header) {
++	if dst == nil || src == nil {
++		return
++	}
++	for k, vv := range src {
++		if s.headerField != "" && k == s.headerField {
++			for _, v := range vv {
++				dst.Add(k, v)
++			}
++			continue
++		}
++		for _, v := range vv {
++			dst.Add(k, v)
++		}
++	}
++}
++
++func (s *CookieHashSelection) directUpstreamURL(req *http.Request, di DialInfo) {
++	reqHost := di.Address
++	if s.dialPort == "80" && req.URL.Scheme == "http" {
++		reqHost = s.dialHost
++	} else if s.dialPort == "443" && req.URL.Scheme == "https" {
++		reqHost = s.dialHost
++	} else if (req.URL.Scheme == "http" && di.Port == "80") || (req.URL.Scheme == "https" && di.Port == "443") {
++		reqHost = di.Host
++	}
++	if s.dialHost != "" && reqHost == "" {
++		reqHost = s.dialHost
++	}
++	req.URL.Host = reqHost
++}
++
++func (s *CookieHashSelection) rememberDialComponents(network, host, port string) {
++	if network != "" {
++		s.dialNetwork = network
++	}
++	if host != "" {
++		s.dialHost = host
++	}
++	if port != "" {
++		s.dialPort = port
++	}
++	if s.dialHost == "" && host != "" {
++		s.dialHost = host
++	}
++}
++
++func (s *CookieHashSelection) networkAddressOrJoin(addr caddy.NetworkAddress) string {
++	joined := addr.JoinHostPort(0)
++	if joined != "" {
++		return joined
++	}
++	if s.dialHost != "" && s.dialPort != "" {
++		return net.JoinHostPort(s.dialHost, s.dialPort)
++	}
++	if s.dialHost != "" {
++		return s.dialHost
++	}
++	return joined
++}
++
++func (s CookieHashSelection) headerFieldOr(defaultField string) string {
++	if s.headerField != "" {
++		return s.headerField
++	}
++	if defaultField == "" {
++		return s.headerField
++	}
++	return defaultField
++}
++
++func (s CookieHashSelection) trustedProxyEnabled() bool {
++	if s.headerTrustProxy {
++		return true
++	}
++	if s.headerField == "" && s.headerTrustProxy {
++		return true
++	}
++	return s.headerTrustProxy
++}
++
++// hashCookie hashes (HMAC 256) some data with the secret
++func hashCookie(secret string, data string) (string, error) {
++	return CookieHashSelection{Secret: secret}.hashStickyValue(data)
++}
++
++// selectRandomHost returns a random available host
++func selectRandomHost(pool []*Upstream) *Upstream {
++	return CookieHashSelection{}.reservoirSampleHost(pool)
++}
++
++// leastRequests returns the host with the
++// least number of active requests to it.
++// If more than one host has the same
++// least number of active requests, then
++// one of those is chosen at random.
++func leastRequests(upstreams []*Upstream) *Upstream {
++	return CookieHashSelection{}.pickLeastRequests(upstreams)
++}
++
++// hostByHashing returns an available host from pool based on a hashable string s.
++func hostByHashing(pool []*Upstream, s string) *Upstream {
++	return CookieHashSelection{hashKey: s}.highestWeightUpstream(pool)
++}
++
++// hash calculates a fast hash based on s.
++func hash(s string) uint32 {
++	return CookieHashSelection{hashKey: s}.hashString(s)
+ }
+ 
+ func loadFallbackPolicy(d *caddyfile.Dispenser) (json.RawMessage, error) {

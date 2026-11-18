@@ -1,0 +1,184 @@
+diff --git a/src/compile.c b/src/compile.c
+index d679d5a..855ddc5 100644
+--- a/src/compile.c
++++ b/src/compile.c
+@@ -1052,19 +1052,20 @@ block gen_try_handler(block handler) {
+ block gen_try(block exp, block handler) {
+   /*
+    * Produce something like:
+-   *  FORK_OPT <address of handler>
++   *  TRY_BEGIN <address of handler>
+    *  <exp>
++   *  TRY_END
+    *  JUMP <end of handler>
+    *  <handler>
+    *
+    * If this is not an internal try/catch, then catch and re-raise
+    * internal errors to prevent them from leaking.
+    *
+-   * The handler will only execute if we backtrack to the FORK_OPT with
+-   * an error (exception).  If <exp> produces no value then FORK_OPT
+-   * will backtrack (propagate the `empty`, as it were.  If <exp>
+-   * produces a value then we'll execute whatever bytecode follows this
+-   * sequence.
++   * The handler will only execute if we backtrack to TRY_BEGIN with an
++   * error (exception).  If <exp> produces no value then TRY_BEGIN will
++   * backtrack (propagate the `empty`, as it were).  If <exp> produces a
++   * value then TRY_END records a backtrack point which wraps any later
++   * error so that it won't be caught by this try.
+    */
+   int need_placeholder = 0;
+   int nonempty_constants = 0;
+@@ -1073,6 +1074,7 @@ block gen_try(block exp, block handler) {
+   inst* loc_src = 0;
+   inst* jump_i = 0;
+   inst* fork_i = 0;
++  inst* try_end_i = 0;
+   inst* dup_i = 0;
+   inst* pop_i = 0;
+   const struct opcode_description* jump_d;
+@@ -1134,14 +1136,16 @@ block gen_try(block exp, block handler) {
+   }
+ 
+   jump_d = opcode_describe(JUMP);
+-  fork_d = opcode_describe(FORK_OPT);
++  fork_d = opcode_describe(TRY_BEGIN);
++  try_end_i = inst_new(TRY_END);
++  exp = BLOCK(exp, inst_block(try_end_i));
+   if (jump_d->flags & OP_HAS_BRANCH) {
+     jump_i = inst_new(JUMP);
+     jump_i->imm.target = handler.last;
+     exp = BLOCK(exp, inst_block(jump_i));
+   }
+   if (fork_d->flags & OP_HAS_BRANCH) {
+-    fork_i = inst_new(FORK_OPT);
++    fork_i = inst_new(TRY_BEGIN);
+     fork_i->imm.target = exp.last;
+   }
+   if (loc_line + nonempty_constants >= nonempty_constants) {
+diff --git a/src/execute.c b/src/execute.c
+index 34bb63d..5eadf1f 100644
+--- a/src/execute.c
++++ b/src/execute.c
+@@ -336,6 +336,38 @@ static void set_error(jq_state *jq, jv value) {
+   jq->error = value;
+ }
+ 
++// Errors that occur after a `try` expression has already produced a value
++// must not be caught by that `try`.  TRY_END wraps such errors so that the
++// matching TRY_BEGIN can tell them apart and re-raise them instead.
++static jv wrap_try_error(jv err) {
++  jv msg = jv_invalid_get_msg(err);
++  return jv_invalid_with_msg(
++      JV_OBJECT(jv_string("__jq"),
++                JV_OBJECT(jv_string("__jq_try"), msg)));
++}
++
++static int is_wrapped_try_error(jv err) {
++  jv msg = jv_invalid_get_msg(jv_copy(err));
++  int wrapped = 0;
++  if (jv_get_kind(msg) == JV_KIND_OBJECT) {
++    jv inner = jv_object_get(jv_copy(msg), jv_string("__jq"));
++    if (jv_get_kind(inner) == JV_KIND_OBJECT &&
++        jv_object_has(jv_copy(inner), jv_string("__jq_try"))) {
++      wrapped = 1;
++    }
++    jv_free(inner);
++  }
++  jv_free(msg);
++  return wrapped;
++}
++
++static jv unwrap_try_error(jv err) {
++  jv msg = jv_invalid_get_msg(err);
++  jv inner = jv_object_get(msg, jv_string("__jq"));
++  jv orig = jv_object_get(inner, jv_string("__jq_try"));
++  return jv_invalid_with_msg(orig);
++}
++
+ #define ON_BACKTRACK(op) ((op)+NUM_OPCODES)
+ 
+ jv jq_next(jq_state *jq) {
+@@ -808,7 +840,7 @@ jv jq_next(jq_state *jq) {
+       break;
+     }
+ 
+-    case FORK_OPT:
++    case TRY_BEGIN:
+     case DESTRUCTURE_ALT:
+     case FORK: {
+       stack_save(jq, pc - 1, stack_get_pos(jq));
+@@ -816,22 +848,51 @@ jv jq_next(jq_state *jq) {
+       break;
+     }
+ 
+-    case ON_BACKTRACK(FORK_OPT):
+-    case ON_BACKTRACK(DESTRUCTURE_ALT): {
++    case TRY_END: {
++      stack_save(jq, pc - 1, stack_get_pos(jq));
++      break;
++    }
++
++    case ON_BACKTRACK(TRY_BEGIN): {
+       if (jv_is_valid(jq->error)) {
+         // `try EXP ...` backtracked here (no value, `empty`), so we backtrack more
+         jv_free(stack_pop(jq));
+         goto do_backtrack;
+       }
++      if (is_wrapped_try_error(jq->error)) {
++        // The error was raised after the try expression produced a value;
++        // re-raise it instead of catching it here.
++        jq->error = unwrap_try_error(jq->error);
++        goto do_backtrack;
++      }
+       // `try EXP ...` exception caught in EXP
++      jv_free(stack_pop(jq)); // free the input
++      stack_push(jq, jv_invalid_get_msg(jq->error));  // push the error's message
++      jq->error = jv_null();
++      uint16_t offset = *pc++;
++      pc += offset;
++      break;
++    }
++    case ON_BACKTRACK(TRY_END): {
++      if (jv_is_valid(jq->error)) {
++        // Backtracking normally: discard the value and continue into EXP.
++        jv_free(stack_pop(jq));
++        goto do_backtrack;
++      }
++      // Anything raised after TRY_END must not be caught by the matching
++      // TRY_BEGIN, so wrap it before propagating the error.
++      jq->error = wrap_try_error(jq->error);
++      goto do_backtrack;
++    }
++    case ON_BACKTRACK(DESTRUCTURE_ALT): {
++      if (jv_is_valid(jq->error)) {
++        // `try EXP ...` backtracked here (no value, `empty`), so we backtrack more
++        jv_free(stack_pop(jq));
++        goto do_backtrack;
++      }
+       // DESTRUCTURE_ALT doesn't want the error message on the stack,
+       // as we would just want to throw it away anyway.
+-      if (opcode != ON_BACKTRACK(DESTRUCTURE_ALT)) {
+-        jv_free(stack_pop(jq)); // free the input
+-        stack_push(jq, jv_invalid_get_msg(jq->error));  // push the error's message
+-      } else {
+-        jv_free(jq->error);
+-      }
++      jv_free(jq->error);
+       jq->error = jv_null();
+       uint16_t offset = *pc++;
+       pc += offset;
+diff --git a/src/opcode_list.h b/src/opcode_list.h
+index 886131d..ab77f7f 100644
+--- a/src/opcode_list.h
++++ b/src/opcode_list.h
+@@ -13,7 +13,8 @@ OP(INDEX_OPT, NONE,     2, 1)
+ OP(EACH,  NONE,     1, 1)
+ OP(EACH_OPT,  NONE,     1, 1)
+ OP(FORK,  BRANCH,   0, 0)
+-OP(FORK_OPT,  BRANCH,   0, 0)
++OP(TRY_BEGIN, BRANCH, 0, 0)
++OP(TRY_END, NONE, 0, 0)
+ OP(JUMP,  BRANCH,   0, 0)
+ OP(JUMP_F,BRANCH,   1, 0)
+ OP(BACKTRACK, NONE, 0, 0)

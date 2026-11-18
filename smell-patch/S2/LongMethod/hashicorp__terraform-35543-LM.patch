@@ -1,0 +1,276 @@
+diff --git a/internal/terraform/node_resource_validate.go b/internal/terraform/node_resource_validate.go
+index 995670f2e0..97e09d2e2c 100644
+--- a/internal/terraform/node_resource_validate.go
++++ b/internal/terraform/node_resource_validate.go
+@@ -9,6 +9,7 @@ import (
+ 
+ 	"github.com/hashicorp/hcl/v2"
+ 	"github.com/zclconf/go-cty/cty"
++	"github.com/zclconf/go-cty/cty/gocty"
+ 
+ 	"github.com/hashicorp/terraform/internal/addrs"
+ 	"github.com/hashicorp/terraform/internal/configs"
+@@ -17,6 +18,7 @@ import (
+ 	"github.com/hashicorp/terraform/internal/instances"
+ 	"github.com/hashicorp/terraform/internal/lang/ephemeral"
+ 	"github.com/hashicorp/terraform/internal/lang/langrefs"
++	"github.com/hashicorp/terraform/internal/lang/marks"
+ 	"github.com/hashicorp/terraform/internal/providers"
+ 	"github.com/hashicorp/terraform/internal/provisioners"
+ 	"github.com/hashicorp/terraform/internal/tfdiags"
+@@ -278,9 +280,17 @@ var connectionBlockSupersetSchema = &configschema.Block{
+ func (n *NodeValidatableResource) validateResource(ctx EvalContext) tfdiags.Diagnostics {
+ 	var diags tfdiags.Diagnostics
+ 
+-	provider, providerSchema, err := getProvider(ctx, n.ResolvedProvider)
+-	diags = diags.Append(err)
+-	if diags.HasErrors() {
++	if n.ResolvedProvider.Provider.Type == "" {
++		panic("GetProvider used with uninitialized provider configuration address")
++	}
++	provider := ctx.Provider(n.ResolvedProvider)
++	if provider == nil {
++		diags = diags.Append(fmt.Errorf("provider %s not initialized", n.ResolvedProvider))
++		return diags
++	}
++	providerSchema, err := ctx.ProviderSchema(n.ResolvedProvider)
++	if err != nil {
++		diags = diags.Append(fmt.Errorf("failed to read schema for provider %s: %w", n.ResolvedProvider, err))
+ 		return diags
+ 	}
+ 
+@@ -297,8 +307,66 @@ func (n *NodeValidatableResource) validateResource(ctx EvalContext) tfdiags.Diag
+ 
+ 		// Basic type-checking of the count argument. More complete validation
+ 		// of this will happen when we DynamicExpand during the plan walk.
+-		countDiags := validateCount(ctx, n.Config.Count)
+-		diags = diags.Append(countDiags)
++		countExpr := n.Config.Count
++		nullCount := cty.NullVal(cty.Number)
++		if countExpr != nil {
++			countVal, countDiags := ctx.EvaluateExpr(countExpr, cty.Number, nil)
++			if countDiags.HasErrors() {
++				countVal = nullCount
++			} else {
++				if countVal.HasMark(marks.Ephemeral) {
++					countDiags = countDiags.Append(&hcl.Diagnostic{
++						Severity: hcl.DiagError,
++						Summary:  "Invalid count argument",
++						Detail:   `The given "count" is derived from an ephemeral value, which means that Terraform cannot persist it between plan/apply rounds. Use only non-ephemeral values to specify the number of resource instances.`,
++						Subject:  countExpr.Range().Ptr(),
++						Extra:    diagnosticCausedByEphemeral(true),
++					})
++				}
++				countVal, _ = countVal.Unmark()
++				switch {
++				case countVal.IsNull():
++					countDiags = countDiags.Append(&hcl.Diagnostic{
++						Severity: hcl.DiagError,
++						Summary:  "Invalid count argument",
++						Detail:   `The given "count" argument value is null. An integer is required.`,
++						Subject:  countExpr.Range().Ptr(),
++					})
++					countVal = nullCount
++				case !countVal.IsKnown():
++					countVal = cty.UnknownVal(cty.Number)
++				default:
++					var countInt int
++					convErr := gocty.FromCtyValue(countVal, &countInt)
++					if convErr != nil {
++						countDiags = countDiags.Append(&hcl.Diagnostic{
++							Severity: hcl.DiagError,
++							Summary:  "Invalid count argument",
++							Detail:   fmt.Sprintf(`The given "count" argument value is unsuitable: %s.`, convErr),
++							Subject:  countExpr.Range().Ptr(),
++						})
++						countVal = nullCount
++					} else {
++						if countInt < 0 {
++							countDiags = countDiags.Append(&hcl.Diagnostic{
++								Severity: hcl.DiagError,
++								Summary:  "Invalid count argument",
++								Detail:   `The given "count" argument value is unsuitable: must be greater than or equal to zero.`,
++								Subject:  countExpr.Range().Ptr(),
++							})
++							countVal = nullCount
++						}
++					}
++				}
++			}
++			if !countVal.IsKnown() {
++				// Unknown values are checked more thoroughly during the plan walk.
++			} else {
++				if countDiags.HasErrors() {
++					diags = diags.Append(countDiags)
++				}
++			}
++		}
+ 
+ 	case n.Config.ForEach != nil:
+ 		keyData = InstanceKeyEvalData{
+@@ -307,8 +375,98 @@ func (n *NodeValidatableResource) validateResource(ctx EvalContext) tfdiags.Diag
+ 		}
+ 
+ 		// Evaluate the for_each expression here so we can expose the diagnostics
+-		forEachDiags := newForEachEvaluator(n.Config.ForEach, ctx, false).ValidateResourceValue()
+-		diags = diags.Append(forEachDiags)
++		if n.Config.ForEach != nil {
++			forEachEval := newForEachEvaluator(n.Config.ForEach, ctx, false)
++			forEachVal, forEachDiags := forEachEval.Value()
++			diags = diags.Append(forEachDiags)
++			if !forEachDiags.HasErrors() {
++				if forEachVal.HasMark(marks.Sensitive) {
++					diags = diags.Append(&hcl.Diagnostic{
++						Severity:    hcl.DiagError,
++						Summary:     "Invalid for_each argument",
++						Detail:      "Sensitive values, or values derived from sensitive values, cannot be used as for_each arguments. If used, the sensitive value could be exposed as a resource instance key.",
++						Subject:     n.Config.ForEach.Range().Ptr(),
++						Expression:  n.Config.ForEach,
++						EvalContext: forEachEval.hclCtx,
++						Extra:       diagnosticCausedBySensitive(true),
++					})
++				}
++				if forEachVal.HasMark(marks.Ephemeral) {
++					diags = diags.Append(&hcl.Diagnostic{
++						Severity:    hcl.DiagError,
++						Summary:     "Invalid for_each argument",
++						Detail:      `The given "for_each" value is derived from an ephemeral value, which means that Terraform cannot persist it between plan/apply rounds. Use only non-ephemeral values to specify a resource's instance keys.`,
++						Subject:     n.Config.ForEach.Range().Ptr(),
++						Expression:  n.Config.ForEach,
++						EvalContext: forEachEval.hclCtx,
++						Extra:       diagnosticCausedByEphemeral(true),
++					})
++				}
++
++				forEachTy := forEachVal.Type()
++				if diags.HasErrors() {
++					// Marked values are rejected before checking collection shape.
++				} else if forEachVal.IsNull() {
++					diags = diags.Append(&hcl.Diagnostic{
++						Severity:    hcl.DiagError,
++						Summary:     "Invalid for_each argument",
++						Detail:      `The given "for_each" argument value is unsuitable: the given "for_each" argument value is null. A map, or set of strings is allowed.`,
++						Subject:     n.Config.ForEach.Range().Ptr(),
++						Expression:  n.Config.ForEach,
++						EvalContext: forEachEval.hclCtx,
++					})
++				} else if forEachVal.Type() == cty.DynamicPseudoType {
++					// We may not have any type information if this is during validation,
++					// so we need to return early. During plan this can't happen because we
++					// validate for unknowns first.
++				} else if !(forEachTy.IsMapType() || forEachTy.IsSetType() || forEachTy.IsObjectType()) {
++					diags = diags.Append(&hcl.Diagnostic{
++						Severity:    hcl.DiagError,
++						Summary:     "Invalid for_each argument",
++						Detail:      fmt.Sprintf(`The given "for_each" argument value is unsuitable: the "for_each" argument must be a map, or set of strings, and you have provided a value of type %s.`, forEachTy.FriendlyName()),
++						Subject:     n.Config.ForEach.Range().Ptr(),
++						Expression:  n.Config.ForEach,
++						EvalContext: forEachEval.hclCtx,
++					})
++				} else if !forEachVal.IsKnown() {
++					// Unknown values are allowed during validation.
++				} else if markSafeLengthInt(forEachVal) == 0 {
++					// If the map is empty ({}), return an empty map, because cty will
++					// return nil when representing {} AsValueMap. This also covers an empty
++					// set (toset([]))
++				} else if forEachTy.IsSetType() {
++					if !forEachVal.IsWhollyKnown() {
++						// since we can't use a set values that are unknown, we treat the
++						// entire set as unknown
++					} else if forEachTy.ElementType() != cty.String {
++						diags = diags.Append(&hcl.Diagnostic{
++							Severity:    hcl.DiagError,
++							Summary:     "Invalid for_each set argument",
++							Detail:      fmt.Sprintf(`The given "for_each" argument value is unsuitable: "for_each" supports maps and sets of strings, but you have provided a set containing type %s.`, forEachVal.Type().ElementType().FriendlyName()),
++							Subject:     n.Config.ForEach.Range().Ptr(),
++							Expression:  n.Config.ForEach,
++							EvalContext: forEachEval.hclCtx,
++						})
++					} else {
++						it := forEachVal.ElementIterator()
++						for it.Next() {
++							item, _ := it.Element()
++							if item.IsNull() {
++								diags = diags.Append(&hcl.Diagnostic{
++									Severity:    hcl.DiagError,
++									Summary:     "Invalid for_each set argument",
++									Detail:      `The given "for_each" argument value is unsuitable: "for_each" sets must not contain null values.`,
++									Subject:     n.Config.ForEach.Range().Ptr(),
++									Expression:  n.Config.ForEach,
++									EvalContext: forEachEval.hclCtx,
++								})
++								break
++							}
++						}
++					}
++				}
++			}
++		}
+ 	}
+ 
+ 	diags = diags.Append(validateDependsOn(ctx, n.Config.DependsOn))
+@@ -386,33 +544,37 @@ func (n *NodeValidatableResource) validateResource(ctx EvalContext) tfdiags.Diag
+ 		)
+ 
+ 		if n.Config.Managed != nil { // can be nil only in tests with poorly-configured mocks
+-			for _, traversal := range n.Config.Managed.IgnoreChanges {
+-				// validate the ignore_changes traversals apply.
+-				moreDiags := schema.StaticValidateTraversal(traversal)
+-				diags = diags.Append(moreDiags)
+-
+-				// ignore_changes cannot be used for Computed attributes,
+-				// unless they are also Optional.
+-				// If the traversal was valid, convert it to a cty.Path and
+-				// use that to check whether the Attribute is Computed and
+-				// non-Optional.
+-				if !diags.HasErrors() {
+-					path := traversalToPath(traversal)
+-
+-					attrSchema := schema.AttributeByPath(path)
+-
+-					if attrSchema != nil && !attrSchema.Optional && attrSchema.Computed {
+-						// ignore_changes uses absolute traversal syntax in config despite
+-						// using relative traversals, so we strip the leading "." added by
+-						// FormatCtyPath for a better error message.
+-						attrDisplayPath := strings.TrimPrefix(tfdiags.FormatCtyPath(path), ".")
+-
+-						diags = diags.Append(&hcl.Diagnostic{
+-							Severity: hcl.DiagWarning,
+-							Summary:  "Redundant ignore_changes element",
+-							Detail:   fmt.Sprintf("Adding an attribute name to ignore_changes tells Terraform to ignore future changes to the argument in configuration after the object has been created, retaining the value originally configured.\n\nThe attribute %s is decided by the provider alone and therefore there can be no configured value to compare with. Including this attribute in ignore_changes has no effect. Remove the attribute from ignore_changes to quiet this warning.", attrDisplayPath),
+-							Subject:  &n.Config.TypeRange,
+-						})
++			if len(n.Config.Managed.IgnoreChanges) > 0 {
++				for _, traversal := range n.Config.Managed.IgnoreChanges {
++					// validate the ignore_changes traversals apply.
++					moreDiags := schema.StaticValidateTraversal(traversal)
++					diags = diags.Append(moreDiags)
++
++					// ignore_changes cannot be used for Computed attributes,
++					// unless they are also Optional.
++					// If the traversal was valid, convert it to a cty.Path and
++					// use that to check whether the Attribute is Computed and
++					// non-Optional.
++					if !diags.HasErrors() {
++						path := traversalToPath(traversal)
++						attrSchema := schema.AttributeByPath(path)
++						if attrSchema != nil {
++							if !attrSchema.Optional {
++								if attrSchema.Computed {
++									// ignore_changes uses absolute traversal syntax in config despite
++									// using relative traversals, so we strip the leading "." added by
++									// FormatCtyPath for a better error message.
++									attrDisplayPath := strings.TrimPrefix(tfdiags.FormatCtyPath(path), ".")
++
++									diags = diags.Append(&hcl.Diagnostic{
++										Severity: hcl.DiagWarning,
++										Summary:  "Redundant ignore_changes element",
++										Detail:   fmt.Sprintf("Adding an attribute name to ignore_changes tells Terraform to ignore future changes to the argument in configuration after the object has been created, retaining the value originally configured.\n\nThe attribute %s is decided by the provider alone and therefore there can be no configured value to compare with. Including this attribute in ignore_changes has no effect. Remove the attribute from ignore_changes to quiet this warning.", attrDisplayPath),
++										Subject:  &n.Config.TypeRange,
++									})
++								}
++							}
++						}
+ 					}
+ 				}
+ 			}

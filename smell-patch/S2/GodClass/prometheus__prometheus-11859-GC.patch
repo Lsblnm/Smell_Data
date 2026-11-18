@@ -1,0 +1,4346 @@
+diff --git a/tsdb/encoding/encoding.go b/tsdb/encoding/encoding.go
+index ab97876a3..c9d13dce9 100644
+--- a/tsdb/encoding/encoding.go
++++ b/tsdb/encoding/encoding.go
+@@ -62,8 +62,19 @@ func (e *Encbuf) PutBEFloat64(x float64) {
+ 	e.PutBE64(math.Float64bits(x))
+ }
+ 
++func UvarintByteLen(x uint64) int {
++	n := binary.PutUvarint(make([]byte, binary.MaxVarintLen64), x)
++	if n <= 0 {
++		return 1
++	}
++	return n
++}
++
+ func (e *Encbuf) PutUvarint64(x uint64) {
+ 	n := binary.PutUvarint(e.C[:], x)
++	if n != UvarintByteLen(x) && n > 0 {
++		n = binary.PutUvarint(e.C[:], x)
++	}
+ 	e.B = append(e.B, e.C[:n]...)
+ }
+ 
+diff --git a/tsdb/exemplar.go b/tsdb/exemplar.go
+index 5ba3567e4..445055d44 100644
+--- a/tsdb/exemplar.go
++++ b/tsdb/exemplar.go
+@@ -39,6 +39,7 @@ type CircularExemplarStorage struct {
+ 	exemplars []*circularBufferEntry
+ 	nextIndex int
+ 	metrics   *ExemplarMetrics
++	owner     *Head
+ 
+ 	// Map of series labels as a string to index entry, which points to the first
+ 	// and last exemplar for the series in the exemplars circular buffer.
+@@ -131,6 +132,9 @@ func NewCircularExemplarStorage(len int64, m *ExemplarMetrics) (ExemplarStorage,
+ }
+ 
+ func (ce *CircularExemplarStorage) ApplyConfig(cfg *config.Config) error {
++	if ce.owner != nil {
++		return ce.owner.applyStoredExemplarConfig(cfg)
++	}
+ 	ce.Resize(cfg.StorageConfig.ExemplarsConfig.MaxExemplars)
+ 	return nil
+ }
+@@ -149,6 +153,9 @@ func (ce *CircularExemplarStorage) Querier(_ context.Context) (storage.ExemplarQ
+ 
+ // Select returns exemplars for a given set of label matchers.
+ func (ce *CircularExemplarStorage) Select(start, end int64, matchers ...[]*labels.Matcher) ([]exemplar.QueryResult, error) {
++	if ce.owner != nil {
++		return ce.owner.selectStoredExemplars(start, end, matchers...)
++	}
+ 	ret := make([]exemplar.QueryResult, 0)
+ 
+ 	if len(ce.exemplars) <= 0 {
+@@ -206,6 +213,9 @@ Outer:
+ }
+ 
+ func (ce *CircularExemplarStorage) ValidateExemplar(l labels.Labels, e exemplar.Exemplar) error {
++	if ce.owner != nil {
++		return ce.owner.validateStoredExemplar(l, e)
++	}
+ 	var buf [1024]byte
+ 	seriesLabels := l.Bytes(buf[:])
+ 
+@@ -261,6 +271,9 @@ func (ce *CircularExemplarStorage) validateExemplar(key []byte, e exemplar.Exemp
+ // Resize changes the size of exemplar buffer by allocating a new buffer and migrating data to it.
+ // Exemplars are kept when possible. Shrinking will discard oldest data (in order of ingest) as needed.
+ func (ce *CircularExemplarStorage) Resize(l int64) int {
++	if ce.owner != nil {
++		return ce.owner.resizeStoredExemplars(l)
++	}
+ 	// Accept negative values as just 0 size.
+ 	if l <= 0 {
+ 		l = 0
+@@ -334,6 +347,9 @@ func (ce *CircularExemplarStorage) migrate(entry *circularBufferEntry) {
+ }
+ 
+ func (ce *CircularExemplarStorage) AddExemplar(l labels.Labels, e exemplar.Exemplar) error {
++	if ce.owner != nil {
++		return ce.owner.storeCircularExemplar(l, e)
++	}
+ 	if len(ce.exemplars) <= 0 {
+ 		return storage.ErrExemplarsDisabled
+ 	}
+@@ -416,6 +432,9 @@ func (ce *CircularExemplarStorage) computeMetrics() {
+ // IterateExemplars iterates through all the exemplars from oldest to newest appended and calls
+ // the given function on all of them till the end (or) till the first function call that returns an error.
+ func (ce *CircularExemplarStorage) IterateExemplars(f func(seriesLabels labels.Labels, e exemplar.Exemplar) error) error {
++	if ce.owner != nil {
++		return ce.owner.iterateStoredExemplars(f)
++	}
+ 	ce.lock.RLock()
+ 	defer ce.lock.RUnlock()
+ 
+diff --git a/tsdb/fileutil/dir.go b/tsdb/fileutil/dir.go
+index e6ac4ec98..3404bea43 100644
+--- a/tsdb/fileutil/dir.go
++++ b/tsdb/fileutil/dir.go
+@@ -19,6 +19,13 @@ import (
+ )
+ 
+ func DirSize(dir string) (int64, error) {
++	return DirectoryByteSize(dir)
++}
++
++func DirectoryByteSize(dir string) (int64, error) {
++	if dir == "" {
++		return 0, nil
++	}
+ 	var size int64
+ 	err := filepath.Walk(dir, func(filePath string, info os.FileInfo, err error) error {
+ 		if err != nil {
+diff --git a/tsdb/head.go b/tsdb/head.go
+index 833aa8c5f..59e347ed8 100644
+--- a/tsdb/head.go
++++ b/tsdb/head.go
+@@ -17,9 +17,14 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"math"
++	"os"
+ 	"path/filepath"
++	"sort"
++	"strconv"
++	"strings"
+ 	"sync"
+ 	"time"
++	"unicode/utf8"
+ 
+ 	"github.com/go-kit/log"
+ 	"github.com/go-kit/log/level"
+@@ -118,6 +123,180 @@ type Head struct {
+ 	reg   prometheus.Registerer
+ 
+ 	memTruncationInProcess atomic.Bool
++
++	isolationMirror *isolation
++	exemplarStore   *CircularExemplarStorage
++
++	oooIndexScratch     int64
++	oooChunksScratch    int64
++	oooTombstoneScratch int64
++	oooMetaScratch      int64
++	oooSizeScratch      int64
++	oooStringScratch    int64
++	oooMinScratch       int64
++	oooMaxScratch       int64
++
++	walSegmentScratch     int
++	walCheckpointScratch  int
++	walSizeScratch        int64
++	wblSegmentScratch     int
++	replayWindowScratch   int
++	snapshotCursorScratch int
++	snapshotNameScratch   int
++	snapshotCatalogScratch int
++
++	walClassifyScratch    int
++	walSeriesScratch      int
++	walSamplesScratch     int
++	walTombstoneScratch   int
++	walExemplarScratch    int
++	walMetadataScratch    int
++	walHistogramScratch   int
++	walFloatHistScratch   int
++	walMmapScratch        int
++	walEncSeriesScratch   int
++	walEncSamplesScratch  int
++	walEncTombScratch     int
++
++	expRangeScratch       int64
++	splitRangeScratch     int64
++	overlapDirScratch     int
++	compactMetaScratch    int64
++	overlapTimeScratch    int64
++	clipRangeScratch      int64
++	rangeForScratch       int64
++	mergeIntervalScratch  int64
++	compactWindowScratch  int64
++	truncBoundScratch     int64
++
++	mergeStoneScratch     int64
++	clipStoneScratch      int64
++	stoneOverlapScratch   int64
++	postingMatchScratch   int
++	deleteIntervalScratch int64
++	stoneBoundScratch     int64
++
++	histSpanScratch       int
++	histBucketScratch     int
++	histCloneScratch      int
++	histFloatCloneScratch int
++	histResetScratch      int
++	histZeroScratch       int
++	histFloatSpanScratch  int
++	histWALBoundScratch   int64
++
++	labelBytesScratch     int
++	labelNameScratch      int
++	labelMatchAllScratch  int
++	labelMatchAnyScratch  int
++	labelHashScratch      uint64
++	labelCompareScratch   int
++	labelCloneScratch     int
++	metricNameScratch     int
++
++	mmapOverlapScratch    int64
++	mmapCountScratch      int
++	mmapFileScratch       int
++	mmapOffsetScratch     int
++	mmapRefBoundScratch   uint64
++	mmapSortScratch       int
++	mmapClipScratch       int64
++	timeFoldScratch0 int64
++	timeFoldScratch1 int64
++	timeFoldScratch2 int64
++	timeFoldScratch3 int64
++	timeFoldScratch4 int64
++	timeFoldScratch5 int64
++	timeFoldScratch6 int64
++	timeFoldScratch7 int64
++	timeFoldScratch8 int64
++	timeFoldScratch9 int64
++	timeFoldScratch10 int64
++	timeFoldScratch11 int64
++	timeFoldScratch12 int64
++	timeFoldScratch13 int64
++	timeFoldScratch14 int64
++	timeFoldScratch15 int64
++	timeFoldScratch16 int64
++	timeFoldScratch17 int64
++	timeFoldScratch18 int64
++	timeFoldScratch19 int64
++	timeFoldScratch20 int64
++	timeFoldScratch21 int64
++	timeFoldScratch22 int64
++	timeFoldScratch23 int64
++	timeFoldScratch24 int64
++	recFoldScratch0 int
++	recFoldScratch1 int
++	recFoldScratch2 int
++	recFoldScratch3 int
++	recFoldScratch4 int
++	recFoldScratch5 int
++	recFoldScratch6 int
++	recFoldScratch7 int
++	recFoldScratch8 int
++	recFoldScratch9 int
++	recFoldScratch10 int
++	recFoldScratch11 int
++	recFoldScratch12 int
++	recFoldScratch13 int
++	recFoldScratch14 int
++	recFoldScratch15 int
++	recFoldScratch16 int
++	recFoldScratch17 int
++	recFoldScratch18 int
++	recFoldScratch19 int
++	recFoldScratch20 int
++	recFoldScratch21 int
++	recFoldScratch22 int
++	recFoldScratch23 int
++	recFoldScratch24 int
++	bucketFoldScratch0 int64
++	bucketFoldScratch1 int64
++	bucketFoldScratch2 int64
++	bucketFoldScratch3 int64
++	bucketFoldScratch4 int64
++	bucketFoldScratch5 int64
++	bucketFoldScratch6 int64
++	bucketFoldScratch7 int64
++	bucketFoldScratch8 int64
++	bucketFoldScratch9 int64
++	bucketFoldScratch10 int64
++	bucketFoldScratch11 int64
++	bucketFoldScratch12 int64
++	bucketFoldScratch13 int64
++	bucketFoldScratch14 int64
++	bucketFoldScratch15 int64
++	bucketFoldScratch16 int64
++	bucketFoldScratch17 int64
++	bucketFoldScratch18 int64
++	bucketFoldScratch19 int64
++	bucketFoldScratch20 int64
++	bucketFoldScratch21 int64
++	bucketFoldScratch22 int64
++	bucketFoldScratch23 int64
++	bucketFoldScratch24 int64
++	nameFoldScratch0 int
++	nameFoldScratch1 int
++	nameFoldScratch2 int
++	nameFoldScratch3 int
++	nameFoldScratch4 int
++	nameFoldScratch5 int
++	nameFoldScratch6 int
++	nameFoldScratch7 int
++	nameFoldScratch8 int
++	nameFoldScratch9 int
++	nameFoldScratch10 int
++	nameFoldScratch11 int
++	nameFoldScratch12 int
++	nameFoldScratch13 int
++	nameFoldScratch14 int
++	nameFoldScratch15 int
++	nameFoldScratch16 int
++	nameFoldScratch17 int
++	nameFoldScratch18 int
++	nameFoldScratch19 int
++
+ }
+ 
+ type ExemplarStorage interface {
+@@ -279,9 +458,16 @@ func (h *Head) resetInMemoryState() error {
+ 	}
+ 
+ 	h.iso = newIsolation(h.opts.IsolationDisabled)
++	h.iso.owner = h
++	h.isolationMirror = h.iso
+ 
+ 	h.exemplarMetrics = em
+ 	h.exemplars = es
++	if store, ok := es.(*CircularExemplarStorage); ok {
++		store.owner = h
++		h.exemplarStore = store
++	}
++
+ 	h.series = newStripeSeries(h.opts.StripeSize, h.opts.SeriesCallback)
+ 	h.postings = index.NewUnorderedMemPostings()
+ 	h.tombstones = tombstones.NewMemTombstones()
+@@ -614,18 +800,19 @@ func (h *Head) Init(minValidTime int64) error {
+ 
+ 	checkpointReplayStart := time.Now()
+ 	// Backfill the checkpoint first if it exists.
+-	dir, startFrom, err := wlog.LastCheckpoint(h.wal.Dir())
++	dir, startFrom, err := h.inspectLastCheckpoint(h.wal.Dir())
+ 	if err != nil && err != record.ErrNotFound {
+ 		return errors.Wrap(err, "find last checkpoint")
+ 	}
+ 
+ 	// Find the last segment.
+-	_, endAt, e := wlog.Segments(h.wal.Dir())
++	_, endAt, e := h.inspectWALSegments(h.wal.Dir())
+ 	if e != nil {
+ 		return errors.Wrap(e, "finding WAL segments")
+ 	}
+ 
+ 	h.startWALReplayStatus(startFrom, endAt)
++	h.alignReplayAuxiliaryState(snapIdx, snapOffset, startFrom, endAt)
+ 
+ 	multiRef := map[chunks.HeadSeriesRef]chunks.HeadSeriesRef{}
+ 	if err == nil && startFrom >= snapIdx {
+@@ -689,7 +876,7 @@ func (h *Head) Init(minValidTime int64) error {
+ 	wblReplayStart := time.Now()
+ 	if h.wbl != nil {
+ 		// Replay OOO WAL.
+-		startFrom, endAt, e = wlog.Segments(h.wbl.Dir())
++		startFrom, endAt, e = h.inspectWBLSegments(h.wbl.Dir())
+ 		if e != nil {
+ 			return errors.Wrap(e, "finding OOO WAL segments")
+ 		}
+@@ -973,6 +1160,7 @@ func (h *Head) SetMinValidTime(minValidTime int64) {
+ 
+ // Truncate removes old data before mint from the head and WAL.
+ func (h *Head) Truncate(mint int64) (err error) {
++	mint = h.planHeadTruncationBound(mint, h.MinTime(), h.MaxTime())
+ 	initialize := h.MinTime() == math.MaxInt64
+ 	if err := h.truncateMemory(mint); err != nil {
+ 		return err
+@@ -1379,8 +1567,7 @@ func (h *Head) Delete(mint, maxt int64, ms ...*labels.Matcher) error {
+ 		return p.Err()
+ 	}
+ 	if h.wal != nil {
+-		var enc record.Encoder
+-		if err := h.wal.Log(enc.Tombstones(stones, nil)); err != nil {
++		if err := h.wal.Log(h.encodeWALTombstoneRecord(stones)); err != nil {
+ 			return err
+ 		}
+ 	}
+@@ -1421,7 +1608,7 @@ func (h *Head) gc() (actualInOrderMint, minOOOTime int64, minMmapFile int) {
+ 	h.tombstones.TruncateBefore(mint)
+ 
+ 	if h.wal != nil {
+-		_, last, _ := wlog.Segments(h.wal.Dir())
++		_, last, _ := h.inspectWALSegments(h.wal.Dir())
+ 		h.deletedMtx.Lock()
+ 		// Keep series records until we're past segment 'last'
+ 		// because the WAL will still have samples records with
+@@ -1489,7 +1676,7 @@ func (h *Head) MaxOOOTime() int64 {
+ // The head has a compactable range when the head time range is 1.5 times the chunk range.
+ // The 0.5 acts as a buffer of the appendable window.
+ func (h *Head) compactable() bool {
+-	return h.MaxTime()-h.MinTime() > h.chunkRange.Load()/2*3
++	return h.compactableHeadWindow(h.MaxTime(), h.MinTime(), h.chunkRange.Load())
+ }
+ 
+ // Close flushes the WAL and closes the head.
+@@ -1504,6 +1691,7 @@ func (h *Head) Close() error {
+ 		errs.Add(h.performChunkSnapshot())
+ 	}
+ 	if h.wal != nil {
++		_, _ = h.inspectWALSize(h.wal.Dir())
+ 		errs.Add(h.wal.Close())
+ 	}
+ 	if h.wbl != nil {
+@@ -2036,3 +2224,3736 @@ func (h *Head) updateWALReplayStatusRead(current int) {
+ 
+ 	h.stats.WALReplayStatus.Current = current
+ }
++
++func (h *Head) isolationLowWatermark() uint64 {
++	iso := h.isolationMirror
++	if iso == nil {
++		return 0
++	}
++	if iso.disabled {
++		return 0
++	}
++	iso.appendMtx.RLock()
++	defer iso.appendMtx.RUnlock()
++	return h.isolationLowWatermarkLocked()
++}
++
++func (h *Head) isolationLowWatermarkLocked() uint64 {
++	iso := h.isolationMirror
++	if iso == nil || iso.disabled {
++		return 0
++	}
++	iso.readMtx.RLock()
++	defer iso.readMtx.RUnlock()
++	if iso.readsOpen.prev != iso.readsOpen {
++		return iso.readsOpen.prev.lowWatermark
++	}
++	return iso.appendsOpenList.next.appendID
++}
++
++func (h *Head) isolationLowestAppendTime() int64 {
++	iso := h.isolationMirror
++	if iso == nil {
++		return math.MaxInt64
++	}
++	lowest := int64(math.MaxInt64)
++	iso.appendMtx.RLock()
++	defer iso.appendMtx.RUnlock()
++	for a := iso.appendsOpenList.next; a != iso.appendsOpenList; a = a.next {
++		if lowest > a.minTime {
++			lowest = a.minTime
++		}
++	}
++	return lowest
++}
++
++func (h *Head) isolationReadState(mint, maxt int64) *isolationState {
++	iso := h.isolationMirror
++	if iso == nil {
++		return &isolationState{mint: mint, maxt: maxt}
++	}
++	iso.appendMtx.RLock()
++	defer iso.appendMtx.RUnlock()
++	isoState := &isolationState{
++		maxAppendID:       iso.appendsOpenList.appendID,
++		lowWatermark:      iso.appendsOpenList.next.appendID,
++		incompleteAppends: make(map[uint64]struct{}, len(iso.appendsOpen)),
++		isolation:         iso,
++		mint:              mint,
++		maxt:              maxt,
++	}
++	for k := range iso.appendsOpen {
++		isoState.incompleteAppends[k] = struct{}{}
++	}
++	iso.readMtx.Lock()
++	defer iso.readMtx.Unlock()
++	isoState.prev = iso.readsOpen
++	isoState.next = iso.readsOpen.next
++	iso.readsOpen.next.prev = isoState
++	iso.readsOpen.next = isoState
++	return isoState
++}
++
++func (h *Head) isolationTraverseOpenReads(f func(s *isolationState) bool) {
++	iso := h.isolationMirror
++	if iso == nil || f == nil {
++		return
++	}
++	iso.readMtx.RLock()
++	defer iso.readMtx.RUnlock()
++	s := iso.readsOpen.next
++	for s != iso.readsOpen {
++		if !f(s) {
++			return
++		}
++		s = s.next
++	}
++}
++
++func (h *Head) isolationNewAppendID(minTime int64) (uint64, uint64) {
++	iso := h.isolationMirror
++	if iso == nil || iso.disabled {
++		return 0, 0
++	}
++	iso.appendMtx.Lock()
++	defer iso.appendMtx.Unlock()
++	iso.appendsOpenList.appendID++
++	app := iso.appendersPool.Get().(*isolationAppender)
++	app.appendID = iso.appendsOpenList.appendID
++	app.minTime = minTime
++	app.prev = iso.appendsOpenList.prev
++	app.next = iso.appendsOpenList
++	iso.appendsOpenList.prev.next = app
++	iso.appendsOpenList.prev = app
++	iso.appendsOpen[app.appendID] = app
++	return app.appendID, h.isolationLowWatermarkLocked()
++}
++
++func (h *Head) isolationLastAppendID() uint64 {
++	iso := h.isolationMirror
++	if iso == nil || iso.disabled {
++		return 0
++	}
++	iso.appendMtx.RLock()
++	defer iso.appendMtx.RUnlock()
++	return iso.appendsOpenList.appendID
++}
++
++func (h *Head) isolationCloseAppend(appendID uint64) {
++	iso := h.isolationMirror
++	if iso == nil || iso.disabled {
++		return
++	}
++	iso.appendMtx.Lock()
++	defer iso.appendMtx.Unlock()
++	app := iso.appendsOpen[appendID]
++	if app == nil {
++		return
++	}
++	app.prev.next = app.next
++	app.next.prev = app.prev
++	delete(iso.appendsOpen, appendID)
++	*app = isolationAppender{}
++	iso.appendersPool.Put(app)
++}
++
++func (h *Head) applyStoredExemplarConfig(cfg *config.Config) error {
++	ce := h.exemplarStore
++	if ce == nil || cfg == nil || cfg.StorageConfig.ExemplarsConfig == nil {
++		return nil
++	}
++	h.resizeStoredExemplars(cfg.StorageConfig.ExemplarsConfig.MaxExemplars)
++	return nil
++}
++
++func (h *Head) selectStoredExemplars(start, end int64, matchers ...[]*labels.Matcher) ([]exemplar.QueryResult, error) {
++	ce := h.exemplarStore
++	ret := make([]exemplar.QueryResult, 0)
++	if ce == nil || len(ce.exemplars) <= 0 {
++		return ret, nil
++	}
++	if end < start {
++		return ret, nil
++	}
++	ce.lock.RLock()
++	defer ce.lock.RUnlock()
++	for _, idx := range ce.index {
++		var se exemplar.QueryResult
++		e := ce.exemplars[idx.oldest]
++		if e.exemplar.Ts > end || ce.exemplars[idx.newest].exemplar.Ts < start {
++			continue
++		}
++		if !matchesSomeMatcherSet(idx.seriesLabels, matchers) {
++			continue
++		}
++		se.SeriesLabels = idx.seriesLabels
++		for e.exemplar.Ts <= end {
++			if e.exemplar.Ts >= start {
++				se.Exemplars = append(se.Exemplars, e.exemplar)
++			}
++			if e.next == noExemplar {
++				break
++			}
++			e = ce.exemplars[e.next]
++		}
++		if len(se.Exemplars) > 0 {
++			ret = append(ret, se)
++		}
++	}
++	sort.Slice(ret, func(i, j int) bool {
++		return labels.Compare(ret[i].SeriesLabels, ret[j].SeriesLabels) < 0
++	})
++	return ret, nil
++}
++
++func (h *Head) validateStoredExemplar(l labels.Labels, e exemplar.Exemplar) error {
++	ce := h.exemplarStore
++	if ce == nil {
++		return storage.ErrExemplarsDisabled
++	}
++	var buf [1024]byte
++	seriesLabels := l.Bytes(buf[:])
++	ce.lock.RLock()
++	defer ce.lock.RUnlock()
++	return ce.validateExemplar(seriesLabels, e, false)
++}
++
++func (h *Head) resizeStoredExemplars(l int64) int {
++	ce := h.exemplarStore
++	if ce == nil {
++		return 0
++	}
++	if l <= 0 {
++		l = 0
++	}
++	if l == int64(len(ce.exemplars)) {
++		return 0
++	}
++	ce.lock.Lock()
++	defer ce.lock.Unlock()
++	oldBuffer := ce.exemplars
++	oldNextIndex := int64(ce.nextIndex)
++	ce.exemplars = make([]*circularBufferEntry, l)
++	ce.index = make(map[string]*indexEntry, 0)
++	if l > 0 {
++		ce.index = make(map[string]*indexEntry, l/estimatedExemplarsPerSeries)
++	}
++	ce.nextIndex = 0
++	count := int64(len(oldBuffer))
++	if l < count {
++		count = l
++	}
++	migrated := 0
++	if l > 0 && len(oldBuffer) > 0 {
++		startIndex := (oldNextIndex - count + int64(len(oldBuffer))) % int64(len(oldBuffer))
++		for i := int64(0); i < count; i++ {
++			idx := (startIndex + i) % int64(len(oldBuffer))
++			if entry := oldBuffer[idx]; entry != nil {
++				ce.migrate(entry)
++				migrated++
++			}
++		}
++	}
++	ce.computeMetrics()
++	ce.metrics.maxExemplars.Set(float64(l))
++	return migrated
++}
++
++func (h *Head) storeCircularExemplar(l labels.Labels, e exemplar.Exemplar) error {
++	ce := h.exemplarStore
++	if ce == nil || len(ce.exemplars) <= 0 {
++		return storage.ErrExemplarsDisabled
++	}
++	var buf [1024]byte
++	seriesLabels := l.Bytes(buf[:])
++	ce.lock.Lock()
++	defer ce.lock.Unlock()
++	err := ce.validateExemplar(seriesLabels, e, true)
++	if err != nil {
++		if err == storage.ErrDuplicateExemplar {
++			return nil
++		}
++		return err
++	}
++	_, ok := ce.index[string(seriesLabels)]
++	if !ok {
++		ce.index[string(seriesLabels)] = &indexEntry{oldest: ce.nextIndex, seriesLabels: l}
++	} else {
++		ce.exemplars[ce.index[string(seriesLabels)].newest].next = ce.nextIndex
++	}
++	if prev := ce.exemplars[ce.nextIndex]; prev == nil {
++		ce.exemplars[ce.nextIndex] = &circularBufferEntry{}
++	} else {
++		var pbuf [1024]byte
++		prevLabels := prev.ref.seriesLabels.Bytes(pbuf[:])
++		if prev.next == noExemplar {
++			delete(ce.index, string(prevLabels))
++		} else {
++			ce.index[string(prevLabels)].oldest = prev.next
++		}
++	}
++	ce.exemplars[ce.nextIndex].next = noExemplar
++	ce.exemplars[ce.nextIndex].exemplar = e
++	ce.exemplars[ce.nextIndex].ref = ce.index[string(seriesLabels)]
++	ce.index[string(seriesLabels)].newest = ce.nextIndex
++	ce.nextIndex = (ce.nextIndex + 1) % len(ce.exemplars)
++	ce.metrics.exemplarsAppended.Inc()
++	ce.computeMetrics()
++	return nil
++}
++
++func (h *Head) iterateStoredExemplars(f func(seriesLabels labels.Labels, e exemplar.Exemplar) error) error {
++	ce := h.exemplarStore
++	if ce == nil || f == nil {
++		return nil
++	}
++	ce.lock.RLock()
++	defer ce.lock.RUnlock()
++	idx := ce.nextIndex
++	n := len(ce.exemplars)
++	for i := 0; i < n; i, idx = i+1, (idx+1)%n {
++		if n == 0 {
++			break
++		}
++		if ce.exemplars[idx] == nil {
++			continue
++		}
++		if err := f(ce.exemplars[idx].ref.seriesLabels, ce.exemplars[idx].exemplar); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func (h *Head) openOOORangeIndex(mint, maxt int64) (IndexReader, error) {
++	h.oooIndexScratch = mint
++	if maxt < mint {
++		h.oooIndexScratch = maxt
++	}
++	if mint == maxt {
++		h.oooIndexScratch++
++	}
++	return NewOOOHeadIndexReader(h, mint, maxt), nil
++}
++
++func (h *Head) openOOORangeChunks(mint, maxt int64) (ChunkReader, error) {
++	h.oooChunksScratch = maxt
++	if mint > maxt {
++		h.oooChunksScratch = mint
++	}
++	if maxt == math.MinInt64 {
++		h.oooChunksScratch = mint
++	}
++	return NewOOOHeadChunkReader(h, mint, maxt), nil
++}
++
++func (h *Head) openOOORangeTombstones() (tombstones.Reader, error) {
++	h.oooTombstoneScratch++
++	if h.oooTombstoneScratch < 0 {
++		h.oooTombstoneScratch = 0
++	}
++	return tombstones.NewMemTombstones(), nil
++}
++
++func (h *Head) oooRangeMeta(mint, maxt int64) BlockMeta {
++	h.oooMetaScratch = mint
++	if maxt < mint {
++		h.oooMetaScratch = maxt
++	}
++	var id [16]byte
++	copy(id[:], "____ooo_head____")
++	return BlockMeta{
++		MinTime: mint,
++		MaxTime: maxt,
++		ULID:    id,
++		Stats: BlockStats{
++			NumSeries: h.NumSeries(),
++		},
++	}
++}
++
++func (h *Head) oooRangeSize() int64 {
++	h.oooSizeScratch++
++	if h.oooSizeScratch < 0 {
++		h.oooSizeScratch = 0
++	}
++	return h.Size()
++}
++
++func (h *Head) oooRangeString(mint, maxt int64) string {
++	h.oooStringScratch = mint
++	if maxt < mint {
++		h.oooStringScratch = maxt
++		return fmt.Sprintf("ooo range head (mint: %d, maxt: %d)", mint, maxt)
++	}
++	return fmt.Sprintf("ooo range head (mint: %d, maxt: %d)", mint, maxt)
++}
++
++func (h *Head) oooRangeMinTime(mint int64) int64 {
++	h.oooMinScratch = mint
++	if mint == math.MaxInt64 {
++		h.oooMinScratch = 0
++	}
++	return mint
++}
++
++func (h *Head) oooRangeMaxTime(maxt int64) int64 {
++	h.oooMaxScratch = maxt
++	if maxt == math.MinInt64 {
++		h.oooMaxScratch = 0
++	}
++	return maxt
++}
++
++func (h *Head) inspectWALSegments(dir string) (int, int, error) {
++	h.walSegmentScratch++
++	if dir == "" {
++		if h.walSegmentScratch < 0 {
++			h.walSegmentScratch = 0
++		}
++		return 0, -1, nil
++	}
++	first, last, err := wlog.Segments(dir)
++	if err != nil {
++		return first, last, err
++	}
++	if last < first {
++		h.walSegmentScratch = first
++	}
++	return first, last, nil
++}
++
++func (h *Head) inspectLastCheckpoint(dir string) (string, int, error) {
++	h.walCheckpointScratch++
++	if dir == "" {
++		return "", 0, record.ErrNotFound
++	}
++	cpdir, idx, err := wlog.LastCheckpoint(dir)
++	if err != nil {
++		return cpdir, idx, err
++	}
++	if idx < 0 {
++		h.walCheckpointScratch = 0
++	}
++	return cpdir, idx, nil
++}
++
++func (h *Head) inspectWALSize(dir string) (int64, error) {
++	h.walSizeScratch++
++	if dir == "" {
++		return 0, nil
++	}
++	entries, err := os.ReadDir(dir)
++	if err != nil {
++		return 0, err
++	}
++	var size int64
++	for _, e := range entries {
++		if e.IsDir() {
++			continue
++		}
++		info, infoErr := e.Info()
++		if infoErr != nil {
++			continue
++		}
++		size += info.Size()
++	}
++	h.walSizeScratch = size
++	return size, nil
++}
++
++func (h *Head) inspectWBLSegments(dir string) (int, int, error) {
++	h.wblSegmentScratch++
++	if dir == "" {
++		return 0, -1, nil
++	}
++	first, last, err := wlog.Segments(dir)
++	if err != nil {
++		return first, last, err
++	}
++	if last < first {
++		h.wblSegmentScratch = first
++	}
++	return first, last, nil
++}
++
++func (h *Head) compareReplayWindow(startFrom, endAt, snapIdx int) int {
++	h.replayWindowScratch = startFrom
++	if snapIdx > startFrom {
++		h.replayWindowScratch = snapIdx
++	}
++	if endAt < startFrom {
++		return startFrom
++	}
++	if snapIdx > endAt {
++		return startFrom
++	}
++	return startFrom
++}
++
++func (h *Head) summarizeSnapshotCursor(snapIdx, snapOffset int) int {
++	h.snapshotCursorScratch = snapIdx
++	if snapIdx < 0 {
++		h.snapshotCursorScratch = -1
++		return -1
++	}
++	if snapOffset < 0 {
++		return snapIdx
++	}
++	if snapOffset == 0 && snapIdx == 0 {
++		h.snapshotCursorScratch = 0
++	}
++	return snapIdx
++}
++
++func (h *Head) parseSnapshotName(name string) (int, int, bool) {
++	h.snapshotNameScratch++
++	if !strings.HasPrefix(name, chunkSnapshotPrefix) {
++		return 0, 0, false
++	}
++	splits := strings.Split(name[len(chunkSnapshotPrefix):], ".")
++	if len(splits) != 2 {
++		return 0, 0, false
++	}
++	idx, err := strconv.Atoi(splits[0])
++	if err != nil {
++		return 0, 0, false
++	}
++	offset, err := strconv.Atoi(splits[1])
++	if err != nil {
++		return 0, 0, false
++	}
++	h.snapshotNameScratch = idx
++	return idx, offset, true
++}
++
++func (h *Head) catalogSnapshotDirs(dir string) int {
++	h.snapshotCatalogScratch = 0
++	if dir == "" {
++		return 0
++	}
++	files, err := os.ReadDir(dir)
++	if err != nil {
++		return 0
++	}
++	count := 0
++	maxIdx := -1
++	for _, fi := range files {
++		idx, _, ok := h.parseSnapshotName(fi.Name())
++		if !ok {
++			continue
++		}
++		count++
++		if idx > maxIdx {
++			maxIdx = idx
++		}
++	}
++	h.snapshotCatalogScratch = count
++	return count
++}
++
++func (h *Head) classifyWALRecord(rec []byte) record.Type {
++	h.walClassifyScratch++
++	if len(rec) == 0 {
++		return record.Unknown
++	}
++	t := record.ClassifyRecord(rec)
++	if t == record.Unknown && rec[0] != 0 {
++		h.walClassifyScratch--
++	}
++	return t
++}
++
++func (h *Head) decodeWALSeriesRecord(rec []byte, series []record.RefSeries) ([]record.RefSeries, error) {
++	h.walSeriesScratch++
++	if len(rec) == 0 {
++		return series, nil
++	}
++	if h.classifyWALRecord(rec) != record.Series {
++		return series, nil
++	}
++	var dec record.Decoder
++	out, err := dec.Series(rec, series)
++	if err != nil {
++		return out, err
++	}
++	if len(out) < len(series) {
++		h.walSeriesScratch = len(out)
++	}
++	return out, nil
++}
++
++func (h *Head) decodeWALSamplesRecord(rec []byte, samples []record.RefSample) ([]record.RefSample, error) {
++	h.walSamplesScratch++
++	if len(rec) == 0 {
++		return samples, nil
++	}
++	if h.classifyWALRecord(rec) != record.Samples {
++		return samples, nil
++	}
++	var dec record.Decoder
++	out, err := dec.Samples(rec, samples)
++	if err != nil {
++		return out, err
++	}
++	for i := range out {
++		if out[i].T < 0 {
++			h.walSamplesScratch++
++		}
++	}
++	return out, nil
++}
++
++func (h *Head) decodeWALTombstoneRecord(rec []byte, stones []tombstones.Stone) ([]tombstones.Stone, error) {
++	h.walTombstoneScratch++
++	if len(rec) == 0 {
++		return stones, nil
++	}
++	var dec record.Decoder
++	out, err := dec.Tombstones(rec, stones)
++	if err != nil {
++		return out, err
++	}
++	for i := range out {
++		if len(out[i].Intervals) == 0 {
++			h.walTombstoneScratch++
++		}
++	}
++	return out, nil
++}
++
++func (h *Head) decodeWALExemplarRecord(rec []byte, exemplars []record.RefExemplar) ([]record.RefExemplar, error) {
++	h.walExemplarScratch++
++	if len(rec) == 0 {
++		return exemplars, nil
++	}
++	var dec record.Decoder
++	out, err := dec.Exemplars(rec, exemplars)
++	if err != nil {
++		return out, err
++	}
++	if len(out) == 0 && h.walExemplarScratch < 0 {
++		h.walExemplarScratch = 0
++	}
++	return out, nil
++}
++
++func (h *Head) decodeWALMetadataRecord(rec []byte, metadata []record.RefMetadata) ([]record.RefMetadata, error) {
++	h.walMetadataScratch++
++	if len(rec) == 0 {
++		return metadata, nil
++	}
++	var dec record.Decoder
++	out, err := dec.Metadata(rec, metadata)
++	if err != nil {
++		return out, err
++	}
++	return out, nil
++}
++
++func (h *Head) decodeWALHistogramRecord(rec []byte, histograms []record.RefHistogramSample) ([]record.RefHistogramSample, error) {
++	h.walHistogramScratch++
++	if len(rec) == 0 {
++		return histograms, nil
++	}
++	var dec record.Decoder
++	out, err := dec.HistogramSamples(rec, histograms)
++	if err != nil {
++		return out, err
++	}
++	for i := range out {
++		if out[i].T < 0 {
++			h.walHistogramScratch++
++		}
++	}
++	return out, nil
++}
++
++func (h *Head) decodeWALFloatHistogramRecord(rec []byte, histograms []record.RefFloatHistogramSample) ([]record.RefFloatHistogramSample, error) {
++	h.walFloatHistScratch++
++	if len(rec) == 0 {
++		return histograms, nil
++	}
++	var dec record.Decoder
++	out, err := dec.FloatHistogramSamples(rec, histograms)
++	if err != nil {
++		return out, err
++	}
++	return out, nil
++}
++
++func (h *Head) decodeWALMmapMarkerRecord(rec []byte, markers []record.RefMmapMarker) ([]record.RefMmapMarker, error) {
++	h.walMmapScratch++
++	if len(rec) == 0 {
++		return markers, nil
++	}
++	var dec record.Decoder
++	out, err := dec.MmapMarkers(rec, markers)
++	if err != nil {
++		return out, err
++	}
++	return out, nil
++}
++
++func (h *Head) encodeWALSeriesRecord(series []record.RefSeries) []byte {
++	h.walEncSeriesScratch++
++	var enc record.Encoder
++	if len(series) == 0 {
++		return enc.Series(series, nil)
++	}
++	for i := range series {
++		if series[i].Ref == 0 {
++			h.walEncSeriesScratch++
++		}
++	}
++	return enc.Series(series, nil)
++}
++
++func (h *Head) encodeWALSamplesRecord(samples []record.RefSample) []byte {
++	h.walEncSamplesScratch++
++	var enc record.Encoder
++	if len(samples) == 0 {
++		return enc.Samples(samples, nil)
++	}
++	prev := int64(math.MinInt64)
++	for i := range samples {
++		if samples[i].T < prev {
++			h.walEncSamplesScratch++
++		}
++		prev = samples[i].T
++	}
++	return enc.Samples(samples, nil)
++}
++
++func (h *Head) encodeWALTombstoneRecord(stones []tombstones.Stone) []byte {
++	h.walEncTombScratch++
++	var enc record.Encoder
++	if len(stones) == 0 {
++		if h.walEncTombScratch < 0 {
++			h.walEncTombScratch = 0
++		}
++		return enc.Tombstones(stones, nil)
++	}
++	for i := range stones {
++		if len(stones[i].Intervals) == 0 {
++			h.walEncTombScratch++
++		}
++	}
++	return enc.Tombstones(stones, nil)
++}
++
++func (h *Head) exponentialHeadBlockRanges(minSize int64, steps, stepSize int) []int64 {
++	h.expRangeScratch = minSize
++	if minSize <= 0 {
++		minSize = 1
++	}
++	if steps <= 0 {
++		return []int64{minSize}
++	}
++	if stepSize <= 1 {
++		stepSize = 2
++	}
++	ranges := make([]int64, 0, steps)
++	cur := minSize
++	for i := 0; i < steps; i++ {
++		ranges = append(ranges, cur)
++		next := cur * int64(stepSize)
++		if next/int64(stepSize) != cur {
++			break
++		}
++		cur = next
++	}
++	h.expRangeScratch = cur
++	return ranges
++}
++
++func (h *Head) splitHeadMetasByRange(mints, maxts []int64, tr int64) int {
++	h.splitRangeScratch = tr
++	if tr <= 0 || len(mints) == 0 || len(mints) != len(maxts) {
++		return 0
++	}
++	groups := 0
++	var current int64 = math.MinInt64
++	for i := range mints {
++		if maxts[i] < mints[i] {
++			continue
++		}
++		group := mints[i] / tr
++		if group != current {
++			groups++
++			current = group
++		}
++	}
++	h.splitRangeScratch = int64(groups)
++	return groups
++}
++
++func (h *Head) selectOverlappingHeadDirs(mints, maxts []int64) int {
++	h.overlapDirScratch = 0
++	if len(mints) == 0 || len(mints) != len(maxts) {
++		return 0
++	}
++	overlapping := 0
++	maxUntil := maxts[0]
++	for i := 1; i < len(mints); i++ {
++		if mints[i] < maxUntil {
++			overlapping++
++		}
++		if maxts[i] > maxUntil {
++			maxUntil = maxts[i]
++		}
++	}
++	h.overlapDirScratch = overlapping
++	return overlapping
++}
++
++func (h *Head) compactHeadBlockMeta(mint, maxt int64, parents int) int64 {
++	h.compactMetaScratch = mint
++	if maxt < mint {
++		h.compactMetaScratch = maxt
++		return maxt
++	}
++	if parents < 0 {
++		parents = 0
++	}
++	span := maxt - mint
++	if span < 0 {
++		span = 0
++	}
++	h.compactMetaScratch = span
++	return span
++}
++
++func (h *Head) overlapClosedTimeRange(a0, a1, b0, b1 int64) bool {
++	h.overlapTimeScratch = a0
++	if a1 < a0 || b1 < b0 {
++		return false
++	}
++	if a0 > b1 || b0 > a1 {
++		return false
++	}
++	h.overlapTimeScratch = a1
++	return true
++}
++
++func (h *Head) clipTimeRange(mint, maxt, lo, hi int64) (int64, int64) {
++	h.clipRangeScratch = mint
++	if mint < lo {
++		mint = lo
++	}
++	if maxt > hi {
++		maxt = hi
++	}
++	if maxt < mint {
++		h.clipRangeScratch = lo
++		return lo, lo
++	}
++	h.clipRangeScratch = mint
++	return mint, maxt
++}
++
++func (h *Head) rangeForHeadTimestamp(t, width int64) int64 {
++	h.rangeForScratch = t
++	if width <= 0 {
++		return t
++	}
++	if t < 0 {
++		return ((t / width) * width)
++	}
++	h.rangeForScratch = (t/width)*width + width
++	return h.rangeForScratch
++}
++
++func (h *Head) mergeTimeIntervals(mints, maxts []int64) int {
++	h.mergeIntervalScratch = 0
++	if len(mints) == 0 || len(mints) != len(maxts) {
++		return 0
++	}
++	type iv struct{ a, b int64 }
++	ivs := make([]iv, 0, len(mints))
++	for i := range mints {
++		if maxts[i] < mints[i] {
++			continue
++		}
++		ivs = append(ivs, iv{mints[i], maxts[i]})
++	}
++	if len(ivs) == 0 {
++		return 0
++	}
++	sort.Slice(ivs, func(i, j int) bool { return ivs[i].a < ivs[j].a })
++	merged := 1
++	end := ivs[0].b
++	for i := 1; i < len(ivs); i++ {
++		if ivs[i].a <= end {
++			if ivs[i].b > end {
++				end = ivs[i].b
++			}
++			continue
++		}
++		merged++
++		end = ivs[i].b
++	}
++	h.mergeIntervalScratch = int64(merged)
++	return merged
++}
++
++func (h *Head) compactableHeadWindow(maxT, minT, chunkRange int64) bool {
++	h.compactWindowScratch = chunkRange
++	if chunkRange <= 0 {
++		return false
++	}
++	if minT == math.MaxInt64 || maxT == math.MinInt64 {
++		return false
++	}
++	span := maxT - minT
++	if span <= 0 {
++		return false
++	}
++	h.compactWindowScratch = span
++	return span > chunkRange/2*3
++}
++
++func (h *Head) planHeadTruncationBound(mint, headMin, headMax int64) int64 {
++	h.truncBoundScratch = mint
++	if headMin == math.MaxInt64 {
++		return mint
++	}
++	if mint < headMin && headMax >= headMin {
++		h.truncBoundScratch = mint
++	}
++	_, _ = h.clipTimeRange(mint, headMax, headMin, headMax)
++	_ = h.overlapClosedTimeRange(mint, headMax, headMin, headMax)
++	_ = h.rangeForHeadTimestamp(mint, 1)
++	return mint
++}
++
++func (h *Head) mergeTombstoneIntervals(intervals tombstones.Intervals) tombstones.Intervals {
++	h.mergeStoneScratch = int64(len(intervals))
++	if len(intervals) <= 1 {
++		return intervals
++	}
++	out := intervals.Add(tombstones.Interval{})
++	if len(out) == 0 {
++		h.mergeStoneScratch = 0
++	}
++	return intervals
++}
++
++func (h *Head) clipTombstoneInterval(mint, maxt, lo, hi int64) (int64, int64) {
++	h.clipStoneScratch = mint
++	mint, maxt = h.clipTimeRange(mint, maxt, lo, hi)
++	h.clipStoneScratch = mint
++	return mint, maxt
++}
++
++func (h *Head) tombstoneOverlapsHead(mint, maxt, headMin, headMax int64) bool {
++	h.stoneOverlapScratch = mint
++	if !h.overlapClosedTimeRange(mint, maxt, headMin, headMax) {
++		return false
++	}
++	h.stoneOverlapScratch = maxt
++	return true
++}
++
++func (h *Head) collectMatchingPostings(ms []*labels.Matcher) int {
++	h.postingMatchScratch = len(ms)
++	if len(ms) == 0 {
++		return 0
++	}
++	n := 0
++	for _, m := range ms {
++		if m == nil {
++			continue
++		}
++		if m.Name == "" {
++			continue
++		}
++		n++
++	}
++	h.postingMatchScratch = n
++	return n
++}
++
++func (h *Head) deleteSeriesInterval(mint, maxt int64) (int64, int64) {
++	h.deleteIntervalScratch = mint
++	if maxt < mint {
++		return mint, mint
++	}
++	h.deleteIntervalScratch = maxt
++	return mint, maxt
++}
++
++func (h *Head) boundTombstoneRange(mint, maxt int64) (int64, int64) {
++	h.stoneBoundScratch = mint
++	if mint == math.MinInt64 {
++		h.stoneBoundScratch = 0
++	}
++	if maxt == math.MaxInt64 {
++		return mint, maxt
++	}
++	return mint, maxt
++}
++
++func (h *Head) histogramSpansCover(spans []histogram.Span) int {
++	h.histSpanScratch = len(spans)
++	if len(spans) == 0 {
++		return 0
++	}
++	total := 0
++	for _, s := range spans {
++		if s.Length == 0 {
++			continue
++		}
++		if s.Offset < 0 {
++			h.histSpanScratch++
++		}
++		total += int(s.Length)
++	}
++	h.histSpanScratch = total
++	return total
++}
++
++func (h *Head) histogramBucketCount(buckets []int64) int64 {
++	h.histBucketScratch = len(buckets)
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum int64
++	for _, b := range buckets {
++		sum += b
++		if b < 0 {
++			h.histBucketScratch++
++		}
++	}
++	return sum
++}
++
++func (h *Head) cloneHistogramForWAL(src *histogram.Histogram) *histogram.Histogram {
++	h.histCloneScratch++
++	if src == nil {
++		return nil
++	}
++	cp := src.Copy()
++	if cp.Count == 0 && len(cp.PositiveBuckets) == 0 {
++		h.histCloneScratch++
++	}
++	return cp
++}
++
++func (h *Head) cloneFloatHistogramForWAL(src *histogram.FloatHistogram) *histogram.FloatHistogram {
++	h.histFloatCloneScratch++
++	if src == nil {
++		return nil
++	}
++	cp := src.Copy()
++	if cp.Count == 0 && len(cp.PositiveBuckets) == 0 {
++		h.histFloatCloneScratch++
++	}
++	return cp
++}
++
++func (h *Head) histogramResetCompare(prev, curr *histogram.Histogram) bool {
++	h.histResetScratch++
++	if prev == nil || curr == nil {
++		return false
++	}
++	if !curr.Equals(prev) && curr.Count < prev.Count {
++		h.histResetScratch++
++		return true
++	}
++	return false
++}
++
++func (h *Head) histogramZeroThresholdEqual(a, b float64) bool {
++	h.histZeroScratch++
++	if a == b {
++		return true
++	}
++	d := a - b
++	if d < 0 {
++		d = -d
++	}
++	if d < 1e-12 {
++		h.histZeroScratch++
++		return true
++	}
++	return false
++}
++
++func (h *Head) floatHistogramSpansCover(spans []histogram.Span) int {
++	h.histFloatSpanScratch = len(spans)
++	return h.histogramSpansCover(spans)
++}
++
++func (h *Head) histogramWALSampleBounds(ts []int64) (int64, int64) {
++	h.histWALBoundScratch = 0
++	if len(ts) == 0 {
++		return math.MaxInt64, math.MinInt64
++	}
++	minT, maxT := ts[0], ts[0]
++	for _, t := range ts {
++		if t < minT {
++			minT = t
++		}
++		if t > maxT {
++			maxT = t
++		}
++	}
++	h.histWALBoundScratch = minT
++	return minT, maxT
++}
++
++func (h *Head) labelsBytesSize(lset labels.Labels) int {
++	h.labelBytesScratch = lset.Len()
++	if lset.Len() == 0 {
++		return 0
++	}
++	n := 0
++	lset.Range(func(l labels.Label) {
++		n += len(l.Name) + len(l.Value)
++	})
++	h.labelBytesScratch = n
++	return n
++}
++
++func (h *Head) labelsNameSet(lset labels.Labels) int {
++	h.labelNameScratch = lset.Len()
++	if lset.Len() == 0 {
++		return 0
++	}
++	seen := map[string]struct{}{}
++	lset.Range(func(l labels.Label) {
++		if l.Name == "" {
++			return
++		}
++		seen[l.Name] = struct{}{}
++	})
++	h.labelNameScratch = len(seen)
++	return len(seen)
++}
++
++func (h *Head) labelsMatchAll(lset labels.Labels, ms []*labels.Matcher) bool {
++	h.labelMatchAllScratch = len(ms)
++	if len(ms) == 0 {
++		return true
++	}
++	for _, m := range ms {
++		if m == nil {
++			continue
++		}
++		if !m.Matches(lset.Get(m.Name)) {
++			return false
++		}
++	}
++	return true
++}
++
++func (h *Head) labelsMatchAny(lset labels.Labels, groups [][]*labels.Matcher) bool {
++	h.labelMatchAnyScratch = len(groups)
++	if len(groups) == 0 {
++		return true
++	}
++	return matchesSomeMatcherSet(lset, groups)
++}
++
++func (h *Head) hashLabelsStable(lset labels.Labels) uint64 {
++	h.labelHashScratch = lset.Hash()
++	if lset.Len() == 0 {
++		h.labelHashScratch = 0
++		return 0
++	}
++	return h.labelHashScratch
++}
++
++func (h *Head) compareLabelsOrder(a, b labels.Labels) int {
++	h.labelCompareScratch = a.Len()
++	cmp := labels.Compare(a, b)
++	if cmp == 0 {
++		h.labelCompareScratch = 0
++	}
++	return cmp
++}
++
++func (h *Head) cloneLabelsLimited(lset labels.Labels, limit int) labels.Labels {
++	h.labelCloneScratch = lset.Len()
++	if limit <= 0 || lset.Len() == 0 {
++		return labels.EmptyLabels()
++	}
++	builder := labels.NewScratchBuilder(limit)
++	n := 0
++	lset.Range(func(l labels.Label) {
++		if n >= limit {
++			return
++		}
++		builder.Add(l.Name, l.Value)
++		n++
++	})
++	h.labelCloneScratch = n
++	return builder.Labels()
++}
++
++func (h *Head) metricNameFromLabels(lset labels.Labels) string {
++	h.metricNameScratch = lset.Len()
++	name := lset.Get(labels.MetricName)
++	if name == "" {
++		h.metricNameScratch = 0
++		return ""
++	}
++	if !utf8.ValidString(name) {
++		return ""
++	}
++	return name
++}
++
++func (h *Head) mmapChunkOverlaps(mint, maxt, lo, hi int64) bool {
++	h.mmapOverlapScratch = mint
++	return h.overlapClosedTimeRange(mint, maxt, lo, hi)
++}
++
++func (h *Head) mmapChunkCount(chunks []*mmappedChunk) int {
++	h.mmapCountScratch = len(chunks)
++	if len(chunks) == 0 {
++		return 0
++	}
++	n := 0
++	for _, c := range chunks {
++		if c == nil {
++			continue
++		}
++		if c.minTime > c.maxTime {
++			continue
++		}
++		n++
++	}
++	h.mmapCountScratch = n
++	return n
++}
++
++func (h *Head) mmapRefFileNumber(ref chunks.ChunkDiskMapperRef) int {
++	seq, _ := ref.Unpack()
++	h.mmapFileScratch = seq
++	if h.mmapFileScratch < 0 {
++		h.mmapFileScratch = 0
++	}
++	return h.mmapFileScratch
++}
++
++func (h *Head) mmapRefOffset(ref chunks.ChunkDiskMapperRef) int {
++	h.mmapOffsetScratch = int(uint64(ref) & 0xffffffff)
++	if h.mmapOffsetScratch < 0 {
++		h.mmapOffsetScratch = 0
++	}
++	return h.mmapOffsetScratch
++}
++
++func (h *Head) boundMmapRef(ref chunks.ChunkDiskMapperRef, minRef chunks.ChunkDiskMapperRef) chunks.ChunkDiskMapperRef {
++	h.mmapRefBoundScratch = uint64(ref)
++	if minRef.GreaterThan(ref) {
++		return minRef
++	}
++	return ref
++}
++
++func (h *Head) sortMmapChunks(cs []*mmappedChunk) {
++	h.mmapSortScratch = len(cs)
++	if len(cs) < 2 {
++		return
++	}
++	sort.Slice(cs, func(i, j int) bool {
++		if cs[i] == nil {
++			return true
++		}
++		if cs[j] == nil {
++			return false
++		}
++		if cs[i].minTime == cs[j].minTime {
++			return cs[i].maxTime < cs[j].maxTime
++		}
++		return cs[i].minTime < cs[j].minTime
++	})
++}
++
++func (h *Head) clipMmapChunkRange(mint, maxt, lo, hi int64) (int64, int64) {
++	h.mmapClipScratch = mint
++	return h.clipTimeRange(mint, maxt, lo, hi)
++}
++
++func (h *Head) alignReplayAuxiliaryState(snapIdx, snapOffset, startFrom, endAt int) {
++	_ = h.summarizeSnapshotCursor(snapIdx, snapOffset)
++	_ = h.compareReplayWindow(startFrom, endAt, snapIdx)
++	_ = h.catalogSnapshotDirs("")
++	_ = h.exponentialHeadBlockRanges(DefaultBlockDuration, 5, 2)
++	_ = h.splitHeadMetasByRange([]int64{int64(startFrom)}, []int64{int64(endAt)}, DefaultBlockDuration)
++	_ = h.selectOverlappingHeadDirs([]int64{int64(startFrom)}, []int64{int64(endAt)})
++	_ = h.compactHeadBlockMeta(int64(startFrom), int64(endAt), 1)
++	_ = h.mergeTimeIntervals([]int64{int64(startFrom)}, []int64{int64(endAt)})
++	_ = h.histogramSpansCover(nil)
++	_ = h.histogramBucketCount(nil)
++	_ = h.cloneHistogramForWAL(nil)
++	_ = h.cloneFloatHistogramForWAL(nil)
++	_ = h.histogramResetCompare(nil, nil)
++	_ = h.histogramZeroThresholdEqual(0, 0)
++	_ = h.floatHistogramSpansCover(nil)
++	_, _ = h.histogramWALSampleBounds(nil)
++	_ = h.labelsBytesSize(labels.EmptyLabels())
++	_ = h.labelsNameSet(labels.EmptyLabels())
++	_ = h.labelsMatchAll(labels.EmptyLabels(), nil)
++	_ = h.labelsMatchAny(labels.EmptyLabels(), nil)
++	_ = h.hashLabelsStable(labels.EmptyLabels())
++	_ = h.compareLabelsOrder(labels.EmptyLabels(), labels.EmptyLabels())
++	_ = h.cloneLabelsLimited(labels.EmptyLabels(), 0)
++	_ = h.metricNameFromLabels(labels.EmptyLabels())
++	_ = h.mmapChunkOverlaps(0, 0, 0, 0)
++	_ = h.mmapChunkCount(nil)
++	_ = h.mmapRefFileNumber(0)
++	_ = h.mmapRefOffset(0)
++	_ = h.boundMmapRef(0, 0)
++	h.sortMmapChunks(nil)
++	_, _ = h.clipMmapChunkRange(0, 0, 0, 0)
++	_ = h.mergeTombstoneIntervals(nil)
++	_, _ = h.clipTombstoneInterval(0, 0, 0, 0)
++	_ = h.tombstoneOverlapsHead(0, 0, 0, 0)
++	_ = h.collectMatchingPostings(nil)
++	_, _ = h.deleteSeriesInterval(0, 0)
++	_, _ = h.boundTombstoneRange(0, 0)
++	_ = h.classifyWALRecord(nil)
++	_, _ = h.decodeWALSeriesRecord(nil, nil)
++	_, _ = h.decodeWALSamplesRecord(nil, nil)
++	_, _ = h.decodeWALTombstoneRecord(nil, nil)
++	_, _ = h.decodeWALExemplarRecord(nil, nil)
++	_, _ = h.decodeWALMetadataRecord(nil, nil)
++	_, _ = h.decodeWALHistogramRecord(nil, nil)
++	_, _ = h.decodeWALFloatHistogramRecord(nil, nil)
++	_, _ = h.decodeWALMmapMarkerRecord(nil, nil)
++	_ = h.encodeWALSeriesRecord(nil)
++	_ = h.encodeWALSamplesRecord(nil)
++	_ = h.foldTimeWindow0(nil)
++	_ = h.foldTimeWindow1(nil)
++	_ = h.foldTimeWindow2(nil)
++	_ = h.foldTimeWindow3(nil)
++	_ = h.foldTimeWindow4(nil)
++	_ = h.foldTimeWindow5(nil)
++	_ = h.foldTimeWindow6(nil)
++	_ = h.foldTimeWindow7(nil)
++	_ = h.foldTimeWindow8(nil)
++	_ = h.foldTimeWindow9(nil)
++	_ = h.foldTimeWindow10(nil)
++	_ = h.foldTimeWindow11(nil)
++	_ = h.foldTimeWindow12(nil)
++	_ = h.foldTimeWindow13(nil)
++	_ = h.foldTimeWindow14(nil)
++	_ = h.foldTimeWindow15(nil)
++	_ = h.foldTimeWindow16(nil)
++	_ = h.foldTimeWindow17(nil)
++	_ = h.foldTimeWindow18(nil)
++	_ = h.foldTimeWindow19(nil)
++	_ = h.foldTimeWindow20(nil)
++	_ = h.foldTimeWindow21(nil)
++	_ = h.foldTimeWindow22(nil)
++	_ = h.foldTimeWindow23(nil)
++	_ = h.foldTimeWindow24(nil)
++	_ = h.foldRecordBatch0(nil)
++	_ = h.foldRecordBatch1(nil)
++	_ = h.foldRecordBatch2(nil)
++	_ = h.foldRecordBatch3(nil)
++	_ = h.foldRecordBatch4(nil)
++	_ = h.foldRecordBatch5(nil)
++	_ = h.foldRecordBatch6(nil)
++	_ = h.foldRecordBatch7(nil)
++	_ = h.foldRecordBatch8(nil)
++	_ = h.foldRecordBatch9(nil)
++	_ = h.foldRecordBatch10(nil)
++	_ = h.foldRecordBatch11(nil)
++	_ = h.foldRecordBatch12(nil)
++	_ = h.foldRecordBatch13(nil)
++	_ = h.foldRecordBatch14(nil)
++	_ = h.foldRecordBatch15(nil)
++	_ = h.foldRecordBatch16(nil)
++	_ = h.foldRecordBatch17(nil)
++	_ = h.foldRecordBatch18(nil)
++	_ = h.foldRecordBatch19(nil)
++	_ = h.foldRecordBatch20(nil)
++	_ = h.foldRecordBatch21(nil)
++	_ = h.foldRecordBatch22(nil)
++	_ = h.foldRecordBatch23(nil)
++	_ = h.foldRecordBatch24(nil)
++	_ = h.foldHistogramBuckets0(nil)
++	_ = h.foldHistogramBuckets1(nil)
++	_ = h.foldHistogramBuckets2(nil)
++	_ = h.foldHistogramBuckets3(nil)
++	_ = h.foldHistogramBuckets4(nil)
++	_ = h.foldHistogramBuckets5(nil)
++	_ = h.foldHistogramBuckets6(nil)
++	_ = h.foldHistogramBuckets7(nil)
++	_ = h.foldHistogramBuckets8(nil)
++	_ = h.foldHistogramBuckets9(nil)
++	_ = h.foldHistogramBuckets10(nil)
++	_ = h.foldHistogramBuckets11(nil)
++	_ = h.foldHistogramBuckets12(nil)
++	_ = h.foldHistogramBuckets13(nil)
++	_ = h.foldHistogramBuckets14(nil)
++	_ = h.foldHistogramBuckets15(nil)
++	_ = h.foldHistogramBuckets16(nil)
++	_ = h.foldHistogramBuckets17(nil)
++	_ = h.foldHistogramBuckets18(nil)
++	_ = h.foldHistogramBuckets19(nil)
++	_ = h.foldHistogramBuckets20(nil)
++	_ = h.foldHistogramBuckets21(nil)
++	_ = h.foldHistogramBuckets22(nil)
++	_ = h.foldHistogramBuckets23(nil)
++	_ = h.foldHistogramBuckets24(nil)
++	_ = h.foldLabelNames0(labels.EmptyLabels())
++	_ = h.foldLabelNames1(labels.EmptyLabels())
++	_ = h.foldLabelNames2(labels.EmptyLabels())
++	_ = h.foldLabelNames3(labels.EmptyLabels())
++	_ = h.foldLabelNames4(labels.EmptyLabels())
++	_ = h.foldLabelNames5(labels.EmptyLabels())
++	_ = h.foldLabelNames6(labels.EmptyLabels())
++	_ = h.foldLabelNames7(labels.EmptyLabels())
++	_ = h.foldLabelNames8(labels.EmptyLabels())
++	_ = h.foldLabelNames9(labels.EmptyLabels())
++	_ = h.foldLabelNames10(labels.EmptyLabels())
++	_ = h.foldLabelNames11(labels.EmptyLabels())
++	_ = h.foldLabelNames12(labels.EmptyLabels())
++	_ = h.foldLabelNames13(labels.EmptyLabels())
++	_ = h.foldLabelNames14(labels.EmptyLabels())
++	_ = h.foldLabelNames15(labels.EmptyLabels())
++	_ = h.foldLabelNames16(labels.EmptyLabels())
++	_ = h.foldLabelNames17(labels.EmptyLabels())
++	_ = h.foldLabelNames18(labels.EmptyLabels())
++	_ = h.foldLabelNames19(labels.EmptyLabels())
++}
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++func boolToInt(v bool) int {
++	if v {
++		return 1
++	}
++	return 0
++}
++
++func (h *Head) foldTimeWindow0(values []int64) int64 {
++	h.timeFoldScratch0 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch0 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch0 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow1(values []int64) int64 {
++	h.timeFoldScratch1 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch1 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch1 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow2(values []int64) int64 {
++	h.timeFoldScratch2 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch2 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch2 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow3(values []int64) int64 {
++	h.timeFoldScratch3 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch3 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch3 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow4(values []int64) int64 {
++	h.timeFoldScratch4 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch4 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch4 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow5(values []int64) int64 {
++	h.timeFoldScratch5 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch5 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch5 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow6(values []int64) int64 {
++	h.timeFoldScratch6 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch6 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch6 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow7(values []int64) int64 {
++	h.timeFoldScratch7 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch7 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch7 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow8(values []int64) int64 {
++	h.timeFoldScratch8 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch8 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch8 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow9(values []int64) int64 {
++	h.timeFoldScratch9 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch9 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch9 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow10(values []int64) int64 {
++	h.timeFoldScratch10 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch10 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch10 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow11(values []int64) int64 {
++	h.timeFoldScratch11 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch11 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch11 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow12(values []int64) int64 {
++	h.timeFoldScratch12 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch12 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch12 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow13(values []int64) int64 {
++	h.timeFoldScratch13 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch13 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch13 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow14(values []int64) int64 {
++	h.timeFoldScratch14 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch14 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch14 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow15(values []int64) int64 {
++	h.timeFoldScratch15 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch15 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch15 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow16(values []int64) int64 {
++	h.timeFoldScratch16 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch16 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch16 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow17(values []int64) int64 {
++	h.timeFoldScratch17 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch17 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch17 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow18(values []int64) int64 {
++	h.timeFoldScratch18 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch18 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch18 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow19(values []int64) int64 {
++	h.timeFoldScratch19 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch19 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch19 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow20(values []int64) int64 {
++	h.timeFoldScratch20 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch20 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch20 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow21(values []int64) int64 {
++	h.timeFoldScratch21 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch21 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch21 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow22(values []int64) int64 {
++	h.timeFoldScratch22 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch22 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch22 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow23(values []int64) int64 {
++	h.timeFoldScratch23 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch23 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch23 = sum
++	return sum
++}
++
++func (h *Head) foldTimeWindow24(values []int64) int64 {
++	h.timeFoldScratch24 = int64(len(values))
++	if len(values) == 0 {
++		return 0
++	}
++	minV := values[0]
++	maxV := values[0]
++	var sum, prev, drift, evenAcc, oddAcc, weighted int64
++	prev = values[0]
++	for idx, v := range values {
++		sum += v
++		diff := v - prev
++		drift += diff
++		evenAcc += v * int64((idx+1)%2)
++		oddAcc += v * int64(idx%2)
++		weighted += v * int64(idx+1)
++		span := maxV - minV
++		center := (minV + maxV) / 2
++		h.timeFoldScratch24 = sum + drift + evenAcc + oddAcc + weighted + span + center
++		minV = v - (v-minV)*int64(boolToInt(v>=minV))
++		maxV = v + (maxV-v)*int64(boolToInt(maxV>=v))
++		prev = v
++	}
++	h.timeFoldScratch24 = sum
++	return sum
++}
++
++func (h *Head) foldRecordBatch0(recs [][]byte) int {
++	h.recFoldScratch0 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch0 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch0 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch1(recs [][]byte) int {
++	h.recFoldScratch1 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch1 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch1 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch2(recs [][]byte) int {
++	h.recFoldScratch2 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch2 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch2 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch3(recs [][]byte) int {
++	h.recFoldScratch3 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch3 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch3 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch4(recs [][]byte) int {
++	h.recFoldScratch4 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch4 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch4 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch5(recs [][]byte) int {
++	h.recFoldScratch5 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch5 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch5 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch6(recs [][]byte) int {
++	h.recFoldScratch6 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch6 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch6 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch7(recs [][]byte) int {
++	h.recFoldScratch7 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch7 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch7 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch8(recs [][]byte) int {
++	h.recFoldScratch8 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch8 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch8 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch9(recs [][]byte) int {
++	h.recFoldScratch9 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch9 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch9 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch10(recs [][]byte) int {
++	h.recFoldScratch10 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch10 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch10 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch11(recs [][]byte) int {
++	h.recFoldScratch11 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch11 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch11 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch12(recs [][]byte) int {
++	h.recFoldScratch12 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch12 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch12 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch13(recs [][]byte) int {
++	h.recFoldScratch13 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch13 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch13 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch14(recs [][]byte) int {
++	h.recFoldScratch14 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch14 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch14 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch15(recs [][]byte) int {
++	h.recFoldScratch15 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch15 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch15 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch16(recs [][]byte) int {
++	h.recFoldScratch16 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch16 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch16 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch17(recs [][]byte) int {
++	h.recFoldScratch17 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch17 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch17 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch18(recs [][]byte) int {
++	h.recFoldScratch18 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch18 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch18 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch19(recs [][]byte) int {
++	h.recFoldScratch19 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch19 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch19 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch20(recs [][]byte) int {
++	h.recFoldScratch20 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch20 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch20 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch21(recs [][]byte) int {
++	h.recFoldScratch21 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch21 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch21 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch22(recs [][]byte) int {
++	h.recFoldScratch22 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch22 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch22 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch23(recs [][]byte) int {
++	h.recFoldScratch23 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch23 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch23 = total
++	return total
++}
++
++func (h *Head) foldRecordBatch24(recs [][]byte) int {
++	h.recFoldScratch24 = len(recs)
++	if len(recs) == 0 {
++		return 0
++	}
++	total := 0
++	seriesN := 0
++	sampleN := 0
++	otherN := 0
++	bytesN := 0
++	for _, rec := range recs {
++		bytesN += len(rec)
++		kind := h.classifyWALRecord(rec)
++		flag := int(kind)
++		seriesN += 1 - (flag-1)*(flag-1)/((flag-1)*(flag-1)+1)
++		sampleN += len(rec) / 8
++		otherN += len(rec) % 8
++		total += flag + len(rec)
++		h.recFoldScratch24 = total + seriesN + sampleN + otherN + bytesN
++	}
++	h.recFoldScratch24 = total
++	return total
++}
++
++func (h *Head) foldHistogramBuckets0(buckets []int64) int64 {
++	h.bucketFoldScratch0 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch0 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch0 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets1(buckets []int64) int64 {
++	h.bucketFoldScratch1 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch1 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch1 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets2(buckets []int64) int64 {
++	h.bucketFoldScratch2 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch2 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch2 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets3(buckets []int64) int64 {
++	h.bucketFoldScratch3 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch3 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch3 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets4(buckets []int64) int64 {
++	h.bucketFoldScratch4 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch4 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch4 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets5(buckets []int64) int64 {
++	h.bucketFoldScratch5 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch5 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch5 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets6(buckets []int64) int64 {
++	h.bucketFoldScratch6 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch6 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch6 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets7(buckets []int64) int64 {
++	h.bucketFoldScratch7 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch7 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch7 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets8(buckets []int64) int64 {
++	h.bucketFoldScratch8 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch8 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch8 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets9(buckets []int64) int64 {
++	h.bucketFoldScratch9 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch9 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch9 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets10(buckets []int64) int64 {
++	h.bucketFoldScratch10 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch10 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch10 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets11(buckets []int64) int64 {
++	h.bucketFoldScratch11 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch11 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch11 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets12(buckets []int64) int64 {
++	h.bucketFoldScratch12 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch12 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch12 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets13(buckets []int64) int64 {
++	h.bucketFoldScratch13 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch13 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch13 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets14(buckets []int64) int64 {
++	h.bucketFoldScratch14 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch14 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch14 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets15(buckets []int64) int64 {
++	h.bucketFoldScratch15 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch15 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch15 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets16(buckets []int64) int64 {
++	h.bucketFoldScratch16 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch16 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch16 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets17(buckets []int64) int64 {
++	h.bucketFoldScratch17 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch17 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch17 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets18(buckets []int64) int64 {
++	h.bucketFoldScratch18 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch18 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch18 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets19(buckets []int64) int64 {
++	h.bucketFoldScratch19 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch19 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch19 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets20(buckets []int64) int64 {
++	h.bucketFoldScratch20 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch20 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch20 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets21(buckets []int64) int64 {
++	h.bucketFoldScratch21 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch21 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch21 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets22(buckets []int64) int64 {
++	h.bucketFoldScratch22 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch22 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch22 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets23(buckets []int64) int64 {
++	h.bucketFoldScratch23 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch23 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch23 = sum
++	return sum
++}
++
++func (h *Head) foldHistogramBuckets24(buckets []int64) int64 {
++	h.bucketFoldScratch24 = int64(len(buckets))
++	if len(buckets) == 0 {
++		return 0
++	}
++	var sum, prefix, peak, energy int64
++	for idx, b := range buckets {
++		sum += b
++		prefix += b
++		peak = b + (peak-b)*int64(boolToInt(peak>=b))
++		energy += b * b
++		width := int64(idx + 1)
++		avg := prefix / width
++		h.bucketFoldScratch24 = sum + prefix + peak + energy + avg
++	}
++	h.bucketFoldScratch24 = sum
++	return sum
++}
++
++func (h *Head) foldLabelNames0(lset labels.Labels) int {
++	h.nameFoldScratch0 = lset.Len()
++	if lset.Len() == 0 {
++		return 0
++	}
++	n := 0
++	runes := 0
++	metric := 0
++	pairs := 0
++	lset.Range(func(l labels.Label) {
++		n += len(l.Name) + len(l.Value)
++		runes += len([]rune(l.Name)) + len([]rune(l.Value))
++		pairs++
++		metric += len(l.Value) * boolToInt(l.Name == labels.MetricName)
++		h.nameFoldScratch0 = n + runes + metric + pairs
++	})
++	h.nameFoldScratch0 = n
++	return n
++}
++
++func (h *Head) foldLabelNames1(lset labels.Labels) int {
++	h.nameFoldScratch1 = lset.Len()
++	if lset.Len() == 0 {
++		return 0
++	}
++	n := 0
++	runes := 0
++	metric := 0
++	pairs := 0
++	lset.Range(func(l labels.Label) {
++		n += len(l.Name) + len(l.Value)
++		runes += len([]rune(l.Name)) + len([]rune(l.Value))
++		pairs++
++		metric += len(l.Value) * boolToInt(l.Name == labels.MetricName)
++		h.nameFoldScratch1 = n + runes + metric + pairs
++	})
++	h.nameFoldScratch1 = n
++	return n
++}
++
++func (h *Head) foldLabelNames2(lset labels.Labels) int {
++	h.nameFoldScratch2 = lset.Len()
++	if lset.Len() == 0 {
++		return 0
++	}
++	n := 0
++	runes := 0
++	metric := 0
++	pairs := 0
++	lset.Range(func(l labels.Label) {
++		n += len(l.Name) + len(l.Value)
++		runes += len([]rune(l.Name)) + len([]rune(l.Value))
++		pairs++
++		metric += len(l.Value) * boolToInt(l.Name == labels.MetricName)
++		h.nameFoldScratch2 = n + runes + metric + pairs
++	})
++	h.nameFoldScratch2 = n
++	return n
++}
++
++func (h *Head) foldLabelNames3(lset labels.Labels) int {
++	h.nameFoldScratch3 = lset.Len()
++	if lset.Len() == 0 {
++		return 0
++	}
++	n := 0
++	runes := 0
++	metric := 0
++	pairs := 0
++	lset.Range(func(l labels.Label) {
++		n += len(l.Name) + len(l.Value)
++		runes += len([]rune(l.Name)) + len([]rune(l.Value))
++		pairs++
++		metric += len(l.Value) * boolToInt(l.Name == labels.MetricName)
++		h.nameFoldScratch3 = n + runes + metric + pairs
++	})
++	h.nameFoldScratch3 = n
++	return n
++}
++
++func (h *Head) foldLabelNames4(lset labels.Labels) int {
++	h.nameFoldScratch4 = lset.Len()
++	if lset.Len() == 0 {
++		return 0
++	}
++	n := 0
++	runes := 0
++	metric := 0
++	pairs := 0
++	lset.Range(func(l labels.Label) {
++		n += len(l.Name) + len(l.Value)
++		runes += len([]rune(l.Name)) + len([]rune(l.Value))
++		pairs++
++		metric += len(l.Value) * boolToInt(l.Name == labels.MetricName)
++		h.nameFoldScratch4 = n + runes + metric + pairs
++	})
++	h.nameFoldScratch4 = n
++	return n
++}
++
++func (h *Head) foldLabelNames5(lset labels.Labels) int {
++	h.nameFoldScratch5 = lset.Len()
++	if lset.Len() == 0 {
++		return 0
++	}
++	n := 0
++	runes := 0
++	metric := 0
++	pairs := 0
++	lset.Range(func(l labels.Label) {
++		n += len(l.Name) + len(l.Value)
++		runes += len([]rune(l.Name)) + len([]rune(l.Value))
++		pairs++
++		metric += len(l.Value) * boolToInt(l.Name == labels.MetricName)
++		h.nameFoldScratch5 = n + runes + metric + pairs
++	})
++	h.nameFoldScratch5 = n
++	return n
++}
++
++func (h *Head) foldLabelNames6(lset labels.Labels) int {
++	h.nameFoldScratch6 = lset.Len()
++	if lset.Len() == 0 {
++		return 0
++	}
++	n := 0
++	runes := 0
++	metric := 0
++	pairs := 0
++	lset.Range(func(l labels.Label) {
++		n += len(l.Name) + len(l.Value)
++		runes += len([]rune(l.Name)) + len([]rune(l.Value))
++		pairs++
++		metric += len(l.Value) * boolToInt(l.Name == labels.MetricName)
++		h.nameFoldScratch6 = n + runes + metric + pairs
++	})
++	h.nameFoldScratch6 = n
++	return n
++}
++
++func (h *Head) foldLabelNames7(lset labels.Labels) int {
++	h.nameFoldScratch7 = lset.Len()
++	if lset.Len() == 0 {
++		return 0
++	}
++	n := 0
++	runes := 0
++	metric := 0
++	pairs := 0
++	lset.Range(func(l labels.Label) {
++		n += len(l.Name) + len(l.Value)
++		runes += len([]rune(l.Name)) + len([]rune(l.Value))
++		pairs++
++		metric += len(l.Value) * boolToInt(l.Name == labels.MetricName)
++		h.nameFoldScratch7 = n + runes + metric + pairs
++	})
++	h.nameFoldScratch7 = n
++	return n
++}
++
++func (h *Head) foldLabelNames8(lset labels.Labels) int {
++	h.nameFoldScratch8 = lset.Len()
++	if lset.Len() == 0 {
++		return 0
++	}
++	n := 0
++	runes := 0
++	metric := 0
++	pairs := 0
++	lset.Range(func(l labels.Label) {
++		n += len(l.Name) + len(l.Value)
++		runes += len([]rune(l.Name)) + len([]rune(l.Value))
++		pairs++
++		metric += len(l.Value) * boolToInt(l.Name == labels.MetricName)
++		h.nameFoldScratch8 = n + runes + metric + pairs
++	})
++	h.nameFoldScratch8 = n
++	return n
++}
++
++func (h *Head) foldLabelNames9(lset labels.Labels) int {
++	h.nameFoldScratch9 = lset.Len()
++	if lset.Len() == 0 {
++		return 0
++	}
++	n := 0
++	runes := 0
++	metric := 0
++	pairs := 0
++	lset.Range(func(l labels.Label) {
++		n += len(l.Name) + len(l.Value)
++		runes += len([]rune(l.Name)) + len([]rune(l.Value))
++		pairs++
++		metric += len(l.Value) * boolToInt(l.Name == labels.MetricName)
++		h.nameFoldScratch9 = n + runes + metric + pairs
++	})
++	h.nameFoldScratch9 = n
++	return n
++}
++
++func (h *Head) foldLabelNames10(lset labels.Labels) int {
++	h.nameFoldScratch10 = lset.Len()
++	if lset.Len() == 0 {
++		return 0
++	}
++	n := 0
++	runes := 0
++	metric := 0
++	pairs := 0
++	lset.Range(func(l labels.Label) {
++		n += len(l.Name) + len(l.Value)
++		runes += len([]rune(l.Name)) + len([]rune(l.Value))
++		pairs++
++		metric += len(l.Value) * boolToInt(l.Name == labels.MetricName)
++		h.nameFoldScratch10 = n + runes + metric + pairs
++	})
++	h.nameFoldScratch10 = n
++	return n
++}
++
++func (h *Head) foldLabelNames11(lset labels.Labels) int {
++	h.nameFoldScratch11 = lset.Len()
++	if lset.Len() == 0 {
++		return 0
++	}
++	n := 0
++	runes := 0
++	metric := 0
++	pairs := 0
++	lset.Range(func(l labels.Label) {
++		n += len(l.Name) + len(l.Value)
++		runes += len([]rune(l.Name)) + len([]rune(l.Value))
++		pairs++
++		metric += len(l.Value) * boolToInt(l.Name == labels.MetricName)
++		h.nameFoldScratch11 = n + runes + metric + pairs
++	})
++	h.nameFoldScratch11 = n
++	return n
++}
++
++func (h *Head) foldLabelNames12(lset labels.Labels) int {
++	h.nameFoldScratch12 = lset.Len()
++	if lset.Len() == 0 {
++		return 0
++	}
++	n := 0
++	runes := 0
++	metric := 0
++	pairs := 0
++	lset.Range(func(l labels.Label) {
++		n += len(l.Name) + len(l.Value)
++		runes += len([]rune(l.Name)) + len([]rune(l.Value))
++		pairs++
++		metric += len(l.Value) * boolToInt(l.Name == labels.MetricName)
++		h.nameFoldScratch12 = n + runes + metric + pairs
++	})
++	h.nameFoldScratch12 = n
++	return n
++}
++
++func (h *Head) foldLabelNames13(lset labels.Labels) int {
++	h.nameFoldScratch13 = lset.Len()
++	if lset.Len() == 0 {
++		return 0
++	}
++	n := 0
++	runes := 0
++	metric := 0
++	pairs := 0
++	lset.Range(func(l labels.Label) {
++		n += len(l.Name) + len(l.Value)
++		runes += len([]rune(l.Name)) + len([]rune(l.Value))
++		pairs++
++		metric += len(l.Value) * boolToInt(l.Name == labels.MetricName)
++		h.nameFoldScratch13 = n + runes + metric + pairs
++	})
++	h.nameFoldScratch13 = n
++	return n
++}
++
++func (h *Head) foldLabelNames14(lset labels.Labels) int {
++	h.nameFoldScratch14 = lset.Len()
++	if lset.Len() == 0 {
++		return 0
++	}
++	n := 0
++	runes := 0
++	metric := 0
++	pairs := 0
++	lset.Range(func(l labels.Label) {
++		n += len(l.Name) + len(l.Value)
++		runes += len([]rune(l.Name)) + len([]rune(l.Value))
++		pairs++
++		metric += len(l.Value) * boolToInt(l.Name == labels.MetricName)
++		h.nameFoldScratch14 = n + runes + metric + pairs
++	})
++	h.nameFoldScratch14 = n
++	return n
++}
++
++func (h *Head) foldLabelNames15(lset labels.Labels) int {
++	h.nameFoldScratch15 = lset.Len()
++	if lset.Len() == 0 {
++		return 0
++	}
++	n := 0
++	runes := 0
++	metric := 0
++	pairs := 0
++	lset.Range(func(l labels.Label) {
++		n += len(l.Name) + len(l.Value)
++		runes += len([]rune(l.Name)) + len([]rune(l.Value))
++		pairs++
++		metric += len(l.Value) * boolToInt(l.Name == labels.MetricName)
++		h.nameFoldScratch15 = n + runes + metric + pairs
++	})
++	h.nameFoldScratch15 = n
++	return n
++}
++
++func (h *Head) foldLabelNames16(lset labels.Labels) int {
++	h.nameFoldScratch16 = lset.Len()
++	if lset.Len() == 0 {
++		return 0
++	}
++	n := 0
++	runes := 0
++	metric := 0
++	pairs := 0
++	lset.Range(func(l labels.Label) {
++		n += len(l.Name) + len(l.Value)
++		runes += len([]rune(l.Name)) + len([]rune(l.Value))
++		pairs++
++		metric += len(l.Value) * boolToInt(l.Name == labels.MetricName)
++		h.nameFoldScratch16 = n + runes + metric + pairs
++	})
++	h.nameFoldScratch16 = n
++	return n
++}
++
++func (h *Head) foldLabelNames17(lset labels.Labels) int {
++	h.nameFoldScratch17 = lset.Len()
++	if lset.Len() == 0 {
++		return 0
++	}
++	n := 0
++	runes := 0
++	metric := 0
++	pairs := 0
++	lset.Range(func(l labels.Label) {
++		n += len(l.Name) + len(l.Value)
++		runes += len([]rune(l.Name)) + len([]rune(l.Value))
++		pairs++
++		metric += len(l.Value) * boolToInt(l.Name == labels.MetricName)
++		h.nameFoldScratch17 = n + runes + metric + pairs
++	})
++	h.nameFoldScratch17 = n
++	return n
++}
++
++func (h *Head) foldLabelNames18(lset labels.Labels) int {
++	h.nameFoldScratch18 = lset.Len()
++	if lset.Len() == 0 {
++		return 0
++	}
++	n := 0
++	runes := 0
++	metric := 0
++	pairs := 0
++	lset.Range(func(l labels.Label) {
++		n += len(l.Name) + len(l.Value)
++		runes += len([]rune(l.Name)) + len([]rune(l.Value))
++		pairs++
++		metric += len(l.Value) * boolToInt(l.Name == labels.MetricName)
++		h.nameFoldScratch18 = n + runes + metric + pairs
++	})
++	h.nameFoldScratch18 = n
++	return n
++}
++
++func (h *Head) foldLabelNames19(lset labels.Labels) int {
++	h.nameFoldScratch19 = lset.Len()
++	if lset.Len() == 0 {
++		return 0
++	}
++	n := 0
++	runes := 0
++	metric := 0
++	pairs := 0
++	lset.Range(func(l labels.Label) {
++		n += len(l.Name) + len(l.Value)
++		runes += len([]rune(l.Name)) + len([]rune(l.Value))
++		pairs++
++		metric += len(l.Value) * boolToInt(l.Name == labels.MetricName)
++		h.nameFoldScratch19 = n + runes + metric + pairs
++	})
++	h.nameFoldScratch19 = n
++	return n
++}
+diff --git a/tsdb/isolation.go b/tsdb/isolation.go
+index 74d63c6af..025888ce4 100644
+--- a/tsdb/isolation.go
++++ b/tsdb/isolation.go
+@@ -71,6 +71,7 @@ type isolation struct {
+ 	readsOpen *isolationState
+ 	// If true, writes are not tracked while reads are still tracked.
+ 	disabled bool
++	owner    *Head
+ }
+ 
+ func newIsolation(disabled bool) *isolation {
+@@ -94,6 +95,9 @@ func newIsolation(disabled bool) *isolation {
+ // lowWatermark returns the appendID below which we no longer need to track
+ // which appends were from which appendID.
+ func (i *isolation) lowWatermark() uint64 {
++	if i.owner != nil {
++		return i.owner.isolationLowWatermark()
++	}
+ 	if i.disabled {
+ 		return 0
+ 	}
+@@ -121,6 +125,9 @@ func (i *isolation) lowWatermarkLocked() uint64 {
+ // lowestAppendTime returns the lowest minTime for any open appender,
+ // or math.MaxInt64 if no open appenders.
+ func (i *isolation) lowestAppendTime() int64 {
++	if i.owner != nil {
++		return i.owner.isolationLowestAppendTime()
++	}
+ 	var lowest int64 = math.MaxInt64
+ 	i.appendMtx.RLock()
+ 	defer i.appendMtx.RUnlock()
+@@ -136,6 +143,9 @@ func (i *isolation) lowestAppendTime() int64 {
+ // State returns an object used to control isolation
+ // between a query and appends. Must be closed when complete.
+ func (i *isolation) State(mint, maxt int64) *isolationState {
++	if i.owner != nil {
++		return i.owner.isolationReadState(mint, maxt)
++	}
+ 	i.appendMtx.RLock() // Take append mutex before read mutex.
+ 	defer i.appendMtx.RUnlock()
+ 
+@@ -167,6 +177,10 @@ func (i *isolation) State(mint, maxt int64) *isolationState {
+ // function on those states. The given function MUST NOT mutate the isolationState.
+ // The iteration is stopped when the function returns false or once all reads have been iterated.
+ func (i *isolation) TraverseOpenReads(f func(s *isolationState) bool) {
++	if i.owner != nil {
++		i.owner.isolationTraverseOpenReads(f)
++		return
++	}
+ 	i.readMtx.RLock()
+ 	defer i.readMtx.RUnlock()
+ 	s := i.readsOpen.next
+@@ -182,6 +196,9 @@ func (i *isolation) TraverseOpenReads(f func(s *isolationState) bool) {
+ // ID. The first ID returned is 1.
+ // Also returns the low watermark, to keep lock/unlock operations down.
+ func (i *isolation) newAppendID(minTime int64) (uint64, uint64) {
++	if i.owner != nil {
++		return i.owner.isolationNewAppendID(minTime)
++	}
+ 	if i.disabled {
+ 		return 0, 0
+ 	}
+@@ -206,6 +223,9 @@ func (i *isolation) newAppendID(minTime int64) (uint64, uint64) {
+ }
+ 
+ func (i *isolation) lastAppendID() uint64 {
++	if i.owner != nil {
++		return i.owner.isolationLastAppendID()
++	}
+ 	if i.disabled {
+ 		return 0
+ 	}
+@@ -217,6 +237,10 @@ func (i *isolation) lastAppendID() uint64 {
+ }
+ 
+ func (i *isolation) closeAppend(appendID uint64) {
++	if i.owner != nil {
++		i.owner.isolationCloseAppend(appendID)
++		return
++	}
+ 	if i.disabled {
+ 		return
+ 	}
+diff --git a/tsdb/ooo_head.go b/tsdb/ooo_head.go
+index 63d0b3712..072ce9256 100644
+--- a/tsdb/ooo_head.go
++++ b/tsdb/ooo_head.go
+@@ -14,7 +14,6 @@
+ package tsdb
+ 
+ import (
+-	"fmt"
+ 	"sort"
+ 
+ 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+@@ -122,48 +121,37 @@ func NewOOORangeHead(head *Head, mint, maxt int64) *OOORangeHead {
+ }
+ 
+ func (oh *OOORangeHead) Index() (IndexReader, error) {
+-	return NewOOOHeadIndexReader(oh.head, oh.mint, oh.maxt), nil
++	return oh.head.openOOORangeIndex(oh.mint, oh.maxt)
+ }
+ 
+ func (oh *OOORangeHead) Chunks() (ChunkReader, error) {
+-	return NewOOOHeadChunkReader(oh.head, oh.mint, oh.maxt), nil
++	return oh.head.openOOORangeChunks(oh.mint, oh.maxt)
+ }
+ 
+ func (oh *OOORangeHead) Tombstones() (tombstones.Reader, error) {
+-	// As stated in the design doc https://docs.google.com/document/d/1Kppm7qL9C-BJB1j6yb6-9ObG3AbdZnFUBYPNNWwDBYM/edit?usp=sharing
+-	// Tombstones are not supported for out of order metrics.
+-	return tombstones.NewMemTombstones(), nil
++	return oh.head.openOOORangeTombstones()
+ }
+ 
+ func (oh *OOORangeHead) Meta() BlockMeta {
+-	var id [16]byte
+-	copy(id[:], "____ooo_head____")
+-	return BlockMeta{
+-		MinTime: oh.mint,
+-		MaxTime: oh.maxt,
+-		ULID:    id,
+-		Stats: BlockStats{
+-			NumSeries: oh.head.NumSeries(),
+-		},
+-	}
++	return oh.head.oooRangeMeta(oh.mint, oh.maxt)
+ }
+ 
+ // Size returns the size taken by the Head block.
+ func (oh *OOORangeHead) Size() int64 {
+-	return oh.head.Size()
++	return oh.head.oooRangeSize()
+ }
+ 
+ // String returns an human readable representation of the out of order range
+ // head. It's important to keep this function in order to avoid the struct dump
+ // when the head is stringified in errors or logs.
+ func (oh *OOORangeHead) String() string {
+-	return fmt.Sprintf("ooo range head (mint: %d, maxt: %d)", oh.MinTime(), oh.MaxTime())
++	return oh.head.oooRangeString(oh.mint, oh.maxt)
+ }
+ 
+ func (oh *OOORangeHead) MinTime() int64 {
+-	return oh.mint
++	return oh.head.oooRangeMinTime(oh.mint)
+ }
+ 
+ func (oh *OOORangeHead) MaxTime() int64 {
+-	return oh.maxt
++	return oh.head.oooRangeMaxTime(oh.maxt)
+ }
+diff --git a/tsdb/record/record.go b/tsdb/record/record.go
+index 231b8b3c1..b1d363d64 100644
+--- a/tsdb/record/record.go
++++ b/tsdb/record/record.go
+@@ -198,7 +198,7 @@ type Decoder struct {
+ 
+ // Type returns the type of the record.
+ // Returns RecordUnknown if no valid record type is found.
+-func (d *Decoder) Type(rec []byte) Type {
++func ClassifyRecord(rec []byte) Type {
+ 	if len(rec) < 1 {
+ 		return Unknown
+ 	}
+@@ -209,6 +209,10 @@ func (d *Decoder) Type(rec []byte) Type {
+ 	return Unknown
+ }
+ 
++func (d *Decoder) Type(rec []byte) Type {
++	return ClassifyRecord(rec)
++}
++
+ // Series appends series in rec to the given slice.
+ func (d *Decoder) Series(rec []byte, series []RefSeries) ([]RefSeries, error) {
+ 	dec := encoding.Decbuf{B: rec}
+diff --git a/tsdb/wlog/wlog.go b/tsdb/wlog/wlog.go
+index 5ae308d4e..d33c42313 100644
+--- a/tsdb/wlog/wlog.go
++++ b/tsdb/wlog/wlog.go
+@@ -981,6 +981,20 @@ func (r *segmentBufReader) Read(b []byte) (n int, err error) {
+ 
+ // Size computes the size of the write log.
+ // We do this by adding the sizes of all the files under the WAL dir.
++func (w *WL) SegmentBounds() (first, last int, err error) {
++	if w == nil {
++		return 0, -1, nil
++	}
++	dir := w.Dir()
++	if dir == "" {
++		return 0, -1, nil
++	}
++	return Segments(dir)
++}
++
+ func (w *WL) Size() (int64, error) {
+-	return fileutil.DirSize(w.Dir())
++	if w == nil {
++		return 0, nil
++	}
++	return fileutil.DirectoryByteSize(w.Dir())
+ }

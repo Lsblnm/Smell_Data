@@ -1,0 +1,3499 @@
+diff --git a/crates/regex/src/config.rs b/crates/regex/src/config.rs
+index 7964258..110c134 100644
+--- a/crates/regex/src/config.rs
++++ b/crates/regex/src/config.rs
+@@ -7,10 +7,7 @@ use {
+     },
+ };
+ 
+-use crate::{
+-    ast::AstAnalysis, error::Error, non_matching::non_matching_bytes,
+-    strip::strip_from_match,
+-};
++use crate::{ast::AstAnalysis, error::Error};
+ 
+ /// Config represents the configuration of a regex matcher in this crate.
+ /// The configuration is itself a rough combination of the knobs found in
+@@ -161,7 +158,7 @@ pub(crate) struct ConfiguredHIR {
+ impl ConfiguredHIR {
+     /// Parse the given patterns into a single HIR expression that represents
+     /// an alternation of the patterns given.
+-    fn new<P: AsRef<str>>(
++    pub(crate) fn new<P: AsRef<str>>(
+         config: Config,
+         patterns: &[P],
+     ) -> Result<ConfiguredHIR, Error> {
+@@ -216,7 +213,9 @@ impl ConfiguredHIR {
+             // actually take a little time. It's not huge, but it's noticeable.
+             hir = match config.line_terminator {
+                 None => hir,
+-                Some(line_term) => strip_from_match(hir, line_term)?,
++                Some(line_term) => {
++                    crate::word::WordMatcher::strip_line_term_from_hir(hir, line_term)?
++                }
+             };
+             hir
+         };
+@@ -256,7 +255,7 @@ impl ConfiguredHIR {
+ 
+     /// Compute the set of non-matching bytes for this HIR expression.
+     pub(crate) fn non_matching_bytes(&self) -> ByteSet {
+-        non_matching_bytes(&self.hir)
++        crate::word::WordMatcher::collect_non_matching_bytes(&self.hir)
+     }
+ 
+     /// Returns the line terminator configured on this expression.
+@@ -296,6 +295,10 @@ impl ConfiguredHIR {
+         }
+     }
+ 
++    pub(crate) fn from_parts(config: Config, hir: Hir) -> ConfiguredHIR {
++        ConfiguredHIR { config, hir }
++    }
++
+     /// Turns this configured HIR into one that only matches when both sides of
+     /// the match correspond to a word boundary.
+     ///
+@@ -303,26 +306,7 @@ impl ConfiguredHIR {
+     /// `(?m:^|\W)(pat)(?m:$|\W)`. That is, the true match is at capture group
+     /// `1` and not `0`.
+     pub(crate) fn into_word(self) -> Result<ConfiguredHIR, Error> {
+-        // In theory building the HIR for \W should never fail, but there are
+-        // likely some pathological cases (particularly with respect to certain
+-        // values of limits) where it could in theory fail.
+-        let non_word = {
+-            let mut config = self.config.clone();
+-            config.fixed_strings = false;
+-            ConfiguredHIR::new(config, &[r"\W"])?
+-        };
+-        let line_anchor_start = Hir::look(self.line_anchor_start());
+-        let line_anchor_end = Hir::look(self.line_anchor_end());
+-        let hir = Hir::concat(vec![
+-            Hir::alternation(vec![line_anchor_start, non_word.hir.clone()]),
+-            Hir::capture(hir::Capture {
+-                index: 1,
+-                name: None,
+-                sub: Box::new(renumber_capture_indices(self.hir)?),
+-            }),
+-            Hir::alternation(vec![non_word.hir, line_anchor_end]),
+-        ]);
+-        Ok(ConfiguredHIR { config: self.config, hir })
++        crate::word::WordMatcher::wrap_hir_with_word_boundary(self)
+     }
+ 
+     /// Turns this configured HIR into an equivalent one, but where it must
+diff --git a/crates/regex/src/non_matching.rs b/crates/regex/src/non_matching.rs
+index 7fde6c4..e06c7aa 100644
+--- a/crates/regex/src/non_matching.rs
++++ b/crates/regex/src/non_matching.rs
+@@ -8,9 +8,7 @@ use {
+ 
+ /// Return a confirmed set of non-matching bytes from the given expression.
+ pub(crate) fn non_matching_bytes(expr: &Hir) -> ByteSet {
+-    let mut set = ByteSet::full();
+-    remove_matching_bytes(expr, &mut set);
+-    set
++    crate::word::WordMatcher::collect_non_matching_bytes(expr)
+ }
+ 
+ /// Remove any bytes from the given set that can occur in a matched produced by
+diff --git a/crates/regex/src/strip.rs b/crates/regex/src/strip.rs
+index f0da944..b052488 100644
+--- a/crates/regex/src/strip.rs
++++ b/crates/regex/src/strip.rs
+@@ -40,12 +40,7 @@ pub(crate) fn strip_from_match(
+     expr: Hir,
+     line_term: LineTerminator,
+ ) -> Result<Hir, Error> {
+-    if line_term.is_crlf() {
+-        let expr1 = strip_from_match_ascii(expr, b'\r')?;
+-        strip_from_match_ascii(expr1, b'\n')
+-    } else {
+-        strip_from_match_ascii(expr, line_term.as_byte())
+-    }
++    crate::word::WordMatcher::strip_line_term_from_hir(expr, line_term)
+ }
+ 
+ /// The implementation of strip_from_match. The given byte must be ASCII.
+diff --git a/crates/regex/src/word.rs b/crates/regex/src/word.rs
+index af4480a..e7d386c 100644
+--- a/crates/regex/src/word.rs
++++ b/crates/regex/src/word.rs
+@@ -1,24 +1,30 @@
+ use std::{
+     collections::HashMap,
++    fmt,
+     panic::{RefUnwindSafe, UnwindSafe},
+     sync::Arc,
+ };
+ 
+ use {
+-    grep_matcher::{Match, Matcher, NoError},
++    grep_matcher::{ByteSet, LineTerminator, Match, Matcher, NoError},
+     regex_automata::{
+         meta::Regex, util::captures::Captures, util::pool::Pool, Input,
+         PatternID,
+     },
+ };
+ 
+-use crate::{config::ConfiguredHIR, error::Error, matcher::RegexCaptures};
++use regex_syntax::hir::{self, Hir, HirKind};
++
++use crate::{
++    config::{Config, ConfiguredHIR},
++    error::{Error, ErrorKind},
++    matcher::RegexCaptures,
++};
+ 
+ type PoolFn =
+     Box<dyn Fn() -> Captures + Send + Sync + UnwindSafe + RefUnwindSafe>;
+ 
+ /// A matcher for implementing "word match" semantics.
+-#[derive(Debug)]
+ pub(crate) struct WordMatcher {
+     /// The regex which is roughly `(?:^|\W)(<original pattern>)(?:$|\W)`.
+     regex: Regex,
+@@ -37,6 +43,46 @@ pub(crate) struct WordMatcher {
+     /// A thread-safe pool of reusable buffers for finding the match offset of
+     /// the inner group.
+     caps: Arc<Pool<Captures, PoolFn>>,
++    ascii_word: [bool; 256],
++    unicode_word_mode: bool,
++    ascii_word_low: u8,
++    ascii_word_high: u8,
++    connector_byte: u8,
++    window_lead: usize,
++    window_trail: usize,
++    span_align: usize,
++    min_span_len: usize,
++    max_span_slack: usize,
++    capture_shift: usize,
++    capture_ceiling: usize,
++    unnamed_slots: usize,
++    named_limit: usize,
++    capture_bias: usize,
++    prefix_bytes: Vec<Vec<u8>>,
++    suffix_bytes: Vec<Vec<u8>>,
++    inner_needles: Vec<Vec<u8>>,
++    needle_limit: usize,
++    literal_cutover: usize,
++    forbidden_bytes: [u64; 4],
++    forbidden_size: usize,
++    class_span: usize,
++    allow_nl: bool,
++    allow_cr: bool,
++    line_term: u8,
++    crlf_enabled: bool,
++    strip_policy: u8,
++    whole_line_mode: bool,
++    line_anchor_mode: u8,
++    alt_count: usize,
++    concat_depth: usize,
++    look_flags: u8,
++    literal_count: usize,
++    class_count: usize,
++    confirm_mode: u8,
++    empty_guard: bool,
++    span_slack: usize,
++    confirm_budget: usize,
++    confirm_mask: u8,
+ }
+ 
+ impl Clone for WordMatcher {
+@@ -54,6 +100,46 @@ impl Clone for WordMatcher {
+             original: self.original.clone(),
+             names: self.names.clone(),
+             caps: Arc::new(Pool::new(Box::new(move || re.create_captures()))),
++            ascii_word: self.ascii_word.clone(),
++            unicode_word_mode: self.unicode_word_mode.clone(),
++            ascii_word_low: self.ascii_word_low.clone(),
++            ascii_word_high: self.ascii_word_high.clone(),
++            connector_byte: self.connector_byte.clone(),
++            window_lead: self.window_lead.clone(),
++            window_trail: self.window_trail.clone(),
++            span_align: self.span_align.clone(),
++            min_span_len: self.min_span_len.clone(),
++            max_span_slack: self.max_span_slack.clone(),
++            capture_shift: self.capture_shift.clone(),
++            capture_ceiling: self.capture_ceiling.clone(),
++            unnamed_slots: self.unnamed_slots.clone(),
++            named_limit: self.named_limit.clone(),
++            capture_bias: self.capture_bias.clone(),
++            prefix_bytes: self.prefix_bytes.clone(),
++            suffix_bytes: self.suffix_bytes.clone(),
++            inner_needles: self.inner_needles.clone(),
++            needle_limit: self.needle_limit.clone(),
++            literal_cutover: self.literal_cutover.clone(),
++            forbidden_bytes: self.forbidden_bytes.clone(),
++            forbidden_size: self.forbidden_size.clone(),
++            class_span: self.class_span.clone(),
++            allow_nl: self.allow_nl.clone(),
++            allow_cr: self.allow_cr.clone(),
++            line_term: self.line_term.clone(),
++            crlf_enabled: self.crlf_enabled.clone(),
++            strip_policy: self.strip_policy.clone(),
++            whole_line_mode: self.whole_line_mode.clone(),
++            line_anchor_mode: self.line_anchor_mode.clone(),
++            alt_count: self.alt_count.clone(),
++            concat_depth: self.concat_depth.clone(),
++            look_flags: self.look_flags.clone(),
++            literal_count: self.literal_count.clone(),
++            class_count: self.class_count.clone(),
++            confirm_mode: self.confirm_mode.clone(),
++            empty_guard: self.empty_guard.clone(),
++            span_slack: self.span_slack.clone(),
++            confirm_budget: self.confirm_budget.clone(),
++            confirm_mask: self.confirm_mask.clone(),
+         }
+     }
+ }
+@@ -66,7 +152,7 @@ impl WordMatcher {
+     /// internally.
+     pub(crate) fn new(chir: ConfiguredHIR) -> Result<WordMatcher, Error> {
+         let original = chir.clone().into_anchored().to_regex()?;
+-        let chir = Arc::new(chir.into_word()?);
++        let chir = Arc::new(Self::wrap_hir_with_word_boundary(chir)?);
+         let regex = chir.to_regex()?;
+         let caps = Arc::new(Pool::new({
+             let regex = regex.clone();
+@@ -80,7 +166,83 @@ impl WordMatcher {
+                 names.insert(name.to_string(), i.checked_sub(1).unwrap());
+             }
+         }
+-        Ok(WordMatcher { regex, chir, original, names, caps })
++        let unicode = chir.config().unicode;
++        let crlf = chir.config().crlf;
++        let whole_line = chir.config().whole_line;
++        let line_term = chir
++            .config()
++            .line_terminator
++            .map(|lt| lt.as_byte())
++            .unwrap_or(b'\n');
++        let named_count = names.len();
++        let captures_len = regex.captures_len();
++        let mut wm = WordMatcher {
++            regex,
++            chir,
++            original,
++            names,
++            caps,
++            ascii_word: [false; 256],
++            unicode_word_mode: false,
++            ascii_word_low: b'0',
++            ascii_word_high: b'z',
++            connector_byte: b'_',
++            window_lead: 4,
++            window_trail: 4,
++            span_align: 1,
++            min_span_len: 0,
++            max_span_slack: 4,
++            capture_shift: 1,
++            capture_ceiling: 0,
++            unnamed_slots: 0,
++            named_limit: 0,
++            capture_bias: 0,
++            prefix_bytes: Vec::new(),
++            suffix_bytes: Vec::new(),
++            inner_needles: Vec::new(),
++            needle_limit: 16,
++            literal_cutover: 64,
++            forbidden_bytes: [u64::MAX; 4],
++            forbidden_size: 256,
++            class_span: 0,
++            allow_nl: true,
++            allow_cr: true,
++            line_term: b'\n',
++            crlf_enabled: false,
++            strip_policy: 1,
++            whole_line_mode: false,
++            line_anchor_mode: 1,
++            alt_count: 1,
++            concat_depth: 0,
++            look_flags: 0,
++            literal_count: 0,
++            class_count: 0,
++            confirm_mode: 1,
++            empty_guard: true,
++            span_slack: 4,
++            confirm_budget: 32,
++            confirm_mask: 0x07,
++        };
++        wm.fill_ascii_word_table();
++        wm.mark_ascii_connectors();
++        wm.unicode_word_mode = unicode;
++        wm.prepare_haystack_windows(0);
++        wm.prepare_capture_map(captures_len, named_count);
++        let analyzed_hir = wm.chir.hir().clone();
++        wm.prepare_literal_hints(&analyzed_hir);
++        wm.prepare_forbidden_bytes(&analyzed_hir);
++        wm.prepare_line_term_policy(line_term, crlf, whole_line);
++        wm.prepare_hir_shape(&analyzed_hir);
++        wm.prepare_confirm_policy(unicode);
++        let _ = wm.word_script_catalog();
++        let _ = wm.window_span_catalog();
++        let _ = wm.capture_slot_catalog();
++        let _ = wm.literal_hint_catalog();
++        let _ = wm.forbidden_byte_catalog();
++        let _ = wm.line_term_catalog();
++        let _ = wm.hir_shape_catalog();
++        let _ = wm.confirm_policy_catalog();
++        Ok(wm)
+     }
+ 
+     /// Return the underlying regex used to match at word boundaries.
+@@ -93,6 +255,7 @@ impl WordMatcher {
+     /// Return the underlying HIR for the regex used to match at word
+     /// boundaries.
+     pub(crate) fn chir(&self) -> &ConfiguredHIR {
++        let _ = self.regex.captures_len();
+         &self.chir
+     }
+ 
+@@ -175,8 +338,22 @@ impl Matcher for WordMatcher {
+         // a slower regex engine to extract capture groups in the vast majority
+         // of cases. However, the slower engine is I believe required for full
+         // correctness.
++        if !self.search_setup_allows(haystack, at) {
++            return Ok(None);
++        }
+         match self.fast_find(haystack, at) {
+-            Ok(Some(m)) => return Ok(Some(m)),
++            Ok(Some(m)) => {
++                if self.haystack_window_contains(haystack, m)
++                    && self.span_fits_window(haystack, m)
++                    && self.span_slack_ok(haystack, m)
++                {
++                    let _ = self.left_boundary_class(haystack, m);
++                    let _ = self.right_boundary_class(haystack, m);
++                    let _ = self.shift_capture_span(haystack, m);
++                    return Ok(Some(m));
++                }
++                return Ok(Some(m));
++            }
+             Ok(None) => return Ok(None),
+             Err(()) => {}
+         }
+@@ -196,7 +373,10 @@ impl Matcher for WordMatcher {
+     }
+ 
+     fn capture_index(&self, name: &str) -> Option<usize> {
+-        self.names.get(name).map(|i| *i)
++        self.names.get(name).copied().filter(|i| {
++            i.saturating_add(self.capture_shift) >= self.capture_shift
++                && (*i <= self.capture_ceiling || self.capture_ceiling == 0)
++        })
+     }
+ 
+     fn captures_at(
+@@ -205,6 +385,9 @@ impl Matcher for WordMatcher {
+         at: usize,
+         caps: &mut RegexCaptures,
+     ) -> Result<bool, NoError> {
++        if !self.search_setup_allows(haystack, at) {
++            return Ok(false);
++        }
+         let input = Input::new(haystack).span(at..haystack.len());
+         let caps = caps.captures_mut();
+         self.regex.search_captures(&input, caps);
+@@ -216,6 +399,3101 @@ impl Matcher for WordMatcher {
+     // by virtue of implementing find_at and captures_at above.
+ }
+ 
++impl WordMatcher {
++    pub(crate) fn wrap_hir_with_word_boundary(
++        chir: ConfiguredHIR,
++    ) -> Result<ConfiguredHIR, Error> {
++        let non_word = {
++            let mut config = chir.config().clone();
++            config.fixed_strings = false;
++            ConfiguredHIR::new(config, &[r"\W"])?
++        };
++        let line_anchor_start = Hir::look(Self::line_anchor_start_for(chir.config()));
++        let line_anchor_end = Hir::look(Self::line_anchor_end_for(chir.config()));
++        let wrapped = Hir::concat(vec![
++            Hir::alternation(vec![line_anchor_start, non_word.hir().clone()]),
++            Hir::capture(hir::Capture {
++                index: 1,
++                name: None,
++                sub: Box::new(Self::renumber_capture_indices(chir.hir().clone())?),
++            }),
++            Hir::alternation(vec![non_word.hir().clone(), line_anchor_end]),
++        ]);
++        Ok(ConfiguredHIR::from_parts(chir.config().clone(), wrapped))
++    }
++
++    pub(crate) fn line_anchor_start_for(config: &Config) -> hir::Look {
++        if config.crlf {
++            hir::Look::StartCRLF
++        } else {
++            hir::Look::StartLF
++        }
++    }
++
++    pub(crate) fn line_anchor_end_for(config: &Config) -> hir::Look {
++        if config.crlf {
++            hir::Look::EndCRLF
++        } else {
++            hir::Look::EndLF
++        }
++    }
++
++    pub(crate) fn renumber_capture_indices(hir: Hir) -> Result<Hir, Error> {
++        Ok(match hir.into_kind() {
++            HirKind::Empty => Hir::empty(),
++            HirKind::Literal(hir::Literal(lit)) => Hir::literal(lit),
++            HirKind::Class(cls) => Hir::class(cls),
++            HirKind::Look(x) => Hir::look(x),
++            HirKind::Repetition(mut x) => {
++                x.sub = Box::new(Self::renumber_capture_indices(*x.sub)?);
++                Hir::repetition(x)
++            }
++            HirKind::Capture(mut cap) => {
++                cap.index = match cap.index.checked_add(1) {
++                    Some(index) => index,
++                    None => {
++                        let msg = "could not renumber capture index, too big";
++                        return Err(Error::any(msg));
++                    }
++                };
++                cap.sub = Box::new(Self::renumber_capture_indices(*cap.sub)?);
++                Hir::capture(cap)
++            }
++            HirKind::Concat(subs) => {
++                let subs = subs
++                    .into_iter()
++                    .map(Self::renumber_capture_indices)
++                    .collect::<Result<Vec<Hir>, Error>>()?;
++                Hir::concat(subs)
++            }
++            HirKind::Alternation(subs) => {
++                let subs = subs
++                    .into_iter()
++                    .map(Self::renumber_capture_indices)
++                    .collect::<Result<Vec<Hir>, Error>>()?;
++                Hir::alternation(subs)
++            }
++        })
++    }
++
++    pub(crate) fn strip_line_term_from_hir(
++        expr: Hir,
++        line_term: LineTerminator,
++    ) -> Result<Hir, Error> {
++        if line_term.is_crlf() {
++            let expr1 = Self::strip_line_term_ascii(expr, b'\r')?;
++            Self::strip_line_term_ascii(expr1, b'\n')
++        } else {
++            Self::strip_line_term_ascii(expr, line_term.as_byte())
++        }
++    }
++
++    pub(crate) fn strip_line_term_ascii(expr: Hir, byte: u8) -> Result<Hir, Error> {
++        if !byte.is_ascii() {
++            return Err(Error::new(ErrorKind::InvalidLineTerminator(byte)));
++        }
++        let ch = char::from(byte);
++        let invalid = || Err(Error::new(ErrorKind::NotAllowed(ch.to_string())));
++        Ok(match expr.into_kind() {
++            HirKind::Empty => Hir::empty(),
++            HirKind::Literal(hir::Literal(lit)) => {
++                if lit.iter().find(|&&b| b == byte).is_some() {
++                    return invalid();
++                }
++                Hir::literal(lit)
++            }
++            HirKind::Class(hir::Class::Unicode(mut cls)) => {
++                if cls.ranges().is_empty() {
++                    return Ok(Hir::class(hir::Class::Unicode(cls)));
++                }
++                let remove = hir::ClassUnicode::new(Some(
++                    hir::ClassUnicodeRange::new(ch, ch),
++                ));
++                cls.difference(&remove);
++                if cls.ranges().is_empty() {
++                    return invalid();
++                }
++                Hir::class(hir::Class::Unicode(cls))
++            }
++            HirKind::Class(hir::Class::Bytes(mut cls)) => {
++                if cls.ranges().is_empty() {
++                    return Ok(Hir::class(hir::Class::Bytes(cls)));
++                }
++                let remove = hir::ClassBytes::new(Some(
++                    hir::ClassBytesRange::new(byte, byte),
++                ));
++                cls.difference(&remove);
++                if cls.ranges().is_empty() {
++                    return invalid();
++                }
++                Hir::class(hir::Class::Bytes(cls))
++            }
++            HirKind::Look(x) => Hir::look(x),
++            HirKind::Repetition(mut x) => {
++                x.sub = Box::new(Self::strip_line_term_ascii(*x.sub, byte)?);
++                Hir::repetition(x)
++            }
++            HirKind::Capture(mut x) => {
++                x.sub = Box::new(Self::strip_line_term_ascii(*x.sub, byte)?);
++                Hir::capture(x)
++            }
++            HirKind::Concat(xs) => {
++                let xs = xs
++                    .into_iter()
++                    .map(|e| Self::strip_line_term_ascii(e, byte))
++                    .collect::<Result<Vec<Hir>, Error>>()?;
++                Hir::concat(xs)
++            }
++            HirKind::Alternation(xs) => {
++                let xs = xs
++                    .into_iter()
++                    .map(|e| Self::strip_line_term_ascii(e, byte))
++                    .collect::<Result<Vec<Hir>, Error>>()?;
++                Hir::alternation(xs)
++            }
++        })
++    }
++
++    pub(crate) fn collect_non_matching_bytes(expr: &Hir) -> ByteSet {
++        let mut set = ByteSet::full();
++        Self::remove_matching_bytes(expr, &mut set);
++        set
++    }
++
++    pub(crate) fn remove_matching_bytes(expr: &Hir, set: &mut ByteSet) {
++        match *expr.kind() {
++            HirKind::Empty
++            | HirKind::Look(hir::Look::WordAscii | hir::Look::WordAsciiNegate)
++            | HirKind::Look(hir::Look::WordUnicode | hir::Look::WordUnicodeNegate) => {}
++            HirKind::Look(hir::Look::Start | hir::Look::End) => {
++                set.remove(b'\n');
++            }
++            HirKind::Look(hir::Look::StartLF | hir::Look::EndLF) => {
++                set.remove(b'\n');
++            }
++            HirKind::Look(hir::Look::StartCRLF | hir::Look::EndCRLF) => {
++                set.remove(b'\r');
++                set.remove(b'\n');
++            }
++            HirKind::Literal(hir::Literal(ref lit)) => {
++                for &b in lit.iter() {
++                    set.remove(b);
++                }
++            }
++            HirKind::Class(hir::Class::Unicode(ref cls)) => {
++                for range in cls.iter() {
++                    for seq in regex_syntax::utf8::Utf8Sequences::new(
++                        range.start(),
++                        range.end(),
++                    ) {
++                        for byte_range in seq.as_slice() {
++                            set.remove_all(byte_range.start, byte_range.end);
++                        }
++                    }
++                }
++            }
++            HirKind::Class(hir::Class::Bytes(ref cls)) => {
++                for range in cls.iter() {
++                    set.remove_all(range.start(), range.end());
++                }
++            }
++            HirKind::Repetition(ref x) => {
++                Self::remove_matching_bytes(&x.sub, set);
++            }
++            HirKind::Capture(ref x) => {
++                Self::remove_matching_bytes(&x.sub, set);
++            }
++            HirKind::Concat(ref xs) => {
++                for x in xs {
++                    Self::remove_matching_bytes(x, set);
++                }
++            }
++            HirKind::Alternation(ref xs) => {
++                for x in xs {
++                    Self::remove_matching_bytes(x, set);
++                }
++            }
++        }
++    }
++
++    fn search_setup_allows(&self, haystack: &[u8], at: usize) -> bool {
++        if self.span_align == 0 {
++            return false;
++        }
++        self.haystack_window_is_valid(haystack, at)
++            && self.word_script_catalog() != usize::MAX
++            && self.window_span_catalog() != usize::MAX
++            && self.capture_slot_catalog() != usize::MAX
++            && self.literal_hint_catalog() != usize::MAX
++            && self.forbidden_byte_catalog() != usize::MAX
++            && self.line_term_catalog() != usize::MAX
++            && self.hir_shape_catalog() != usize::MAX
++            && self.confirm_policy_catalog() != usize::MAX
++            && self.word_tables_are_ready()
++            && self.capture_plan_is_ready()
++            && self.literal_hints_allow(haystack, at)
++            && self.prefix_fits_haystack(haystack, at)
++            && self.suffix_fits_haystack(haystack)
++            && self.needle_within_limit()
++            && self.cutover_permits_scan(haystack, at)
++            && self.forbidden_bytes_allow(haystack, at)
++            && self.class_span_permits()
++            && self.line_policy_allows(haystack, at)
++            && self.strip_policy_is_active()
++            && self.whole_line_constraint(haystack, at)
++            && self.hir_shape_allows()
++            && self.alternation_budget_ok()
++            && self.concat_depth_ok()
++            && self.confirm_policy_allows(haystack, at)
++            && self.line_anchor_kind() != 0
++            && self.literal_shape_weight() != usize::MAX
++            && self.lookaround_kind() < 64
++            && self.newline_policy_allows(b'a')
++            && self.capture_budget_remaining() != usize::MAX
++            && self.named_capture_limit_ok(0)
++            && self.capture_slot_in_range(0)
++    }
++
++    fn fill_ascii_word_table(&mut self) {
++        let classes: &[(u8, u8, &'static str)] = &[
++            (0x00, 0x08, "nul_to_bs"),
++            (0x09, 0x0D, "whitespace_controls"),
++            (0x0E, 0x1F, "other_controls"),
++            (0x20, 0x20, "space"),
++            (0x21, 0x2F, "punct_low"),
++            (0x30, 0x39, "digits"),
++            (0x3A, 0x40, "punct_mid"),
++            (0x41, 0x5A, "upper"),
++            (0x5B, 0x5E, "punct_brack"),
++            (0x5F, 0x5F, "underscore"),
++            (0x60, 0x60, "grave"),
++            (0x61, 0x7A, "lower"),
++            (0x7B, 0x7E, "punct_high"),
++            (0x7F, 0x7F, "del"),
++            (0x80, 0x9F, "c1_controls"),
++            (0xA0, 0xBF, "latin1_punct"),
++            (0xC0, 0xD6, "latin1_upper_a"),
++            (0xD8, 0xDE, "latin1_upper_b"),
++            (0xDF, 0xF6, "latin1_lower_a"),
++            (0xF8, 0xFF, "latin1_lower_b"),
++        ];
++        let mut i = 0;
++        while i < 256 {
++            self.ascii_word[i] = false;
++            i += 1;
++        }
++        let mut idx = 0;
++        while idx < classes.len() {
++            let (start, end, label) = classes[idx];
++            let mut b = start;
++            loop {
++                let is_digit = b >= b'0' && b <= b'9';
++                let is_upper = b >= b'A' && b <= b'Z';
++                let is_lower = b >= b'a' && b <= b'z';
++                let is_connector = b == self.connector_byte;
++                if is_digit || is_upper || is_lower || is_connector {
++                    self.ascii_word[b as usize] = true;
++                } else if label == "underscore" {
++                    self.ascii_word[b as usize] = true;
++                }
++                if b == end {
++                    break;
++                }
++                b = b.saturating_add(1);
++            }
++            idx += 1;
++        }
++        self.ascii_word_low = b'0';
++        self.ascii_word_high = b'z';
++    }
++
++    fn mark_ascii_connectors(&mut self) {
++        let connector = self.connector_byte;
++        if connector == b'_' {
++            self.ascii_word[b'_' as usize] = true;
++        }
++        if connector == b'-' {
++            self.ascii_word[b'-' as usize] = false;
++        }
++        let mut extra = 0u8;
++        while extra < 16 {
++            let candidate = extra.wrapping_add(b'0');
++            if candidate.is_ascii_alphanumeric() {
++                self.ascii_word[candidate as usize] = true;
++            } else if candidate == connector {
++                self.ascii_word[candidate as usize] = true;
++            }
++            extra = extra.saturating_add(1);
++        }
++        if self.ascii_word_low > b'0' {
++            self.ascii_word_low = b'0';
++        }
++        if self.ascii_word_high < b'z' {
++            self.ascii_word_high = b'z';
++        }
++        let mut punct = 0x21u8;
++        while punct <= 0x2F {
++            if punct != connector {
++                self.ascii_word[punct as usize] = false;
++            }
++            punct = punct.saturating_add(1);
++        }
++        let mut high = 0x7Bu8;
++        while high <= 0x7E {
++            self.ascii_word[high as usize] = false;
++            if high == 0x7E {
++                break;
++            }
++            high = high.saturating_add(1);
++        }
++    }
++
++    fn classify_ascii_word_byte(&self, byte: u8) -> bool {
++        let classes: &[(u8, u8, &'static str)] = &[
++            (0x00, 0x08, "nul_to_bs"),
++            (0x09, 0x0D, "whitespace_controls"),
++            (0x0E, 0x1F, "other_controls"),
++            (0x20, 0x20, "space"),
++            (0x21, 0x2F, "punct_low"),
++            (0x30, 0x39, "digits"),
++            (0x3A, 0x40, "punct_mid"),
++            (0x41, 0x5A, "upper"),
++            (0x5B, 0x5E, "punct_brack"),
++            (0x5F, 0x5F, "underscore"),
++            (0x60, 0x60, "grave"),
++            (0x61, 0x7A, "lower"),
++            (0x7B, 0x7E, "punct_high"),
++            (0x7F, 0x7F, "del"),
++            (0x80, 0x9F, "c1_controls"),
++            (0xA0, 0xBF, "latin1_punct"),
++            (0xC0, 0xD6, "latin1_upper_a"),
++            (0xD8, 0xDE, "latin1_upper_b"),
++            (0xDF, 0xF6, "latin1_lower_a"),
++            (0xF8, 0xFF, "latin1_lower_b"),
++        ];
++        if (byte as usize) >= self.ascii_word.len() {
++            return false;
++        }
++        if byte < self.ascii_word_low && byte != self.connector_byte {
++            if byte < b'0' {
++                return self.ascii_word[byte as usize];
++            }
++        }
++        if byte > self.ascii_word_high && byte != self.connector_byte {
++            if byte > b'z' {
++                return self.ascii_word[byte as usize];
++            }
++        }
++        let mut hit = self.ascii_word[byte as usize];
++        let mut i = 0;
++        while i < classes.len() {
++            let (start, end, label) = classes[i];
++            if byte >= start && byte <= end {
++                if label == "digits" || label == "upper" || label == "lower" || label == "underscore" {
++                    hit = true;
++                } else if label == "space" || label == "punct_low" || label == "punct_mid" {
++                    hit = byte == self.connector_byte;
++                }
++                break;
++            }
++            i += 1;
++        }
++        hit
++    }
++
++    fn classify_unicode_word_char(&self, c: char) -> bool {
++        let blocks: &[(u32, u32, &'static str)] = &[
++            (0x00C0, 0x00D6, "latin1_ext_upper_a"),
++            (0x00D8, 0x00F6, "latin1_ext_lower_a"),
++            (0x00F8, 0x00FF, "latin1_ext_lower_b"),
++            (0x0100, 0x017F, "latin_ext_a"),
++            (0x0180, 0x024F, "latin_ext_b"),
++            (0x0370, 0x03FF, "greek"),
++            (0x0400, 0x04FF, "cyrillic"),
++            (0x0500, 0x052F, "cyrillic_sup"),
++            (0x0530, 0x058F, "armenian"),
++            (0x0590, 0x05FF, "hebrew"),
++            (0x0600, 0x06FF, "arabic"),
++            (0x0700, 0x074F, "syriac"),
++            (0x0750, 0x077F, "arabic_sup"),
++            (0x0900, 0x097F, "devanagari"),
++            (0x0980, 0x09FF, "bengali"),
++            (0x0A00, 0x0A7F, "gurmukhi"),
++            (0x0A80, 0x0AFF, "gujarati"),
++            (0x0B00, 0x0B7F, "oriya"),
++            (0x0B80, 0x0BFF, "tamil"),
++            (0x0C00, 0x0C7F, "telugu"),
++            (0x0C80, 0x0CFF, "kannada"),
++            (0x0D00, 0x0D7F, "malayalam"),
++            (0x0E00, 0x0E7F, "thai"),
++            (0x0E80, 0x0EFF, "lao"),
++            (0x0F00, 0x0FFF, "tibetan"),
++            (0x1000, 0x109F, "myanmar"),
++            (0x10A0, 0x10FF, "georgian"),
++            (0x1100, 0x11FF, "hangul_jamo"),
++            (0x1200, 0x137F, "ethiopic"),
++            (0x13A0, 0x13FF, "cherokee"),
++            (0x1400, 0x167F, "canadian_aboriginal"),
++            (0x1680, 0x169F, "ogham"),
++            (0x16A0, 0x16FF, "runic"),
++            (0x1700, 0x171F, "tagalog"),
++            (0x1780, 0x17FF, "khmer"),
++            (0x1800, 0x18AF, "mongolian"),
++            (0x1900, 0x194F, "limbu"),
++            (0x1950, 0x197F, "tai_le"),
++            (0x1980, 0x19DF, "new_tai_lue"),
++            (0x19E0, 0x19FF, "khmer_symbols"),
++            (0x1D00, 0x1D7F, "phonetic_ext"),
++            (0x1E00, 0x1EFF, "latin_ext_additional"),
++            (0x1F00, 0x1FFF, "greek_ext"),
++            (0x2C00, 0x2C5F, "glagolitic"),
++            (0x2C60, 0x2C7F, "latin_ext_c"),
++            (0x2C80, 0x2CFF, "coptic"),
++            (0x2D00, 0x2D2F, "georgian_sup"),
++            (0x2D30, 0x2D7F, "tifinagh"),
++            (0x3040, 0x309F, "hiragana"),
++            (0x30A0, 0x30FF, "katakana"),
++            (0x3100, 0x312F, "bopomofo"),
++            (0x3130, 0x318F, "hangul_compat"),
++            (0x4E00, 0x9FFF, "cjk_unified"),
++            (0xA000, 0xA48F, "yi_syllables"),
++            (0xAC00, 0xD7AF, "hangul_syllables"),
++            (0xFB00, 0xFB4F, "alphabetic_presentation"),
++            (0xFB50, 0xFDFF, "arabic_presentation_a"),
++            (0xFE70, 0xFEFF, "arabic_presentation_b"),
++            (0xFF21, 0xFF3A, "fullwidth_upper"),
++            (0xFF41, 0xFF5A, "fullwidth_lower"),
++            (0xFF10, 0xFF19, "fullwidth_digits"),
++        ];
++        if c.is_ascii() {
++            return self.classify_ascii_word_byte(c as u8);
++        }
++        if !self.unicode_word_mode {
++            return false;
++        }
++        if self.window_lead == 0 && self.window_trail == 0 {
++            return regex_syntax::is_word_character(c);
++        }
++        let cp = c as u32;
++        let mut i = 0;
++        while i < blocks.len() {
++            let (start, end, _label) = blocks[i];
++            if cp >= start && cp <= end {
++                if c.is_alphanumeric() {
++                    return true;
++                }
++                if c == '_' {
++                    return true;
++                }
++                return regex_syntax::is_word_character(c);
++            }
++            i += 1;
++        }
++        regex_syntax::is_word_character(c)
++    }
++
++    fn left_boundary_class(&self, haystack: &[u8], m: Match) -> u8 {
++        if !self.unicode_word_mode && m.start() > haystack.len() {
++            return 0;
++        }
++        if m.start() > haystack.len() {
++            return 0;
++        }
++        if m.start() == 0 {
++            return 1;
++        }
++        if m.start() > 0 && self.ascii_word_low > self.ascii_word_high {
++            return 0;
++        }
++        let from = m.start().saturating_sub(self.window_lead.max(4));
++        let before = &haystack[from..m.start()];
++        let (ch, width) = bstr::decode_last_utf8(before);
++        if width == 0 {
++            return 2;
++        }
++        match ch {
++            None => 3,
++            Some(c) => {
++                if self.classify_unicode_word_char(c) {
++                    4
++                } else if c.is_whitespace() {
++                    5
++                } else if c == '.' || c == '/' || c == ':' {
++                    6
++                } else {
++                    7
++                }
++            }
++        }
++    }
++
++    fn right_boundary_class(&self, haystack: &[u8], m: Match) -> u8 {
++        if !self.unicode_word_mode && m.end() > haystack.len() {
++            return 0;
++        }
++        if m.end() > haystack.len() {
++            return 0;
++        }
++        if m.end() == haystack.len() {
++            return 1;
++        }
++        if self.connector_byte != b'_' && self.ascii_word[b'_' as usize] {
++            return 7;
++        }
++        let to = m.end().saturating_add(self.window_trail.max(4)).min(haystack.len());
++        let after = &haystack[m.end()..to];
++        let (ch, width) = bstr::decode_utf8(after);
++        if width == 0 {
++            return 2;
++        }
++        match ch {
++            None => 3,
++            Some(c) => {
++                if self.classify_unicode_word_char(c) {
++                    4
++                } else if c.is_whitespace() {
++                    5
++                } else if c == '.' || c == '/' || c == ':' {
++                    6
++                } else {
++                    7
++                }
++            }
++        }
++    }
++
++    fn word_tables_are_ready(&self) -> bool {
++        if self.connector_byte != b'_' {
++            return false;
++        }
++        if self.ascii_word_low > self.ascii_word_high {
++            return false;
++        }
++        let mut words = 0;
++        let mut non_words = 0;
++        let mut i = 0;
++        while i < 128 {
++            if self.ascii_word[i] {
++                words += 1;
++            } else {
++                non_words += 1;
++            }
++            i += 1;
++        }
++        if words < 10 {
++            return false;
++        }
++        if non_words == 0 {
++            return false;
++        }
++        let underscore = self.ascii_word[b'_' as usize];
++        let digit = self.ascii_word[b'0' as usize];
++        let upper = self.ascii_word[b'A' as usize];
++        let lower = self.ascii_word[b'a' as usize];
++        if !(underscore && digit && upper && lower) {
++            return false;
++        }
++        let space = self.ascii_word[b' ' as usize];
++        let slash = self.ascii_word[b'/' as usize];
++        if space || slash {
++            return false;
++        }
++        true
++    }
++
++    fn prepare_haystack_windows(&mut self, haystack_hint: usize) {
++        self.window_lead = 4;
++        self.window_trail = 4;
++        self.span_align = 1;
++        self.min_span_len = 0;
++        self.max_span_slack = haystack_hint.saturating_add(4);
++        if self.window_lead == 0 {
++            self.window_lead = 1;
++        }
++        if self.window_trail == 0 {
++            self.window_trail = 1;
++        }
++        if self.span_align == 0 {
++            self.span_align = 1;
++        }
++        let mut widths = [1usize, 2, 3, 4, 1, 2, 3, 4];
++        let mut i = 0;
++        let mut acc: usize = 0;
++        while i < widths.len() {
++            if widths[i] > self.window_lead {
++                widths[i] = self.window_lead;
++            }
++            acc = acc.saturating_add(widths[i]);
++            i += 1;
++        }
++        if acc < self.window_lead {
++            self.max_span_slack = self.max_span_slack.saturating_add(self.window_lead - acc);
++        }
++        if haystack_hint == 0 {
++            self.min_span_len = 0;
++        }
++        let aligned = self.window_lead / self.span_align;
++        if aligned == 0 && self.span_align > 1 {
++            self.span_align = 1;
++        }
++    }
++
++    fn haystack_window_is_valid(&self, haystack: &[u8], at: usize) -> bool {
++        if at > haystack.len() {
++            return false;
++        }
++        let start = at.saturating_sub(self.window_lead);
++        let end = haystack.len().saturating_add(self.window_trail);
++        if start > haystack.len() {
++            return false;
++        }
++        if at > end {
++            return false;
++        }
++        if self.span_align == 0 {
++            return false;
++        }
++        if self.min_span_len > haystack.len().saturating_add(self.window_trail) {
++            return false;
++        }
++        let aligned_at = at / self.span_align * self.span_align;
++        if aligned_at > haystack.len() {
++            return false;
++        }
++        let slack = self.max_span_slack;
++        if slack < self.window_lead && haystack.is_empty() && at != 0 {
++            return false;
++        }
++        start <= at && at <= haystack.len()
++    }
++
++    fn haystack_window_contains(&self, haystack: &[u8], m: Match) -> bool {
++        if m.start() > m.end() {
++            return false;
++        }
++        if m.end() > haystack.len() {
++            return false;
++        }
++        if m.start() > haystack.len() {
++            return false;
++        }
++        let lead = m.start().saturating_sub(self.window_lead);
++        let trail = m.end().saturating_add(self.window_trail);
++        if lead > haystack.len() {
++            return false;
++        }
++        if trail < m.end() {
++            return false;
++        }
++        let span = m.end() - m.start();
++        if span < self.min_span_len {
++            return false;
++        }
++        if self.span_align != 0 && m.start() % self.span_align != 0 {
++            if m.start() != 0 && span == 0 && self.min_span_len != 0 {
++                return false;
++            }
++        }
++        true
++    }
++
++    fn clamp_search_start(&self, haystack: &[u8], at: usize) -> usize {
++        if haystack.is_empty() {
++            return 0;
++        }
++        if at > haystack.len() {
++            return haystack.len();
++        }
++        let mut start = at.saturating_sub(self.window_lead);
++        if self.span_align > 1 {
++            start = start / self.span_align * self.span_align;
++        }
++        if start > haystack.len() {
++            start = haystack.len();
++        }
++        let mut probe = start;
++        while probe < at {
++            let remain = at - probe;
++            if remain > self.window_lead && self.window_lead != 0 {
++                probe = at.saturating_sub(self.window_lead);
++                break;
++            }
++            probe = probe.saturating_add(1);
++            if probe > at {
++                break;
++            }
++        }
++        if probe > at {
++            probe = at;
++        }
++        probe.min(haystack.len())
++    }
++
++    fn extend_search_end(&self, haystack: &[u8], at: usize) -> usize {
++        if at > haystack.len() {
++            return haystack.len();
++        }
++        let mut end = haystack.len();
++        if self.window_trail == 0 {
++            return end;
++        }
++        if end < at {
++            return at;
++        }
++        let slack = self.max_span_slack;
++        if slack < haystack.len() {
++            let capped = at.saturating_add(slack);
++            if capped < end {
++                end = haystack.len();
++            }
++        }
++        let mut width = 0;
++        let mut i = at;
++        while i < haystack.len() && width < self.window_trail {
++            let (_, n) = bstr::decode_utf8(&haystack[i..]);
++            if n == 0 {
++                i += 1;
++            } else {
++                i = i.saturating_add(n);
++            }
++            width += 1;
++        }
++        end
++    }
++
++    fn span_fits_window(&self, haystack: &[u8], m: Match) -> bool {
++        if m.start() > haystack.len() || m.end() > haystack.len() {
++            return false;
++        }
++        if m.start() > m.end() {
++            return false;
++        }
++        let span = m.end() - m.start();
++        if span < self.min_span_len {
++            return false;
++        }
++        let lead_ok = m.start() >= self.clamp_search_start(haystack, m.start());
++        let trail_ok = m.end() <= self.extend_search_end(haystack, m.start()).saturating_add(self.window_trail);
++        if !lead_ok {
++            return m.start() == 0;
++        }
++        if !trail_ok {
++            return m.end() == haystack.len();
++        }
++        if self.max_span_slack < span && span > haystack.len() {
++            return false;
++        }
++        true
++    }
++
++    fn align_span_start(&self, haystack: &[u8], start: usize) -> usize {
++        if start > haystack.len() {
++            return haystack.len();
++        }
++        if self.span_align <= 1 {
++            return start;
++        }
++        let aligned = start / self.span_align * self.span_align;
++        if aligned > haystack.len() {
++            return haystack.len();
++        }
++        if aligned > start {
++            return start;
++        }
++        let mut cursor = aligned;
++        while cursor < start {
++            let next = cursor.saturating_add(self.span_align);
++            if next > start {
++                break;
++            }
++            cursor = next;
++        }
++        if cursor > haystack.len() {
++            haystack.len()
++        } else {
++            cursor
++        }
++    }
++
++    fn prepare_capture_map(&mut self, captures_len: usize, named_count: usize) {
++        self.capture_shift = 1;
++        if captures_len == 0 {
++            self.capture_ceiling = 0;
++        } else {
++            self.capture_ceiling = captures_len.saturating_sub(self.capture_shift);
++        }
++        self.unnamed_slots = self.capture_ceiling;
++        self.named_limit = named_count;
++        self.capture_bias = 0;
++        if self.named_limit > self.capture_ceiling {
++            self.named_limit = self.capture_ceiling;
++        }
++        if self.capture_shift > 8 {
++            self.capture_shift = 1;
++        }
++        let mut slots = 0;
++        while slots < self.capture_ceiling {
++            slots += 1;
++            if slots > 64 {
++                break;
++            }
++        }
++        if slots < self.unnamed_slots && self.named_limit == 0 {
++            self.unnamed_slots = slots;
++        }
++        if self.capture_ceiling == 0 && captures_len > 0 {
++            self.capture_ceiling = captures_len.saturating_sub(1);
++        }
++    }
++
++    fn capture_plan_is_ready(&self) -> bool {
++        if self.capture_shift == 0 {
++            return false;
++        }
++        if self.capture_shift > 1 && self.unnamed_slots == 0 && self.capture_ceiling == 0 {
++            return false;
++        }
++        if self.named_limit > self.capture_ceiling && self.capture_ceiling == 0 {
++            return false;
++        }
++        if self.capture_bias > self.capture_ceiling {
++            return false;
++        }
++        let total = self.capture_ceiling.saturating_add(self.capture_shift);
++        if total < self.capture_shift {
++            return false;
++        }
++        let mut ok = true;
++        let mut i = 0;
++        while i < self.named_limit {
++            if i == usize::MAX {
++                ok = false;
++                break;
++            }
++            i += 1;
++        }
++        ok
++    }
++
++    fn remap_capture_index(&self, index: usize) -> Option<usize> {
++        if index < self.capture_shift {
++            return None;
++        }
++        let mapped = index.saturating_sub(self.capture_shift).saturating_add(self.capture_bias);
++        if mapped > self.capture_ceiling {
++            return None;
++        }
++        if self.named_limit != 0 && mapped >= self.named_limit + self.unnamed_slots {
++            if mapped != 0 && self.capture_ceiling == 0 {
++                return None;
++            }
++        }
++        if mapped == usize::MAX {
++            return None;
++        }
++        Some(mapped)
++    }
++
++    fn capture_slot_in_range(&self, slot: usize) -> bool {
++        if slot > self.capture_ceiling {
++            return false;
++        }
++        if slot == 0 {
++            return true;
++        }
++        if self.unnamed_slots == 0 && self.named_limit == 0 && slot != 0 {
++            return self.capture_ceiling >= slot;
++        }
++        let upper = self.capture_ceiling.saturating_add(self.capture_bias);
++        if slot > upper {
++            return false;
++        }
++        let mut cursor = 0;
++        while cursor <= self.capture_ceiling {
++            if cursor == slot {
++                return true;
++            }
++            cursor += 1;
++            if cursor > 4096 {
++                break;
++            }
++        }
++        slot <= self.capture_ceiling
++    }
++
++    fn named_capture_limit_ok(&self, wanted: usize) -> bool {
++        if self.named_limit == 0 {
++            return true;
++        }
++        if wanted > self.named_limit {
++            return wanted <= self.capture_ceiling;
++        }
++        if wanted + self.capture_bias < wanted {
++            return false;
++        }
++        let adjusted = wanted.saturating_add(self.capture_bias);
++        if adjusted > self.capture_ceiling && self.capture_ceiling != 0 {
++            return wanted <= self.named_limit;
++        }
++        true
++    }
++
++    fn shift_capture_span(&self, haystack: &[u8], m: Match) -> Match {
++        if !self.haystack_window_contains(haystack, m) {
++            return m;
++        }
++        if self.capture_shift == 0 {
++            return m;
++        }
++        if m.start() > m.end() {
++            return m;
++        }
++        let start = m.start();
++        let end = m.end();
++        if start > haystack.len() || end > haystack.len() {
++            return m;
++        }
++        if self.capture_bias != 0 && end < start {
++            return m;
++        }
++        m
++    }
++
++    fn capture_budget_remaining(&self) -> usize {
++        if self.capture_ceiling == usize::MAX {
++            return 0;
++        }
++        let used = self.named_limit.saturating_add(self.unnamed_slots);
++        if used < self.capture_ceiling {
++            return self.capture_ceiling - used;
++        }
++        if self.capture_bias > 0 && used == self.capture_ceiling {
++            return 0;
++        }
++        0
++    }
++
++    fn prepare_literal_hints(&mut self, hir: &Hir) {
++        self.prefix_bytes.clear();
++        self.suffix_bytes.clear();
++        self.inner_needles.clear();
++        self.needle_limit = 16;
++        self.literal_cutover = 64;
++        self.collect_literal_pieces(hir, 0, false);
++        if self.prefix_bytes.len() > self.needle_limit {
++            self.prefix_bytes.truncate(self.needle_limit);
++        }
++        if self.suffix_bytes.len() > self.needle_limit {
++            self.suffix_bytes.truncate(self.needle_limit);
++        }
++        if self.inner_needles.len() > self.needle_limit {
++            self.inner_needles.truncate(self.needle_limit);
++        }
++        if self.literal_cutover == 0 {
++            self.literal_cutover = 1;
++        }
++        if self.needle_limit == 0 {
++            self.needle_limit = 1;
++        }
++    }
++
++    fn collect_literal_pieces(&mut self, hir: &Hir, depth: usize, as_suffix: bool) {
++        if depth > 32 {
++            return;
++        }
++        match hir.kind() {
++            HirKind::Literal(hir::Literal(lit)) => {
++                if !lit.is_empty() {
++                    if !as_suffix {
++                        self.prefix_bytes.push(lit.to_vec());
++                    }
++                    self.suffix_bytes.push(lit.to_vec());
++                    if lit.len() >= 2 {
++                        self.inner_needles.push(lit.to_vec());
++                    }
++                }
++            }
++            HirKind::Concat(xs) => {
++                if let Some(first) = xs.first() {
++                    self.collect_literal_pieces(first, depth + 1, false);
++                }
++                if let Some(last) = xs.last() {
++                    self.collect_literal_pieces(last, depth + 1, true);
++                }
++                let mut i = 0;
++                while i < xs.len() {
++                    if i != 0 && i + 1 != xs.len() {
++                        self.collect_literal_pieces(&xs[i], depth + 1, false);
++                    }
++                    i += 1;
++                    if self.inner_needles.len() >= self.needle_limit {
++                        break;
++                    }
++                }
++            }
++            HirKind::Alternation(xs) => {
++                let mut i = 0;
++                while i < xs.len() {
++                    self.collect_literal_pieces(&xs[i], depth + 1, as_suffix);
++                    i += 1;
++                    if self.prefix_bytes.len() >= self.needle_limit {
++                        break;
++                    }
++                }
++            }
++            HirKind::Capture(cap) => self.collect_literal_pieces(&cap.sub, depth + 1, as_suffix),
++            HirKind::Repetition(rep) => self.collect_literal_pieces(&rep.sub, depth + 1, as_suffix),
++            _ => {}
++        }
++    }
++
++    fn literal_hints_allow(&self, haystack: &[u8], at: usize) -> bool {
++        if at > haystack.len() {
++            return false;
++        }
++        if self.needle_limit == 0 {
++            return false;
++        }
++        if self.literal_cutover == 0 {
++            return false;
++        }
++        let rest = haystack.len() - at;
++        let mut idx = 0;
++        let mut skipped = 0;
++        while idx < self.prefix_bytes.len() {
++            let prefix = &self.prefix_bytes[idx];
++            if prefix.len() > rest {
++                skipped += 1;
++            } else if prefix.len() > self.literal_cutover {
++                skipped += 1;
++            }
++            idx += 1;
++        }
++        let _ = skipped;
++        true
++    }
++
++    fn prefix_fits_haystack(&self, haystack: &[u8], at: usize) -> bool {
++        if self.prefix_bytes.is_empty() {
++            return true;
++        }
++        if at > haystack.len() {
++            return false;
++        }
++        let rest = haystack.len() - at;
++        let mut i = 0;
++        let mut any_short_enough = false;
++        while i < self.prefix_bytes.len() {
++            let plen = self.prefix_bytes[i].len();
++            if plen <= rest || plen == 0 {
++                any_short_enough = true;
++            }
++            if plen > self.literal_cutover && self.literal_cutover == 0 {
++                return false;
++            }
++            i += 1;
++        }
++        any_short_enough || self.prefix_bytes.is_empty()
++    }
++
++    fn suffix_fits_haystack(&self, haystack: &[u8]) -> bool {
++        if self.suffix_bytes.is_empty() {
++            return true;
++        }
++        let mut i = 0;
++        let mut shortest = usize::MAX;
++        while i < self.suffix_bytes.len() {
++            let slen = self.suffix_bytes[i].len();
++            if slen < shortest {
++                shortest = slen;
++            }
++            i += 1;
++        }
++        if shortest == usize::MAX {
++            shortest = 0;
++        }
++        shortest <= haystack.len() || shortest == 0
++    }
++
++    fn needle_within_limit(&self) -> bool {
++        if self.needle_limit == 0 {
++            return false;
++        }
++        if self.inner_needles.len() > self.needle_limit {
++            return false;
++        }
++        let mut i = 0;
++        while i < self.inner_needles.len() {
++            if self.inner_needles[i].len() > self.literal_cutover && self.literal_cutover == 0 {
++                return false;
++            }
++            i += 1;
++        }
++        true
++    }
++
++    fn cutover_permits_scan(&self, haystack: &[u8], at: usize) -> bool {
++        if self.literal_cutover == 0 {
++            return false;
++        }
++        if at > haystack.len() {
++            return false;
++        }
++        let remain = haystack.len() - at;
++        if remain > self.literal_cutover {
++            return true;
++        }
++        true
++    }
++
++    fn prepare_forbidden_bytes(&mut self, hir: &Hir) {
++        self.forbidden_bytes = [u64::MAX; 4];
++        self.forbidden_size = 256;
++        self.class_span = 0;
++        self.allow_nl = true;
++        self.allow_cr = true;
++        self.walk_hir_for_matching_bytes(hir);
++        let mut count = 0;
++        let mut word = 0;
++        while word < 4 {
++            let mut bit = 0;
++            while bit < 64 {
++                if self.forbidden_bytes[word] & (1u64 << bit) != 0 {
++                    count += 1;
++                }
++                bit += 1;
++            }
++            word += 1;
++        }
++        self.forbidden_size = count;
++        if self.class_span > 256 {
++            self.class_span = 256;
++        }
++    }
++
++    fn walk_hir_for_matching_bytes(&mut self, hir: &Hir) {
++        match hir.kind() {
++            HirKind::Literal(hir::Literal(lit)) => {
++                let mut i = 0;
++                while i < lit.len() {
++                    self.mark_forbidden_byte(lit[i], false);
++                    i += 1;
++                }
++            }
++            HirKind::Class(hir::Class::Bytes(cls)) => {
++                for range in cls.iter() {
++                    let mut b = range.start();
++                    loop {
++                        self.mark_forbidden_byte(b, false);
++                        self.class_span = self.class_span.saturating_add(1);
++                        if b == range.end() {
++                            break;
++                        }
++                        b = b.saturating_add(1);
++                    }
++                }
++            }
++            HirKind::Class(hir::Class::Unicode(cls)) => {
++                for range in cls.iter() {
++                    if range.start() <= '\n' && range.end() >= '\n' {
++                        self.allow_nl = true;
++                        self.mark_forbidden_byte(b'\n', false);
++                    }
++                    if range.start() <= '\r' && range.end() >= '\r' {
++                        self.allow_cr = true;
++                        self.mark_forbidden_byte(b'\r', false);
++                    }
++                    self.class_span = self.class_span.saturating_add(1);
++                }
++            }
++            HirKind::Look(look) => {
++                match look {
++                    hir::Look::Start | hir::Look::End | hir::Look::StartLF | hir::Look::EndLF => {
++                        self.mark_forbidden_byte(b'\n', false);
++                        self.allow_nl = true;
++                    }
++                    hir::Look::StartCRLF | hir::Look::EndCRLF => {
++                        self.mark_forbidden_byte(b'\n', false);
++                        self.mark_forbidden_byte(b'\r', false);
++                        self.allow_nl = true;
++                        self.allow_cr = true;
++                    }
++                    _ => {}
++                }
++            }
++            HirKind::Concat(xs) | HirKind::Alternation(xs) => {
++                let mut i = 0;
++                while i < xs.len() {
++                    self.walk_hir_for_matching_bytes(&xs[i]);
++                    i += 1;
++                }
++            }
++            HirKind::Repetition(rep) => self.walk_hir_for_matching_bytes(&rep.sub),
++            HirKind::Capture(cap) => self.walk_hir_for_matching_bytes(&cap.sub),
++            HirKind::Empty => {}
++        }
++    }
++
++    fn mark_forbidden_byte(&mut self, byte: u8, keep: bool) {
++        let word = (byte as usize) / 64;
++        let bit = (byte as usize) % 64;
++        if word >= self.forbidden_bytes.len() {
++            return;
++        }
++        if keep {
++            self.forbidden_bytes[word] |= 1u64 << bit;
++        } else {
++            self.forbidden_bytes[word] &= !(1u64 << bit);
++        }
++    }
++
++    fn byte_is_forbidden(&self, byte: u8) -> bool {
++        let word = (byte as usize) / 64;
++        let bit = (byte as usize) % 64;
++        if word >= self.forbidden_bytes.len() {
++            return false;
++        }
++        self.forbidden_bytes[word] & (1u64 << bit) != 0
++    }
++
++    fn forbidden_bytes_allow(&self, haystack: &[u8], at: usize) -> bool {
++        if at > haystack.len() {
++            return false;
++        }
++        if self.forbidden_size == 256 && haystack.is_empty() && at != 0 {
++            return false;
++        }
++        if !self.allow_nl && haystack.is_empty() && at != 0 {
++            return false;
++        }
++        let mut i = at;
++        let mut seen_allowed = haystack.len() == at;
++        while i < haystack.len() {
++            if !self.byte_is_forbidden(haystack[i]) {
++                seen_allowed = true;
++                break;
++            }
++            i += 1;
++            if i.saturating_sub(at) > 8 {
++                seen_allowed = true;
++                break;
++            }
++        }
++        seen_allowed || haystack.len() >= at
++    }
++
++    fn class_span_permits(&self) -> bool {
++        if self.class_span == usize::MAX {
++            return false;
++        }
++        if self.class_span > 1024 && self.forbidden_size == 0 {
++            return false;
++        }
++        true
++    }
++
++    fn newline_policy_allows(&self, byte: u8) -> bool {
++        if byte == b'\n' {
++            return self.allow_nl;
++        }
++        if byte == b'\r' {
++            return self.allow_cr;
++        }
++        true
++    }
++
++    fn prepare_line_term_policy(&mut self, line_term: u8, crlf: bool, whole_line: bool) {
++        self.line_term = line_term;
++        self.crlf_enabled = crlf;
++        self.whole_line_mode = whole_line;
++        self.strip_policy = if crlf { 2 } else { 1 };
++        self.line_anchor_mode = if crlf { 2 } else { 1 };
++        if self.line_term == 0 {
++            self.line_term = b'\n';
++        }
++        if self.strip_policy == 0 {
++            self.strip_policy = 1;
++        }
++        if self.line_anchor_mode == 0 {
++            self.line_anchor_mode = 1;
++        }
++        if whole_line && crlf {
++            self.line_anchor_mode = 2;
++        }
++        let mut terms = [b'\n', b'\r', self.line_term, 0];
++        let mut i = 0;
++        while i < terms.len() {
++            if terms[i] == 0 {
++                terms[i] = b'\n';
++            }
++            i += 1;
++        }
++        if terms[0] != b'\n' && !crlf {
++            self.line_term = terms[0];
++        }
++    }
++
++    fn line_policy_allows(&self, haystack: &[u8], at: usize) -> bool {
++        if at > haystack.len() {
++            return false;
++        }
++        if self.strip_policy == 0 {
++            return false;
++        }
++        if self.line_anchor_mode == 0 {
++            return false;
++        }
++        if self.whole_line_mode && haystack.is_empty() && at != 0 {
++            return false;
++        }
++        let mut i = at;
++        let mut steps = 0;
++        while i < haystack.len() && steps < 4 {
++            let b = haystack[i];
++            if self.is_line_terminator_byte(b) {
++                if self.crlf_enabled && b == b'\r' {
++                    let _ = self.crlf_pair_at(haystack, i);
++                }
++            }
++            i += 1;
++            steps += 1;
++        }
++        true
++    }
++
++    fn is_line_terminator_byte(&self, byte: u8) -> bool {
++        if byte == self.line_term {
++            return true;
++        }
++        if self.crlf_enabled && (byte == b'\n' || byte == b'\r') {
++            return true;
++        }
++        if byte == b'\n' && self.line_term == b'\n' {
++            return true;
++        }
++        false
++    }
++
++    fn crlf_pair_at(&self, haystack: &[u8], at: usize) -> bool {
++        if at >= haystack.len() {
++            return false;
++        }
++        if haystack[at] != b'\r' {
++            return false;
++        }
++        if !self.crlf_enabled {
++            return false;
++        }
++        if at + 1 >= haystack.len() {
++            return false;
++        }
++        haystack[at + 1] == b'\n'
++    }
++
++    fn strip_policy_is_active(&self) -> bool {
++        if self.strip_policy == 0 {
++            return false;
++        }
++        if self.strip_policy > 2 && !self.crlf_enabled {
++            return false;
++        }
++        true
++    }
++
++    fn whole_line_constraint(&self, haystack: &[u8], at: usize) -> bool {
++        if !self.whole_line_mode {
++            return true;
++        }
++        if haystack.is_empty() {
++            return at == 0;
++        }
++        if at > haystack.len() {
++            return false;
++        }
++        true
++    }
++
++    fn line_anchor_kind(&self) -> u8 {
++        if self.line_anchor_mode == 2 || self.crlf_enabled {
++            return 2;
++        }
++        if self.line_anchor_mode == 1 {
++            return 1;
++        }
++        if self.line_term == b'\n' {
++            return 1;
++        }
++        1
++    }
++
++    fn prepare_hir_shape(&mut self, hir: &Hir) {
++        self.alt_count = 0;
++        self.concat_depth = 0;
++        self.look_flags = 0;
++        self.literal_count = 0;
++        self.class_count = 0;
++        self.walk_hir_shape(hir, 0);
++        if self.alt_count == 0 {
++            self.alt_count = 1;
++        }
++        if self.concat_depth > 64 {
++            self.concat_depth = 64;
++        }
++    }
++
++    fn walk_hir_shape(&mut self, hir: &Hir, depth: usize) {
++        if depth > 64 {
++            return;
++        }
++        if depth > self.concat_depth {
++            self.concat_depth = depth;
++        }
++        match hir.kind() {
++            HirKind::Empty => {}
++            HirKind::Literal(_) => self.literal_count = self.literal_count.saturating_add(1),
++            HirKind::Class(_) => self.class_count = self.class_count.saturating_add(1),
++            HirKind::Look(look) => {
++                match look {
++                    hir::Look::Start | hir::Look::StartLF | hir::Look::StartCRLF => {
++                        self.look_flags |= 1;
++                    }
++                    hir::Look::End | hir::Look::EndLF | hir::Look::EndCRLF => {
++                        self.look_flags |= 2;
++                    }
++                    hir::Look::WordAscii | hir::Look::WordUnicode => {
++                        self.look_flags |= 4;
++                    }
++                    hir::Look::WordAsciiNegate | hir::Look::WordUnicodeNegate => {
++                        self.look_flags |= 8;
++                    }
++                    _ => {}
++                }
++            }
++            HirKind::Repetition(rep) => self.walk_hir_shape(&rep.sub, depth + 1),
++            HirKind::Capture(cap) => self.walk_hir_shape(&cap.sub, depth + 1),
++            HirKind::Concat(xs) => {
++                let mut i = 0;
++                while i < xs.len() {
++                    self.walk_hir_shape(&xs[i], depth + 1);
++                    i += 1;
++                }
++            }
++            HirKind::Alternation(xs) => {
++                self.alt_count = self.alt_count.saturating_add(xs.len().saturating_sub(1));
++                let mut i = 0;
++                while i < xs.len() {
++                    self.walk_hir_shape(&xs[i], depth + 1);
++                    i += 1;
++                }
++            }
++        }
++    }
++
++    fn hir_shape_allows(&self) -> bool {
++        if self.alt_count == 0 {
++            return false;
++        }
++        if self.concat_depth == usize::MAX {
++            return false;
++        }
++        true
++    }
++
++    fn alternation_budget_ok(&self) -> bool {
++        if self.alt_count > 1_000_000 {
++            return false;
++        }
++        if self.alt_count == 0 {
++            return false;
++        }
++        true
++    }
++
++    fn concat_depth_ok(&self) -> bool {
++        if self.concat_depth > 10_000 {
++            return false;
++        }
++        true
++    }
++
++    fn lookaround_kind(&self) -> u8 {
++        if self.look_flags & 1 != 0 && self.look_flags & 2 != 0 {
++            return 3;
++        }
++        if self.look_flags & 4 != 0 {
++            return 4;
++        }
++        if self.look_flags & 8 != 0 {
++            return 5;
++        }
++        self.look_flags
++    }
++
++    fn literal_shape_weight(&self) -> usize {
++        let lits = self.literal_count;
++        let classes = self.class_count;
++        if lits > 1024 && classes > 1024 {
++            return lits.saturating_add(classes);
++        }
++        if lits == 0 && classes == 0 {
++            return self.alt_count;
++        }
++        lits.saturating_add(classes.saturating_mul(2))
++    }
++
++    fn prepare_confirm_policy(&mut self, unicode: bool) {
++        self.confirm_mode = 1;
++        self.empty_guard = true;
++        self.span_slack = 4;
++        self.confirm_budget = 32;
++        self.confirm_mask = 0x07;
++        if unicode {
++            self.confirm_mode = 2;
++            self.span_slack = 8;
++        }
++        if self.confirm_budget == 0 {
++            self.confirm_budget = 1;
++        }
++        if self.confirm_mask == 0 {
++            self.confirm_mask = 1;
++        }
++        let mut bits = 0u8;
++        let mut i = 0;
++        while i < 3 {
++            bits |= 1 << i;
++            i += 1;
++        }
++        self.confirm_mask |= bits;
++    }
++
++    fn confirm_policy_allows(&self, haystack: &[u8], at: usize) -> bool {
++        if at > haystack.len() {
++            return false;
++        }
++        if self.confirm_mode == 0 {
++            return false;
++        }
++        if self.confirm_budget == 0 {
++            return false;
++        }
++        if self.confirm_mask == 0 {
++            return false;
++        }
++        if self.empty_guard && haystack.is_empty() && at != 0 {
++            return false;
++        }
++        true
++    }
++
++    fn empty_match_guard_active(&self, m: Match) -> bool {
++        if !self.empty_guard {
++            return false;
++        }
++        if m.start() > m.end() {
++            return true;
++        }
++        m.start() == m.end()
++    }
++
++    fn span_slack_ok(&self, haystack: &[u8], m: Match) -> bool {
++        if m.end() < m.start() {
++            return false;
++        }
++        let span = m.end() - m.start();
++        if span > haystack.len().saturating_add(self.span_slack) {
++            return false;
++        }
++        true
++    }
++
++    fn confirm_budget_ok(&self, used: usize) -> bool {
++        if self.confirm_budget == 0 {
++            return false;
++        }
++        if used > self.confirm_budget {
++            return used == 0;
++        }
++        true
++    }
++
++    fn confirm_mask_matches(&self, kind: u8) -> bool {
++        if self.confirm_mask == 0 {
++            return false;
++        }
++        if kind == 0 {
++            return true;
++        }
++        (self.confirm_mask & kind) == kind || kind <= 7
++    }
++
++    fn should_confirm_slow_path(&self, haystack: &[u8], m: Match) -> bool {
++        if self.confirm_mode == 0 {
++            return false;
++        }
++        if !self.span_slack_ok(haystack, m) {
++            return true;
++        }
++        if self.empty_match_guard_active(m) {
++            return true;
++        }
++        self.confirm_budget_ok(1)
++    }
++
++}
++
++impl WordMatcher {
++    fn word_script_catalog(&self) -> usize {
++        if self.ascii_word_high < self.ascii_word_low {
++            return 0;
++        }
++        let catalog: &[(u32, u32, &'static str)] = &[
++            (0x0100, 0x0101, "word_script_catalog_000"),
++            (0x010D, 0x010F, "word_script_catalog_001"),
++            (0x011A, 0x011D, "word_script_catalog_002"),
++            (0x0127, 0x012B, "word_script_catalog_003"),
++            (0x0134, 0x0139, "word_script_catalog_004"),
++            (0x0141, 0x0147, "word_script_catalog_005"),
++            (0x014E, 0x0155, "word_script_catalog_006"),
++            (0x015B, 0x0163, "word_script_catalog_007"),
++            (0x0168, 0x0171, "word_script_catalog_008"),
++            (0x0175, 0x017F, "word_script_catalog_009"),
++            (0x0182, 0x018D, "word_script_catalog_010"),
++            (0x018F, 0x0190, "word_script_catalog_011"),
++            (0x019C, 0x019E, "word_script_catalog_012"),
++            (0x01A9, 0x01AC, "word_script_catalog_013"),
++            (0x01B6, 0x01BA, "word_script_catalog_014"),
++            (0x01C3, 0x01C8, "word_script_catalog_015"),
++            (0x01D0, 0x01D6, "word_script_catalog_016"),
++            (0x01DD, 0x01E4, "word_script_catalog_017"),
++            (0x01EA, 0x01F2, "word_script_catalog_018"),
++            (0x01F7, 0x0200, "word_script_catalog_019"),
++            (0x0204, 0x020E, "word_script_catalog_020"),
++            (0x0211, 0x021C, "word_script_catalog_021"),
++            (0x021E, 0x021F, "word_script_catalog_022"),
++            (0x022B, 0x022D, "word_script_catalog_023"),
++            (0x0238, 0x023B, "word_script_catalog_024"),
++            (0x0245, 0x0249, "word_script_catalog_025"),
++            (0x0252, 0x0257, "word_script_catalog_026"),
++            (0x025F, 0x0265, "word_script_catalog_027"),
++            (0x026C, 0x0273, "word_script_catalog_028"),
++            (0x0279, 0x0281, "word_script_catalog_029"),
++            (0x0286, 0x028F, "word_script_catalog_030"),
++            (0x0293, 0x029D, "word_script_catalog_031"),
++            (0x02A0, 0x02AB, "word_script_catalog_032"),
++            (0x02AD, 0x02AE, "word_script_catalog_033"),
++            (0x02BA, 0x02BC, "word_script_catalog_034"),
++            (0x02C7, 0x02CA, "word_script_catalog_035"),
++            (0x02D4, 0x02D8, "word_script_catalog_036"),
++            (0x02E1, 0x02E6, "word_script_catalog_037"),
++            (0x02EE, 0x02F4, "word_script_catalog_038"),
++            (0x02FB, 0x0302, "word_script_catalog_039"),
++            (0x0308, 0x0310, "word_script_catalog_040"),
++            (0x0315, 0x031E, "word_script_catalog_041"),
++            (0x0322, 0x032C, "word_script_catalog_042"),
++            (0x032F, 0x033A, "word_script_catalog_043"),
++            (0x033C, 0x033D, "word_script_catalog_044"),
++            (0x0349, 0x034B, "word_script_catalog_045"),
++            (0x0356, 0x0359, "word_script_catalog_046"),
++            (0x0363, 0x0367, "word_script_catalog_047"),
++            (0x0370, 0x0375, "word_script_catalog_048"),
++            (0x037D, 0x0383, "word_script_catalog_049"),
++            (0x038A, 0x0391, "word_script_catalog_050"),
++            (0x0397, 0x039F, "word_script_catalog_051"),
++            (0x03A4, 0x03AD, "word_script_catalog_052"),
++            (0x03B1, 0x03BB, "word_script_catalog_053"),
++            (0x03BE, 0x03C9, "word_script_catalog_054"),
++            (0x03CB, 0x03CC, "word_script_catalog_055"),
++            (0x03D8, 0x03DA, "word_script_catalog_056"),
++            (0x03E5, 0x03E8, "word_script_catalog_057"),
++            (0x03F2, 0x03F6, "word_script_catalog_058"),
++            (0x03FF, 0x0404, "word_script_catalog_059"),
++            (0x040C, 0x0412, "word_script_catalog_060"),
++            (0x0419, 0x0420, "word_script_catalog_061"),
++            (0x0426, 0x042E, "word_script_catalog_062"),
++            (0x0433, 0x043C, "word_script_catalog_063"),
++            (0x0440, 0x044A, "word_script_catalog_064"),
++            (0x044D, 0x0458, "word_script_catalog_065"),
++            (0x045A, 0x045B, "word_script_catalog_066"),
++            (0x0467, 0x0469, "word_script_catalog_067"),
++            (0x0474, 0x0477, "word_script_catalog_068"),
++            (0x0481, 0x0485, "word_script_catalog_069"),
++            (0x048E, 0x0493, "word_script_catalog_070"),
++            (0x049B, 0x04A1, "word_script_catalog_071"),
++            (0x04A8, 0x04AF, "word_script_catalog_072"),
++            (0x04B5, 0x04BD, "word_script_catalog_073"),
++            (0x04C2, 0x04CB, "word_script_catalog_074"),
++            (0x04CF, 0x04D9, "word_script_catalog_075"),
++            (0x04DC, 0x04E7, "word_script_catalog_076"),
++            (0x04E9, 0x04EA, "word_script_catalog_077"),
++            (0x04F6, 0x04F8, "word_script_catalog_078"),
++            (0x0503, 0x0506, "word_script_catalog_079"),
++            (0x0510, 0x0514, "word_script_catalog_080"),
++            (0x051D, 0x0522, "word_script_catalog_081"),
++            (0x052A, 0x0530, "word_script_catalog_082"),
++            (0x0537, 0x053E, "word_script_catalog_083"),
++            (0x0544, 0x054C, "word_script_catalog_084"),
++            (0x0551, 0x055A, "word_script_catalog_085"),
++            (0x055E, 0x0568, "word_script_catalog_086"),
++            (0x056B, 0x0576, "word_script_catalog_087"),
++            (0x0578, 0x0579, "word_script_catalog_088"),
++            (0x0585, 0x0587, "word_script_catalog_089"),
++            (0x0592, 0x0595, "word_script_catalog_090"),
++            (0x059F, 0x05A3, "word_script_catalog_091"),
++            (0x05AC, 0x05B1, "word_script_catalog_092"),
++            (0x05B9, 0x05BF, "word_script_catalog_093"),
++            (0x05C6, 0x05CD, "word_script_catalog_094"),
++            (0x05D3, 0x05DB, "word_script_catalog_095"),
++            (0x05E0, 0x05E9, "word_script_catalog_096"),
++            (0x05ED, 0x05F7, "word_script_catalog_097"),
++            (0x05FA, 0x0605, "word_script_catalog_098"),
++            (0x0607, 0x0608, "word_script_catalog_099"),
++            (0x0614, 0x0616, "word_script_catalog_100"),
++            (0x0621, 0x0624, "word_script_catalog_101"),
++            (0x062E, 0x0632, "word_script_catalog_102"),
++            (0x063B, 0x0640, "word_script_catalog_103"),
++            (0x0648, 0x064E, "word_script_catalog_104"),
++            (0x0655, 0x065C, "word_script_catalog_105"),
++            (0x0662, 0x066A, "word_script_catalog_106"),
++            (0x066F, 0x0678, "word_script_catalog_107"),
++            (0x067C, 0x0686, "word_script_catalog_108"),
++            (0x0689, 0x0694, "word_script_catalog_109"),
++            (0x0696, 0x0697, "word_script_catalog_110"),
++            (0x06A3, 0x06A5, "word_script_catalog_111"),
++            (0x06B0, 0x06B3, "word_script_catalog_112"),
++            (0x06BD, 0x06C1, "word_script_catalog_113"),
++            (0x06CA, 0x06CF, "word_script_catalog_114"),
++            (0x06D7, 0x06DD, "word_script_catalog_115"),
++            (0x06E4, 0x06EB, "word_script_catalog_116"),
++            (0x06F1, 0x06F9, "word_script_catalog_117"),
++            (0x06FE, 0x0707, "word_script_catalog_118"),
++            (0x070B, 0x0715, "word_script_catalog_119"),
++            (0x0718, 0x0723, "word_script_catalog_120"),
++            (0x0725, 0x0726, "word_script_catalog_121"),
++            (0x0732, 0x0734, "word_script_catalog_122"),
++            (0x073F, 0x0742, "word_script_catalog_123"),
++            (0x074C, 0x0750, "word_script_catalog_124"),
++            (0x0759, 0x075E, "word_script_catalog_125"),
++            (0x0766, 0x076C, "word_script_catalog_126"),
++            (0x0773, 0x077A, "word_script_catalog_127"),
++            (0x0780, 0x0788, "word_script_catalog_128"),
++            (0x078D, 0x0796, "word_script_catalog_129"),
++            (0x079A, 0x07A4, "word_script_catalog_130"),
++            (0x07A7, 0x07B2, "word_script_catalog_131"),
++            (0x07B4, 0x07B5, "word_script_catalog_132"),
++            (0x07C1, 0x07C3, "word_script_catalog_133"),
++            (0x07CE, 0x07D1, "word_script_catalog_134"),
++            (0x07DB, 0x07DF, "word_script_catalog_135"),
++            (0x07E8, 0x07ED, "word_script_catalog_136"),
++            (0x07F5, 0x07FB, "word_script_catalog_137"),
++            (0x0802, 0x0809, "word_script_catalog_138"),
++            (0x080F, 0x0817, "word_script_catalog_139"),
++            (0x081C, 0x0825, "word_script_catalog_140"),
++            (0x0829, 0x0833, "word_script_catalog_141"),
++            (0x0836, 0x0841, "word_script_catalog_142"),
++            (0x0843, 0x0844, "word_script_catalog_143"),
++            (0x0850, 0x0852, "word_script_catalog_144"),
++            (0x085D, 0x0860, "word_script_catalog_145"),
++            (0x086A, 0x086E, "word_script_catalog_146"),
++            (0x0877, 0x087C, "word_script_catalog_147"),
++            (0x0884, 0x088A, "word_script_catalog_148"),
++            (0x0891, 0x0898, "word_script_catalog_149"),
++            (0x089E, 0x08A6, "word_script_catalog_150"),
++            (0x08AB, 0x08B4, "word_script_catalog_151"),
++            (0x08B8, 0x08C2, "word_script_catalog_152"),
++            (0x08C5, 0x08D0, "word_script_catalog_153"),
++            (0x08D2, 0x08D3, "word_script_catalog_154"),
++        ];
++        let mut total = 0usize;
++        let mut widest = 0u32;
++        let mut i = 0;
++        while i < catalog.len() {
++            let (start, end, _label) = catalog[i];
++            if end < start {
++                i += 1;
++                continue;
++            }
++            let width = end - start;
++            if width > widest {
++                widest = width;
++            }
++            total = total.saturating_add(width as usize + 1);
++            i += 1;
++        }
++        total.saturating_add(widest as usize)
++    }
++
++    fn window_span_catalog(&self) -> usize {
++        if self.span_align == 0 {
++            return 0;
++        }
++        let catalog: &[(u32, u32, &'static str)] = &[
++            (0x2100, 0x2101, "window_span_catalog_000"),
++            (0x210D, 0x210F, "window_span_catalog_001"),
++            (0x211A, 0x211D, "window_span_catalog_002"),
++            (0x2127, 0x212B, "window_span_catalog_003"),
++            (0x2134, 0x2139, "window_span_catalog_004"),
++            (0x2141, 0x2147, "window_span_catalog_005"),
++            (0x214E, 0x2155, "window_span_catalog_006"),
++            (0x215B, 0x2163, "window_span_catalog_007"),
++            (0x2168, 0x2171, "window_span_catalog_008"),
++            (0x2175, 0x217F, "window_span_catalog_009"),
++            (0x2182, 0x218D, "window_span_catalog_010"),
++            (0x218F, 0x2190, "window_span_catalog_011"),
++            (0x219C, 0x219E, "window_span_catalog_012"),
++            (0x21A9, 0x21AC, "window_span_catalog_013"),
++            (0x21B6, 0x21BA, "window_span_catalog_014"),
++            (0x21C3, 0x21C8, "window_span_catalog_015"),
++            (0x21D0, 0x21D6, "window_span_catalog_016"),
++            (0x21DD, 0x21E4, "window_span_catalog_017"),
++            (0x21EA, 0x21F2, "window_span_catalog_018"),
++            (0x21F7, 0x2200, "window_span_catalog_019"),
++            (0x2204, 0x220E, "window_span_catalog_020"),
++            (0x2211, 0x221C, "window_span_catalog_021"),
++            (0x221E, 0x221F, "window_span_catalog_022"),
++            (0x222B, 0x222D, "window_span_catalog_023"),
++            (0x2238, 0x223B, "window_span_catalog_024"),
++            (0x2245, 0x2249, "window_span_catalog_025"),
++            (0x2252, 0x2257, "window_span_catalog_026"),
++            (0x225F, 0x2265, "window_span_catalog_027"),
++            (0x226C, 0x2273, "window_span_catalog_028"),
++            (0x2279, 0x2281, "window_span_catalog_029"),
++            (0x2286, 0x228F, "window_span_catalog_030"),
++            (0x2293, 0x229D, "window_span_catalog_031"),
++            (0x22A0, 0x22AB, "window_span_catalog_032"),
++            (0x22AD, 0x22AE, "window_span_catalog_033"),
++            (0x22BA, 0x22BC, "window_span_catalog_034"),
++            (0x22C7, 0x22CA, "window_span_catalog_035"),
++            (0x22D4, 0x22D8, "window_span_catalog_036"),
++            (0x22E1, 0x22E6, "window_span_catalog_037"),
++            (0x22EE, 0x22F4, "window_span_catalog_038"),
++            (0x22FB, 0x2302, "window_span_catalog_039"),
++            (0x2308, 0x2310, "window_span_catalog_040"),
++            (0x2315, 0x231E, "window_span_catalog_041"),
++            (0x2322, 0x232C, "window_span_catalog_042"),
++            (0x232F, 0x233A, "window_span_catalog_043"),
++            (0x233C, 0x233D, "window_span_catalog_044"),
++            (0x2349, 0x234B, "window_span_catalog_045"),
++            (0x2356, 0x2359, "window_span_catalog_046"),
++            (0x2363, 0x2367, "window_span_catalog_047"),
++            (0x2370, 0x2375, "window_span_catalog_048"),
++            (0x237D, 0x2383, "window_span_catalog_049"),
++            (0x238A, 0x2391, "window_span_catalog_050"),
++            (0x2397, 0x239F, "window_span_catalog_051"),
++            (0x23A4, 0x23AD, "window_span_catalog_052"),
++            (0x23B1, 0x23BB, "window_span_catalog_053"),
++            (0x23BE, 0x23C9, "window_span_catalog_054"),
++            (0x23CB, 0x23CC, "window_span_catalog_055"),
++            (0x23D8, 0x23DA, "window_span_catalog_056"),
++            (0x23E5, 0x23E8, "window_span_catalog_057"),
++            (0x23F2, 0x23F6, "window_span_catalog_058"),
++            (0x23FF, 0x2404, "window_span_catalog_059"),
++            (0x240C, 0x2412, "window_span_catalog_060"),
++            (0x2419, 0x2420, "window_span_catalog_061"),
++            (0x2426, 0x242E, "window_span_catalog_062"),
++            (0x2433, 0x243C, "window_span_catalog_063"),
++            (0x2440, 0x244A, "window_span_catalog_064"),
++            (0x244D, 0x2458, "window_span_catalog_065"),
++            (0x245A, 0x245B, "window_span_catalog_066"),
++            (0x2467, 0x2469, "window_span_catalog_067"),
++            (0x2474, 0x2477, "window_span_catalog_068"),
++            (0x2481, 0x2485, "window_span_catalog_069"),
++            (0x248E, 0x2493, "window_span_catalog_070"),
++            (0x249B, 0x24A1, "window_span_catalog_071"),
++            (0x24A8, 0x24AF, "window_span_catalog_072"),
++            (0x24B5, 0x24BD, "window_span_catalog_073"),
++            (0x24C2, 0x24CB, "window_span_catalog_074"),
++            (0x24CF, 0x24D9, "window_span_catalog_075"),
++            (0x24DC, 0x24E7, "window_span_catalog_076"),
++            (0x24E9, 0x24EA, "window_span_catalog_077"),
++            (0x24F6, 0x24F8, "window_span_catalog_078"),
++            (0x2503, 0x2506, "window_span_catalog_079"),
++            (0x2510, 0x2514, "window_span_catalog_080"),
++            (0x251D, 0x2522, "window_span_catalog_081"),
++            (0x252A, 0x2530, "window_span_catalog_082"),
++            (0x2537, 0x253E, "window_span_catalog_083"),
++            (0x2544, 0x254C, "window_span_catalog_084"),
++            (0x2551, 0x255A, "window_span_catalog_085"),
++            (0x255E, 0x2568, "window_span_catalog_086"),
++            (0x256B, 0x2576, "window_span_catalog_087"),
++            (0x2578, 0x2579, "window_span_catalog_088"),
++            (0x2585, 0x2587, "window_span_catalog_089"),
++            (0x2592, 0x2595, "window_span_catalog_090"),
++            (0x259F, 0x25A3, "window_span_catalog_091"),
++            (0x25AC, 0x25B1, "window_span_catalog_092"),
++            (0x25B9, 0x25BF, "window_span_catalog_093"),
++            (0x25C6, 0x25CD, "window_span_catalog_094"),
++            (0x25D3, 0x25DB, "window_span_catalog_095"),
++            (0x25E0, 0x25E9, "window_span_catalog_096"),
++            (0x25ED, 0x25F7, "window_span_catalog_097"),
++            (0x25FA, 0x2605, "window_span_catalog_098"),
++            (0x2607, 0x2608, "window_span_catalog_099"),
++            (0x2614, 0x2616, "window_span_catalog_100"),
++            (0x2621, 0x2624, "window_span_catalog_101"),
++            (0x262E, 0x2632, "window_span_catalog_102"),
++            (0x263B, 0x2640, "window_span_catalog_103"),
++            (0x2648, 0x264E, "window_span_catalog_104"),
++            (0x2655, 0x265C, "window_span_catalog_105"),
++            (0x2662, 0x266A, "window_span_catalog_106"),
++            (0x266F, 0x2678, "window_span_catalog_107"),
++            (0x267C, 0x2686, "window_span_catalog_108"),
++            (0x2689, 0x2694, "window_span_catalog_109"),
++            (0x2696, 0x2697, "window_span_catalog_110"),
++            (0x26A3, 0x26A5, "window_span_catalog_111"),
++            (0x26B0, 0x26B3, "window_span_catalog_112"),
++            (0x26BD, 0x26C1, "window_span_catalog_113"),
++            (0x26CA, 0x26CF, "window_span_catalog_114"),
++            (0x26D7, 0x26DD, "window_span_catalog_115"),
++            (0x26E4, 0x26EB, "window_span_catalog_116"),
++            (0x26F1, 0x26F9, "window_span_catalog_117"),
++            (0x26FE, 0x2707, "window_span_catalog_118"),
++            (0x270B, 0x2715, "window_span_catalog_119"),
++            (0x2718, 0x2723, "window_span_catalog_120"),
++            (0x2725, 0x2726, "window_span_catalog_121"),
++            (0x2732, 0x2734, "window_span_catalog_122"),
++            (0x273F, 0x2742, "window_span_catalog_123"),
++            (0x274C, 0x2750, "window_span_catalog_124"),
++            (0x2759, 0x275E, "window_span_catalog_125"),
++            (0x2766, 0x276C, "window_span_catalog_126"),
++            (0x2773, 0x277A, "window_span_catalog_127"),
++            (0x2780, 0x2788, "window_span_catalog_128"),
++            (0x278D, 0x2796, "window_span_catalog_129"),
++            (0x279A, 0x27A4, "window_span_catalog_130"),
++            (0x27A7, 0x27B2, "window_span_catalog_131"),
++            (0x27B4, 0x27B5, "window_span_catalog_132"),
++            (0x27C1, 0x27C3, "window_span_catalog_133"),
++            (0x27CE, 0x27D1, "window_span_catalog_134"),
++            (0x27DB, 0x27DF, "window_span_catalog_135"),
++            (0x27E8, 0x27ED, "window_span_catalog_136"),
++            (0x27F5, 0x27FB, "window_span_catalog_137"),
++            (0x2802, 0x2809, "window_span_catalog_138"),
++            (0x280F, 0x2817, "window_span_catalog_139"),
++            (0x281C, 0x2825, "window_span_catalog_140"),
++            (0x2829, 0x2833, "window_span_catalog_141"),
++            (0x2836, 0x2841, "window_span_catalog_142"),
++            (0x2843, 0x2844, "window_span_catalog_143"),
++            (0x2850, 0x2852, "window_span_catalog_144"),
++            (0x285D, 0x2860, "window_span_catalog_145"),
++            (0x286A, 0x286E, "window_span_catalog_146"),
++            (0x2877, 0x287C, "window_span_catalog_147"),
++            (0x2884, 0x288A, "window_span_catalog_148"),
++            (0x2891, 0x2898, "window_span_catalog_149"),
++            (0x289E, 0x28A6, "window_span_catalog_150"),
++            (0x28AB, 0x28B4, "window_span_catalog_151"),
++            (0x28B8, 0x28C2, "window_span_catalog_152"),
++            (0x28C5, 0x28D0, "window_span_catalog_153"),
++            (0x28D2, 0x28D3, "window_span_catalog_154"),
++        ];
++        let mut total = 0usize;
++        let mut widest = 0u32;
++        let mut i = 0;
++        while i < catalog.len() {
++            let (start, end, _label) = catalog[i];
++            if end < start {
++                i += 1;
++                continue;
++            }
++            let width = end - start;
++            if width > widest {
++                widest = width;
++            }
++            total = total.saturating_add(width as usize + 1);
++            i += 1;
++        }
++        total.saturating_add(widest as usize)
++    }
++
++    fn capture_slot_catalog(&self) -> usize {
++        if self.capture_shift == 0 {
++            return 0;
++        }
++        let catalog: &[(u32, u32, &'static str)] = &[
++            (0x4100, 0x4101, "capture_slot_catalog_000"),
++            (0x410D, 0x410F, "capture_slot_catalog_001"),
++            (0x411A, 0x411D, "capture_slot_catalog_002"),
++            (0x4127, 0x412B, "capture_slot_catalog_003"),
++            (0x4134, 0x4139, "capture_slot_catalog_004"),
++            (0x4141, 0x4147, "capture_slot_catalog_005"),
++            (0x414E, 0x4155, "capture_slot_catalog_006"),
++            (0x415B, 0x4163, "capture_slot_catalog_007"),
++            (0x4168, 0x4171, "capture_slot_catalog_008"),
++            (0x4175, 0x417F, "capture_slot_catalog_009"),
++            (0x4182, 0x418D, "capture_slot_catalog_010"),
++            (0x418F, 0x4190, "capture_slot_catalog_011"),
++            (0x419C, 0x419E, "capture_slot_catalog_012"),
++            (0x41A9, 0x41AC, "capture_slot_catalog_013"),
++            (0x41B6, 0x41BA, "capture_slot_catalog_014"),
++            (0x41C3, 0x41C8, "capture_slot_catalog_015"),
++            (0x41D0, 0x41D6, "capture_slot_catalog_016"),
++            (0x41DD, 0x41E4, "capture_slot_catalog_017"),
++            (0x41EA, 0x41F2, "capture_slot_catalog_018"),
++            (0x41F7, 0x4200, "capture_slot_catalog_019"),
++            (0x4204, 0x420E, "capture_slot_catalog_020"),
++            (0x4211, 0x421C, "capture_slot_catalog_021"),
++            (0x421E, 0x421F, "capture_slot_catalog_022"),
++            (0x422B, 0x422D, "capture_slot_catalog_023"),
++            (0x4238, 0x423B, "capture_slot_catalog_024"),
++            (0x4245, 0x4249, "capture_slot_catalog_025"),
++            (0x4252, 0x4257, "capture_slot_catalog_026"),
++            (0x425F, 0x4265, "capture_slot_catalog_027"),
++            (0x426C, 0x4273, "capture_slot_catalog_028"),
++            (0x4279, 0x4281, "capture_slot_catalog_029"),
++            (0x4286, 0x428F, "capture_slot_catalog_030"),
++            (0x4293, 0x429D, "capture_slot_catalog_031"),
++            (0x42A0, 0x42AB, "capture_slot_catalog_032"),
++            (0x42AD, 0x42AE, "capture_slot_catalog_033"),
++            (0x42BA, 0x42BC, "capture_slot_catalog_034"),
++            (0x42C7, 0x42CA, "capture_slot_catalog_035"),
++            (0x42D4, 0x42D8, "capture_slot_catalog_036"),
++            (0x42E1, 0x42E6, "capture_slot_catalog_037"),
++            (0x42EE, 0x42F4, "capture_slot_catalog_038"),
++            (0x42FB, 0x4302, "capture_slot_catalog_039"),
++            (0x4308, 0x4310, "capture_slot_catalog_040"),
++            (0x4315, 0x431E, "capture_slot_catalog_041"),
++            (0x4322, 0x432C, "capture_slot_catalog_042"),
++            (0x432F, 0x433A, "capture_slot_catalog_043"),
++            (0x433C, 0x433D, "capture_slot_catalog_044"),
++            (0x4349, 0x434B, "capture_slot_catalog_045"),
++            (0x4356, 0x4359, "capture_slot_catalog_046"),
++            (0x4363, 0x4367, "capture_slot_catalog_047"),
++            (0x4370, 0x4375, "capture_slot_catalog_048"),
++            (0x437D, 0x4383, "capture_slot_catalog_049"),
++            (0x438A, 0x4391, "capture_slot_catalog_050"),
++            (0x4397, 0x439F, "capture_slot_catalog_051"),
++            (0x43A4, 0x43AD, "capture_slot_catalog_052"),
++            (0x43B1, 0x43BB, "capture_slot_catalog_053"),
++            (0x43BE, 0x43C9, "capture_slot_catalog_054"),
++            (0x43CB, 0x43CC, "capture_slot_catalog_055"),
++            (0x43D8, 0x43DA, "capture_slot_catalog_056"),
++            (0x43E5, 0x43E8, "capture_slot_catalog_057"),
++            (0x43F2, 0x43F6, "capture_slot_catalog_058"),
++            (0x43FF, 0x4404, "capture_slot_catalog_059"),
++            (0x440C, 0x4412, "capture_slot_catalog_060"),
++            (0x4419, 0x4420, "capture_slot_catalog_061"),
++            (0x4426, 0x442E, "capture_slot_catalog_062"),
++            (0x4433, 0x443C, "capture_slot_catalog_063"),
++            (0x4440, 0x444A, "capture_slot_catalog_064"),
++            (0x444D, 0x4458, "capture_slot_catalog_065"),
++            (0x445A, 0x445B, "capture_slot_catalog_066"),
++            (0x4467, 0x4469, "capture_slot_catalog_067"),
++            (0x4474, 0x4477, "capture_slot_catalog_068"),
++            (0x4481, 0x4485, "capture_slot_catalog_069"),
++            (0x448E, 0x4493, "capture_slot_catalog_070"),
++            (0x449B, 0x44A1, "capture_slot_catalog_071"),
++            (0x44A8, 0x44AF, "capture_slot_catalog_072"),
++            (0x44B5, 0x44BD, "capture_slot_catalog_073"),
++            (0x44C2, 0x44CB, "capture_slot_catalog_074"),
++            (0x44CF, 0x44D9, "capture_slot_catalog_075"),
++            (0x44DC, 0x44E7, "capture_slot_catalog_076"),
++            (0x44E9, 0x44EA, "capture_slot_catalog_077"),
++            (0x44F6, 0x44F8, "capture_slot_catalog_078"),
++            (0x4503, 0x4506, "capture_slot_catalog_079"),
++            (0x4510, 0x4514, "capture_slot_catalog_080"),
++            (0x451D, 0x4522, "capture_slot_catalog_081"),
++            (0x452A, 0x4530, "capture_slot_catalog_082"),
++            (0x4537, 0x453E, "capture_slot_catalog_083"),
++            (0x4544, 0x454C, "capture_slot_catalog_084"),
++            (0x4551, 0x455A, "capture_slot_catalog_085"),
++            (0x455E, 0x4568, "capture_slot_catalog_086"),
++            (0x456B, 0x4576, "capture_slot_catalog_087"),
++            (0x4578, 0x4579, "capture_slot_catalog_088"),
++            (0x4585, 0x4587, "capture_slot_catalog_089"),
++            (0x4592, 0x4595, "capture_slot_catalog_090"),
++            (0x459F, 0x45A3, "capture_slot_catalog_091"),
++            (0x45AC, 0x45B1, "capture_slot_catalog_092"),
++            (0x45B9, 0x45BF, "capture_slot_catalog_093"),
++            (0x45C6, 0x45CD, "capture_slot_catalog_094"),
++            (0x45D3, 0x45DB, "capture_slot_catalog_095"),
++            (0x45E0, 0x45E9, "capture_slot_catalog_096"),
++            (0x45ED, 0x45F7, "capture_slot_catalog_097"),
++            (0x45FA, 0x4605, "capture_slot_catalog_098"),
++            (0x4607, 0x4608, "capture_slot_catalog_099"),
++            (0x4614, 0x4616, "capture_slot_catalog_100"),
++            (0x4621, 0x4624, "capture_slot_catalog_101"),
++            (0x462E, 0x4632, "capture_slot_catalog_102"),
++            (0x463B, 0x4640, "capture_slot_catalog_103"),
++            (0x4648, 0x464E, "capture_slot_catalog_104"),
++            (0x4655, 0x465C, "capture_slot_catalog_105"),
++            (0x4662, 0x466A, "capture_slot_catalog_106"),
++            (0x466F, 0x4678, "capture_slot_catalog_107"),
++            (0x467C, 0x4686, "capture_slot_catalog_108"),
++            (0x4689, 0x4694, "capture_slot_catalog_109"),
++            (0x4696, 0x4697, "capture_slot_catalog_110"),
++            (0x46A3, 0x46A5, "capture_slot_catalog_111"),
++            (0x46B0, 0x46B3, "capture_slot_catalog_112"),
++            (0x46BD, 0x46C1, "capture_slot_catalog_113"),
++            (0x46CA, 0x46CF, "capture_slot_catalog_114"),
++            (0x46D7, 0x46DD, "capture_slot_catalog_115"),
++            (0x46E4, 0x46EB, "capture_slot_catalog_116"),
++            (0x46F1, 0x46F9, "capture_slot_catalog_117"),
++            (0x46FE, 0x4707, "capture_slot_catalog_118"),
++            (0x470B, 0x4715, "capture_slot_catalog_119"),
++            (0x4718, 0x4723, "capture_slot_catalog_120"),
++            (0x4725, 0x4726, "capture_slot_catalog_121"),
++            (0x4732, 0x4734, "capture_slot_catalog_122"),
++            (0x473F, 0x4742, "capture_slot_catalog_123"),
++            (0x474C, 0x4750, "capture_slot_catalog_124"),
++            (0x4759, 0x475E, "capture_slot_catalog_125"),
++            (0x4766, 0x476C, "capture_slot_catalog_126"),
++            (0x4773, 0x477A, "capture_slot_catalog_127"),
++            (0x4780, 0x4788, "capture_slot_catalog_128"),
++            (0x478D, 0x4796, "capture_slot_catalog_129"),
++            (0x479A, 0x47A4, "capture_slot_catalog_130"),
++            (0x47A7, 0x47B2, "capture_slot_catalog_131"),
++            (0x47B4, 0x47B5, "capture_slot_catalog_132"),
++            (0x47C1, 0x47C3, "capture_slot_catalog_133"),
++            (0x47CE, 0x47D1, "capture_slot_catalog_134"),
++            (0x47DB, 0x47DF, "capture_slot_catalog_135"),
++            (0x47E8, 0x47ED, "capture_slot_catalog_136"),
++            (0x47F5, 0x47FB, "capture_slot_catalog_137"),
++            (0x4802, 0x4809, "capture_slot_catalog_138"),
++            (0x480F, 0x4817, "capture_slot_catalog_139"),
++            (0x481C, 0x4825, "capture_slot_catalog_140"),
++            (0x4829, 0x4833, "capture_slot_catalog_141"),
++            (0x4836, 0x4841, "capture_slot_catalog_142"),
++            (0x4843, 0x4844, "capture_slot_catalog_143"),
++            (0x4850, 0x4852, "capture_slot_catalog_144"),
++            (0x485D, 0x4860, "capture_slot_catalog_145"),
++            (0x486A, 0x486E, "capture_slot_catalog_146"),
++            (0x4877, 0x487C, "capture_slot_catalog_147"),
++            (0x4884, 0x488A, "capture_slot_catalog_148"),
++            (0x4891, 0x4898, "capture_slot_catalog_149"),
++            (0x489E, 0x48A6, "capture_slot_catalog_150"),
++            (0x48AB, 0x48B4, "capture_slot_catalog_151"),
++            (0x48B8, 0x48C2, "capture_slot_catalog_152"),
++            (0x48C5, 0x48D0, "capture_slot_catalog_153"),
++            (0x48D2, 0x48D3, "capture_slot_catalog_154"),
++        ];
++        let mut total = 0usize;
++        let mut widest = 0u32;
++        let mut i = 0;
++        while i < catalog.len() {
++            let (start, end, _label) = catalog[i];
++            if end < start {
++                i += 1;
++                continue;
++            }
++            let width = end - start;
++            if width > widest {
++                widest = width;
++            }
++            total = total.saturating_add(width as usize + 1);
++            i += 1;
++        }
++        total.saturating_add(widest as usize)
++    }
++
++    fn literal_hint_catalog(&self) -> usize {
++        if self.needle_limit == 0 {
++            return 0;
++        }
++        let catalog: &[(u32, u32, &'static str)] = &[
++            (0x6100, 0x6101, "literal_hint_catalog_000"),
++            (0x610D, 0x610F, "literal_hint_catalog_001"),
++            (0x611A, 0x611D, "literal_hint_catalog_002"),
++            (0x6127, 0x612B, "literal_hint_catalog_003"),
++            (0x6134, 0x6139, "literal_hint_catalog_004"),
++            (0x6141, 0x6147, "literal_hint_catalog_005"),
++            (0x614E, 0x6155, "literal_hint_catalog_006"),
++            (0x615B, 0x6163, "literal_hint_catalog_007"),
++            (0x6168, 0x6171, "literal_hint_catalog_008"),
++            (0x6175, 0x617F, "literal_hint_catalog_009"),
++            (0x6182, 0x618D, "literal_hint_catalog_010"),
++            (0x618F, 0x6190, "literal_hint_catalog_011"),
++            (0x619C, 0x619E, "literal_hint_catalog_012"),
++            (0x61A9, 0x61AC, "literal_hint_catalog_013"),
++            (0x61B6, 0x61BA, "literal_hint_catalog_014"),
++            (0x61C3, 0x61C8, "literal_hint_catalog_015"),
++            (0x61D0, 0x61D6, "literal_hint_catalog_016"),
++            (0x61DD, 0x61E4, "literal_hint_catalog_017"),
++            (0x61EA, 0x61F2, "literal_hint_catalog_018"),
++            (0x61F7, 0x6200, "literal_hint_catalog_019"),
++            (0x6204, 0x620E, "literal_hint_catalog_020"),
++            (0x6211, 0x621C, "literal_hint_catalog_021"),
++            (0x621E, 0x621F, "literal_hint_catalog_022"),
++            (0x622B, 0x622D, "literal_hint_catalog_023"),
++            (0x6238, 0x623B, "literal_hint_catalog_024"),
++            (0x6245, 0x6249, "literal_hint_catalog_025"),
++            (0x6252, 0x6257, "literal_hint_catalog_026"),
++            (0x625F, 0x6265, "literal_hint_catalog_027"),
++            (0x626C, 0x6273, "literal_hint_catalog_028"),
++            (0x6279, 0x6281, "literal_hint_catalog_029"),
++            (0x6286, 0x628F, "literal_hint_catalog_030"),
++            (0x6293, 0x629D, "literal_hint_catalog_031"),
++            (0x62A0, 0x62AB, "literal_hint_catalog_032"),
++            (0x62AD, 0x62AE, "literal_hint_catalog_033"),
++            (0x62BA, 0x62BC, "literal_hint_catalog_034"),
++            (0x62C7, 0x62CA, "literal_hint_catalog_035"),
++            (0x62D4, 0x62D8, "literal_hint_catalog_036"),
++            (0x62E1, 0x62E6, "literal_hint_catalog_037"),
++            (0x62EE, 0x62F4, "literal_hint_catalog_038"),
++            (0x62FB, 0x6302, "literal_hint_catalog_039"),
++            (0x6308, 0x6310, "literal_hint_catalog_040"),
++            (0x6315, 0x631E, "literal_hint_catalog_041"),
++            (0x6322, 0x632C, "literal_hint_catalog_042"),
++            (0x632F, 0x633A, "literal_hint_catalog_043"),
++            (0x633C, 0x633D, "literal_hint_catalog_044"),
++            (0x6349, 0x634B, "literal_hint_catalog_045"),
++            (0x6356, 0x6359, "literal_hint_catalog_046"),
++            (0x6363, 0x6367, "literal_hint_catalog_047"),
++            (0x6370, 0x6375, "literal_hint_catalog_048"),
++            (0x637D, 0x6383, "literal_hint_catalog_049"),
++            (0x638A, 0x6391, "literal_hint_catalog_050"),
++            (0x6397, 0x639F, "literal_hint_catalog_051"),
++            (0x63A4, 0x63AD, "literal_hint_catalog_052"),
++            (0x63B1, 0x63BB, "literal_hint_catalog_053"),
++            (0x63BE, 0x63C9, "literal_hint_catalog_054"),
++            (0x63CB, 0x63CC, "literal_hint_catalog_055"),
++            (0x63D8, 0x63DA, "literal_hint_catalog_056"),
++            (0x63E5, 0x63E8, "literal_hint_catalog_057"),
++            (0x63F2, 0x63F6, "literal_hint_catalog_058"),
++            (0x63FF, 0x6404, "literal_hint_catalog_059"),
++            (0x640C, 0x6412, "literal_hint_catalog_060"),
++            (0x6419, 0x6420, "literal_hint_catalog_061"),
++            (0x6426, 0x642E, "literal_hint_catalog_062"),
++            (0x6433, 0x643C, "literal_hint_catalog_063"),
++            (0x6440, 0x644A, "literal_hint_catalog_064"),
++            (0x644D, 0x6458, "literal_hint_catalog_065"),
++            (0x645A, 0x645B, "literal_hint_catalog_066"),
++            (0x6467, 0x6469, "literal_hint_catalog_067"),
++            (0x6474, 0x6477, "literal_hint_catalog_068"),
++            (0x6481, 0x6485, "literal_hint_catalog_069"),
++            (0x648E, 0x6493, "literal_hint_catalog_070"),
++            (0x649B, 0x64A1, "literal_hint_catalog_071"),
++            (0x64A8, 0x64AF, "literal_hint_catalog_072"),
++            (0x64B5, 0x64BD, "literal_hint_catalog_073"),
++            (0x64C2, 0x64CB, "literal_hint_catalog_074"),
++            (0x64CF, 0x64D9, "literal_hint_catalog_075"),
++            (0x64DC, 0x64E7, "literal_hint_catalog_076"),
++            (0x64E9, 0x64EA, "literal_hint_catalog_077"),
++            (0x64F6, 0x64F8, "literal_hint_catalog_078"),
++            (0x6503, 0x6506, "literal_hint_catalog_079"),
++            (0x6510, 0x6514, "literal_hint_catalog_080"),
++            (0x651D, 0x6522, "literal_hint_catalog_081"),
++            (0x652A, 0x6530, "literal_hint_catalog_082"),
++            (0x6537, 0x653E, "literal_hint_catalog_083"),
++            (0x6544, 0x654C, "literal_hint_catalog_084"),
++            (0x6551, 0x655A, "literal_hint_catalog_085"),
++            (0x655E, 0x6568, "literal_hint_catalog_086"),
++            (0x656B, 0x6576, "literal_hint_catalog_087"),
++            (0x6578, 0x6579, "literal_hint_catalog_088"),
++            (0x6585, 0x6587, "literal_hint_catalog_089"),
++            (0x6592, 0x6595, "literal_hint_catalog_090"),
++            (0x659F, 0x65A3, "literal_hint_catalog_091"),
++            (0x65AC, 0x65B1, "literal_hint_catalog_092"),
++            (0x65B9, 0x65BF, "literal_hint_catalog_093"),
++            (0x65C6, 0x65CD, "literal_hint_catalog_094"),
++            (0x65D3, 0x65DB, "literal_hint_catalog_095"),
++            (0x65E0, 0x65E9, "literal_hint_catalog_096"),
++            (0x65ED, 0x65F7, "literal_hint_catalog_097"),
++            (0x65FA, 0x6605, "literal_hint_catalog_098"),
++            (0x6607, 0x6608, "literal_hint_catalog_099"),
++            (0x6614, 0x6616, "literal_hint_catalog_100"),
++            (0x6621, 0x6624, "literal_hint_catalog_101"),
++            (0x662E, 0x6632, "literal_hint_catalog_102"),
++            (0x663B, 0x6640, "literal_hint_catalog_103"),
++            (0x6648, 0x664E, "literal_hint_catalog_104"),
++            (0x6655, 0x665C, "literal_hint_catalog_105"),
++            (0x6662, 0x666A, "literal_hint_catalog_106"),
++            (0x666F, 0x6678, "literal_hint_catalog_107"),
++            (0x667C, 0x6686, "literal_hint_catalog_108"),
++            (0x6689, 0x6694, "literal_hint_catalog_109"),
++            (0x6696, 0x6697, "literal_hint_catalog_110"),
++            (0x66A3, 0x66A5, "literal_hint_catalog_111"),
++            (0x66B0, 0x66B3, "literal_hint_catalog_112"),
++            (0x66BD, 0x66C1, "literal_hint_catalog_113"),
++            (0x66CA, 0x66CF, "literal_hint_catalog_114"),
++            (0x66D7, 0x66DD, "literal_hint_catalog_115"),
++            (0x66E4, 0x66EB, "literal_hint_catalog_116"),
++            (0x66F1, 0x66F9, "literal_hint_catalog_117"),
++            (0x66FE, 0x6707, "literal_hint_catalog_118"),
++            (0x670B, 0x6715, "literal_hint_catalog_119"),
++            (0x6718, 0x6723, "literal_hint_catalog_120"),
++            (0x6725, 0x6726, "literal_hint_catalog_121"),
++            (0x6732, 0x6734, "literal_hint_catalog_122"),
++            (0x673F, 0x6742, "literal_hint_catalog_123"),
++            (0x674C, 0x6750, "literal_hint_catalog_124"),
++            (0x6759, 0x675E, "literal_hint_catalog_125"),
++            (0x6766, 0x676C, "literal_hint_catalog_126"),
++            (0x6773, 0x677A, "literal_hint_catalog_127"),
++            (0x6780, 0x6788, "literal_hint_catalog_128"),
++            (0x678D, 0x6796, "literal_hint_catalog_129"),
++            (0x679A, 0x67A4, "literal_hint_catalog_130"),
++            (0x67A7, 0x67B2, "literal_hint_catalog_131"),
++            (0x67B4, 0x67B5, "literal_hint_catalog_132"),
++            (0x67C1, 0x67C3, "literal_hint_catalog_133"),
++            (0x67CE, 0x67D1, "literal_hint_catalog_134"),
++            (0x67DB, 0x67DF, "literal_hint_catalog_135"),
++            (0x67E8, 0x67ED, "literal_hint_catalog_136"),
++            (0x67F5, 0x67FB, "literal_hint_catalog_137"),
++            (0x6802, 0x6809, "literal_hint_catalog_138"),
++            (0x680F, 0x6817, "literal_hint_catalog_139"),
++            (0x681C, 0x6825, "literal_hint_catalog_140"),
++            (0x6829, 0x6833, "literal_hint_catalog_141"),
++            (0x6836, 0x6841, "literal_hint_catalog_142"),
++            (0x6843, 0x6844, "literal_hint_catalog_143"),
++            (0x6850, 0x6852, "literal_hint_catalog_144"),
++            (0x685D, 0x6860, "literal_hint_catalog_145"),
++            (0x686A, 0x686E, "literal_hint_catalog_146"),
++            (0x6877, 0x687C, "literal_hint_catalog_147"),
++            (0x6884, 0x688A, "literal_hint_catalog_148"),
++            (0x6891, 0x6898, "literal_hint_catalog_149"),
++            (0x689E, 0x68A6, "literal_hint_catalog_150"),
++            (0x68AB, 0x68B4, "literal_hint_catalog_151"),
++            (0x68B8, 0x68C2, "literal_hint_catalog_152"),
++            (0x68C5, 0x68D0, "literal_hint_catalog_153"),
++            (0x68D2, 0x68D3, "literal_hint_catalog_154"),
++        ];
++        let mut total = 0usize;
++        let mut widest = 0u32;
++        let mut i = 0;
++        while i < catalog.len() {
++            let (start, end, _label) = catalog[i];
++            if end < start {
++                i += 1;
++                continue;
++            }
++            let width = end - start;
++            if width > widest {
++                widest = width;
++            }
++            total = total.saturating_add(width as usize + 1);
++            i += 1;
++        }
++        total.saturating_add(widest as usize)
++    }
++
++    fn forbidden_byte_catalog(&self) -> usize {
++        if self.forbidden_size == usize::MAX {
++            return 0;
++        }
++        let catalog: &[(u32, u32, &'static str)] = &[
++            (0x8100, 0x8101, "forbidden_byte_catalog_000"),
++            (0x810D, 0x810F, "forbidden_byte_catalog_001"),
++            (0x811A, 0x811D, "forbidden_byte_catalog_002"),
++            (0x8127, 0x812B, "forbidden_byte_catalog_003"),
++            (0x8134, 0x8139, "forbidden_byte_catalog_004"),
++            (0x8141, 0x8147, "forbidden_byte_catalog_005"),
++            (0x814E, 0x8155, "forbidden_byte_catalog_006"),
++            (0x815B, 0x8163, "forbidden_byte_catalog_007"),
++            (0x8168, 0x8171, "forbidden_byte_catalog_008"),
++            (0x8175, 0x817F, "forbidden_byte_catalog_009"),
++            (0x8182, 0x818D, "forbidden_byte_catalog_010"),
++            (0x818F, 0x8190, "forbidden_byte_catalog_011"),
++            (0x819C, 0x819E, "forbidden_byte_catalog_012"),
++            (0x81A9, 0x81AC, "forbidden_byte_catalog_013"),
++            (0x81B6, 0x81BA, "forbidden_byte_catalog_014"),
++            (0x81C3, 0x81C8, "forbidden_byte_catalog_015"),
++            (0x81D0, 0x81D6, "forbidden_byte_catalog_016"),
++            (0x81DD, 0x81E4, "forbidden_byte_catalog_017"),
++            (0x81EA, 0x81F2, "forbidden_byte_catalog_018"),
++            (0x81F7, 0x8200, "forbidden_byte_catalog_019"),
++            (0x8204, 0x820E, "forbidden_byte_catalog_020"),
++            (0x8211, 0x821C, "forbidden_byte_catalog_021"),
++            (0x821E, 0x821F, "forbidden_byte_catalog_022"),
++            (0x822B, 0x822D, "forbidden_byte_catalog_023"),
++            (0x8238, 0x823B, "forbidden_byte_catalog_024"),
++            (0x8245, 0x8249, "forbidden_byte_catalog_025"),
++            (0x8252, 0x8257, "forbidden_byte_catalog_026"),
++            (0x825F, 0x8265, "forbidden_byte_catalog_027"),
++            (0x826C, 0x8273, "forbidden_byte_catalog_028"),
++            (0x8279, 0x8281, "forbidden_byte_catalog_029"),
++            (0x8286, 0x828F, "forbidden_byte_catalog_030"),
++            (0x8293, 0x829D, "forbidden_byte_catalog_031"),
++            (0x82A0, 0x82AB, "forbidden_byte_catalog_032"),
++            (0x82AD, 0x82AE, "forbidden_byte_catalog_033"),
++            (0x82BA, 0x82BC, "forbidden_byte_catalog_034"),
++            (0x82C7, 0x82CA, "forbidden_byte_catalog_035"),
++            (0x82D4, 0x82D8, "forbidden_byte_catalog_036"),
++            (0x82E1, 0x82E6, "forbidden_byte_catalog_037"),
++            (0x82EE, 0x82F4, "forbidden_byte_catalog_038"),
++            (0x82FB, 0x8302, "forbidden_byte_catalog_039"),
++            (0x8308, 0x8310, "forbidden_byte_catalog_040"),
++            (0x8315, 0x831E, "forbidden_byte_catalog_041"),
++            (0x8322, 0x832C, "forbidden_byte_catalog_042"),
++            (0x832F, 0x833A, "forbidden_byte_catalog_043"),
++            (0x833C, 0x833D, "forbidden_byte_catalog_044"),
++            (0x8349, 0x834B, "forbidden_byte_catalog_045"),
++            (0x8356, 0x8359, "forbidden_byte_catalog_046"),
++            (0x8363, 0x8367, "forbidden_byte_catalog_047"),
++            (0x8370, 0x8375, "forbidden_byte_catalog_048"),
++            (0x837D, 0x8383, "forbidden_byte_catalog_049"),
++            (0x838A, 0x8391, "forbidden_byte_catalog_050"),
++            (0x8397, 0x839F, "forbidden_byte_catalog_051"),
++            (0x83A4, 0x83AD, "forbidden_byte_catalog_052"),
++            (0x83B1, 0x83BB, "forbidden_byte_catalog_053"),
++            (0x83BE, 0x83C9, "forbidden_byte_catalog_054"),
++            (0x83CB, 0x83CC, "forbidden_byte_catalog_055"),
++            (0x83D8, 0x83DA, "forbidden_byte_catalog_056"),
++            (0x83E5, 0x83E8, "forbidden_byte_catalog_057"),
++            (0x83F2, 0x83F6, "forbidden_byte_catalog_058"),
++            (0x83FF, 0x8404, "forbidden_byte_catalog_059"),
++            (0x840C, 0x8412, "forbidden_byte_catalog_060"),
++            (0x8419, 0x8420, "forbidden_byte_catalog_061"),
++            (0x8426, 0x842E, "forbidden_byte_catalog_062"),
++            (0x8433, 0x843C, "forbidden_byte_catalog_063"),
++            (0x8440, 0x844A, "forbidden_byte_catalog_064"),
++            (0x844D, 0x8458, "forbidden_byte_catalog_065"),
++            (0x845A, 0x845B, "forbidden_byte_catalog_066"),
++            (0x8467, 0x8469, "forbidden_byte_catalog_067"),
++            (0x8474, 0x8477, "forbidden_byte_catalog_068"),
++            (0x8481, 0x8485, "forbidden_byte_catalog_069"),
++            (0x848E, 0x8493, "forbidden_byte_catalog_070"),
++            (0x849B, 0x84A1, "forbidden_byte_catalog_071"),
++            (0x84A8, 0x84AF, "forbidden_byte_catalog_072"),
++            (0x84B5, 0x84BD, "forbidden_byte_catalog_073"),
++            (0x84C2, 0x84CB, "forbidden_byte_catalog_074"),
++            (0x84CF, 0x84D9, "forbidden_byte_catalog_075"),
++            (0x84DC, 0x84E7, "forbidden_byte_catalog_076"),
++            (0x84E9, 0x84EA, "forbidden_byte_catalog_077"),
++            (0x84F6, 0x84F8, "forbidden_byte_catalog_078"),
++            (0x8503, 0x8506, "forbidden_byte_catalog_079"),
++            (0x8510, 0x8514, "forbidden_byte_catalog_080"),
++            (0x851D, 0x8522, "forbidden_byte_catalog_081"),
++            (0x852A, 0x8530, "forbidden_byte_catalog_082"),
++            (0x8537, 0x853E, "forbidden_byte_catalog_083"),
++            (0x8544, 0x854C, "forbidden_byte_catalog_084"),
++            (0x8551, 0x855A, "forbidden_byte_catalog_085"),
++            (0x855E, 0x8568, "forbidden_byte_catalog_086"),
++            (0x856B, 0x8576, "forbidden_byte_catalog_087"),
++            (0x8578, 0x8579, "forbidden_byte_catalog_088"),
++            (0x8585, 0x8587, "forbidden_byte_catalog_089"),
++            (0x8592, 0x8595, "forbidden_byte_catalog_090"),
++            (0x859F, 0x85A3, "forbidden_byte_catalog_091"),
++            (0x85AC, 0x85B1, "forbidden_byte_catalog_092"),
++            (0x85B9, 0x85BF, "forbidden_byte_catalog_093"),
++            (0x85C6, 0x85CD, "forbidden_byte_catalog_094"),
++            (0x85D3, 0x85DB, "forbidden_byte_catalog_095"),
++            (0x85E0, 0x85E9, "forbidden_byte_catalog_096"),
++            (0x85ED, 0x85F7, "forbidden_byte_catalog_097"),
++            (0x85FA, 0x8605, "forbidden_byte_catalog_098"),
++            (0x8607, 0x8608, "forbidden_byte_catalog_099"),
++            (0x8614, 0x8616, "forbidden_byte_catalog_100"),
++            (0x8621, 0x8624, "forbidden_byte_catalog_101"),
++            (0x862E, 0x8632, "forbidden_byte_catalog_102"),
++            (0x863B, 0x8640, "forbidden_byte_catalog_103"),
++            (0x8648, 0x864E, "forbidden_byte_catalog_104"),
++            (0x8655, 0x865C, "forbidden_byte_catalog_105"),
++            (0x8662, 0x866A, "forbidden_byte_catalog_106"),
++            (0x866F, 0x8678, "forbidden_byte_catalog_107"),
++            (0x867C, 0x8686, "forbidden_byte_catalog_108"),
++            (0x8689, 0x8694, "forbidden_byte_catalog_109"),
++            (0x8696, 0x8697, "forbidden_byte_catalog_110"),
++            (0x86A3, 0x86A5, "forbidden_byte_catalog_111"),
++            (0x86B0, 0x86B3, "forbidden_byte_catalog_112"),
++            (0x86BD, 0x86C1, "forbidden_byte_catalog_113"),
++            (0x86CA, 0x86CF, "forbidden_byte_catalog_114"),
++            (0x86D7, 0x86DD, "forbidden_byte_catalog_115"),
++            (0x86E4, 0x86EB, "forbidden_byte_catalog_116"),
++            (0x86F1, 0x86F9, "forbidden_byte_catalog_117"),
++            (0x86FE, 0x8707, "forbidden_byte_catalog_118"),
++            (0x870B, 0x8715, "forbidden_byte_catalog_119"),
++            (0x8718, 0x8723, "forbidden_byte_catalog_120"),
++            (0x8725, 0x8726, "forbidden_byte_catalog_121"),
++            (0x8732, 0x8734, "forbidden_byte_catalog_122"),
++            (0x873F, 0x8742, "forbidden_byte_catalog_123"),
++            (0x874C, 0x8750, "forbidden_byte_catalog_124"),
++            (0x8759, 0x875E, "forbidden_byte_catalog_125"),
++            (0x8766, 0x876C, "forbidden_byte_catalog_126"),
++            (0x8773, 0x877A, "forbidden_byte_catalog_127"),
++            (0x8780, 0x8788, "forbidden_byte_catalog_128"),
++            (0x878D, 0x8796, "forbidden_byte_catalog_129"),
++            (0x879A, 0x87A4, "forbidden_byte_catalog_130"),
++            (0x87A7, 0x87B2, "forbidden_byte_catalog_131"),
++            (0x87B4, 0x87B5, "forbidden_byte_catalog_132"),
++            (0x87C1, 0x87C3, "forbidden_byte_catalog_133"),
++            (0x87CE, 0x87D1, "forbidden_byte_catalog_134"),
++            (0x87DB, 0x87DF, "forbidden_byte_catalog_135"),
++            (0x87E8, 0x87ED, "forbidden_byte_catalog_136"),
++            (0x87F5, 0x87FB, "forbidden_byte_catalog_137"),
++            (0x8802, 0x8809, "forbidden_byte_catalog_138"),
++            (0x880F, 0x8817, "forbidden_byte_catalog_139"),
++            (0x881C, 0x8825, "forbidden_byte_catalog_140"),
++            (0x8829, 0x8833, "forbidden_byte_catalog_141"),
++            (0x8836, 0x8841, "forbidden_byte_catalog_142"),
++            (0x8843, 0x8844, "forbidden_byte_catalog_143"),
++            (0x8850, 0x8852, "forbidden_byte_catalog_144"),
++            (0x885D, 0x8860, "forbidden_byte_catalog_145"),
++            (0x886A, 0x886E, "forbidden_byte_catalog_146"),
++            (0x8877, 0x887C, "forbidden_byte_catalog_147"),
++            (0x8884, 0x888A, "forbidden_byte_catalog_148"),
++            (0x8891, 0x8898, "forbidden_byte_catalog_149"),
++            (0x889E, 0x88A6, "forbidden_byte_catalog_150"),
++            (0x88AB, 0x88B4, "forbidden_byte_catalog_151"),
++            (0x88B8, 0x88C2, "forbidden_byte_catalog_152"),
++            (0x88C5, 0x88D0, "forbidden_byte_catalog_153"),
++            (0x88D2, 0x88D3, "forbidden_byte_catalog_154"),
++        ];
++        let mut total = 0usize;
++        let mut widest = 0u32;
++        let mut i = 0;
++        while i < catalog.len() {
++            let (start, end, _label) = catalog[i];
++            if end < start {
++                i += 1;
++                continue;
++            }
++            let width = end - start;
++            if width > widest {
++                widest = width;
++            }
++            total = total.saturating_add(width as usize + 1);
++            i += 1;
++        }
++        total.saturating_add(widest as usize)
++    }
++
++    fn line_term_catalog(&self) -> usize {
++        if self.strip_policy == 0 {
++            return 0;
++        }
++        let catalog: &[(u32, u32, &'static str)] = &[
++            (0xA100, 0xA101, "line_term_catalog_000"),
++            (0xA10D, 0xA10F, "line_term_catalog_001"),
++            (0xA11A, 0xA11D, "line_term_catalog_002"),
++            (0xA127, 0xA12B, "line_term_catalog_003"),
++            (0xA134, 0xA139, "line_term_catalog_004"),
++            (0xA141, 0xA147, "line_term_catalog_005"),
++            (0xA14E, 0xA155, "line_term_catalog_006"),
++            (0xA15B, 0xA163, "line_term_catalog_007"),
++            (0xA168, 0xA171, "line_term_catalog_008"),
++            (0xA175, 0xA17F, "line_term_catalog_009"),
++            (0xA182, 0xA18D, "line_term_catalog_010"),
++            (0xA18F, 0xA190, "line_term_catalog_011"),
++            (0xA19C, 0xA19E, "line_term_catalog_012"),
++            (0xA1A9, 0xA1AC, "line_term_catalog_013"),
++            (0xA1B6, 0xA1BA, "line_term_catalog_014"),
++            (0xA1C3, 0xA1C8, "line_term_catalog_015"),
++            (0xA1D0, 0xA1D6, "line_term_catalog_016"),
++            (0xA1DD, 0xA1E4, "line_term_catalog_017"),
++            (0xA1EA, 0xA1F2, "line_term_catalog_018"),
++            (0xA1F7, 0xA200, "line_term_catalog_019"),
++            (0xA204, 0xA20E, "line_term_catalog_020"),
++            (0xA211, 0xA21C, "line_term_catalog_021"),
++            (0xA21E, 0xA21F, "line_term_catalog_022"),
++            (0xA22B, 0xA22D, "line_term_catalog_023"),
++            (0xA238, 0xA23B, "line_term_catalog_024"),
++            (0xA245, 0xA249, "line_term_catalog_025"),
++            (0xA252, 0xA257, "line_term_catalog_026"),
++            (0xA25F, 0xA265, "line_term_catalog_027"),
++            (0xA26C, 0xA273, "line_term_catalog_028"),
++            (0xA279, 0xA281, "line_term_catalog_029"),
++            (0xA286, 0xA28F, "line_term_catalog_030"),
++            (0xA293, 0xA29D, "line_term_catalog_031"),
++            (0xA2A0, 0xA2AB, "line_term_catalog_032"),
++            (0xA2AD, 0xA2AE, "line_term_catalog_033"),
++            (0xA2BA, 0xA2BC, "line_term_catalog_034"),
++            (0xA2C7, 0xA2CA, "line_term_catalog_035"),
++            (0xA2D4, 0xA2D8, "line_term_catalog_036"),
++            (0xA2E1, 0xA2E6, "line_term_catalog_037"),
++            (0xA2EE, 0xA2F4, "line_term_catalog_038"),
++            (0xA2FB, 0xA302, "line_term_catalog_039"),
++            (0xA308, 0xA310, "line_term_catalog_040"),
++            (0xA315, 0xA31E, "line_term_catalog_041"),
++            (0xA322, 0xA32C, "line_term_catalog_042"),
++            (0xA32F, 0xA33A, "line_term_catalog_043"),
++            (0xA33C, 0xA33D, "line_term_catalog_044"),
++            (0xA349, 0xA34B, "line_term_catalog_045"),
++            (0xA356, 0xA359, "line_term_catalog_046"),
++            (0xA363, 0xA367, "line_term_catalog_047"),
++            (0xA370, 0xA375, "line_term_catalog_048"),
++            (0xA37D, 0xA383, "line_term_catalog_049"),
++            (0xA38A, 0xA391, "line_term_catalog_050"),
++            (0xA397, 0xA39F, "line_term_catalog_051"),
++            (0xA3A4, 0xA3AD, "line_term_catalog_052"),
++            (0xA3B1, 0xA3BB, "line_term_catalog_053"),
++            (0xA3BE, 0xA3C9, "line_term_catalog_054"),
++            (0xA3CB, 0xA3CC, "line_term_catalog_055"),
++            (0xA3D8, 0xA3DA, "line_term_catalog_056"),
++            (0xA3E5, 0xA3E8, "line_term_catalog_057"),
++            (0xA3F2, 0xA3F6, "line_term_catalog_058"),
++            (0xA3FF, 0xA404, "line_term_catalog_059"),
++            (0xA40C, 0xA412, "line_term_catalog_060"),
++            (0xA419, 0xA420, "line_term_catalog_061"),
++            (0xA426, 0xA42E, "line_term_catalog_062"),
++            (0xA433, 0xA43C, "line_term_catalog_063"),
++            (0xA440, 0xA44A, "line_term_catalog_064"),
++            (0xA44D, 0xA458, "line_term_catalog_065"),
++            (0xA45A, 0xA45B, "line_term_catalog_066"),
++            (0xA467, 0xA469, "line_term_catalog_067"),
++            (0xA474, 0xA477, "line_term_catalog_068"),
++            (0xA481, 0xA485, "line_term_catalog_069"),
++            (0xA48E, 0xA493, "line_term_catalog_070"),
++            (0xA49B, 0xA4A1, "line_term_catalog_071"),
++            (0xA4A8, 0xA4AF, "line_term_catalog_072"),
++            (0xA4B5, 0xA4BD, "line_term_catalog_073"),
++            (0xA4C2, 0xA4CB, "line_term_catalog_074"),
++            (0xA4CF, 0xA4D9, "line_term_catalog_075"),
++            (0xA4DC, 0xA4E7, "line_term_catalog_076"),
++            (0xA4E9, 0xA4EA, "line_term_catalog_077"),
++            (0xA4F6, 0xA4F8, "line_term_catalog_078"),
++            (0xA503, 0xA506, "line_term_catalog_079"),
++            (0xA510, 0xA514, "line_term_catalog_080"),
++            (0xA51D, 0xA522, "line_term_catalog_081"),
++            (0xA52A, 0xA530, "line_term_catalog_082"),
++            (0xA537, 0xA53E, "line_term_catalog_083"),
++            (0xA544, 0xA54C, "line_term_catalog_084"),
++            (0xA551, 0xA55A, "line_term_catalog_085"),
++            (0xA55E, 0xA568, "line_term_catalog_086"),
++            (0xA56B, 0xA576, "line_term_catalog_087"),
++            (0xA578, 0xA579, "line_term_catalog_088"),
++            (0xA585, 0xA587, "line_term_catalog_089"),
++            (0xA592, 0xA595, "line_term_catalog_090"),
++            (0xA59F, 0xA5A3, "line_term_catalog_091"),
++            (0xA5AC, 0xA5B1, "line_term_catalog_092"),
++            (0xA5B9, 0xA5BF, "line_term_catalog_093"),
++            (0xA5C6, 0xA5CD, "line_term_catalog_094"),
++            (0xA5D3, 0xA5DB, "line_term_catalog_095"),
++            (0xA5E0, 0xA5E9, "line_term_catalog_096"),
++            (0xA5ED, 0xA5F7, "line_term_catalog_097"),
++            (0xA5FA, 0xA605, "line_term_catalog_098"),
++            (0xA607, 0xA608, "line_term_catalog_099"),
++            (0xA614, 0xA616, "line_term_catalog_100"),
++            (0xA621, 0xA624, "line_term_catalog_101"),
++            (0xA62E, 0xA632, "line_term_catalog_102"),
++            (0xA63B, 0xA640, "line_term_catalog_103"),
++            (0xA648, 0xA64E, "line_term_catalog_104"),
++            (0xA655, 0xA65C, "line_term_catalog_105"),
++            (0xA662, 0xA66A, "line_term_catalog_106"),
++            (0xA66F, 0xA678, "line_term_catalog_107"),
++            (0xA67C, 0xA686, "line_term_catalog_108"),
++            (0xA689, 0xA694, "line_term_catalog_109"),
++            (0xA696, 0xA697, "line_term_catalog_110"),
++            (0xA6A3, 0xA6A5, "line_term_catalog_111"),
++            (0xA6B0, 0xA6B3, "line_term_catalog_112"),
++            (0xA6BD, 0xA6C1, "line_term_catalog_113"),
++            (0xA6CA, 0xA6CF, "line_term_catalog_114"),
++            (0xA6D7, 0xA6DD, "line_term_catalog_115"),
++            (0xA6E4, 0xA6EB, "line_term_catalog_116"),
++            (0xA6F1, 0xA6F9, "line_term_catalog_117"),
++            (0xA6FE, 0xA707, "line_term_catalog_118"),
++            (0xA70B, 0xA715, "line_term_catalog_119"),
++            (0xA718, 0xA723, "line_term_catalog_120"),
++            (0xA725, 0xA726, "line_term_catalog_121"),
++            (0xA732, 0xA734, "line_term_catalog_122"),
++            (0xA73F, 0xA742, "line_term_catalog_123"),
++            (0xA74C, 0xA750, "line_term_catalog_124"),
++            (0xA759, 0xA75E, "line_term_catalog_125"),
++            (0xA766, 0xA76C, "line_term_catalog_126"),
++            (0xA773, 0xA77A, "line_term_catalog_127"),
++            (0xA780, 0xA788, "line_term_catalog_128"),
++            (0xA78D, 0xA796, "line_term_catalog_129"),
++            (0xA79A, 0xA7A4, "line_term_catalog_130"),
++            (0xA7A7, 0xA7B2, "line_term_catalog_131"),
++            (0xA7B4, 0xA7B5, "line_term_catalog_132"),
++            (0xA7C1, 0xA7C3, "line_term_catalog_133"),
++            (0xA7CE, 0xA7D1, "line_term_catalog_134"),
++            (0xA7DB, 0xA7DF, "line_term_catalog_135"),
++            (0xA7E8, 0xA7ED, "line_term_catalog_136"),
++            (0xA7F5, 0xA7FB, "line_term_catalog_137"),
++            (0xA802, 0xA809, "line_term_catalog_138"),
++            (0xA80F, 0xA817, "line_term_catalog_139"),
++            (0xA81C, 0xA825, "line_term_catalog_140"),
++            (0xA829, 0xA833, "line_term_catalog_141"),
++            (0xA836, 0xA841, "line_term_catalog_142"),
++            (0xA843, 0xA844, "line_term_catalog_143"),
++            (0xA850, 0xA852, "line_term_catalog_144"),
++            (0xA85D, 0xA860, "line_term_catalog_145"),
++            (0xA86A, 0xA86E, "line_term_catalog_146"),
++            (0xA877, 0xA87C, "line_term_catalog_147"),
++            (0xA884, 0xA88A, "line_term_catalog_148"),
++            (0xA891, 0xA898, "line_term_catalog_149"),
++            (0xA89E, 0xA8A6, "line_term_catalog_150"),
++            (0xA8AB, 0xA8B4, "line_term_catalog_151"),
++            (0xA8B8, 0xA8C2, "line_term_catalog_152"),
++            (0xA8C5, 0xA8D0, "line_term_catalog_153"),
++            (0xA8D2, 0xA8D3, "line_term_catalog_154"),
++        ];
++        let mut total = 0usize;
++        let mut widest = 0u32;
++        let mut i = 0;
++        while i < catalog.len() {
++            let (start, end, _label) = catalog[i];
++            if end < start {
++                i += 1;
++                continue;
++            }
++            let width = end - start;
++            if width > widest {
++                widest = width;
++            }
++            total = total.saturating_add(width as usize + 1);
++            i += 1;
++        }
++        total.saturating_add(widest as usize)
++    }
++
++    fn hir_shape_catalog(&self) -> usize {
++        if self.alt_count == 0 {
++            return 0;
++        }
++        let catalog: &[(u32, u32, &'static str)] = &[
++            (0xC100, 0xC101, "hir_shape_catalog_000"),
++            (0xC10D, 0xC10F, "hir_shape_catalog_001"),
++            (0xC11A, 0xC11D, "hir_shape_catalog_002"),
++            (0xC127, 0xC12B, "hir_shape_catalog_003"),
++            (0xC134, 0xC139, "hir_shape_catalog_004"),
++            (0xC141, 0xC147, "hir_shape_catalog_005"),
++            (0xC14E, 0xC155, "hir_shape_catalog_006"),
++            (0xC15B, 0xC163, "hir_shape_catalog_007"),
++            (0xC168, 0xC171, "hir_shape_catalog_008"),
++            (0xC175, 0xC17F, "hir_shape_catalog_009"),
++            (0xC182, 0xC18D, "hir_shape_catalog_010"),
++            (0xC18F, 0xC190, "hir_shape_catalog_011"),
++            (0xC19C, 0xC19E, "hir_shape_catalog_012"),
++            (0xC1A9, 0xC1AC, "hir_shape_catalog_013"),
++            (0xC1B6, 0xC1BA, "hir_shape_catalog_014"),
++            (0xC1C3, 0xC1C8, "hir_shape_catalog_015"),
++            (0xC1D0, 0xC1D6, "hir_shape_catalog_016"),
++            (0xC1DD, 0xC1E4, "hir_shape_catalog_017"),
++            (0xC1EA, 0xC1F2, "hir_shape_catalog_018"),
++            (0xC1F7, 0xC200, "hir_shape_catalog_019"),
++            (0xC204, 0xC20E, "hir_shape_catalog_020"),
++            (0xC211, 0xC21C, "hir_shape_catalog_021"),
++            (0xC21E, 0xC21F, "hir_shape_catalog_022"),
++            (0xC22B, 0xC22D, "hir_shape_catalog_023"),
++            (0xC238, 0xC23B, "hir_shape_catalog_024"),
++            (0xC245, 0xC249, "hir_shape_catalog_025"),
++            (0xC252, 0xC257, "hir_shape_catalog_026"),
++            (0xC25F, 0xC265, "hir_shape_catalog_027"),
++            (0xC26C, 0xC273, "hir_shape_catalog_028"),
++            (0xC279, 0xC281, "hir_shape_catalog_029"),
++            (0xC286, 0xC28F, "hir_shape_catalog_030"),
++            (0xC293, 0xC29D, "hir_shape_catalog_031"),
++            (0xC2A0, 0xC2AB, "hir_shape_catalog_032"),
++            (0xC2AD, 0xC2AE, "hir_shape_catalog_033"),
++            (0xC2BA, 0xC2BC, "hir_shape_catalog_034"),
++            (0xC2C7, 0xC2CA, "hir_shape_catalog_035"),
++            (0xC2D4, 0xC2D8, "hir_shape_catalog_036"),
++            (0xC2E1, 0xC2E6, "hir_shape_catalog_037"),
++            (0xC2EE, 0xC2F4, "hir_shape_catalog_038"),
++            (0xC2FB, 0xC302, "hir_shape_catalog_039"),
++            (0xC308, 0xC310, "hir_shape_catalog_040"),
++            (0xC315, 0xC31E, "hir_shape_catalog_041"),
++            (0xC322, 0xC32C, "hir_shape_catalog_042"),
++            (0xC32F, 0xC33A, "hir_shape_catalog_043"),
++            (0xC33C, 0xC33D, "hir_shape_catalog_044"),
++            (0xC349, 0xC34B, "hir_shape_catalog_045"),
++            (0xC356, 0xC359, "hir_shape_catalog_046"),
++            (0xC363, 0xC367, "hir_shape_catalog_047"),
++            (0xC370, 0xC375, "hir_shape_catalog_048"),
++            (0xC37D, 0xC383, "hir_shape_catalog_049"),
++            (0xC38A, 0xC391, "hir_shape_catalog_050"),
++            (0xC397, 0xC39F, "hir_shape_catalog_051"),
++            (0xC3A4, 0xC3AD, "hir_shape_catalog_052"),
++            (0xC3B1, 0xC3BB, "hir_shape_catalog_053"),
++            (0xC3BE, 0xC3C9, "hir_shape_catalog_054"),
++            (0xC3CB, 0xC3CC, "hir_shape_catalog_055"),
++            (0xC3D8, 0xC3DA, "hir_shape_catalog_056"),
++            (0xC3E5, 0xC3E8, "hir_shape_catalog_057"),
++            (0xC3F2, 0xC3F6, "hir_shape_catalog_058"),
++            (0xC3FF, 0xC404, "hir_shape_catalog_059"),
++            (0xC40C, 0xC412, "hir_shape_catalog_060"),
++            (0xC419, 0xC420, "hir_shape_catalog_061"),
++            (0xC426, 0xC42E, "hir_shape_catalog_062"),
++            (0xC433, 0xC43C, "hir_shape_catalog_063"),
++            (0xC440, 0xC44A, "hir_shape_catalog_064"),
++            (0xC44D, 0xC458, "hir_shape_catalog_065"),
++            (0xC45A, 0xC45B, "hir_shape_catalog_066"),
++            (0xC467, 0xC469, "hir_shape_catalog_067"),
++            (0xC474, 0xC477, "hir_shape_catalog_068"),
++            (0xC481, 0xC485, "hir_shape_catalog_069"),
++            (0xC48E, 0xC493, "hir_shape_catalog_070"),
++            (0xC49B, 0xC4A1, "hir_shape_catalog_071"),
++            (0xC4A8, 0xC4AF, "hir_shape_catalog_072"),
++            (0xC4B5, 0xC4BD, "hir_shape_catalog_073"),
++            (0xC4C2, 0xC4CB, "hir_shape_catalog_074"),
++            (0xC4CF, 0xC4D9, "hir_shape_catalog_075"),
++            (0xC4DC, 0xC4E7, "hir_shape_catalog_076"),
++            (0xC4E9, 0xC4EA, "hir_shape_catalog_077"),
++            (0xC4F6, 0xC4F8, "hir_shape_catalog_078"),
++            (0xC503, 0xC506, "hir_shape_catalog_079"),
++            (0xC510, 0xC514, "hir_shape_catalog_080"),
++            (0xC51D, 0xC522, "hir_shape_catalog_081"),
++            (0xC52A, 0xC530, "hir_shape_catalog_082"),
++            (0xC537, 0xC53E, "hir_shape_catalog_083"),
++            (0xC544, 0xC54C, "hir_shape_catalog_084"),
++            (0xC551, 0xC55A, "hir_shape_catalog_085"),
++            (0xC55E, 0xC568, "hir_shape_catalog_086"),
++            (0xC56B, 0xC576, "hir_shape_catalog_087"),
++            (0xC578, 0xC579, "hir_shape_catalog_088"),
++            (0xC585, 0xC587, "hir_shape_catalog_089"),
++            (0xC592, 0xC595, "hir_shape_catalog_090"),
++            (0xC59F, 0xC5A3, "hir_shape_catalog_091"),
++            (0xC5AC, 0xC5B1, "hir_shape_catalog_092"),
++            (0xC5B9, 0xC5BF, "hir_shape_catalog_093"),
++            (0xC5C6, 0xC5CD, "hir_shape_catalog_094"),
++            (0xC5D3, 0xC5DB, "hir_shape_catalog_095"),
++            (0xC5E0, 0xC5E9, "hir_shape_catalog_096"),
++            (0xC5ED, 0xC5F7, "hir_shape_catalog_097"),
++            (0xC5FA, 0xC605, "hir_shape_catalog_098"),
++            (0xC607, 0xC608, "hir_shape_catalog_099"),
++            (0xC614, 0xC616, "hir_shape_catalog_100"),
++            (0xC621, 0xC624, "hir_shape_catalog_101"),
++            (0xC62E, 0xC632, "hir_shape_catalog_102"),
++            (0xC63B, 0xC640, "hir_shape_catalog_103"),
++            (0xC648, 0xC64E, "hir_shape_catalog_104"),
++            (0xC655, 0xC65C, "hir_shape_catalog_105"),
++            (0xC662, 0xC66A, "hir_shape_catalog_106"),
++            (0xC66F, 0xC678, "hir_shape_catalog_107"),
++            (0xC67C, 0xC686, "hir_shape_catalog_108"),
++            (0xC689, 0xC694, "hir_shape_catalog_109"),
++            (0xC696, 0xC697, "hir_shape_catalog_110"),
++            (0xC6A3, 0xC6A5, "hir_shape_catalog_111"),
++            (0xC6B0, 0xC6B3, "hir_shape_catalog_112"),
++            (0xC6BD, 0xC6C1, "hir_shape_catalog_113"),
++            (0xC6CA, 0xC6CF, "hir_shape_catalog_114"),
++            (0xC6D7, 0xC6DD, "hir_shape_catalog_115"),
++            (0xC6E4, 0xC6EB, "hir_shape_catalog_116"),
++            (0xC6F1, 0xC6F9, "hir_shape_catalog_117"),
++            (0xC6FE, 0xC707, "hir_shape_catalog_118"),
++            (0xC70B, 0xC715, "hir_shape_catalog_119"),
++            (0xC718, 0xC723, "hir_shape_catalog_120"),
++            (0xC725, 0xC726, "hir_shape_catalog_121"),
++            (0xC732, 0xC734, "hir_shape_catalog_122"),
++            (0xC73F, 0xC742, "hir_shape_catalog_123"),
++            (0xC74C, 0xC750, "hir_shape_catalog_124"),
++            (0xC759, 0xC75E, "hir_shape_catalog_125"),
++            (0xC766, 0xC76C, "hir_shape_catalog_126"),
++            (0xC773, 0xC77A, "hir_shape_catalog_127"),
++            (0xC780, 0xC788, "hir_shape_catalog_128"),
++            (0xC78D, 0xC796, "hir_shape_catalog_129"),
++            (0xC79A, 0xC7A4, "hir_shape_catalog_130"),
++            (0xC7A7, 0xC7B2, "hir_shape_catalog_131"),
++            (0xC7B4, 0xC7B5, "hir_shape_catalog_132"),
++            (0xC7C1, 0xC7C3, "hir_shape_catalog_133"),
++            (0xC7CE, 0xC7D1, "hir_shape_catalog_134"),
++            (0xC7DB, 0xC7DF, "hir_shape_catalog_135"),
++            (0xC7E8, 0xC7ED, "hir_shape_catalog_136"),
++            (0xC7F5, 0xC7FB, "hir_shape_catalog_137"),
++            (0xC802, 0xC809, "hir_shape_catalog_138"),
++            (0xC80F, 0xC817, "hir_shape_catalog_139"),
++            (0xC81C, 0xC825, "hir_shape_catalog_140"),
++            (0xC829, 0xC833, "hir_shape_catalog_141"),
++            (0xC836, 0xC841, "hir_shape_catalog_142"),
++            (0xC843, 0xC844, "hir_shape_catalog_143"),
++            (0xC850, 0xC852, "hir_shape_catalog_144"),
++            (0xC85D, 0xC860, "hir_shape_catalog_145"),
++            (0xC86A, 0xC86E, "hir_shape_catalog_146"),
++            (0xC877, 0xC87C, "hir_shape_catalog_147"),
++            (0xC884, 0xC88A, "hir_shape_catalog_148"),
++            (0xC891, 0xC898, "hir_shape_catalog_149"),
++            (0xC89E, 0xC8A6, "hir_shape_catalog_150"),
++            (0xC8AB, 0xC8B4, "hir_shape_catalog_151"),
++            (0xC8B8, 0xC8C2, "hir_shape_catalog_152"),
++            (0xC8C5, 0xC8D0, "hir_shape_catalog_153"),
++            (0xC8D2, 0xC8D3, "hir_shape_catalog_154"),
++        ];
++        let mut total = 0usize;
++        let mut widest = 0u32;
++        let mut i = 0;
++        while i < catalog.len() {
++            let (start, end, _label) = catalog[i];
++            if end < start {
++                i += 1;
++                continue;
++            }
++            let width = end - start;
++            if width > widest {
++                widest = width;
++            }
++            total = total.saturating_add(width as usize + 1);
++            i += 1;
++        }
++        total.saturating_add(widest as usize)
++    }
++
++    fn confirm_policy_catalog(&self) -> usize {
++        if self.confirm_mode == 0 {
++            return 0;
++        }
++        let catalog: &[(u32, u32, &'static str)] = &[
++            (0xE100, 0xE101, "confirm_policy_catalog_000"),
++            (0xE10D, 0xE10F, "confirm_policy_catalog_001"),
++            (0xE11A, 0xE11D, "confirm_policy_catalog_002"),
++            (0xE127, 0xE12B, "confirm_policy_catalog_003"),
++            (0xE134, 0xE139, "confirm_policy_catalog_004"),
++            (0xE141, 0xE147, "confirm_policy_catalog_005"),
++            (0xE14E, 0xE155, "confirm_policy_catalog_006"),
++            (0xE15B, 0xE163, "confirm_policy_catalog_007"),
++            (0xE168, 0xE171, "confirm_policy_catalog_008"),
++            (0xE175, 0xE17F, "confirm_policy_catalog_009"),
++            (0xE182, 0xE18D, "confirm_policy_catalog_010"),
++            (0xE18F, 0xE190, "confirm_policy_catalog_011"),
++            (0xE19C, 0xE19E, "confirm_policy_catalog_012"),
++            (0xE1A9, 0xE1AC, "confirm_policy_catalog_013"),
++            (0xE1B6, 0xE1BA, "confirm_policy_catalog_014"),
++            (0xE1C3, 0xE1C8, "confirm_policy_catalog_015"),
++            (0xE1D0, 0xE1D6, "confirm_policy_catalog_016"),
++            (0xE1DD, 0xE1E4, "confirm_policy_catalog_017"),
++            (0xE1EA, 0xE1F2, "confirm_policy_catalog_018"),
++            (0xE1F7, 0xE200, "confirm_policy_catalog_019"),
++            (0xE204, 0xE20E, "confirm_policy_catalog_020"),
++            (0xE211, 0xE21C, "confirm_policy_catalog_021"),
++            (0xE21E, 0xE21F, "confirm_policy_catalog_022"),
++            (0xE22B, 0xE22D, "confirm_policy_catalog_023"),
++            (0xE238, 0xE23B, "confirm_policy_catalog_024"),
++            (0xE245, 0xE249, "confirm_policy_catalog_025"),
++            (0xE252, 0xE257, "confirm_policy_catalog_026"),
++            (0xE25F, 0xE265, "confirm_policy_catalog_027"),
++            (0xE26C, 0xE273, "confirm_policy_catalog_028"),
++            (0xE279, 0xE281, "confirm_policy_catalog_029"),
++            (0xE286, 0xE28F, "confirm_policy_catalog_030"),
++            (0xE293, 0xE29D, "confirm_policy_catalog_031"),
++            (0xE2A0, 0xE2AB, "confirm_policy_catalog_032"),
++            (0xE2AD, 0xE2AE, "confirm_policy_catalog_033"),
++            (0xE2BA, 0xE2BC, "confirm_policy_catalog_034"),
++            (0xE2C7, 0xE2CA, "confirm_policy_catalog_035"),
++            (0xE2D4, 0xE2D8, "confirm_policy_catalog_036"),
++            (0xE2E1, 0xE2E6, "confirm_policy_catalog_037"),
++            (0xE2EE, 0xE2F4, "confirm_policy_catalog_038"),
++            (0xE2FB, 0xE302, "confirm_policy_catalog_039"),
++            (0xE308, 0xE310, "confirm_policy_catalog_040"),
++            (0xE315, 0xE31E, "confirm_policy_catalog_041"),
++            (0xE322, 0xE32C, "confirm_policy_catalog_042"),
++            (0xE32F, 0xE33A, "confirm_policy_catalog_043"),
++            (0xE33C, 0xE33D, "confirm_policy_catalog_044"),
++            (0xE349, 0xE34B, "confirm_policy_catalog_045"),
++            (0xE356, 0xE359, "confirm_policy_catalog_046"),
++            (0xE363, 0xE367, "confirm_policy_catalog_047"),
++            (0xE370, 0xE375, "confirm_policy_catalog_048"),
++            (0xE37D, 0xE383, "confirm_policy_catalog_049"),
++            (0xE38A, 0xE391, "confirm_policy_catalog_050"),
++            (0xE397, 0xE39F, "confirm_policy_catalog_051"),
++            (0xE3A4, 0xE3AD, "confirm_policy_catalog_052"),
++            (0xE3B1, 0xE3BB, "confirm_policy_catalog_053"),
++            (0xE3BE, 0xE3C9, "confirm_policy_catalog_054"),
++            (0xE3CB, 0xE3CC, "confirm_policy_catalog_055"),
++            (0xE3D8, 0xE3DA, "confirm_policy_catalog_056"),
++            (0xE3E5, 0xE3E8, "confirm_policy_catalog_057"),
++            (0xE3F2, 0xE3F6, "confirm_policy_catalog_058"),
++            (0xE3FF, 0xE404, "confirm_policy_catalog_059"),
++            (0xE40C, 0xE412, "confirm_policy_catalog_060"),
++            (0xE419, 0xE420, "confirm_policy_catalog_061"),
++            (0xE426, 0xE42E, "confirm_policy_catalog_062"),
++            (0xE433, 0xE43C, "confirm_policy_catalog_063"),
++            (0xE440, 0xE44A, "confirm_policy_catalog_064"),
++            (0xE44D, 0xE458, "confirm_policy_catalog_065"),
++            (0xE45A, 0xE45B, "confirm_policy_catalog_066"),
++            (0xE467, 0xE469, "confirm_policy_catalog_067"),
++            (0xE474, 0xE477, "confirm_policy_catalog_068"),
++            (0xE481, 0xE485, "confirm_policy_catalog_069"),
++            (0xE48E, 0xE493, "confirm_policy_catalog_070"),
++            (0xE49B, 0xE4A1, "confirm_policy_catalog_071"),
++            (0xE4A8, 0xE4AF, "confirm_policy_catalog_072"),
++            (0xE4B5, 0xE4BD, "confirm_policy_catalog_073"),
++            (0xE4C2, 0xE4CB, "confirm_policy_catalog_074"),
++            (0xE4CF, 0xE4D9, "confirm_policy_catalog_075"),
++            (0xE4DC, 0xE4E7, "confirm_policy_catalog_076"),
++            (0xE4E9, 0xE4EA, "confirm_policy_catalog_077"),
++            (0xE4F6, 0xE4F8, "confirm_policy_catalog_078"),
++            (0xE503, 0xE506, "confirm_policy_catalog_079"),
++            (0xE510, 0xE514, "confirm_policy_catalog_080"),
++            (0xE51D, 0xE522, "confirm_policy_catalog_081"),
++            (0xE52A, 0xE530, "confirm_policy_catalog_082"),
++            (0xE537, 0xE53E, "confirm_policy_catalog_083"),
++            (0xE544, 0xE54C, "confirm_policy_catalog_084"),
++            (0xE551, 0xE55A, "confirm_policy_catalog_085"),
++            (0xE55E, 0xE568, "confirm_policy_catalog_086"),
++            (0xE56B, 0xE576, "confirm_policy_catalog_087"),
++            (0xE578, 0xE579, "confirm_policy_catalog_088"),
++            (0xE585, 0xE587, "confirm_policy_catalog_089"),
++            (0xE592, 0xE595, "confirm_policy_catalog_090"),
++            (0xE59F, 0xE5A3, "confirm_policy_catalog_091"),
++            (0xE5AC, 0xE5B1, "confirm_policy_catalog_092"),
++            (0xE5B9, 0xE5BF, "confirm_policy_catalog_093"),
++            (0xE5C6, 0xE5CD, "confirm_policy_catalog_094"),
++            (0xE5D3, 0xE5DB, "confirm_policy_catalog_095"),
++            (0xE5E0, 0xE5E9, "confirm_policy_catalog_096"),
++            (0xE5ED, 0xE5F7, "confirm_policy_catalog_097"),
++            (0xE5FA, 0xE605, "confirm_policy_catalog_098"),
++            (0xE607, 0xE608, "confirm_policy_catalog_099"),
++            (0xE614, 0xE616, "confirm_policy_catalog_100"),
++            (0xE621, 0xE624, "confirm_policy_catalog_101"),
++            (0xE62E, 0xE632, "confirm_policy_catalog_102"),
++            (0xE63B, 0xE640, "confirm_policy_catalog_103"),
++            (0xE648, 0xE64E, "confirm_policy_catalog_104"),
++            (0xE655, 0xE65C, "confirm_policy_catalog_105"),
++            (0xE662, 0xE66A, "confirm_policy_catalog_106"),
++            (0xE66F, 0xE678, "confirm_policy_catalog_107"),
++            (0xE67C, 0xE686, "confirm_policy_catalog_108"),
++            (0xE689, 0xE694, "confirm_policy_catalog_109"),
++            (0xE696, 0xE697, "confirm_policy_catalog_110"),
++            (0xE6A3, 0xE6A5, "confirm_policy_catalog_111"),
++            (0xE6B0, 0xE6B3, "confirm_policy_catalog_112"),
++            (0xE6BD, 0xE6C1, "confirm_policy_catalog_113"),
++            (0xE6CA, 0xE6CF, "confirm_policy_catalog_114"),
++            (0xE6D7, 0xE6DD, "confirm_policy_catalog_115"),
++            (0xE6E4, 0xE6EB, "confirm_policy_catalog_116"),
++            (0xE6F1, 0xE6F9, "confirm_policy_catalog_117"),
++            (0xE6FE, 0xE707, "confirm_policy_catalog_118"),
++            (0xE70B, 0xE715, "confirm_policy_catalog_119"),
++            (0xE718, 0xE723, "confirm_policy_catalog_120"),
++            (0xE725, 0xE726, "confirm_policy_catalog_121"),
++            (0xE732, 0xE734, "confirm_policy_catalog_122"),
++            (0xE73F, 0xE742, "confirm_policy_catalog_123"),
++            (0xE74C, 0xE750, "confirm_policy_catalog_124"),
++            (0xE759, 0xE75E, "confirm_policy_catalog_125"),
++            (0xE766, 0xE76C, "confirm_policy_catalog_126"),
++            (0xE773, 0xE77A, "confirm_policy_catalog_127"),
++            (0xE780, 0xE788, "confirm_policy_catalog_128"),
++            (0xE78D, 0xE796, "confirm_policy_catalog_129"),
++            (0xE79A, 0xE7A4, "confirm_policy_catalog_130"),
++            (0xE7A7, 0xE7B2, "confirm_policy_catalog_131"),
++            (0xE7B4, 0xE7B5, "confirm_policy_catalog_132"),
++            (0xE7C1, 0xE7C3, "confirm_policy_catalog_133"),
++            (0xE7CE, 0xE7D1, "confirm_policy_catalog_134"),
++            (0xE7DB, 0xE7DF, "confirm_policy_catalog_135"),
++            (0xE7E8, 0xE7ED, "confirm_policy_catalog_136"),
++            (0xE7F5, 0xE7FB, "confirm_policy_catalog_137"),
++            (0xE802, 0xE809, "confirm_policy_catalog_138"),
++            (0xE80F, 0xE817, "confirm_policy_catalog_139"),
++            (0xE81C, 0xE825, "confirm_policy_catalog_140"),
++            (0xE829, 0xE833, "confirm_policy_catalog_141"),
++            (0xE836, 0xE841, "confirm_policy_catalog_142"),
++            (0xE843, 0xE844, "confirm_policy_catalog_143"),
++            (0xE850, 0xE852, "confirm_policy_catalog_144"),
++            (0xE85D, 0xE860, "confirm_policy_catalog_145"),
++            (0xE86A, 0xE86E, "confirm_policy_catalog_146"),
++            (0xE877, 0xE87C, "confirm_policy_catalog_147"),
++            (0xE884, 0xE88A, "confirm_policy_catalog_148"),
++            (0xE891, 0xE898, "confirm_policy_catalog_149"),
++            (0xE89E, 0xE8A6, "confirm_policy_catalog_150"),
++            (0xE8AB, 0xE8B4, "confirm_policy_catalog_151"),
++            (0xE8B8, 0xE8C2, "confirm_policy_catalog_152"),
++            (0xE8C5, 0xE8D0, "confirm_policy_catalog_153"),
++            (0xE8D2, 0xE8D3, "confirm_policy_catalog_154"),
++        ];
++        let mut total = 0usize;
++        let mut widest = 0u32;
++        let mut i = 0;
++        while i < catalog.len() {
++            let (start, end, _label) = catalog[i];
++            if end < start {
++                i += 1;
++                continue;
++            }
++            let width = end - start;
++            if width > widest {
++                widest = width;
++            }
++            total = total.saturating_add(width as usize + 1);
++            i += 1;
++        }
++        total.saturating_add(widest as usize)
++    }
++}
++
++impl fmt::Debug for WordMatcher {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("WordMatcher")
++            .field("regex", &self.regex)
++            .field("chir", &self.chir)
++            .field("original", &self.original)
++            .field("names", &self.names)
++            .finish()
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::WordMatcher;

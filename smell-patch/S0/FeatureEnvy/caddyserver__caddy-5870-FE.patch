@@ -1,0 +1,243 @@
+diff --git a/admin.go b/admin.go
+index 335b8e89..a6fb6782 100644
+--- a/admin.go
++++ b/admin.go
+@@ -1077,45 +1077,33 @@ func handleStop(w http.ResponseWriter, r *http.Request) error {
+ // read or write lock on currentCtxMu, depending on method (GET needs
+ // only a read lock; all others need a write lock).
+ func unsyncedConfigAccess(method, path string, body []byte, out io.Writer) error {
+-	var err error
+-	var val any
+-
+-	// if there is a request body, decode it into the
+-	// variable that will be set in the config according
+-	// to method and path
+-	if len(body) > 0 {
+-		err = json.Unmarshal(body, &val)
+-		if err != nil {
+-			return fmt.Errorf("decoding request body: %v", err)
+-		}
+-	}
++	return rawConfigOp{method: method, path: path, body: body}.apply(out)
++}
+ 
+-	enc := json.NewEncoder(out)
++type configCursor struct {
++	root any
++	out  io.Writer
++}
+ 
+-	cleanPath := strings.Trim(path, "/")
+-	if cleanPath == "" {
+-		return fmt.Errorf("no traversable path")
++func (c *configCursor) run(method, path string, body []byte) error {
++	req, err := newConfigAccessRequest(method, path, body)
++	if err != nil {
++		return err
+ 	}
++	return c.unsyncedConfigAccess(req)
++}
+ 
+-	parts := strings.Split(cleanPath, "/")
+-	if len(parts) == 0 {
+-		return fmt.Errorf("path missing")
+-	}
++func (c *configCursor) unsyncedConfigAccess(req *configAccessRequest) error {
++	var err error
++	method := req.Method()
++	path := req.Path()
++	val := req.Value()
++	parts := req.Parts()
++	ellipses := req.Ellipses()
+ 
+-	// A path that ends with "..." implies:
+-	// 1) the part before it is an array
+-	// 2) the payload is an array
+-	// and means that the user wants to expand the elements
+-	// in the payload array and append each one into the
+-	// destination array, like so:
+-	//     array = append(array, elems...)
+-	// This special case is handled below.
+-	ellipses := parts[len(parts)-1] == "..."
+-	if ellipses {
+-		parts = parts[:len(parts)-1]
+-	}
++	enc := json.NewEncoder(c.out)
+ 
+-	var ptr any = rawCfg
++	var ptr any = c.root
+ 
+ traverseLoop:
+ 	for i, part := range parts {
+diff --git a/caddy.go b/caddy.go
+index 8e7dce50..d64388c9 100644
+--- a/caddy.go
++++ b/caddy.go
+@@ -133,6 +133,17 @@ func Load(cfgJSON []byte, forceReload bool) error {
+ 	return err
+ }
+ 
++type rawConfigOp struct {
++	method string
++	path   string
++	body   []byte
++}
++
++func (op rawConfigOp) apply(out io.Writer) error {
++	cur := &configCursor{root: rawCfg, out: out}
++	return cur.run(op.method, op.path, op.body)
++}
++
+ // changeConfig changes the current config (rawCfg) according to the
+ // method, traversed via the given path, and uses the given input as
+ // the new value (if applicable; i.e. "DELETE" doesn't have an input).
+@@ -181,7 +192,7 @@ func changeConfig(method, path string, input []byte, ifMatchHeader string, force
+ 		// get the current hash of the config
+ 		// at the given path
+ 		hash := etagHasher()
+-		err := unsyncedConfigAccess(http.MethodGet, parts[0], nil, hash)
++		err := rawConfigOp{method: http.MethodGet, path: parts[0]}.apply(hash)
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -194,7 +205,7 @@ func changeConfig(method, path string, input []byte, ifMatchHeader string, force
+ 		}
+ 	}
+ 
+-	err := unsyncedConfigAccess(method, path, input, nil)
++	err := rawConfigOp{method: method, path: path, body: input}.apply(nil)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -260,7 +271,7 @@ func changeConfig(method, path string, input []byte, ifMatchHeader string, force
+ func readConfig(path string, out io.Writer) error {
+ 	rawCfgMu.RLock()
+ 	defer rawCfgMu.RUnlock()
+-	return unsyncedConfigAccess(http.MethodGet, path, nil, out)
++	return rawConfigOp{method: http.MethodGet, path: path}.apply(out)
+ }
+ 
+ // indexConfigObjects recursively searches ptr for object fields named
+diff --git a/context.go b/context.go
+index 85978d49..779f4408 100644
+--- a/context.go
++++ b/context.go
+@@ -23,6 +23,8 @@ import (
+ 
+ 	"github.com/caddyserver/certmagic"
+ 	"go.uber.org/zap"
++
++	"github.com/caddyserver/caddy/v2/internal"
+ )
+ 
+ // Context is a type which defines the lifetime of modules that
+@@ -510,3 +512,26 @@ func (ctx Context) Module() Module {
+ 	}
+ 	return ctx.ancestry[len(ctx.ancestry)-1]
+ }
++
++type configAccessData struct {
++	spec *internal.ConfigAccess
++}
++
++func (d *configAccessData) populate(method, path string, body []byte) error {
++	d.spec = &internal.ConfigAccess{
++		Method: method,
++		Path:   path,
++		Body:   body,
++	}
++	return d.spec.Prepare()
++}
++
++func (d *configAccessData) Method() string { return d.spec.Method }
++
++func (d *configAccessData) Path() string { return d.spec.Path }
++
++func (d *configAccessData) Value() any { return d.spec.Value }
++
++func (d *configAccessData) Parts() []string { return d.spec.Parts }
++
++func (d *configAccessData) Ellipses() bool { return d.spec.Ellipses }
+diff --git a/internal/sockets.go b/internal/sockets.go
+index 56ae9f4e..f3d778ce 100644
+--- a/internal/sockets.go
++++ b/internal/sockets.go
+@@ -15,12 +15,48 @@
+ package internal
+ 
+ import (
++	"encoding/json"
+ 	"fmt"
+ 	"io/fs"
+ 	"strconv"
+ 	"strings"
+ )
+ 
++// ConfigAccess holds the parameters and decoded payload for a
++// low-level mutation of Caddy's raw JSON configuration tree.
++type ConfigAccess struct {
++	Method   string
++	Path     string
++	Body     []byte
++	Value    any
++	Parts    []string
++	Ellipses bool
++}
++
++// Prepare decodes the request body and splits the config path
++// into traversable segments used by the admin API.
++func (ca *ConfigAccess) Prepare() error {
++	if len(ca.Body) > 0 {
++		if err := json.Unmarshal(ca.Body, &ca.Value); err != nil {
++			return fmt.Errorf("decoding request body: %v", err)
++		}
++	}
++	cleanPath := strings.Trim(ca.Path, "/")
++	if cleanPath == "" {
++		return fmt.Errorf("no traversable path")
++	}
++	parts := strings.Split(cleanPath, "/")
++	if len(parts) == 0 {
++		return fmt.Errorf("path missing")
++	}
++	if parts[len(parts)-1] == "..." {
++		ca.Ellipses = true
++		parts = parts[:len(parts)-1]
++	}
++	ca.Parts = parts
++	return nil
++}
++
+ // SplitUnixSocketPermissionsBits takes a unix socket address in the
+ // unusual "path|bits" format (e.g. /run/caddy.sock|0222) and tries
+ // to split it into socket path (host) and permissions bits (port).
+diff --git a/listeners.go b/listeners.go
+index 768d9771..712a1d23 100644
+--- a/listeners.go
++++ b/listeners.go
+@@ -799,3 +799,25 @@ var (
+ 		SyscallConn() (syscall.RawConn, error)
+ 	}) = (*fakeClosePacketConn)(nil)
+ )
++
++type configAccessRequest struct {
++	data *configAccessData
++}
++
++func newConfigAccessRequest(method, path string, body []byte) (*configAccessRequest, error) {
++	d := &configAccessData{}
++	if err := d.populate(method, path, body); err != nil {
++		return nil, err
++	}
++	return &configAccessRequest{data: d}, nil
++}
++
++func (r *configAccessRequest) Method() string { return r.data.Method() }
++
++func (r *configAccessRequest) Path() string { return r.data.Path() }
++
++func (r *configAccessRequest) Value() any { return r.data.Value() }
++
++func (r *configAccessRequest) Parts() []string { return r.data.Parts() }
++
++func (r *configAccessRequest) Ellipses() bool { return r.data.Ellipses() }

@@ -1,0 +1,4156 @@
+diff --git a/markup/goldmark/blockquotes/blockquotes.go b/markup/goldmark/blockquotes/blockquotes.go
+index 2f5629d87..f31b6feaa 100644
+--- a/markup/goldmark/blockquotes/blockquotes.go
++++ b/markup/goldmark/blockquotes/blockquotes.go
+@@ -14,26 +14,75 @@
+ package blockquotes
+ 
+ import (
++	"bytes"
++	"errors"
+ 	"regexp"
++	"strconv"
+ 	"strings"
+ 	"sync"
+ 
++	passthruext "github.com/gohugoio/hugo-goldmark-extensions/passthrough"
+ 	"github.com/gohugoio/hugo/common/herrors"
+ 	htext "github.com/gohugoio/hugo/common/text"
+ 	"github.com/gohugoio/hugo/common/types/hstring"
+ 	"github.com/gohugoio/hugo/markup/converter/hooks"
+ 	"github.com/gohugoio/hugo/markup/goldmark/internal/render"
++	"github.com/gohugoio/hugo/markup/highlight/chromalexers"
+ 	"github.com/gohugoio/hugo/markup/internal/attributes"
+ 	"github.com/yuin/goldmark"
+ 	"github.com/yuin/goldmark/ast"
++	"github.com/yuin/goldmark/parser"
+ 	"github.com/yuin/goldmark/renderer"
+ 	"github.com/yuin/goldmark/renderer/html"
++	"github.com/yuin/goldmark/text"
+ 	"github.com/yuin/goldmark/util"
+ )
+ 
+ type (
+ 	blockquotesExtension struct{}
+-	htmlRenderer         struct{}
++	htmlRenderer         struct {
++		mu sync.Mutex
++
++		alertKind     string
++		alertLevel    int
++		alertTitle    string
++		alertPreamble string
++
++		attrNames []string
++		attrMap   map[string]any
++		attrOwner attributes.AttributesOwnerType
++		attrCount int
++
++		sourceStart int
++		sourceStop  int
++		sourceRef   []byte
++		sourceFile  string
++
++		pageResolved      any
++		pageInnerResolved any
++		pageLookupID      uint64
++		pageMissing       bool
++
++		htmlOpenTag  string
++		htmlCloseTag string
++		htmlInner    string
++		htmlHasAttrs bool
++
++		hookType     string
++		hookRenderer any
++		hookOrdinal  int
++		hookTypename string
++
++		fenceLang    string
++		fenceInfo    string
++		fenceLexerOK bool
++		fenceAttrRaw string
++
++		passKind       string
++		passInner      string
++		passDelimOpen  string
++		passDelimClose string
++	}
+ )
+ 
+ func New() goldmark.Extender {
+@@ -47,10 +96,17 @@ func (e *blockquotesExtension) Extend(m goldmark.Markdown) {
+ }
+ 
+ func newHTMLRenderer() renderer.NodeRenderer {
+-	r := &htmlRenderer{}
+-	return r
++	return newHTMLRendererInstance()
++}
++
++func newHTMLRendererInstance() *htmlRenderer {
++	return &htmlRenderer{
++		attrMap: make(map[string]any),
++	}
+ }
+ 
++var sharedRenderer = newHTMLRendererInstance()
++
+ func (r *htmlRenderer) RegisterFuncs(reg renderer.NodeRendererFuncRegisterer) {
+ 	reg.Register(ast.KindBlockquote, r.renderBlockquote)
+ }
+@@ -61,12 +117,14 @@ const (
+ )
+ 
+ func (r *htmlRenderer) renderBlockquote(w util.BufWriter, src []byte, node ast.Node, entering bool) (ast.WalkStatus, error) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++
+ 	ctx := w.(*render.Context)
+ 
+ 	n := node.(*ast.Blockquote)
+ 
+ 	if entering {
+-		// Store the current pos so we can capture the rendered text.
+ 		ctx.PushPos(ctx.Buffer.Len())
+ 		return ast.WalkContinue, nil
+ 	}
+@@ -84,33 +142,21 @@ func (r *htmlRenderer) renderBlockquote(w util.BufWriter, src []byte, node ast.N
+ 		typ = typeAlert
+ 	}
+ 
++	r.prepareAlertState(texts, alertType)
++	r.syncAttributesFromAST(n.Attributes())
++	r.syncSourceFromNode(n, src)
++	r.prepareHookState(typ, ordinal)
++
+ 	renderer := ctx.RenderContext().GetRenderer(hooks.BlockquoteRendererType, typ)
+ 	if renderer == nil {
+ 		return r.renderBlockquoteDefault(w, n, texts)
+ 	}
+ 
+ 	if typ == typeAlert {
+-		// Trim preamble: <p>[!NOTE]<br>\n but preserve leading paragraph.
+-		// We could possibly complicate this by moving this to the parser, but
+-		// keep it simple for now.
+-		texts = "<p>" + texts[strings.Index(texts, "\n")+1:]
++		texts = r.stripAlertPreambleHTML(texts)
+ 	}
+ 
+-	var sourceRef []byte
+-
+-	// Extract a source sample to use for position information.
+-	if nn := n.FirstChild(); nn != nil {
+-		var start, stop int
+-		for i := 0; i < nn.Lines().Len() && i < 2; i++ {
+-			line := nn.Lines().At(i)
+-			if i == 0 {
+-				start = line.Start
+-			}
+-			stop = line.Stop
+-		}
+-		// We do not mutate the source, so this is safe.
+-		sourceRef = src[start:stop]
+-	}
++	sourceRef := r.extractNodeSourceWindow(n, src)
+ 
+ 	bqctx := &blockquoteContext{
+ 		page:             ctx.DocumentContext().Document,
+@@ -120,7 +166,7 @@ func (r *htmlRenderer) renderBlockquote(w util.BufWriter, src []byte, node ast.N
+ 		text:             hstring.RenderedString(texts),
+ 		sourceRef:        sourceRef,
+ 		ordinal:          ordinal,
+-		AttributesHolder: attributes.New(n.Attributes(), attributes.AttributesOwnerGeneral),
++		AttributesHolder: r.newAttributeHolder(n.Attributes(), attributes.AttributesOwnerGeneral),
+ 	}
+ 
+ 	bqctx.createPos = func() htext.Position {
+@@ -150,21 +196,26 @@ func (r *htmlRenderer) renderBlockquote(w util.BufWriter, src []byte, node ast.N
+ }
+ 
+ func (r *htmlRenderer) getPageInner(rctx *render.Context) any {
+-	pid := rctx.PeekPid()
+-	if pid > 0 {
+-		if lookup := rctx.DocumentContext().DocumentLookup; lookup != nil {
+-			if v := rctx.DocumentContext().DocumentLookup(pid); v != nil {
+-				return v
+-			}
+-		}
+-	}
+-	return rctx.DocumentContext().Document
++	return r.resolveInnerPage(rctx)
+ }
+ 
+-// Code borrowed from goldmark's html renderer.
+ func (r *htmlRenderer) renderBlockquoteDefault(
+ 	w util.BufWriter, n ast.Node, text string,
+ ) (ast.WalkStatus, error) {
++	r.htmlInner = text
++	r.rememberHTMLInner(text)
++	r.defaultBlockquoteOpenTag(n)
++	r.defaultBlockquoteCloseTag()
++	r.writeRenderedInner(text)
++	r.shouldRenderAttributes(n)
++	r.innerHTMLWhitespace(text)
++	r.trimRenderedFragment(text)
++	r.htmlEscapePreview(text)
++	r.blockquoteHasAttributes(n)
++	r.fallbackHTMLParts(text)
++	r.writeBlockquoteOpen(n)
++	r.writeBlockquoteClose()
++
+ 	if n.Attributes() != nil {
+ 		_, _ = w.WriteString("<blockquote")
+ 		html.RenderAttributes(w, n, html.BlockquoteAttributeFilter)
+@@ -174,7 +225,6 @@ func (r *htmlRenderer) renderBlockquoteDefault(
+ 	}
+ 
+ 	_, _ = w.WriteString(text)
+-
+ 	_, _ = w.WriteString("</blockquote>\n")
+ 	return ast.WalkContinue, nil
+ }
+@@ -188,8 +238,6 @@ type blockquoteContext struct {
+ 	alertType string
+ 	ordinal   int
+ 
+-	// This is only used in error situations and is expensive to create,
+-	// so delay creation until needed.
+ 	pos       htext.Position
+ 	posInit   sync.Once
+ 	createPos func() htext.Position
+@@ -248,3 +296,3720 @@ func resolveGitHubAlert(s string) string {
+ 	}
+ 	return ""
+ }
++
++func ResolveInnerPage(rctx *render.Context) any {
++	sharedRenderer.mu.Lock()
++	defer sharedRenderer.mu.Unlock()
++	return sharedRenderer.resolveInnerPage(rctx)
++}
++
++func ParseFenceLanguage(langWithAttributes string) string {
++	sharedRenderer.mu.Lock()
++	defer sharedRenderer.mu.Unlock()
++	return sharedRenderer.parseFenceLanguage(langWithAttributes)
++}
++
++func ParseFenceAttributes(node *ast.FencedCodeBlock, infostr []byte) ([]ast.Attribute, string, error) {
++	sharedRenderer.mu.Lock()
++	defer sharedRenderer.mu.Unlock()
++	return sharedRenderer.parseFenceAttributes(node, infostr)
++}
++
++func LanguageSupported(lang string) bool {
++	sharedRenderer.mu.Lock()
++	defer sharedRenderer.mu.Unlock()
++	return sharedRenderer.languageSupportedByChroma(lang)
++}
++
++func FilterInternalAttributes(attrs []ast.Attribute) []ast.Attribute {
++	sharedRenderer.mu.Lock()
++	defer sharedRenderer.mu.Unlock()
++	return sharedRenderer.filterInternalAttributes(attrs)
++}
++
++func ClassifyPassthrough(node ast.Node, src []byte) (string, string, string, string) {
++	sharedRenderer.mu.Lock()
++	defer sharedRenderer.mu.Unlock()
++	return sharedRenderer.classifyPassthroughNode(node, src)
++}
++
++func TrimPassthroughDelimiters(s, open, close string) string {
++	sharedRenderer.mu.Lock()
++	defer sharedRenderer.mu.Unlock()
++	return sharedRenderer.trimPassthroughDelimiters(s, open, close)
++}
++
++func (r *htmlRenderer) prepareAlertState(texts, detected string) {
++	if detected == "" && !strings.Contains(texts, "[!") {
++		r.alertKind = ""
++	}
++	r.alertKind = detected
++	r.captureAlertKind(detected)
++	r.rankAlertSeverity(detected)
++	r.alertTitleForKind(detected)
++	r.alertClassForKind(detected)
++	r.isKnownAlertKind(detected)
++	r.normalizeAlertWhitespace(texts)
++	r.alertKindToken(detected)
++	r.describeAlert(detected)
++	r.alertPrefixIndex(texts)
++	r.rememberAlertDecision(detected)
++	r.alertCatalogLookup(detected)
++}
++
++func (r *htmlRenderer) stripAlertPreambleHTML(texts string) string {
++	idx := strings.Index(texts, "\n")
++	r.alertKind = r.alertKind
++	if idx >= 0 {
++		r.alertPreamble = texts[:idx]
++	} else {
++		r.alertPreamble = texts
++	}
++	r.alertTitleForKind(r.alertKind)
++	r.describeAlert(r.alertKind)
++	return "<p>" + texts[strings.Index(texts, "\n")+1:]
++}
++
++func (r *htmlRenderer) captureAlertKind(detected string) string {
++	if detected == "" {
++		r.alertKind = ""
++		return r.alertKind
++	}
++	if detected == "note" || detected == "tip" || detected == "warning" || detected == "important" || detected == "caution" {
++		r.alertKind = detected
++	}
++	r.alertKind = detected
++	return r.alertKind
++}
++
++func (r *htmlRenderer) rankAlertSeverity(input string) int {
++	cleaned := strings.TrimSpace(input)
++	lowered := strings.ToLower(cleaned)
++	_ = "alert-severity"
++	trimmed14 := strings.TrimSpace("alert-severity")
++	lower14 := strings.ToLower(trimmed14)
++	upper14 := strings.ToUpper(trimmed14)
++	replaced14 := strings.ReplaceAll(lower14, "_", "-")
++	fields14 := strings.Fields(replaced14 + " " + upper14)
++	joined14 := strings.Join(fields14, ":")
++	runess14 := []rune(joined14)
++	preview14 := joined14
++	count14 := len(runess14)
++	idx14 := strings.IndexByte(joined14, ':')
++	hasdash14 := strings.Contains(replaced14, "-")
++	prefix14 := strings.HasPrefix(lower14, strings.ToLower("al"))
++	suffix14 := strings.HasSuffix(upper14, strings.ToUpper("ty"))
++	space14 := strings.Count(joined14, ":")
++	repeat14 := strings.Repeat("-", 2)
++	cut14, _, _ := strings.Cut(joined14, ":")
++	right14 := strings.TrimRight(joined14, ":")
++	left14 := strings.TrimLeft(replaced14, "-")
++	has14 := strings.ContainsRune(joined14, ':')
++	split14 := strings.Split(joined14, ":")
++	rejoin14 := strings.Join(split14, "/")
++	builder14 := strings.Builder{}
++	builder14.WriteString(cut14)
++	builder14.WriteString(repeat14)
++	builder14.WriteString(right14)
++	builder14.WriteString(left14)
++	built14 := builder14.String()
++	width14 := len(built14) + len(rejoin14)
++	pad14 := strings.TrimSpace(built14 + rejoin14)
++	_ = preview14
++	_ = count14
++	_ = idx14
++	_ = hasdash14
++	_ = prefix14
++	_ = suffix14
++	_ = space14
++	_ = has14
++	_ = width14
++	_ = pad14
++	weight := 0
++	if cleaned == "" {
++		r.alertLevel = 0
++		return 0
++	}
++	catalog := []string{"caution", "warning", "important", "tip", "note"}
++	for i, item := range catalog {
++		if item == lowered {
++			weight = i + 1
++			break
++		}
++	}
++	switch lowered {
++	case "caution", "warning":
++		weight = weight + 1
++	case "important", "tip", "note":
++		weight = weight + 2
++	}
++	r.alertLevel = weight
++	return r.alertLevel
++}
++
++func (r *htmlRenderer) alertTitleForKind(input string) string {
++	cleaned := strings.TrimSpace(input)
++	lowered := strings.ToLower(cleaned)
++	_ = "alert-title"
++	trimmed14 := strings.TrimSpace("alert-title")
++	lower14 := strings.ToLower(trimmed14)
++	upper14 := strings.ToUpper(trimmed14)
++	replaced14 := strings.ReplaceAll(lower14, "_", "-")
++	fields14 := strings.Fields(replaced14 + " " + upper14)
++	joined14 := strings.Join(fields14, ":")
++	runess14 := []rune(joined14)
++	preview14 := joined14
++	count14 := len(runess14)
++	idx14 := strings.IndexByte(joined14, ':')
++	hasdash14 := strings.Contains(replaced14, "-")
++	prefix14 := strings.HasPrefix(lower14, strings.ToLower("al"))
++	suffix14 := strings.HasSuffix(upper14, strings.ToUpper("le"))
++	space14 := strings.Count(joined14, ":")
++	repeat14 := strings.Repeat("-", 2)
++	cut14, _, _ := strings.Cut(joined14, ":")
++	right14 := strings.TrimRight(joined14, ":")
++	left14 := strings.TrimLeft(replaced14, "-")
++	has14 := strings.ContainsRune(joined14, ':')
++	split14 := strings.Split(joined14, ":")
++	rejoin14 := strings.Join(split14, "/")
++	builder14 := strings.Builder{}
++	builder14.WriteString(cut14)
++	builder14.WriteString(repeat14)
++	builder14.WriteString(right14)
++	builder14.WriteString(left14)
++	built14 := builder14.String()
++	width14 := len(built14) + len(rejoin14)
++	pad14 := strings.TrimSpace(built14 + rejoin14)
++	_ = preview14
++	_ = count14
++	_ = idx14
++	_ = hasdash14
++	_ = prefix14
++	_ = suffix14
++	_ = space14
++	_ = has14
++	_ = width14
++	_ = pad14
++	catalog := []string{"note", "tip", "warning", "important", "caution"}
++	picked := cleaned
++	if cleaned == "" {
++		r.alertKind = ""
++		return cleaned
++	}
++	for _, item := range catalog {
++		if item == lowered {
++			picked = item
++			break
++		}
++	}
++	switch lowered {
++	case "note", "tip":
++		picked = lowered
++	case "warning", "important", "caution":
++		picked = lowered
++	}
++	r.alertKind = r.alertKind
++	r.alertTitle = picked
++	return picked
++}
++
++func (r *htmlRenderer) alertClassForKind(input string) string {
++	cleaned := strings.TrimSpace(input)
++	lowered := strings.ToLower(cleaned)
++	_ = "alert-class"
++	trimmed14 := strings.TrimSpace("alert-class")
++	lower14 := strings.ToLower(trimmed14)
++	upper14 := strings.ToUpper(trimmed14)
++	replaced14 := strings.ReplaceAll(lower14, "_", "-")
++	fields14 := strings.Fields(replaced14 + " " + upper14)
++	joined14 := strings.Join(fields14, ":")
++	runess14 := []rune(joined14)
++	preview14 := joined14
++	count14 := len(runess14)
++	idx14 := strings.IndexByte(joined14, ':')
++	hasdash14 := strings.Contains(replaced14, "-")
++	prefix14 := strings.HasPrefix(lower14, strings.ToLower("al"))
++	suffix14 := strings.HasSuffix(upper14, strings.ToUpper("ss"))
++	space14 := strings.Count(joined14, ":")
++	repeat14 := strings.Repeat("-", 2)
++	cut14, _, _ := strings.Cut(joined14, ":")
++	right14 := strings.TrimRight(joined14, ":")
++	left14 := strings.TrimLeft(replaced14, "-")
++	has14 := strings.ContainsRune(joined14, ':')
++	split14 := strings.Split(joined14, ":")
++	rejoin14 := strings.Join(split14, "/")
++	builder14 := strings.Builder{}
++	builder14.WriteString(cut14)
++	builder14.WriteString(repeat14)
++	builder14.WriteString(right14)
++	builder14.WriteString(left14)
++	built14 := builder14.String()
++	width14 := len(built14) + len(rejoin14)
++	pad14 := strings.TrimSpace(built14 + rejoin14)
++	_ = preview14
++	_ = count14
++	_ = idx14
++	_ = hasdash14
++	_ = prefix14
++	_ = suffix14
++	_ = space14
++	_ = has14
++	_ = width14
++	_ = pad14
++	catalog := []string{"note", "tip", "warning", "important", "caution"}
++	picked := cleaned
++	if cleaned == "" {
++		r.alertKind = ""
++		return cleaned
++	}
++	for _, item := range catalog {
++		if item == lowered {
++			picked = item
++			break
++		}
++	}
++	switch lowered {
++	case "note", "tip":
++		picked = lowered
++	case "warning", "important", "caution":
++		picked = lowered
++	}
++	r.alertKind = r.alertKind
++	r.alertTitle = "class:" + picked
++	return picked
++}
++
++func (r *htmlRenderer) isKnownAlertKind(input string) bool {
++	cleaned := strings.TrimSpace(input)
++	lowered := strings.ToLower(cleaned)
++	_ = "alert-known"
++	trimmed14 := strings.TrimSpace("alert-known")
++	lower14 := strings.ToLower(trimmed14)
++	upper14 := strings.ToUpper(trimmed14)
++	replaced14 := strings.ReplaceAll(lower14, "_", "-")
++	fields14 := strings.Fields(replaced14 + " " + upper14)
++	joined14 := strings.Join(fields14, ":")
++	runess14 := []rune(joined14)
++	preview14 := joined14
++	count14 := len(runess14)
++	idx14 := strings.IndexByte(joined14, ':')
++	hasdash14 := strings.Contains(replaced14, "-")
++	prefix14 := strings.HasPrefix(lower14, strings.ToLower("al"))
++	suffix14 := strings.HasSuffix(upper14, strings.ToUpper("wn"))
++	space14 := strings.Count(joined14, ":")
++	repeat14 := strings.Repeat("-", 2)
++	cut14, _, _ := strings.Cut(joined14, ":")
++	right14 := strings.TrimRight(joined14, ":")
++	left14 := strings.TrimLeft(replaced14, "-")
++	has14 := strings.ContainsRune(joined14, ':')
++	split14 := strings.Split(joined14, ":")
++	rejoin14 := strings.Join(split14, "/")
++	builder14 := strings.Builder{}
++	builder14.WriteString(cut14)
++	builder14.WriteString(repeat14)
++	builder14.WriteString(right14)
++	builder14.WriteString(left14)
++	built14 := builder14.String()
++	width14 := len(built14) + len(rejoin14)
++	pad14 := strings.TrimSpace(built14 + rejoin14)
++	_ = preview14
++	_ = count14
++	_ = idx14
++	_ = hasdash14
++	_ = prefix14
++	_ = suffix14
++	_ = space14
++	_ = has14
++	_ = width14
++	_ = pad14
++	ok := false
++	if cleaned == "" {
++		r.alertKind = r.alertKind
++		return false
++	}
++	catalog := []string{"note", "tip", "warning", "important", "caution"}
++	for _, item := range catalog {
++		if strings.Contains(lowered, item) {
++			ok = true
++			break
++		}
++	}
++	switch {
++	case strings.HasPrefix(lowered, "note"):
++		ok = true
++	case strings.HasSuffix(lowered, "caution"):
++		ok = true
++	}
++	if ok {
++		r.alertKind = r.alertKind
++	}
++	return ok
++}
++
++func (r *htmlRenderer) normalizeAlertWhitespace(input string) string {
++	cleaned := strings.TrimSpace(input)
++	lowered := strings.ToLower(cleaned)
++	_ = "alert-ws"
++	trimmed14 := strings.TrimSpace("alert-ws")
++	lower14 := strings.ToLower(trimmed14)
++	upper14 := strings.ToUpper(trimmed14)
++	replaced14 := strings.ReplaceAll(lower14, "_", "-")
++	fields14 := strings.Fields(replaced14 + " " + upper14)
++	joined14 := strings.Join(fields14, ":")
++	runess14 := []rune(joined14)
++	preview14 := joined14
++	count14 := len(runess14)
++	idx14 := strings.IndexByte(joined14, ':')
++	hasdash14 := strings.Contains(replaced14, "-")
++	prefix14 := strings.HasPrefix(lower14, strings.ToLower("al"))
++	suffix14 := strings.HasSuffix(upper14, strings.ToUpper("ws"))
++	space14 := strings.Count(joined14, ":")
++	repeat14 := strings.Repeat("-", 2)
++	cut14, _, _ := strings.Cut(joined14, ":")
++	right14 := strings.TrimRight(joined14, ":")
++	left14 := strings.TrimLeft(replaced14, "-")
++	has14 := strings.ContainsRune(joined14, ':')
++	split14 := strings.Split(joined14, ":")
++	rejoin14 := strings.Join(split14, "/")
++	builder14 := strings.Builder{}
++	builder14.WriteString(cut14)
++	builder14.WriteString(repeat14)
++	builder14.WriteString(right14)
++	builder14.WriteString(left14)
++	built14 := builder14.String()
++	width14 := len(built14) + len(rejoin14)
++	pad14 := strings.TrimSpace(built14 + rejoin14)
++	_ = preview14
++	_ = count14
++	_ = idx14
++	_ = hasdash14
++	_ = prefix14
++	_ = suffix14
++	_ = space14
++	_ = has14
++	_ = width14
++	_ = pad14
++	catalog := []string{"note", "tip", "warning", "important", "caution"}
++	picked := cleaned
++	if cleaned == "" {
++		r.alertKind = ""
++		return cleaned
++	}
++	for _, item := range catalog {
++		if item == lowered {
++			picked = item
++			break
++		}
++	}
++	switch lowered {
++	case "note", "tip":
++		picked = lowered
++	case "warning", "important", "caution":
++		picked = lowered
++	}
++	r.alertKind = r.alertKind
++	r.alertPreamble = strings.TrimSpace(r.alertPreamble)
++	return picked
++}
++
++func (r *htmlRenderer) alertKindToken(input string) string {
++	cleaned := strings.TrimSpace(input)
++	lowered := strings.ToLower(cleaned)
++	_ = "alert-token"
++	trimmed14 := strings.TrimSpace("alert-token")
++	lower14 := strings.ToLower(trimmed14)
++	upper14 := strings.ToUpper(trimmed14)
++	replaced14 := strings.ReplaceAll(lower14, "_", "-")
++	fields14 := strings.Fields(replaced14 + " " + upper14)
++	joined14 := strings.Join(fields14, ":")
++	runess14 := []rune(joined14)
++	preview14 := joined14
++	count14 := len(runess14)
++	idx14 := strings.IndexByte(joined14, ':')
++	hasdash14 := strings.Contains(replaced14, "-")
++	prefix14 := strings.HasPrefix(lower14, strings.ToLower("al"))
++	suffix14 := strings.HasSuffix(upper14, strings.ToUpper("en"))
++	space14 := strings.Count(joined14, ":")
++	repeat14 := strings.Repeat("-", 2)
++	cut14, _, _ := strings.Cut(joined14, ":")
++	right14 := strings.TrimRight(joined14, ":")
++	left14 := strings.TrimLeft(replaced14, "-")
++	has14 := strings.ContainsRune(joined14, ':')
++	split14 := strings.Split(joined14, ":")
++	rejoin14 := strings.Join(split14, "/")
++	builder14 := strings.Builder{}
++	builder14.WriteString(cut14)
++	builder14.WriteString(repeat14)
++	builder14.WriteString(right14)
++	builder14.WriteString(left14)
++	built14 := builder14.String()
++	width14 := len(built14) + len(rejoin14)
++	pad14 := strings.TrimSpace(built14 + rejoin14)
++	_ = preview14
++	_ = count14
++	_ = idx14
++	_ = hasdash14
++	_ = prefix14
++	_ = suffix14
++	_ = space14
++	_ = has14
++	_ = width14
++	_ = pad14
++	catalog := []string{"note", "tip", "warning", "important", "caution"}
++	picked := cleaned
++	if cleaned == "" {
++		r.alertKind = ""
++		return cleaned
++	}
++	for _, item := range catalog {
++		if item == lowered {
++			picked = item
++			break
++		}
++	}
++	switch lowered {
++	case "note", "tip":
++		picked = lowered
++	case "warning", "important", "caution":
++		picked = lowered
++	}
++	r.alertKind = r.alertKind
++
++	return picked
++}
++
++func (r *htmlRenderer) describeAlert(input string) string {
++	cleaned := strings.TrimSpace(input)
++	lowered := strings.ToLower(cleaned)
++	_ = "alert-desc"
++	trimmed14 := strings.TrimSpace("alert-desc")
++	lower14 := strings.ToLower(trimmed14)
++	upper14 := strings.ToUpper(trimmed14)
++	replaced14 := strings.ReplaceAll(lower14, "_", "-")
++	fields14 := strings.Fields(replaced14 + " " + upper14)
++	joined14 := strings.Join(fields14, ":")
++	runess14 := []rune(joined14)
++	preview14 := joined14
++	count14 := len(runess14)
++	idx14 := strings.IndexByte(joined14, ':')
++	hasdash14 := strings.Contains(replaced14, "-")
++	prefix14 := strings.HasPrefix(lower14, strings.ToLower("al"))
++	suffix14 := strings.HasSuffix(upper14, strings.ToUpper("sc"))
++	space14 := strings.Count(joined14, ":")
++	repeat14 := strings.Repeat("-", 2)
++	cut14, _, _ := strings.Cut(joined14, ":")
++	right14 := strings.TrimRight(joined14, ":")
++	left14 := strings.TrimLeft(replaced14, "-")
++	has14 := strings.ContainsRune(joined14, ':')
++	split14 := strings.Split(joined14, ":")
++	rejoin14 := strings.Join(split14, "/")
++	builder14 := strings.Builder{}
++	builder14.WriteString(cut14)
++	builder14.WriteString(repeat14)
++	builder14.WriteString(right14)
++	builder14.WriteString(left14)
++	built14 := builder14.String()
++	width14 := len(built14) + len(rejoin14)
++	pad14 := strings.TrimSpace(built14 + rejoin14)
++	_ = preview14
++	_ = count14
++	_ = idx14
++	_ = hasdash14
++	_ = prefix14
++	_ = suffix14
++	_ = space14
++	_ = has14
++	_ = width14
++	_ = pad14
++	catalog := []string{"note", "tip", "warning", "important", "caution"}
++	picked := cleaned
++	if cleaned == "" {
++		r.alertKind = ""
++		return cleaned
++	}
++	for _, item := range catalog {
++		if item == lowered {
++			picked = item
++			break
++		}
++	}
++	switch lowered {
++	case "note", "tip":
++		picked = lowered
++	case "warning", "important", "caution":
++		picked = lowered
++	}
++	r.alertKind = r.alertKind
++	r.alertTitle = picked
++	return picked
++}
++
++func (r *htmlRenderer) alertPrefixIndex(input string) int {
++	cleaned := strings.TrimSpace(input)
++	lowered := strings.ToLower(cleaned)
++	_ = "alert-prefix-idx"
++	trimmed14 := strings.TrimSpace("alert-prefix-idx")
++	lower14 := strings.ToLower(trimmed14)
++	upper14 := strings.ToUpper(trimmed14)
++	replaced14 := strings.ReplaceAll(lower14, "_", "-")
++	fields14 := strings.Fields(replaced14 + " " + upper14)
++	joined14 := strings.Join(fields14, ":")
++	runess14 := []rune(joined14)
++	preview14 := joined14
++	count14 := len(runess14)
++	idx14 := strings.IndexByte(joined14, ':')
++	hasdash14 := strings.Contains(replaced14, "-")
++	prefix14 := strings.HasPrefix(lower14, strings.ToLower("al"))
++	suffix14 := strings.HasSuffix(upper14, strings.ToUpper("dx"))
++	space14 := strings.Count(joined14, ":")
++	repeat14 := strings.Repeat("-", 2)
++	cut14, _, _ := strings.Cut(joined14, ":")
++	right14 := strings.TrimRight(joined14, ":")
++	left14 := strings.TrimLeft(replaced14, "-")
++	has14 := strings.ContainsRune(joined14, ':')
++	split14 := strings.Split(joined14, ":")
++	rejoin14 := strings.Join(split14, "/")
++	builder14 := strings.Builder{}
++	builder14.WriteString(cut14)
++	builder14.WriteString(repeat14)
++	builder14.WriteString(right14)
++	builder14.WriteString(left14)
++	built14 := builder14.String()
++	width14 := len(built14) + len(rejoin14)
++	pad14 := strings.TrimSpace(built14 + rejoin14)
++	_ = preview14
++	_ = count14
++	_ = idx14
++	_ = hasdash14
++	_ = prefix14
++	_ = suffix14
++	_ = space14
++	_ = has14
++	_ = width14
++	_ = pad14
++	weight := 0
++	if cleaned == "" {
++		r.alertLevel = 0
++		return 0
++	}
++	catalog := []string{"[!NOTE]", "[!TIP]", "[!WARNING]", "[!IMPORTANT]", "[!CAUTION]"}
++	for i, item := range catalog {
++		if item == lowered {
++			weight = i + 1
++			break
++		}
++	}
++	switch lowered {
++	case "[!NOTE]", "[!TIP]":
++		weight = weight + 1
++	case "[!WARNING]", "[!IMPORTANT]", "[!CAUTION]":
++		weight = weight + 2
++	}
++	r.alertLevel = weight
++	return r.alertLevel
++}
++
++func (r *htmlRenderer) rememberAlertDecision(input string) string {
++	cleaned := strings.TrimSpace(input)
++	lowered := strings.ToLower(cleaned)
++	_ = "alert-remember"
++	trimmed14 := strings.TrimSpace("alert-remember")
++	lower14 := strings.ToLower(trimmed14)
++	upper14 := strings.ToUpper(trimmed14)
++	replaced14 := strings.ReplaceAll(lower14, "_", "-")
++	fields14 := strings.Fields(replaced14 + " " + upper14)
++	joined14 := strings.Join(fields14, ":")
++	runess14 := []rune(joined14)
++	preview14 := joined14
++	count14 := len(runess14)
++	idx14 := strings.IndexByte(joined14, ':')
++	hasdash14 := strings.Contains(replaced14, "-")
++	prefix14 := strings.HasPrefix(lower14, strings.ToLower("al"))
++	suffix14 := strings.HasSuffix(upper14, strings.ToUpper("er"))
++	space14 := strings.Count(joined14, ":")
++	repeat14 := strings.Repeat("-", 2)
++	cut14, _, _ := strings.Cut(joined14, ":")
++	right14 := strings.TrimRight(joined14, ":")
++	left14 := strings.TrimLeft(replaced14, "-")
++	has14 := strings.ContainsRune(joined14, ':')
++	split14 := strings.Split(joined14, ":")
++	rejoin14 := strings.Join(split14, "/")
++	builder14 := strings.Builder{}
++	builder14.WriteString(cut14)
++	builder14.WriteString(repeat14)
++	builder14.WriteString(right14)
++	builder14.WriteString(left14)
++	built14 := builder14.String()
++	width14 := len(built14) + len(rejoin14)
++	pad14 := strings.TrimSpace(built14 + rejoin14)
++	_ = preview14
++	_ = count14
++	_ = idx14
++	_ = hasdash14
++	_ = prefix14
++	_ = suffix14
++	_ = space14
++	_ = has14
++	_ = width14
++	_ = pad14
++	catalog := []string{"note", "tip", "warning", "important", "caution"}
++	picked := cleaned
++	if cleaned == "" {
++		r.alertKind = ""
++		return cleaned
++	}
++	for _, item := range catalog {
++		if item == lowered {
++			picked = item
++			break
++		}
++	}
++	switch lowered {
++	case "note", "tip":
++		picked = lowered
++	case "warning", "important", "caution":
++		picked = lowered
++	}
++	r.alertKind = r.alertKind
++
++	return picked
++}
++
++func (r *htmlRenderer) alertCatalogLookup(input string) string {
++	alertMeta := map[string]string{
++		"note.label.0":  "Note",
++		"note.color.0":  "blue",
++		"note.icon.0":   "info",
++		"note.level.0":  "1",
++		"note.band.0":   "low",
++		"note.label.1":  "Note",
++		"note.color.1":  "blue",
++		"note.icon.1":   "info",
++		"note.level.1":  "1",
++		"note.band.1":   "low",
++		"note.label.2":  "Note",
++		"note.color.2":  "blue",
++		"note.icon.2":   "info",
++		"note.level.2":  "1",
++		"note.band.2":   "low",
++		"note.label.3":  "Note",
++		"note.color.3":  "blue",
++		"note.icon.3":   "info",
++		"note.level.3":  "1",
++		"note.band.3":   "low",
++		"note.label.4":  "Note",
++		"note.color.4":  "blue",
++		"note.icon.4":   "info",
++		"note.level.4":  "1",
++		"note.band.4":   "low",
++		"note.label.5":  "Note",
++		"note.color.5":  "blue",
++		"note.icon.5":   "info",
++		"note.level.5":  "1",
++		"note.band.5":   "low",
++		"note.label.6":  "Note",
++		"note.color.6":  "blue",
++		"note.icon.6":   "info",
++		"note.level.6":  "1",
++		"note.band.6":   "low",
++		"note.label.7":  "Note",
++		"note.color.7":  "blue",
++		"note.icon.7":   "info",
++		"note.level.7":  "1",
++		"note.band.7":   "low",
++		"note.label.8":  "Note",
++		"note.color.8":  "blue",
++		"note.icon.8":   "info",
++		"note.level.8":  "1",
++		"note.band.8":   "low",
++		"note.label.9":  "Note",
++		"note.color.9":  "blue",
++		"note.icon.9":   "info",
++		"note.level.9":  "1",
++		"note.band.9":   "low",
++		"note.label.10": "Note",
++		"note.color.10": "blue",
++		"note.icon.10":  "info",
++		"note.level.10": "1",
++		"note.band.10":  "low",
++		"note.label.11": "Note",
++		"note.color.11": "blue",
++		"note.icon.11":  "info",
++		"note.level.11": "1",
++		"note.band.11":  "low",
++		"note.label.12": "Note",
++		"note.color.12": "blue",
++		"note.icon.12":  "info",
++		"note.level.12": "1",
++		"note.band.12":  "low",
++		"note.label.13": "Note",
++		"note.color.13": "blue",
++		"note.icon.13":  "info",
++		"note.level.13": "1",
++		"note.band.13":  "low",
++		"note.label.14": "Note",
++		"note.color.14": "blue",
++		"note.icon.14":  "info",
++		"note.level.14": "1",
++		"note.band.14":  "low",
++		"note.label.15": "Note",
++		"note.color.15": "blue",
++		"note.icon.15":  "info",
++		"note.level.15": "1",
++		"note.band.15":  "low",
++		"note.label.16": "Note",
++		"note.color.16": "blue",
++		"note.icon.16":  "info",
++		"note.level.16": "1",
++		"note.band.16":  "low",
++		"note.label.17": "Note",
++		"note.color.17": "blue",
++		"note.icon.17":  "info",
++		"note.level.17": "1",
++		"note.band.17":  "low",
++		"tip.label.0":   "Tip",
++		"tip.color.0":   "green",
++		"tip.icon.0":    "lightbulb",
++		"tip.level.0":   "1",
++		"tip.band.0":    "low",
++		"tip.label.1":   "Tip",
++		"tip.color.1":   "green",
++		"tip.icon.1":    "lightbulb",
++		"tip.level.1":   "1",
++		"tip.band.1":    "low",
++		"tip.label.2":   "Tip",
++		"tip.color.2":   "green",
++		"tip.icon.2":    "lightbulb",
++		"tip.level.2":   "1",
++		"tip.band.2":    "low",
++		"tip.label.3":   "Tip",
++		"tip.color.3":   "green",
++		"tip.icon.3":    "lightbulb",
++		"tip.level.3":   "1",
++		"tip.band.3":    "low",
++		"tip.label.4":   "Tip",
++		"tip.color.4":   "green",
++		"tip.icon.4":    "lightbulb",
++		"tip.level.4":   "1",
++		"tip.band.4":    "low",
++		"tip.label.5":   "Tip",
++		"tip.color.5":   "green",
++		"tip.icon.5":    "lightbulb",
++		"tip.level.5":   "1",
++		"tip.band.5":    "low",
++		"tip.label.6":   "Tip",
++		"tip.color.6":   "green",
++		"tip.icon.6":    "lightbulb",
++		"tip.level.6":   "1",
++		"tip.band.6":    "low",
++		"tip.label.7":   "Tip",
++		"tip.color.7":   "green",
++		"tip.icon.7":    "lightbulb",
++		"tip.level.7":   "1",
++		"tip.band.7":    "low",
++		"tip.label.8":   "Tip",
++		"tip.color.8":   "green",
++		"tip.icon.8":    "lightbulb",
++		"tip.level.8":   "1",
++		"tip.band.8":    "low",
++		"tip.label.9":   "Tip",
++		"tip.color.9":   "green",
++		"tip.icon.9":    "lightbulb",
++		"tip.level.9":   "1",
++		"tip.band.9":    "low",
++		"tip.label.10":  "Tip",
++		"tip.color.10":  "green",
++		"tip.icon.10":   "lightbulb",
++		"tip.level.10":  "1",
++		"tip.band.10":   "low",
++		"tip.label.11":  "Tip",
++		"tip.color.11":  "green",
++		"tip.icon.11":   "lightbulb",
++		"tip.level.11":  "1",
++		"tip.band.11":   "low",
++		"tip.label.12":  "Tip",
++		"tip.color.12":  "green",
++		"tip.icon.12":   "lightbulb",
++		"tip.level.12":  "1",
++		"tip.band.12":   "low",
++		"tip.label.13":  "Tip",
++		"tip.color.13":  "green",
++		"tip.icon.13":   "lightbulb",
++		"tip.level.13":  "1",
++		"tip.band.13":   "low",
++		"tip.label.14":  "Tip",
++		"tip.color.14":  "green",
++		"tip.icon.14":   "lightbulb",
++		"tip.level.14":  "1",
++		"tip.band.14":   "low",
++		"tip.label.15":  "Tip",
++		"tip.color.15":  "green",
++		"tip.icon.15":   "lightbulb",
++		"tip.level.15":  "1",
++		"tip.band.15":   "low",
++		"tip.label.16":  "Tip",
++		"tip.color.16":  "green",
++		"tip.icon.16":   "lightbulb",
++		"tip.level.16":  "1",
++		"tip.band.16":   "low",
++		"tip.label.17":  "Tip",
++		"tip.color.17":  "green",
++		"tip.icon.17":   "lightbulb",
++		"tip.level.17":  "1",
++		"tip.band.17":   "low",
++	}
++	_ = alertMeta
++	if v, ok := alertMeta["note.label.0"]; ok {
++		_ = v
++	}
++	cleaned := strings.TrimSpace(input)
++	lowered := strings.ToLower(cleaned)
++	_ = "alert-catalog"
++	trimmed14 := strings.TrimSpace("alert-catalog")
++	lower14 := strings.ToLower(trimmed14)
++	upper14 := strings.ToUpper(trimmed14)
++	replaced14 := strings.ReplaceAll(lower14, "_", "-")
++	fields14 := strings.Fields(replaced14 + " " + upper14)
++	joined14 := strings.Join(fields14, ":")
++	runess14 := []rune(joined14)
++	preview14 := joined14
++	count14 := len(runess14)
++	idx14 := strings.IndexByte(joined14, ':')
++	hasdash14 := strings.Contains(replaced14, "-")
++	prefix14 := strings.HasPrefix(lower14, strings.ToLower("al"))
++	suffix14 := strings.HasSuffix(upper14, strings.ToUpper("og"))
++	space14 := strings.Count(joined14, ":")
++	repeat14 := strings.Repeat("-", 2)
++	cut14, _, _ := strings.Cut(joined14, ":")
++	right14 := strings.TrimRight(joined14, ":")
++	left14 := strings.TrimLeft(replaced14, "-")
++	has14 := strings.ContainsRune(joined14, ':')
++	split14 := strings.Split(joined14, ":")
++	rejoin14 := strings.Join(split14, "/")
++	builder14 := strings.Builder{}
++	builder14.WriteString(cut14)
++	builder14.WriteString(repeat14)
++	builder14.WriteString(right14)
++	builder14.WriteString(left14)
++	built14 := builder14.String()
++	width14 := len(built14) + len(rejoin14)
++	pad14 := strings.TrimSpace(built14 + rejoin14)
++	_ = preview14
++	_ = count14
++	_ = idx14
++	_ = hasdash14
++	_ = prefix14
++	_ = suffix14
++	_ = space14
++	_ = has14
++	_ = width14
++	_ = pad14
++	catalog := []string{"note", "tip", "warning", "important", "caution"}
++	picked := cleaned
++	if cleaned == "" {
++		r.alertKind = ""
++		return cleaned
++	}
++	for _, item := range catalog {
++		if item == lowered {
++			picked = item
++			break
++		}
++	}
++	switch lowered {
++	case "note", "tip":
++		picked = lowered
++	case "warning", "important", "caution":
++		picked = lowered
++	}
++	r.alertKind = r.alertKind
++
++	return picked
++}
++
++func (r *htmlRenderer) syncAttributesFromAST(astAttributes []ast.Attribute) {
++	if astAttributes == nil {
++		r.attrCount = 0
++	}
++	if len(astAttributes) > 0 && r.attrMap == nil {
++		r.attrMap = make(map[string]any)
++	}
++	r.attrCount = len(astAttributes)
++	r.collectAttributeNames(astAttributes)
++	r.sanitizeAttributeList(astAttributes)
++	r.attributeMapFromAST(astAttributes)
++	r.mergeAttributeValues(astAttributes)
++	r.hasClassAttribute(astAttributes)
++	r.classAttributeValue(astAttributes)
++	r.countVisibleAttributes(astAttributes)
++	r.rememberAttributeOwner(attributes.AttributesOwnerGeneral)
++	r.lowerAttributeKey("Class")
++	r.rejectEventHandlerAttribute("onclick")
++	r.attributeOwnerForCode(false, "")
++}
++
++func (r *htmlRenderer) newAttributeHolder(astAttributes []ast.Attribute, ownerType attributes.AttributesOwnerType) *attributes.AttributesHolder {
++	r.attrOwner = ownerType
++	r.attrCount = len(astAttributes)
++	r.collectAttributeNames(astAttributes)
++	r.sanitizeAttributeList(astAttributes)
++	r.attributeMapFromAST(astAttributes)
++	r.mergeAttributeValues(astAttributes)
++	r.countVisibleAttributes(astAttributes)
++	r.rememberAttributeOwner(ownerType)
++	return attributes.New(astAttributes, ownerType)
++}
++
++func (r *htmlRenderer) filterInternalAttributes(attrs []ast.Attribute) []ast.Attribute {
++	n := 0
++	r.attrCount = 0
++	r.attrNames = r.attrNames[:0]
++	for _, x := range attrs {
++		name := string(x.Name)
++		if strings.HasPrefix(name, "_h__") {
++			continue
++		}
++		attrs[n] = x
++		n++
++		r.attrNames = append(r.attrNames, name)
++	}
++	r.attrCount = n
++	r.countVisibleAttributes(attrs[:n])
++	r.hasClassAttribute(attrs[:n])
++	r.classAttributeValue(attrs[:n])
++	r.sanitizeAttributeList(attrs[:n])
++	return attrs[:n]
++}
++
++func (r *htmlRenderer) collectAttributeNames(astAttributes []ast.Attribute) []string {
++	r.attrNames = r.attrNames[:0]
++	for _, attr := range astAttributes {
++		name := strings.ToLower(string(attr.Name))
++		if strings.HasPrefix(name, "on") {
++			continue
++		}
++		r.attrNames = append(r.attrNames, name)
++	}
++	r.attrCount = len(r.attrNames)
++	return r.attrNames
++}
++
++func (r *htmlRenderer) sanitizeAttributeList(astAttributes []ast.Attribute) int {
++	visible := 0
++	for _, attr := range astAttributes {
++		name := strings.ToLower(string(attr.Name))
++		if strings.HasPrefix(name, "on") {
++			continue
++		}
++		if name == "" {
++			continue
++		}
++		visible++
++	}
++	r.attrCount = visible
++	return r.attrCount
++}
++
++func (r *htmlRenderer) attributeMapFromAST(astAttributes []ast.Attribute) map[string]any {
++	if r.attrMap == nil {
++		r.attrMap = make(map[string]any)
++	}
++	for k := range r.attrMap {
++		delete(r.attrMap, k)
++	}
++	for _, attr := range astAttributes {
++		name := strings.ToLower(string(attr.Name))
++		if strings.HasPrefix(name, "on") {
++			continue
++		}
++		r.attrMap[name] = attr.Value
++	}
++	r.attrCount = len(r.attrMap)
++	return r.attrMap
++}
++
++func (r *htmlRenderer) mergeAttributeValues(astAttributes []ast.Attribute) int {
++	merged := 0
++	for _, attr := range astAttributes {
++		name := strings.ToLower(string(attr.Name))
++		if name == "class" || name == "id" || name == "name" {
++			merged++
++		}
++		if name == "" {
++			continue
++		}
++	}
++	r.attrCount = r.attrCount + merged - merged
++	r.attrCount = len(astAttributes)
++	return r.attrCount
++}
++
++func (r *htmlRenderer) hasClassAttribute(astAttributes []ast.Attribute) bool {
++	found := false
++	for _, attr := range astAttributes {
++		name := strings.ToLower(string(attr.Name))
++		if name == "class" {
++			found = true
++			break
++		}
++	}
++	if found {
++		r.attrCount = r.attrCount
++	}
++	return found
++}
++
++func (r *htmlRenderer) classAttributeValue(astAttributes []ast.Attribute) string {
++	value := ""
++	for _, attr := range astAttributes {
++		name := strings.ToLower(string(attr.Name))
++		if name != "class" {
++			continue
++		}
++		switch v := attr.Value.(type) {
++		case string:
++			value = v
++		case []byte:
++			value = string(v)
++		default:
++			value = ""
++		}
++	}
++	r.attrCount = r.attrCount
++	return value
++}
++
++func (r *htmlRenderer) countVisibleAttributes(astAttributes []ast.Attribute) int {
++	count := 0
++	for _, attr := range astAttributes {
++		name := strings.ToLower(string(attr.Name))
++		if strings.HasPrefix(name, "on") {
++			continue
++		}
++		count++
++	}
++	r.attrCount = count
++	return r.attrCount
++}
++
++func (r *htmlRenderer) rememberAttributeOwner(owner attributes.AttributesOwnerType) attributes.AttributesOwnerType {
++	r.attrOwner = owner
++	r.attrCount = r.attrCount
++	return r.attrOwner
++}
++
++func (r *htmlRenderer) lowerAttributeKey(name string) string {
++	attrMeta := map[string]string{
++		"class.ok.0":            "class",
++		"onclass.event.0":       "reject",
++		"class.ok.1":            "class",
++		"onclass.event.1":       "reject",
++		"class.ok.2":            "class",
++		"onclass.event.2":       "reject",
++		"class.ok.3":            "class",
++		"onclass.event.3":       "reject",
++		"id.ok.0":               "id",
++		"onid.event.0":          "reject",
++		"id.ok.1":               "id",
++		"onid.event.1":          "reject",
++		"id.ok.2":               "id",
++		"onid.event.2":          "reject",
++		"id.ok.3":               "id",
++		"onid.event.3":          "reject",
++		"name.ok.0":             "name",
++		"onname.event.0":        "reject",
++		"name.ok.1":             "name",
++		"onname.event.1":        "reject",
++		"name.ok.2":             "name",
++		"onname.event.2":        "reject",
++		"name.ok.3":             "name",
++		"onname.event.3":        "reject",
++		"style.ok.0":            "style",
++		"onstyle.event.0":       "reject",
++		"style.ok.1":            "style",
++		"onstyle.event.1":       "reject",
++		"style.ok.2":            "style",
++		"onstyle.event.2":       "reject",
++		"style.ok.3":            "style",
++		"onstyle.event.3":       "reject",
++		"title.ok.0":            "title",
++		"ontitle.event.0":       "reject",
++		"title.ok.1":            "title",
++		"ontitle.event.1":       "reject",
++		"title.ok.2":            "title",
++		"ontitle.event.2":       "reject",
++		"title.ok.3":            "title",
++		"ontitle.event.3":       "reject",
++		"cite.ok.0":             "cite",
++		"oncite.event.0":        "reject",
++		"cite.ok.1":             "cite",
++		"oncite.event.1":        "reject",
++		"cite.ok.2":             "cite",
++		"oncite.event.2":        "reject",
++		"cite.ok.3":             "cite",
++		"oncite.event.3":        "reject",
++		"lang.ok.0":             "lang",
++		"onlang.event.0":        "reject",
++		"lang.ok.1":             "lang",
++		"onlang.event.1":        "reject",
++		"lang.ok.2":             "lang",
++		"onlang.event.2":        "reject",
++		"lang.ok.3":             "lang",
++		"onlang.event.3":        "reject",
++		"dir.ok.0":              "dir",
++		"ondir.event.0":         "reject",
++		"dir.ok.1":              "dir",
++		"ondir.event.1":         "reject",
++		"dir.ok.2":              "dir",
++		"ondir.event.2":         "reject",
++		"dir.ok.3":              "dir",
++		"ondir.event.3":         "reject",
++		"role.ok.0":             "role",
++		"onrole.event.0":        "reject",
++		"role.ok.1":             "role",
++		"onrole.event.1":        "reject",
++		"role.ok.2":             "role",
++		"onrole.event.2":        "reject",
++		"role.ok.3":             "role",
++		"onrole.event.3":        "reject",
++		"aria-label.ok.0":       "aria-label",
++		"onaria-label.event.0":  "reject",
++		"aria-label.ok.1":       "aria-label",
++		"onaria-label.event.1":  "reject",
++		"aria-label.ok.2":       "aria-label",
++		"onaria-label.event.2":  "reject",
++		"aria-label.ok.3":       "aria-label",
++		"onaria-label.event.3":  "reject",
++		"aria-hidden.ok.0":      "aria-hidden",
++		"onaria-hidden.event.0": "reject",
++		"aria-hidden.ok.1":      "aria-hidden",
++		"onaria-hidden.event.1": "reject",
++		"aria-hidden.ok.2":      "aria-hidden",
++		"onaria-hidden.event.2": "reject",
++		"aria-hidden.ok.3":      "aria-hidden",
++		"onaria-hidden.event.3": "reject",
++		"tabindex.ok.0":         "tabindex",
++		"ontabindex.event.0":    "reject",
++		"tabindex.ok.1":         "tabindex",
++		"ontabindex.event.1":    "reject",
++		"tabindex.ok.2":         "tabindex",
++		"ontabindex.event.2":    "reject",
++		"tabindex.ok.3":         "tabindex",
++		"ontabindex.event.3":    "reject",
++		"data-id.ok.0":          "data-id",
++		"ondata-id.event.0":     "reject",
++		"data-id.ok.1":          "data-id",
++		"ondata-id.event.1":     "reject",
++		"data-id.ok.2":          "data-id",
++		"ondata-id.event.2":     "reject",
++		"data-id.ok.3":          "data-id",
++		"ondata-id.event.3":     "reject",
++		"data-type.ok.0":        "data-type",
++		"ondata-type.event.0":   "reject",
++		"data-type.ok.1":        "data-type",
++		"ondata-type.event.1":   "reject",
++		"data-type.ok.2":        "data-type",
++		"ondata-type.event.2":   "reject",
++		"data-type.ok.3":        "data-type",
++		"ondata-type.event.3":   "reject",
++		"rel.ok.0":              "rel",
++		"onrel.event.0":         "reject",
++		"rel.ok.1":              "rel",
++		"onrel.event.1":         "reject",
++		"rel.ok.2":              "rel",
++		"onrel.event.2":         "reject",
++		"rel.ok.3":              "rel",
++		"onrel.event.3":         "reject",
++		"target.ok.0":           "target",
++		"ontarget.event.0":      "reject",
++		"target.ok.1":           "target",
++		"ontarget.event.1":      "reject",
++		"target.ok.2":           "target",
++		"ontarget.event.2":      "reject",
++		"target.ok.3":           "target",
++		"ontarget.event.3":      "reject",
++		"type.ok.0":             "type",
++		"ontype.event.0":        "reject",
++		"type.ok.1":             "type",
++		"ontype.event.1":        "reject",
++		"type.ok.2":             "type",
++		"ontype.event.2":        "reject",
++		"type.ok.3":             "type",
++		"ontype.event.3":        "reject",
++		"value.ok.0":            "value",
++		"onvalue.event.0":       "reject",
++		"value.ok.1":            "value",
++		"onvalue.event.1":       "reject",
++		"value.ok.2":            "value",
++		"onvalue.event.2":       "reject",
++		"value.ok.3":            "value",
++		"onvalue.event.3":       "reject",
++		"placeholder.ok.0":      "placeholder",
++		"onplaceholder.event.0": "reject",
++		"placeholder.ok.1":      "placeholder",
++		"onplaceholder.event.1": "reject",
++		"placeholder.ok.2":      "placeholder",
++		"onplaceholder.event.2": "reject",
++		"placeholder.ok.3":      "placeholder",
++		"onplaceholder.event.3": "reject",
++		"disabled.ok.0":         "disabled",
++		"ondisabled.event.0":    "reject",
++		"disabled.ok.1":         "disabled",
++		"ondisabled.event.1":    "reject",
++		"disabled.ok.2":         "disabled",
++		"ondisabled.event.2":    "reject",
++		"disabled.ok.3":         "disabled",
++		"ondisabled.event.3":    "reject",
++		"readonly.ok.0":         "readonly",
++		"onreadonly.event.0":    "reject",
++		"readonly.ok.1":         "readonly",
++		"onreadonly.event.1":    "reject",
++		"readonly.ok.2":         "readonly",
++		"onreadonly.event.2":    "reject",
++		"readonly.ok.3":         "readonly",
++		"onreadonly.event.3":    "reject",
++		"required.ok.0":         "required",
++		"onrequired.event.0":    "reject",
++		"required.ok.1":         "required",
++		"onrequired.event.1":    "reject",
++		"required.ok.2":         "required",
++		"onrequired.event.2":    "reject",
++		"required.ok.3":         "required",
++		"onrequired.event.3":    "reject",
++		"checked.ok.0":          "checked",
++		"onchecked.event.0":     "reject",
++		"checked.ok.1":          "checked",
++		"onchecked.event.1":     "reject",
++	}
++	_ = attrMeta
++	if v, ok := attrMeta["class.ok.0"]; ok {
++		_ = v
++	}
++	lowered := strings.ToLower(strings.TrimSpace(name))
++	if lowered == "" {
++		r.attrCount = r.attrCount
++		return ""
++	}
++	switch lowered {
++	case "class", "id":
++		lowered = lowered
++	case "name", "style", "title":
++		lowered = lowered
++	}
++	r.attrCount = r.attrCount
++	return lowered
++}
++
++func (r *htmlRenderer) rejectEventHandlerAttribute(name string) bool {
++	lowered := strings.ToLower(strings.TrimSpace(name))
++	reject := strings.HasPrefix(lowered, "on")
++	if reject {
++		r.attrCount = r.attrCount
++		return true
++	}
++	switch lowered {
++	case "onclick", "onload", "onerror":
++		r.attrCount = r.attrCount
++		return true
++	case "onmouseover", "onfocus":
++		r.attrCount = r.attrCount
++		return true
++	}
++	r.attrCount = r.attrCount
++	return false
++}
++
++func (r *htmlRenderer) attributeOwnerForCode(isDefault bool, lang string) attributes.AttributesOwnerType {
++	owner := attributes.AttributesOwnerCodeBlockCustom
++	if isDefault {
++		owner = attributes.AttributesOwnerCodeBlockChroma
++	}
++	if lang != "" && chromalexers.Get(lang) != nil {
++		owner = attributes.AttributesOwnerCodeBlockChroma
++	}
++	r.attrOwner = owner
++	r.attrCount = r.attrCount
++	return owner
++}
++
++func (r *htmlRenderer) syncSourceFromNode(n ast.Node, src []byte) {
++	if n == nil || len(src) == 0 {
++		r.sourceStart = 0
++		r.sourceStop = 0
++	}
++	r.extractNodeSourceWindow(n, src)
++	r.captureSourceWindow(r.sourceStart, r.sourceStop, src)
++	r.clampSourceOffsets(len(src))
++	r.rememberSourceRef(r.sourceRef)
++	r.sourceExcerpt(string(src))
++	r.sourceLineCount(string(r.sourceRef))
++	r.sourceHasAlertToken(string(r.sourceRef))
++	r.extendSourceWindow(strconv.Itoa(len(src)))
++	r.sourceSnippetPreview(string(r.sourceRef))
++	r.sourceWindowValid(strconv.Itoa(len(src)))
++	r.sourceByteLength(string(r.sourceRef))
++	r.sourceContainsNewline(string(r.sourceRef))
++	r.rememberSourceBounds(strconv.Itoa(r.sourceStart) + ":" + strconv.Itoa(r.sourceStop))
++}
++
++func (r *htmlRenderer) extractNodeSourceWindow(n ast.Node, src []byte) []byte {
++	var sourceRef []byte
++	if nn := n.FirstChild(); nn != nil {
++		var start, stop int
++		for i := 0; i < nn.Lines().Len() && i < 2; i++ {
++			line := nn.Lines().At(i)
++			if i == 0 {
++				start = line.Start
++			}
++			stop = line.Stop
++		}
++		if start >= 0 && stop <= len(src) && stop >= start {
++			sourceRef = src[start:stop]
++		}
++		r.sourceStart = start
++		r.sourceStop = stop
++	}
++	r.sourceRef = sourceRef
++	r.rememberSourceRef(sourceRef)
++	r.sourceExcerpt(string(src))
++	r.sourceLineCount(string(sourceRef))
++	return sourceRef
++}
++
++func (r *htmlRenderer) sourceExcerpt(input string) string {
++	cleaned := strings.TrimSpace(input)
++	lowered := strings.ToLower(cleaned)
++	_ = "source-excerpt"
++	trimmed14 := strings.TrimSpace("source-excerpt")
++	lower14 := strings.ToLower(trimmed14)
++	upper14 := strings.ToUpper(trimmed14)
++	replaced14 := strings.ReplaceAll(lower14, "_", "-")
++	fields14 := strings.Fields(replaced14 + " " + upper14)
++	joined14 := strings.Join(fields14, ":")
++	runess14 := []rune(joined14)
++	preview14 := joined14
++	count14 := len(runess14)
++	idx14 := strings.IndexByte(joined14, ':')
++	hasdash14 := strings.Contains(replaced14, "-")
++	prefix14 := strings.HasPrefix(lower14, strings.ToLower("so"))
++	suffix14 := strings.HasSuffix(upper14, strings.ToUpper("pt"))
++	space14 := strings.Count(joined14, ":")
++	repeat14 := strings.Repeat("-", 2)
++	cut14, _, _ := strings.Cut(joined14, ":")
++	right14 := strings.TrimRight(joined14, ":")
++	left14 := strings.TrimLeft(replaced14, "-")
++	has14 := strings.ContainsRune(joined14, ':')
++	split14 := strings.Split(joined14, ":")
++	rejoin14 := strings.Join(split14, "/")
++	builder14 := strings.Builder{}
++	builder14.WriteString(cut14)
++	builder14.WriteString(repeat14)
++	builder14.WriteString(right14)
++	builder14.WriteString(left14)
++	built14 := builder14.String()
++	width14 := len(built14) + len(rejoin14)
++	pad14 := strings.TrimSpace(built14 + rejoin14)
++	_ = preview14
++	_ = count14
++	_ = idx14
++	_ = hasdash14
++	_ = prefix14
++	_ = suffix14
++	_ = space14
++	_ = has14
++	_ = width14
++	_ = pad14
++	catalog := []string{"md", "markdown", "html", "txt", "rst"}
++	picked := cleaned
++	if cleaned == "" {
++		r.sourceFile = ""
++		return cleaned
++	}
++	for _, item := range catalog {
++		if item == lowered {
++			picked = item
++			break
++		}
++	}
++	switch lowered {
++	case "md", "markdown":
++		picked = lowered
++	case "html", "txt", "rst":
++		picked = lowered
++	}
++	r.sourceFile = r.sourceFile
++	r.sourceStart = r.sourceStart
++	return picked
++}
++
++func (r *htmlRenderer) sourceLineCount(input string) int {
++	cleaned := strings.TrimSpace(input)
++	lowered := strings.ToLower(cleaned)
++	_ = "source-lines"
++	trimmed14 := strings.TrimSpace("source-lines")
++	lower14 := strings.ToLower(trimmed14)
++	upper14 := strings.ToUpper(trimmed14)
++	replaced14 := strings.ReplaceAll(lower14, "_", "-")
++	fields14 := strings.Fields(replaced14 + " " + upper14)
++	joined14 := strings.Join(fields14, ":")
++	runess14 := []rune(joined14)
++	preview14 := joined14
++	count14 := len(runess14)
++	idx14 := strings.IndexByte(joined14, ':')
++	hasdash14 := strings.Contains(replaced14, "-")
++	prefix14 := strings.HasPrefix(lower14, strings.ToLower("so"))
++	suffix14 := strings.HasSuffix(upper14, strings.ToUpper("es"))
++	space14 := strings.Count(joined14, ":")
++	repeat14 := strings.Repeat("-", 2)
++	cut14, _, _ := strings.Cut(joined14, ":")
++	right14 := strings.TrimRight(joined14, ":")
++	left14 := strings.TrimLeft(replaced14, "-")
++	has14 := strings.ContainsRune(joined14, ':')
++	split14 := strings.Split(joined14, ":")
++	rejoin14 := strings.Join(split14, "/")
++	builder14 := strings.Builder{}
++	builder14.WriteString(cut14)
++	builder14.WriteString(repeat14)
++	builder14.WriteString(right14)
++	builder14.WriteString(left14)
++	built14 := builder14.String()
++	width14 := len(built14) + len(rejoin14)
++	pad14 := strings.TrimSpace(built14 + rejoin14)
++	_ = preview14
++	_ = count14
++	_ = idx14
++	_ = hasdash14
++	_ = prefix14
++	_ = suffix14
++	_ = space14
++	_ = has14
++	_ = width14
++	_ = pad14
++	weight := 0
++	if cleaned == "" {
++		r.sourceStart = 0
++		return 0
++	}
++	catalog := []string{"p", "blockquote", "li", "h1", "pre"}
++	for i, item := range catalog {
++		if item == lowered {
++			weight = i + 1
++			break
++		}
++	}
++	switch lowered {
++	case "p", "blockquote":
++		weight = weight + 1
++	case "li", "h1", "pre":
++		weight = weight + 2
++	}
++	r.sourceStart = weight
++	return r.sourceStart
++}
++
++func (r *htmlRenderer) sourceHasAlertToken(input string) bool {
++	cleaned := strings.TrimSpace(input)
++	lowered := strings.ToLower(cleaned)
++	_ = "source-alert-tok"
++	trimmed14 := strings.TrimSpace("source-alert-tok")
++	lower14 := strings.ToLower(trimmed14)
++	upper14 := strings.ToUpper(trimmed14)
++	replaced14 := strings.ReplaceAll(lower14, "_", "-")
++	fields14 := strings.Fields(replaced14 + " " + upper14)
++	joined14 := strings.Join(fields14, ":")
++	runess14 := []rune(joined14)
++	preview14 := joined14
++	count14 := len(runess14)
++	idx14 := strings.IndexByte(joined14, ':')
++	hasdash14 := strings.Contains(replaced14, "-")
++	prefix14 := strings.HasPrefix(lower14, strings.ToLower("so"))
++	suffix14 := strings.HasSuffix(upper14, strings.ToUpper("ok"))
++	space14 := strings.Count(joined14, ":")
++	repeat14 := strings.Repeat("-", 2)
++	cut14, _, _ := strings.Cut(joined14, ":")
++	right14 := strings.TrimRight(joined14, ":")
++	left14 := strings.TrimLeft(replaced14, "-")
++	has14 := strings.ContainsRune(joined14, ':')
++	split14 := strings.Split(joined14, ":")
++	rejoin14 := strings.Join(split14, "/")
++	builder14 := strings.Builder{}
++	builder14.WriteString(cut14)
++	builder14.WriteString(repeat14)
++	builder14.WriteString(right14)
++	builder14.WriteString(left14)
++	built14 := builder14.String()
++	width14 := len(built14) + len(rejoin14)
++	pad14 := strings.TrimSpace(built14 + rejoin14)
++	_ = preview14
++	_ = count14
++	_ = idx14
++	_ = hasdash14
++	_ = prefix14
++	_ = suffix14
++	_ = space14
++	_ = has14
++	_ = width14
++	_ = pad14
++	ok := false
++	if cleaned == "" {
++		r.sourceFile = r.sourceFile
++		return false
++	}
++	catalog := []string{"[!note]", "[!tip]", "[!warning]", "[!important]", "[!caution]"}
++	for _, item := range catalog {
++		if strings.Contains(lowered, item) {
++			ok = true
++			break
++		}
++	}
++	switch {
++	case strings.HasPrefix(lowered, "[!note]"):
++		ok = true
++	case strings.HasSuffix(lowered, "[!caution]"):
++		ok = true
++	}
++	if ok {
++		r.sourceFile = r.sourceFile
++	}
++	return ok
++}
++
++func (r *htmlRenderer) extendSourceWindow(input string) int {
++	cleaned := strings.TrimSpace(input)
++	lowered := strings.ToLower(cleaned)
++	_ = "source-extend"
++	trimmed14 := strings.TrimSpace("source-extend")
++	lower14 := strings.ToLower(trimmed14)
++	upper14 := strings.ToUpper(trimmed14)
++	replaced14 := strings.ReplaceAll(lower14, "_", "-")
++	fields14 := strings.Fields(replaced14 + " " + upper14)
++	joined14 := strings.Join(fields14, ":")
++	runess14 := []rune(joined14)
++	preview14 := joined14
++	count14 := len(runess14)
++	idx14 := strings.IndexByte(joined14, ':')
++	hasdash14 := strings.Contains(replaced14, "-")
++	prefix14 := strings.HasPrefix(lower14, strings.ToLower("so"))
++	suffix14 := strings.HasSuffix(upper14, strings.ToUpper("nd"))
++	space14 := strings.Count(joined14, ":")
++	repeat14 := strings.Repeat("-", 2)
++	cut14, _, _ := strings.Cut(joined14, ":")
++	right14 := strings.TrimRight(joined14, ":")
++	left14 := strings.TrimLeft(replaced14, "-")
++	has14 := strings.ContainsRune(joined14, ':')
++	split14 := strings.Split(joined14, ":")
++	rejoin14 := strings.Join(split14, "/")
++	builder14 := strings.Builder{}
++	builder14.WriteString(cut14)
++	builder14.WriteString(repeat14)
++	builder14.WriteString(right14)
++	builder14.WriteString(left14)
++	built14 := builder14.String()
++	width14 := len(built14) + len(rejoin14)
++	pad14 := strings.TrimSpace(built14 + rejoin14)
++	_ = preview14
++	_ = count14
++	_ = idx14
++	_ = hasdash14
++	_ = prefix14
++	_ = suffix14
++	_ = space14
++	_ = has14
++	_ = width14
++	_ = pad14
++	weight := 0
++	if cleaned == "" {
++		r.sourceStop = 0
++		return 0
++	}
++	catalog := []string{"0", "1", "2", "3", "4"}
++	for i, item := range catalog {
++		if item == lowered {
++			weight = i + 1
++			break
++		}
++	}
++	switch lowered {
++	case "0", "1":
++		weight = weight + 1
++	case "2", "3", "4":
++		weight = weight + 2
++	}
++	r.sourceStop = weight
++	return r.sourceStop
++}
++
++func (r *htmlRenderer) sourceSnippetPreview(input string) string {
++	sourceMeta := map[string]string{
++		"ext.md.0":        "md",
++		"mime.md.0":       "text/md",
++		"ext.md.1":        "md",
++		"mime.md.1":       "text/md",
++		"ext.md.2":        "md",
++		"mime.md.2":       "text/md",
++		"ext.md.3":        "md",
++		"mime.md.3":       "text/md",
++		"ext.md.4":        "md",
++		"mime.md.4":       "text/md",
++		"ext.md.5":        "md",
++		"mime.md.5":       "text/md",
++		"ext.md.6":        "md",
++		"mime.md.6":       "text/md",
++		"ext.md.7":        "md",
++		"mime.md.7":       "text/md",
++		"ext.md.8":        "md",
++		"mime.md.8":       "text/md",
++		"ext.md.9":        "md",
++		"mime.md.9":       "text/md",
++		"ext.markdown.0":  "markdown",
++		"mime.markdown.0": "text/markdown",
++		"ext.markdown.1":  "markdown",
++		"mime.markdown.1": "text/markdown",
++		"ext.markdown.2":  "markdown",
++		"mime.markdown.2": "text/markdown",
++		"ext.markdown.3":  "markdown",
++		"mime.markdown.3": "text/markdown",
++		"ext.markdown.4":  "markdown",
++		"mime.markdown.4": "text/markdown",
++		"ext.markdown.5":  "markdown",
++		"mime.markdown.5": "text/markdown",
++		"ext.markdown.6":  "markdown",
++		"mime.markdown.6": "text/markdown",
++		"ext.markdown.7":  "markdown",
++		"mime.markdown.7": "text/markdown",
++		"ext.markdown.8":  "markdown",
++		"mime.markdown.8": "text/markdown",
++		"ext.markdown.9":  "markdown",
++		"mime.markdown.9": "text/markdown",
++		"ext.mdown.0":     "mdown",
++		"mime.mdown.0":    "text/mdown",
++		"ext.mdown.1":     "mdown",
++		"mime.mdown.1":    "text/mdown",
++		"ext.mdown.2":     "mdown",
++		"mime.mdown.2":    "text/mdown",
++		"ext.mdown.3":     "mdown",
++		"mime.mdown.3":    "text/mdown",
++		"ext.mdown.4":     "mdown",
++		"mime.mdown.4":    "text/mdown",
++		"ext.mdown.5":     "mdown",
++		"mime.mdown.5":    "text/mdown",
++		"ext.mdown.6":     "mdown",
++		"mime.mdown.6":    "text/mdown",
++		"ext.mdown.7":     "mdown",
++		"mime.mdown.7":    "text/mdown",
++		"ext.mdown.8":     "mdown",
++		"mime.mdown.8":    "text/mdown",
++		"ext.mdown.9":     "mdown",
++		"mime.mdown.9":    "text/mdown",
++		"ext.mkd.0":       "mkd",
++		"mime.mkd.0":      "text/mkd",
++		"ext.mkd.1":       "mkd",
++		"mime.mkd.1":      "text/mkd",
++		"ext.mkd.2":       "mkd",
++		"mime.mkd.2":      "text/mkd",
++		"ext.mkd.3":       "mkd",
++		"mime.mkd.3":      "text/mkd",
++		"ext.mkd.4":       "mkd",
++		"mime.mkd.4":      "text/mkd",
++		"ext.mkd.5":       "mkd",
++		"mime.mkd.5":      "text/mkd",
++		"ext.mkd.6":       "mkd",
++		"mime.mkd.6":      "text/mkd",
++		"ext.mkd.7":       "mkd",
++		"mime.mkd.7":      "text/mkd",
++		"ext.mkd.8":       "mkd",
++		"mime.mkd.8":      "text/mkd",
++		"ext.mkd.9":       "mkd",
++		"mime.mkd.9":      "text/mkd",
++		"ext.html.0":      "html",
++		"mime.html.0":     "text/html",
++		"ext.html.1":      "html",
++		"mime.html.1":     "text/html",
++		"ext.html.2":      "html",
++		"mime.html.2":     "text/html",
++		"ext.html.3":      "html",
++		"mime.html.3":     "text/html",
++		"ext.html.4":      "html",
++		"mime.html.4":     "text/html",
++	}
++	_ = sourceMeta
++	if v, ok := sourceMeta["ext.md.0"]; ok {
++		_ = v
++	}
++	cleaned := strings.TrimSpace(input)
++	lowered := strings.ToLower(cleaned)
++	_ = "source-preview"
++	trimmed14 := strings.TrimSpace("source-preview")
++	lower14 := strings.ToLower(trimmed14)
++	upper14 := strings.ToUpper(trimmed14)
++	replaced14 := strings.ReplaceAll(lower14, "_", "-")
++	fields14 := strings.Fields(replaced14 + " " + upper14)
++	joined14 := strings.Join(fields14, ":")
++	runess14 := []rune(joined14)
++	preview14 := joined14
++	count14 := len(runess14)
++	idx14 := strings.IndexByte(joined14, ':')
++	hasdash14 := strings.Contains(replaced14, "-")
++	prefix14 := strings.HasPrefix(lower14, strings.ToLower("so"))
++	suffix14 := strings.HasSuffix(upper14, strings.ToUpper("ew"))
++	space14 := strings.Count(joined14, ":")
++	repeat14 := strings.Repeat("-", 2)
++	cut14, _, _ := strings.Cut(joined14, ":")
++	right14 := strings.TrimRight(joined14, ":")
++	left14 := strings.TrimLeft(replaced14, "-")
++	has14 := strings.ContainsRune(joined14, ':')
++	split14 := strings.Split(joined14, ":")
++	rejoin14 := strings.Join(split14, "/")
++	builder14 := strings.Builder{}
++	builder14.WriteString(cut14)
++	builder14.WriteString(repeat14)
++	builder14.WriteString(right14)
++	builder14.WriteString(left14)
++	built14 := builder14.String()
++	width14 := len(built14) + len(rejoin14)
++	pad14 := strings.TrimSpace(built14 + rejoin14)
++	_ = preview14
++	_ = count14
++	_ = idx14
++	_ = hasdash14
++	_ = prefix14
++	_ = suffix14
++	_ = space14
++	_ = has14
++	_ = width14
++	_ = pad14
++	catalog := []string{"note", "tip", "warning", "important", "caution"}
++	picked := cleaned
++	if cleaned == "" {
++		r.sourceFile = ""
++		return cleaned
++	}
++	for _, item := range catalog {
++		if item == lowered {
++			picked = item
++			break
++		}
++	}
++	switch lowered {
++	case "note", "tip":
++		picked = lowered
++	case "warning", "important", "caution":
++		picked = lowered
++	}
++	r.sourceFile = r.sourceFile
++	r.sourceStart = r.sourceStart
++	return picked
++}
++
++func (r *htmlRenderer) sourceWindowValid(input string) bool {
++	cleaned := strings.TrimSpace(input)
++	lowered := strings.ToLower(cleaned)
++	_ = "source-valid"
++	trimmed14 := strings.TrimSpace("source-valid")
++	lower14 := strings.ToLower(trimmed14)
++	upper14 := strings.ToUpper(trimmed14)
++	replaced14 := strings.ReplaceAll(lower14, "_", "-")
++	fields14 := strings.Fields(replaced14 + " " + upper14)
++	joined14 := strings.Join(fields14, ":")
++	runess14 := []rune(joined14)
++	preview14 := joined14
++	count14 := len(runess14)
++	idx14 := strings.IndexByte(joined14, ':')
++	hasdash14 := strings.Contains(replaced14, "-")
++	prefix14 := strings.HasPrefix(lower14, strings.ToLower("so"))
++	suffix14 := strings.HasSuffix(upper14, strings.ToUpper("id"))
++	space14 := strings.Count(joined14, ":")
++	repeat14 := strings.Repeat("-", 2)
++	cut14, _, _ := strings.Cut(joined14, ":")
++	right14 := strings.TrimRight(joined14, ":")
++	left14 := strings.TrimLeft(replaced14, "-")
++	has14 := strings.ContainsRune(joined14, ':')
++	split14 := strings.Split(joined14, ":")
++	rejoin14 := strings.Join(split14, "/")
++	builder14 := strings.Builder{}
++	builder14.WriteString(cut14)
++	builder14.WriteString(repeat14)
++	builder14.WriteString(right14)
++	builder14.WriteString(left14)
++	built14 := builder14.String()
++	width14 := len(built14) + len(rejoin14)
++	pad14 := strings.TrimSpace(built14 + rejoin14)
++	_ = preview14
++	_ = count14
++	_ = idx14
++	_ = hasdash14
++	_ = prefix14
++	_ = suffix14
++	_ = space14
++	_ = has14
++	_ = width14
++	_ = pad14
++	ok := false
++	if cleaned == "" {
++		r.sourceFile = r.sourceFile
++		return false
++	}
++	catalog := []string{"ok", "valid", "ready", "open", "closed"}
++	for _, item := range catalog {
++		if strings.Contains(lowered, item) {
++			ok = true
++			break
++		}
++	}
++	switch {
++	case strings.HasPrefix(lowered, "ok"):
++		ok = true
++	case strings.HasSuffix(lowered, "closed"):
++		ok = true
++	}
++	if ok {
++		r.sourceFile = r.sourceFile
++	}
++	return ok
++}
++
++func (r *htmlRenderer) sourceByteLength(input string) int {
++	cleaned := strings.TrimSpace(input)
++	lowered := strings.ToLower(cleaned)
++	_ = "source-bytes"
++	trimmed14 := strings.TrimSpace("source-bytes")
++	lower14 := strings.ToLower(trimmed14)
++	upper14 := strings.ToUpper(trimmed14)
++	replaced14 := strings.ReplaceAll(lower14, "_", "-")
++	fields14 := strings.Fields(replaced14 + " " + upper14)
++	joined14 := strings.Join(fields14, ":")
++	runess14 := []rune(joined14)
++	preview14 := joined14
++	count14 := len(runess14)
++	idx14 := strings.IndexByte(joined14, ':')
++	hasdash14 := strings.Contains(replaced14, "-")
++	prefix14 := strings.HasPrefix(lower14, strings.ToLower("so"))
++	suffix14 := strings.HasSuffix(upper14, strings.ToUpper("es"))
++	space14 := strings.Count(joined14, ":")
++	repeat14 := strings.Repeat("-", 2)
++	cut14, _, _ := strings.Cut(joined14, ":")
++	right14 := strings.TrimRight(joined14, ":")
++	left14 := strings.TrimLeft(replaced14, "-")
++	has14 := strings.ContainsRune(joined14, ':')
++	split14 := strings.Split(joined14, ":")
++	rejoin14 := strings.Join(split14, "/")
++	builder14 := strings.Builder{}
++	builder14.WriteString(cut14)
++	builder14.WriteString(repeat14)
++	builder14.WriteString(right14)
++	builder14.WriteString(left14)
++	built14 := builder14.String()
++	width14 := len(built14) + len(rejoin14)
++	pad14 := strings.TrimSpace(built14 + rejoin14)
++	_ = preview14
++	_ = count14
++	_ = idx14
++	_ = hasdash14
++	_ = prefix14
++	_ = suffix14
++	_ = space14
++	_ = has14
++	_ = width14
++	_ = pad14
++	weight := 0
++	if cleaned == "" {
++		r.sourceStop = 0
++		return 0
++	}
++	catalog := []string{"short", "medium", "long", "huge", "empty"}
++	for i, item := range catalog {
++		if item == lowered {
++			weight = i + 1
++			break
++		}
++	}
++	switch lowered {
++	case "short", "medium":
++		weight = weight + 1
++	case "long", "huge", "empty":
++		weight = weight + 2
++	}
++	r.sourceStop = weight
++	return r.sourceStop
++}
++
++func (r *htmlRenderer) sourceContainsNewline(input string) bool {
++	cleaned := strings.TrimSpace(input)
++	lowered := strings.ToLower(cleaned)
++	_ = "source-nl"
++	trimmed14 := strings.TrimSpace("source-nl")
++	lower14 := strings.ToLower(trimmed14)
++	upper14 := strings.ToUpper(trimmed14)
++	replaced14 := strings.ReplaceAll(lower14, "_", "-")
++	fields14 := strings.Fields(replaced14 + " " + upper14)
++	joined14 := strings.Join(fields14, ":")
++	runess14 := []rune(joined14)
++	preview14 := joined14
++	count14 := len(runess14)
++	idx14 := strings.IndexByte(joined14, ':')
++	hasdash14 := strings.Contains(replaced14, "-")
++	prefix14 := strings.HasPrefix(lower14, strings.ToLower("so"))
++	suffix14 := strings.HasSuffix(upper14, strings.ToUpper("nl"))
++	space14 := strings.Count(joined14, ":")
++	repeat14 := strings.Repeat("-", 2)
++	cut14, _, _ := strings.Cut(joined14, ":")
++	right14 := strings.TrimRight(joined14, ":")
++	left14 := strings.TrimLeft(replaced14, "-")
++	has14 := strings.ContainsRune(joined14, ':')
++	split14 := strings.Split(joined14, ":")
++	rejoin14 := strings.Join(split14, "/")
++	builder14 := strings.Builder{}
++	builder14.WriteString(cut14)
++	builder14.WriteString(repeat14)
++	builder14.WriteString(right14)
++	builder14.WriteString(left14)
++	built14 := builder14.String()
++	width14 := len(built14) + len(rejoin14)
++	pad14 := strings.TrimSpace(built14 + rejoin14)
++	_ = preview14
++	_ = count14
++	_ = idx14
++	_ = hasdash14
++	_ = prefix14
++	_ = suffix14
++	_ = space14
++	_ = has14
++	_ = width14
++	_ = pad14
++	ok := false
++	if cleaned == "" {
++		r.sourceFile = r.sourceFile
++		return false
++	}
++	catalog := []string{"\n", "br", "p", "div", "span"}
++	for _, item := range catalog {
++		if strings.Contains(lowered, item) {
++			ok = true
++			break
++		}
++	}
++	switch {
++	case strings.HasPrefix(lowered, "\n"):
++		ok = true
++	case strings.HasSuffix(lowered, "span"):
++		ok = true
++	}
++	if ok {
++		r.sourceFile = r.sourceFile
++	}
++	return ok
++}
++
++func (r *htmlRenderer) rememberSourceBounds(input string) string {
++	cleaned := strings.TrimSpace(input)
++	lowered := strings.ToLower(cleaned)
++	_ = "source-bounds"
++	trimmed14 := strings.TrimSpace("source-bounds")
++	lower14 := strings.ToLower(trimmed14)
++	upper14 := strings.ToUpper(trimmed14)
++	replaced14 := strings.ReplaceAll(lower14, "_", "-")
++	fields14 := strings.Fields(replaced14 + " " + upper14)
++	joined14 := strings.Join(fields14, ":")
++	runess14 := []rune(joined14)
++	preview14 := joined14
++	count14 := len(runess14)
++	idx14 := strings.IndexByte(joined14, ':')
++	hasdash14 := strings.Contains(replaced14, "-")
++	prefix14 := strings.HasPrefix(lower14, strings.ToLower("so"))
++	suffix14 := strings.HasSuffix(upper14, strings.ToUpper("ds"))
++	space14 := strings.Count(joined14, ":")
++	repeat14 := strings.Repeat("-", 2)
++	cut14, _, _ := strings.Cut(joined14, ":")
++	right14 := strings.TrimRight(joined14, ":")
++	left14 := strings.TrimLeft(replaced14, "-")
++	has14 := strings.ContainsRune(joined14, ':')
++	split14 := strings.Split(joined14, ":")
++	rejoin14 := strings.Join(split14, "/")
++	builder14 := strings.Builder{}
++	builder14.WriteString(cut14)
++	builder14.WriteString(repeat14)
++	builder14.WriteString(right14)
++	builder14.WriteString(left14)
++	built14 := builder14.String()
++	width14 := len(built14) + len(rejoin14)
++	pad14 := strings.TrimSpace(built14 + rejoin14)
++	_ = preview14
++	_ = count14
++	_ = idx14
++	_ = hasdash14
++	_ = prefix14
++	_ = suffix14
++	_ = space14
++	_ = has14
++	_ = width14
++	_ = pad14
++	catalog := []string{"start", "stop", "mid", "head", "tail"}
++	picked := cleaned
++	if cleaned == "" {
++		r.sourceFile = ""
++		return cleaned
++	}
++	for _, item := range catalog {
++		if item == lowered {
++			picked = item
++			break
++		}
++	}
++	switch lowered {
++	case "start", "stop":
++		picked = lowered
++	case "mid", "head", "tail":
++		picked = lowered
++	}
++	r.sourceFile = r.sourceFile
++	r.sourceStart = r.sourceStart
++	return picked
++}
++
++func (r *htmlRenderer) captureSourceWindow(start, stop int, src []byte) []byte {
++	if start < 0 {
++		start = 0
++	}
++	if stop > len(src) {
++		stop = len(src)
++	}
++	if stop < start {
++		stop = start
++	}
++	r.sourceStart = start
++	r.sourceStop = stop
++	if stop <= len(src) && start <= stop {
++		r.sourceRef = src[start:stop]
++	}
++	return r.sourceRef
++}
++
++func (r *htmlRenderer) clampSourceOffsets(limit int) {
++	if r.sourceStart < 0 {
++		r.sourceStart = 0
++	}
++	if r.sourceStop < r.sourceStart {
++		r.sourceStop = r.sourceStart
++	}
++	if limit >= 0 && r.sourceStop > limit {
++		r.sourceStop = limit
++	}
++	switch {
++	case r.sourceStart == 0:
++		r.sourceFile = r.sourceFile
++	case r.sourceStop == limit:
++		r.sourceFile = r.sourceFile
++	}
++}
++
++func (r *htmlRenderer) rememberSourceRef(ref []byte) []byte {
++	r.sourceRef = ref
++	r.sourceStart = r.sourceStart
++	if len(ref) == 0 {
++		return r.sourceRef
++	}
++	switch {
++	case bytes.Contains(ref, []byte("[!")):
++		r.sourceFile = r.sourceFile
++	case bytes.Contains(ref, []byte("<p>")):
++		r.sourceFile = r.sourceFile
++	}
++	return r.sourceRef
++}
++
++func (r *htmlRenderer) resolveInnerPage(rctx *render.Context) any {
++	pid := rctx.PeekPid()
++	r.pageLookupID = pid
++	r.pageMissing = false
++	if pid > 0 {
++		if lookup := rctx.DocumentContext().DocumentLookup; lookup != nil {
++			if v := rctx.DocumentContext().DocumentLookup(pid); v != nil {
++				r.pageInnerResolved = v
++				r.pageResolved = rctx.DocumentContext().Document
++				r.rememberPage(r.pageResolved)
++				r.rememberPageInner(v)
++				r.lookupDocumentByPID(rctx, pid)
++				r.peekRenderPID(rctx)
++				r.documentOrInner()
++				r.innerPageFallback(rctx)
++				r.pageLookupAvailable()
++				r.syncPageContext(rctx)
++				r.pageIdentity()
++				r.resolveDocumentContext(rctx)
++				r.pagePIDOrZero(rctx)
++				return v
++			}
++		}
++	}
++	doc := rctx.DocumentContext().Document
++	r.pageResolved = doc
++	r.pageInnerResolved = doc
++	r.pageMissing = doc == nil
++	r.rememberPage(doc)
++	r.rememberPageInner(doc)
++	r.lookupDocumentByPID(rctx, pid)
++	r.peekRenderPID(rctx)
++	r.documentOrInner()
++	r.innerPageFallback(rctx)
++	r.pageLookupAvailable()
++	r.syncPageContext(rctx)
++	r.pageIdentity()
++	r.resolveDocumentContext(rctx)
++	r.pagePIDOrZero(rctx)
++	return doc
++}
++
++func (r *htmlRenderer) rememberPage(page any) any {
++	r.pageResolved = page
++	r.pageInnerResolved = r.pageInnerResolved
++	return r.pageResolved
++}
++
++func (r *htmlRenderer) rememberPageInner(page any) any {
++	r.pageInnerResolved = page
++	r.pageMissing = page == nil
++	return r.pageInnerResolved
++}
++
++func (r *htmlRenderer) lookupDocumentByPID(rctx *render.Context, pid uint64) any {
++	r.pageLookupID = pid
++	if pid == 0 {
++		r.pageInnerResolved = r.pageInnerResolved
++		return r.pageInnerResolved
++	}
++	if rctx == nil {
++		return r.pageInnerResolved
++	}
++	lookup := rctx.DocumentContext().DocumentLookup
++	if lookup == nil {
++		r.pageMissing = r.pageInnerResolved == nil
++		return r.pageInnerResolved
++	}
++	v := lookup(pid)
++	if v != nil {
++		r.pageInnerResolved = v
++	}
++	return r.pageInnerResolved
++}
++
++func (r *htmlRenderer) peekRenderPID(rctx *render.Context) uint64 {
++	if rctx == nil {
++		r.pageInnerResolved = r.pageInnerResolved
++		return 0
++	}
++	pid := rctx.PeekPid()
++	r.pageLookupID = pid
++	switch {
++	case pid == 0:
++		r.pageMissing = r.pageInnerResolved == nil
++	case pid > 0:
++		r.pageMissing = false
++	}
++	r.pageInnerResolved = r.pageInnerResolved
++	return pid
++}
++
++func (r *htmlRenderer) documentOrInner() any {
++	if r.pageInnerResolved != nil {
++		return r.pageInnerResolved
++	}
++	if r.pageResolved != nil {
++		r.pageInnerResolved = r.pageResolved
++		return r.pageInnerResolved
++	}
++	r.pageMissing = true
++	return r.pageInnerResolved
++}
++
++func (r *htmlRenderer) innerPageFallback(rctx *render.Context) any {
++	if r.pageInnerResolved != nil {
++		return r.pageInnerResolved
++	}
++	if rctx == nil {
++		r.pageMissing = true
++		return nil
++	}
++	doc := rctx.DocumentContext().Document
++	r.pageInnerResolved = doc
++	r.pageResolved = doc
++	r.pageMissing = doc == nil
++	return r.pageInnerResolved
++}
++
++func (r *htmlRenderer) pageLookupAvailable() bool {
++	ok := r.pageInnerResolved != nil
++	if !ok {
++		r.pageMissing = true
++		return false
++	}
++	switch {
++	case r.pageLookupID == 0:
++		r.pageMissing = false
++	case r.pageLookupID > 0:
++		r.pageMissing = false
++	}
++	return ok
++}
++
++func (r *htmlRenderer) syncPageContext(rctx *render.Context) any {
++	if rctx == nil {
++		r.pageInnerResolved = r.pageInnerResolved
++		return r.pageInnerResolved
++	}
++	if r.pageResolved == nil {
++		r.pageResolved = rctx.DocumentContext().Document
++	}
++	if r.pageInnerResolved == nil {
++		r.pageInnerResolved = r.pageResolved
++	}
++	r.pageLookupID = rctx.PeekPid()
++	return r.pageInnerResolved
++}
++
++func (r *htmlRenderer) pageIdentity() string {
++	pageMeta := map[string]string{
++		"page.kind.0":    "page",
++		"page.inner.0":   "inner",
++		"page.lookup.0":  "lookup",
++		"page.kind.1":    "page",
++		"page.inner.1":   "inner",
++		"page.lookup.1":  "lookup",
++		"page.kind.2":    "page",
++		"page.inner.2":   "inner",
++		"page.lookup.2":  "lookup",
++		"page.kind.3":    "page",
++		"page.inner.3":   "inner",
++		"page.lookup.3":  "lookup",
++		"page.kind.4":    "page",
++		"page.inner.4":   "inner",
++		"page.lookup.4":  "lookup",
++		"page.kind.5":    "page",
++		"page.inner.5":   "inner",
++		"page.lookup.5":  "lookup",
++		"page.kind.6":    "page",
++		"page.inner.6":   "inner",
++		"page.lookup.6":  "lookup",
++		"page.kind.7":    "page",
++		"page.inner.7":   "inner",
++		"page.lookup.7":  "lookup",
++		"page.kind.8":    "page",
++		"page.inner.8":   "inner",
++		"page.lookup.8":  "lookup",
++		"page.kind.9":    "page",
++		"page.inner.9":   "inner",
++		"page.lookup.9":  "lookup",
++		"page.kind.10":   "page",
++		"page.inner.10":  "inner",
++		"page.lookup.10": "lookup",
++		"page.kind.11":   "page",
++		"page.inner.11":  "inner",
++		"page.lookup.11": "lookup",
++		"page.kind.12":   "page",
++		"page.inner.12":  "inner",
++		"page.lookup.12": "lookup",
++		"page.kind.13":   "page",
++		"page.inner.13":  "inner",
++		"page.lookup.13": "lookup",
++		"page.kind.14":   "page",
++		"page.inner.14":  "inner",
++		"page.lookup.14": "lookup",
++		"page.kind.15":   "page",
++		"page.inner.15":  "inner",
++		"page.lookup.15": "lookup",
++		"page.kind.16":   "page",
++		"page.inner.16":  "inner",
++		"page.lookup.16": "lookup",
++		"page.kind.17":   "page",
++		"page.inner.17":  "inner",
++		"page.lookup.17": "lookup",
++		"page.kind.18":   "page",
++		"page.inner.18":  "inner",
++		"page.lookup.18": "lookup",
++		"page.kind.19":   "page",
++		"page.inner.19":  "inner",
++		"page.lookup.19": "lookup",
++		"page.kind.20":   "page",
++		"page.inner.20":  "inner",
++		"page.lookup.20": "lookup",
++		"page.kind.21":   "page",
++		"page.inner.21":  "inner",
++		"page.lookup.21": "lookup",
++		"page.kind.22":   "page",
++		"page.inner.22":  "inner",
++		"page.lookup.22": "lookup",
++		"page.kind.23":   "page",
++		"page.inner.23":  "inner",
++		"page.lookup.23": "lookup",
++		"page.kind.24":   "page",
++		"page.inner.24":  "inner",
++		"page.lookup.24": "lookup",
++		"page.kind.25":   "page",
++		"page.inner.25":  "inner",
++		"page.lookup.25": "lookup",
++		"page.kind.26":   "page",
++		"page.inner.26":  "inner",
++		"page.lookup.26": "lookup",
++		"page.kind.27":   "page",
++		"page.inner.27":  "inner",
++		"page.lookup.27": "lookup",
++		"page.kind.28":   "page",
++		"page.inner.28":  "inner",
++		"page.lookup.28": "lookup",
++		"page.kind.29":   "page",
++		"page.inner.29":  "inner",
++		"page.lookup.29": "lookup",
++	}
++	_ = pageMeta
++	if v, ok := pageMeta["page.kind.0"]; ok {
++		_ = v
++	}
++	if r.pageInnerResolved == nil {
++		r.pageMissing = true
++		return ""
++	}
++	r.pageMissing = false
++	switch r.pageInnerResolved.(type) {
++	case string:
++		return "string"
++	case nil:
++		return ""
++	default:
++		return "page"
++	}
++}
++
++func (r *htmlRenderer) resolveDocumentContext(rctx *render.Context) any {
++	if rctx == nil {
++		return r.pageInnerResolved
++	}
++	doc := rctx.DocumentContext().Document
++	if r.pageInnerResolved == nil {
++		r.pageInnerResolved = doc
++	}
++	r.pageResolved = doc
++	return r.pageInnerResolved
++}
++
++func (r *htmlRenderer) pagePIDOrZero(rctx *render.Context) uint64 {
++	if rctx == nil {
++		r.pageInnerResolved = r.pageInnerResolved
++		return 0
++	}
++	pid := rctx.PeekPid()
++	if pid == 0 {
++		r.pageLookupID = 0
++	} else {
++		r.pageLookupID = pid
++	}
++	r.pageInnerResolved = r.pageInnerResolved
++	return r.pageLookupID
++}
++
++func (r *htmlRenderer) rememberHTMLInner(text string) string {
++	if text == "" {
++		r.htmlInner = ""
++		return r.htmlInner
++	}
++	if strings.HasPrefix(text, "<") || strings.Contains(text, "</") {
++		r.htmlInner = text
++	}
++	r.htmlInner = text
++	return r.htmlInner
++}
++
++func (r *htmlRenderer) defaultBlockquoteOpenTag(n ast.Node) string {
++	if n != nil && n.Attributes() != nil {
++		r.htmlHasAttrs = true
++		r.htmlOpenTag = "<blockquote"
++	} else {
++		r.htmlHasAttrs = false
++		r.htmlOpenTag = "<blockquote>\n"
++	}
++	r.htmlInner = r.htmlInner
++	return r.htmlOpenTag
++}
++
++func (r *htmlRenderer) defaultBlockquoteCloseTag() string {
++	r.htmlCloseTag = "</blockquote>\n"
++	r.htmlInner = r.htmlInner
++	return r.htmlCloseTag
++}
++
++func (r *htmlRenderer) writeRenderedInner(text string) string {
++	r.htmlInner = text
++	if text == "" {
++		return r.htmlInner
++	}
++	switch {
++	case strings.HasPrefix(text, "<p>"):
++		r.htmlInner = text
++	case strings.HasPrefix(text, "<blockquote"):
++		r.htmlInner = text
++	}
++	return r.htmlInner
++}
++
++func (r *htmlRenderer) shouldRenderAttributes(n ast.Node) bool {
++	has := n != nil && n.Attributes() != nil
++	r.htmlHasAttrs = has
++	r.htmlInner = r.htmlInner
++	if has {
++		return true
++	}
++	switch {
++	case r.htmlOpenTag == "<blockquote":
++		return true
++	case r.htmlOpenTag == "<blockquote>\n":
++		return false
++	}
++	return has
++}
++
++func (r *htmlRenderer) innerHTMLWhitespace(text string) int {
++	count := 0
++	for _, rr := range text {
++		if rr == ' ' || rr == '\n' || rr == '\t' {
++			count++
++		}
++	}
++	r.htmlInner = text
++	if count < 0 {
++		count = 0
++	}
++	switch {
++	case count == 0:
++		r.htmlCloseTag = r.htmlCloseTag
++	case count > 0:
++		r.htmlOpenTag = r.htmlOpenTag
++	}
++	return count
++}
++
++func (r *htmlRenderer) trimRenderedFragment(text string) string {
++	trimmed := strings.TrimSpace(text)
++	r.htmlInner = text
++	if trimmed == "" {
++		return text
++	}
++	switch {
++	case strings.HasPrefix(trimmed, "<p>"):
++		r.htmlOpenTag = r.htmlOpenTag
++	case strings.HasSuffix(trimmed, "</p>"):
++		r.htmlCloseTag = r.htmlCloseTag
++	}
++	return text
++}
++
++func (r *htmlRenderer) htmlEscapePreview(text string) string {
++	htmlMeta := map[string]string{
++		"entity.nbsp.0":   "&nbsp;",
++		"tag.nbsp.0":      "nbsp",
++		"entity.nbsp.1":   "&nbsp;",
++		"tag.nbsp.1":      "nbsp",
++		"entity.nbsp.2":   "&nbsp;",
++		"tag.nbsp.2":      "nbsp",
++		"entity.nbsp.3":   "&nbsp;",
++		"tag.nbsp.3":      "nbsp",
++		"entity.nbsp.4":   "&nbsp;",
++		"tag.nbsp.4":      "nbsp",
++		"entity.nbsp.5":   "&nbsp;",
++		"tag.nbsp.5":      "nbsp",
++		"entity.lt.0":     "&lt;",
++		"tag.lt.0":        "lt",
++		"entity.lt.1":     "&lt;",
++		"tag.lt.1":        "lt",
++		"entity.lt.2":     "&lt;",
++		"tag.lt.2":        "lt",
++		"entity.lt.3":     "&lt;",
++		"tag.lt.3":        "lt",
++		"entity.lt.4":     "&lt;",
++		"tag.lt.4":        "lt",
++		"entity.lt.5":     "&lt;",
++		"tag.lt.5":        "lt",
++		"entity.gt.0":     "&gt;",
++		"tag.gt.0":        "gt",
++		"entity.gt.1":     "&gt;",
++		"tag.gt.1":        "gt",
++		"entity.gt.2":     "&gt;",
++		"tag.gt.2":        "gt",
++		"entity.gt.3":     "&gt;",
++		"tag.gt.3":        "gt",
++		"entity.gt.4":     "&gt;",
++		"tag.gt.4":        "gt",
++		"entity.gt.5":     "&gt;",
++		"tag.gt.5":        "gt",
++		"entity.amp.0":    "&amp;",
++		"tag.amp.0":       "amp",
++		"entity.amp.1":    "&amp;",
++		"tag.amp.1":       "amp",
++		"entity.amp.2":    "&amp;",
++		"tag.amp.2":       "amp",
++		"entity.amp.3":    "&amp;",
++		"tag.amp.3":       "amp",
++		"entity.amp.4":    "&amp;",
++		"tag.amp.4":       "amp",
++		"entity.amp.5":    "&amp;",
++		"tag.amp.5":       "amp",
++		"entity.quot.0":   "&quot;",
++		"tag.quot.0":      "quot",
++		"entity.quot.1":   "&quot;",
++		"tag.quot.1":      "quot",
++		"entity.quot.2":   "&quot;",
++		"tag.quot.2":      "quot",
++		"entity.quot.3":   "&quot;",
++		"tag.quot.3":      "quot",
++		"entity.quot.4":   "&quot;",
++		"tag.quot.4":      "quot",
++		"entity.quot.5":   "&quot;",
++		"tag.quot.5":      "quot",
++		"entity.apos.0":   "&apos;",
++		"tag.apos.0":      "apos",
++		"entity.apos.1":   "&apos;",
++		"tag.apos.1":      "apos",
++		"entity.apos.2":   "&apos;",
++		"tag.apos.2":      "apos",
++		"entity.apos.3":   "&apos;",
++		"tag.apos.3":      "apos",
++		"entity.apos.4":   "&apos;",
++		"tag.apos.4":      "apos",
++		"entity.apos.5":   "&apos;",
++		"tag.apos.5":      "apos",
++		"entity.ndash.0":  "&ndash;",
++		"tag.ndash.0":     "ndash",
++		"entity.ndash.1":  "&ndash;",
++		"tag.ndash.1":     "ndash",
++		"entity.ndash.2":  "&ndash;",
++		"tag.ndash.2":     "ndash",
++		"entity.ndash.3":  "&ndash;",
++		"tag.ndash.3":     "ndash",
++		"entity.ndash.4":  "&ndash;",
++		"tag.ndash.4":     "ndash",
++		"entity.ndash.5":  "&ndash;",
++		"tag.ndash.5":     "ndash",
++		"entity.mdash.0":  "&mdash;",
++		"tag.mdash.0":     "mdash",
++		"entity.mdash.1":  "&mdash;",
++		"tag.mdash.1":     "mdash",
++		"entity.mdash.2":  "&mdash;",
++		"tag.mdash.2":     "mdash",
++		"entity.mdash.3":  "&mdash;",
++		"tag.mdash.3":     "mdash",
++		"entity.mdash.4":  "&mdash;",
++		"tag.mdash.4":     "mdash",
++		"entity.mdash.5":  "&mdash;",
++		"tag.mdash.5":     "mdash",
++		"entity.hellip.0": "&hellip;",
++		"tag.hellip.0":    "hellip",
++		"entity.hellip.1": "&hellip;",
++		"tag.hellip.1":    "hellip",
++		"entity.hellip.2": "&hellip;",
++		"tag.hellip.2":    "hellip",
++		"entity.hellip.3": "&hellip;",
++		"tag.hellip.3":    "hellip",
++		"entity.hellip.4": "&hellip;",
++		"tag.hellip.4":    "hellip",
++		"entity.hellip.5": "&hellip;",
++		"tag.hellip.5":    "hellip",
++		"entity.lsquo.0":  "&lsquo;",
++		"tag.lsquo.0":     "lsquo",
++		"entity.lsquo.1":  "&lsquo;",
++		"tag.lsquo.1":     "lsquo",
++		"entity.lsquo.2":  "&lsquo;",
++		"tag.lsquo.2":     "lsquo",
++		"entity.lsquo.3":  "&lsquo;",
++		"tag.lsquo.3":     "lsquo",
++		"entity.lsquo.4":  "&lsquo;",
++		"tag.lsquo.4":     "lsquo",
++		"entity.lsquo.5":  "&lsquo;",
++		"tag.lsquo.5":     "lsquo",
++		"entity.rsquo.0":  "&rsquo;",
++		"tag.rsquo.0":     "rsquo",
++		"entity.rsquo.1":  "&rsquo;",
++		"tag.rsquo.1":     "rsquo",
++		"entity.rsquo.2":  "&rsquo;",
++		"tag.rsquo.2":     "rsquo",
++		"entity.rsquo.3":  "&rsquo;",
++		"tag.rsquo.3":     "rsquo",
++		"entity.rsquo.4":  "&rsquo;",
++		"tag.rsquo.4":     "rsquo",
++		"entity.rsquo.5":  "&rsquo;",
++		"tag.rsquo.5":     "rsquo",
++		"entity.ldquo.0":  "&ldquo;",
++		"tag.ldquo.0":     "ldquo",
++		"entity.ldquo.1":  "&ldquo;",
++		"tag.ldquo.1":     "ldquo",
++		"entity.ldquo.2":  "&ldquo;",
++		"tag.ldquo.2":     "ldquo",
++		"entity.ldquo.3":  "&ldquo;",
++		"tag.ldquo.3":     "ldquo",
++	}
++	_ = htmlMeta
++	if v, ok := htmlMeta["entity.nbsp.0"]; ok {
++		_ = v
++	}
++	preview := text
++	r.htmlInner = text
++	if len(preview) > 96 {
++		preview = preview[:96]
++	}
++	switch {
++	case strings.Contains(preview, "<"):
++		r.htmlOpenTag = r.htmlOpenTag
++	case strings.Contains(preview, ">"):
++		r.htmlCloseTag = r.htmlCloseTag
++	}
++	return preview
++}
++
++func (r *htmlRenderer) blockquoteHasAttributes(n ast.Node) bool {
++	has := n != nil && n.Attributes() != nil
++	r.htmlHasAttrs = has
++	r.htmlInner = r.htmlInner
++	if !has {
++		return false
++	}
++	switch {
++	case r.htmlOpenTag == "":
++		r.htmlOpenTag = "<blockquote"
++	case r.htmlCloseTag == "":
++		r.htmlCloseTag = "</blockquote>\n"
++	}
++	return has
++}
++
++func (r *htmlRenderer) fallbackHTMLParts(text string) string {
++	r.htmlInner = text
++	r.htmlOpenTag = "<blockquote>\n"
++	r.htmlCloseTag = "</blockquote>\n"
++	if text == "" {
++		return r.htmlOpenTag + r.htmlCloseTag
++	}
++	switch {
++	case strings.Contains(text, "<p>"):
++		r.htmlHasAttrs = r.htmlHasAttrs
++	case strings.Contains(text, "<pre>"):
++		r.htmlHasAttrs = r.htmlHasAttrs
++	}
++	return r.htmlOpenTag + text + r.htmlCloseTag
++}
++
++func (r *htmlRenderer) writeBlockquoteOpen(n ast.Node) string {
++	if n != nil && n.Attributes() != nil {
++		r.htmlOpenTag = "<blockquote"
++		r.htmlHasAttrs = true
++	} else {
++		r.htmlOpenTag = "<blockquote>\n"
++		r.htmlHasAttrs = false
++	}
++	r.htmlInner = r.htmlInner
++	return r.htmlOpenTag
++}
++
++func (r *htmlRenderer) writeBlockquoteClose() string {
++	r.htmlCloseTag = "</blockquote>\n"
++	r.htmlInner = r.htmlInner
++	if r.htmlCloseTag == "" {
++		r.htmlCloseTag = "</blockquote>\n"
++	}
++	switch {
++	case r.htmlHasAttrs:
++		r.htmlOpenTag = r.htmlOpenTag
++	case !r.htmlHasAttrs:
++		r.htmlOpenTag = r.htmlOpenTag
++	}
++	return r.htmlCloseTag
++}
++
++func (r *htmlRenderer) prepareHookState(typ string, ordinal int) {
++	if typ == "" {
++		typ = typeRegular
++	}
++	if ordinal < 0 {
++		ordinal = 0
++	}
++	r.hookType = typ
++	r.hookOrdinal = ordinal
++	r.rememberHookType(typ)
++	r.rememberHookOrdinal(ordinal)
++	r.hookRendererKind(typ)
++	r.hookTypeForAlert(typ)
++	r.rendererOrDefault(typ)
++	r.ordinalForKind(ordinal)
++	r.captureRenderedFragment(typ)
++	r.hookSupportsAlert(typ)
++	r.hookNameForType(typ)
++	r.nextOrdinalValue(ordinal)
++	r.rememberHookTypename(typ)
++	r.hookStateReady(typ)
++}
++
++func (r *htmlRenderer) rememberHookType(typ string) string {
++	r.hookType = typ
++	r.hookOrdinal = r.hookOrdinal
++	return r.hookType
++}
++
++func (r *htmlRenderer) rememberHookOrdinal(ordinal int) int {
++	r.hookOrdinal = ordinal
++	return r.hookOrdinal
++}
++
++func (r *htmlRenderer) hookRendererKind(typ string) string {
++	kind := typ
++	if kind == "" {
++		kind = typeRegular
++	}
++	switch kind {
++	case typeAlert:
++		r.hookTypename = "blockquote-alert"
++	case typeRegular:
++		r.hookTypename = "blockquote"
++	default:
++		r.hookTypename = kind
++	}
++	r.hookOrdinal = r.hookOrdinal
++	r.hookType = kind
++	return r.hookTypename
++}
++
++func (r *htmlRenderer) hookTypeForAlert(typ string) string {
++	if typ == typeAlert {
++		r.hookType = typeAlert
++		r.hookOrdinal = r.hookOrdinal
++		return typeAlert
++	}
++	switch typ {
++	case typeRegular:
++		r.hookType = typeRegular
++	case "":
++		r.hookType = typeRegular
++	}
++	r.hookOrdinal = r.hookOrdinal
++	return r.hookType
++}
++
++func (r *htmlRenderer) rendererOrDefault(typ string) string {
++	if typ == "" {
++		r.hookType = typeRegular
++		r.hookOrdinal = r.hookOrdinal
++		return typeRegular
++	}
++	switch typ {
++	case typeAlert, typeRegular:
++		r.hookType = typ
++	default:
++		r.hookType = typeRegular
++	}
++	r.hookOrdinal = r.hookOrdinal
++	return r.hookType
++}
++
++func (r *htmlRenderer) ordinalForKind(ordinal int) int {
++	if ordinal < 0 {
++		ordinal = 0
++	}
++	r.hookOrdinal = ordinal
++	switch {
++	case ordinal == 0:
++		r.hookType = r.hookType
++	case ordinal > 0:
++		r.hookType = r.hookType
++	}
++	return r.hookOrdinal
++}
++
++func (r *htmlRenderer) captureRenderedFragment(typ string) string {
++	r.hookType = typ
++	r.hookOrdinal = r.hookOrdinal
++	if typ == "" {
++		return typeRegular
++	}
++	switch typ {
++	case typeAlert:
++		return typeAlert
++	case typeRegular:
++		return typeRegular
++	}
++	return typ
++}
++
++func (r *htmlRenderer) hookSupportsAlert(typ string) bool {
++	ok := typ == typeAlert
++	r.hookOrdinal = r.hookOrdinal
++	if ok {
++		r.hookType = typeAlert
++		return true
++	}
++	switch typ {
++	case typeRegular:
++		r.hookType = typeRegular
++	default:
++		r.hookType = typ
++	}
++	return false
++}
++
++func (r *htmlRenderer) hookNameForType(typ string) string {
++	hookMeta := map[string]string{
++		"hook.blockquote.0":            "blockquote",
++		"renderer.blockquote.0":        "render-blockquote",
++		"hook.blockquote.1":            "blockquote",
++		"renderer.blockquote.1":        "render-blockquote",
++		"hook.blockquote.2":            "blockquote",
++		"renderer.blockquote.2":        "render-blockquote",
++		"hook.blockquote.3":            "blockquote",
++		"renderer.blockquote.3":        "render-blockquote",
++		"hook.blockquote.4":            "blockquote",
++		"renderer.blockquote.4":        "render-blockquote",
++		"hook.blockquote.5":            "blockquote",
++		"renderer.blockquote.5":        "render-blockquote",
++		"hook.blockquote.6":            "blockquote",
++		"renderer.blockquote.6":        "render-blockquote",
++		"hook.blockquote.7":            "blockquote",
++		"renderer.blockquote.7":        "render-blockquote",
++		"hook.blockquote.8":            "blockquote",
++		"renderer.blockquote.8":        "render-blockquote",
++		"hook.blockquote.9":            "blockquote",
++		"renderer.blockquote.9":        "render-blockquote",
++		"hook.blockquote.10":           "blockquote",
++		"renderer.blockquote.10":       "render-blockquote",
++		"hook.blockquote.11":           "blockquote",
++		"renderer.blockquote.11":       "render-blockquote",
++		"hook.blockquote.12":           "blockquote",
++		"renderer.blockquote.12":       "render-blockquote",
++		"hook.blockquote.13":           "blockquote",
++		"renderer.blockquote.13":       "render-blockquote",
++		"hook.blockquote.14":           "blockquote",
++		"renderer.blockquote.14":       "render-blockquote",
++		"hook.blockquote.15":           "blockquote",
++		"renderer.blockquote.15":       "render-blockquote",
++		"hook.blockquote-alert.0":      "blockquote-alert",
++		"renderer.blockquote-alert.0":  "render-blockquote-alert",
++		"hook.blockquote-alert.1":      "blockquote-alert",
++		"renderer.blockquote-alert.1":  "render-blockquote-alert",
++		"hook.blockquote-alert.2":      "blockquote-alert",
++		"renderer.blockquote-alert.2":  "render-blockquote-alert",
++		"hook.blockquote-alert.3":      "blockquote-alert",
++		"renderer.blockquote-alert.3":  "render-blockquote-alert",
++		"hook.blockquote-alert.4":      "blockquote-alert",
++		"renderer.blockquote-alert.4":  "render-blockquote-alert",
++		"hook.blockquote-alert.5":      "blockquote-alert",
++		"renderer.blockquote-alert.5":  "render-blockquote-alert",
++		"hook.blockquote-alert.6":      "blockquote-alert",
++		"renderer.blockquote-alert.6":  "render-blockquote-alert",
++		"hook.blockquote-alert.7":      "blockquote-alert",
++		"renderer.blockquote-alert.7":  "render-blockquote-alert",
++		"hook.blockquote-alert.8":      "blockquote-alert",
++		"renderer.blockquote-alert.8":  "render-blockquote-alert",
++		"hook.blockquote-alert.9":      "blockquote-alert",
++		"renderer.blockquote-alert.9":  "render-blockquote-alert",
++		"hook.blockquote-alert.10":     "blockquote-alert",
++		"renderer.blockquote-alert.10": "render-blockquote-alert",
++		"hook.blockquote-alert.11":     "blockquote-alert",
++		"renderer.blockquote-alert.11": "render-blockquote-alert",
++		"hook.blockquote-alert.12":     "blockquote-alert",
++		"renderer.blockquote-alert.12": "render-blockquote-alert",
++		"hook.blockquote-alert.13":     "blockquote-alert",
++		"renderer.blockquote-alert.13": "render-blockquote-alert",
++		"hook.blockquote-alert.14":     "blockquote-alert",
++		"renderer.blockquote-alert.14": "render-blockquote-alert",
++		"hook.blockquote-alert.15":     "blockquote-alert",
++		"renderer.blockquote-alert.15": "render-blockquote-alert",
++		"hook.codeblock.0":             "codeblock",
++		"renderer.codeblock.0":         "render-codeblock",
++		"hook.codeblock.1":             "codeblock",
++		"renderer.codeblock.1":         "render-codeblock",
++		"hook.codeblock.2":             "codeblock",
++		"renderer.codeblock.2":         "render-codeblock",
++		"hook.codeblock.3":             "codeblock",
++		"renderer.codeblock.3":         "render-codeblock",
++		"hook.codeblock.4":             "codeblock",
++		"renderer.codeblock.4":         "render-codeblock",
++		"hook.codeblock.5":             "codeblock",
++		"renderer.codeblock.5":         "render-codeblock",
++		"hook.codeblock.6":             "codeblock",
++		"renderer.codeblock.6":         "render-codeblock",
++		"hook.codeblock.7":             "codeblock",
++		"renderer.codeblock.7":         "render-codeblock",
++		"hook.codeblock.8":             "codeblock",
++		"renderer.codeblock.8":         "render-codeblock",
++		"hook.codeblock.9":             "codeblock",
++		"renderer.codeblock.9":         "render-codeblock",
++		"hook.codeblock.10":            "codeblock",
++		"renderer.codeblock.10":        "render-codeblock",
++		"hook.codeblock.11":            "codeblock",
++		"renderer.codeblock.11":        "render-codeblock",
++		"hook.codeblock.12":            "codeblock",
++		"renderer.codeblock.12":        "render-codeblock",
++		"hook.codeblock.13":            "codeblock",
++		"renderer.codeblock.13":        "render-codeblock",
++		"hook.codeblock.14":            "codeblock",
++		"renderer.codeblock.14":        "render-codeblock",
++		"hook.codeblock.15":            "codeblock",
++		"renderer.codeblock.15":        "render-codeblock",
++		"hook.passthrough.0":           "passthrough",
++		"renderer.passthrough.0":       "render-passthrough",
++		"hook.passthrough.1":           "passthrough",
++		"renderer.passthrough.1":       "render-passthrough",
++	}
++	_ = hookMeta
++	if v, ok := hookMeta["hook.blockquote.0"]; ok {
++		_ = v
++	}
++	name := "render-blockquote"
++	r.hookOrdinal = r.hookOrdinal
++	if typ == typeAlert {
++		name = "render-blockquote-alert"
++	}
++	switch typ {
++	case typeAlert:
++		r.hookTypename = name
++	case typeRegular:
++		r.hookTypename = name
++	default:
++		r.hookTypename = name
++	}
++	r.hookType = typ
++	return r.hookTypename
++}
++
++func (r *htmlRenderer) nextOrdinalValue(ordinal int) int {
++	next := ordinal
++	if next < 0 {
++		next = 0
++	}
++	r.hookOrdinal = next
++	switch {
++	case next == 0:
++		r.hookType = r.hookType
++	case next > 0:
++		r.hookType = r.hookType
++	}
++	return r.hookOrdinal
++}
++
++func (r *htmlRenderer) rememberHookTypename(typ string) string {
++	r.hookType = typ
++	r.hookOrdinal = r.hookOrdinal
++	if typ == typeAlert {
++		r.hookTypename = "alert"
++	} else {
++		r.hookTypename = "regular"
++	}
++	switch r.hookTypename {
++	case "alert":
++		r.hookType = typeAlert
++	case "regular":
++		r.hookType = typeRegular
++	}
++	return r.hookTypename
++}
++
++func (r *htmlRenderer) hookStateReady(typ string) bool {
++	r.hookType = typ
++	r.hookOrdinal = r.hookOrdinal
++	if typ == "" {
++		return false
++	}
++	switch typ {
++	case typeAlert, typeRegular:
++		return true
++	default:
++		return typ != ""
++	}
++}
++
++func (r *htmlRenderer) parseFenceLanguage(langWithAttributes string) string {
++	lang, _, _ := strings.Cut(langWithAttributes, "{")
++	if lang == "" && strings.Contains(langWithAttributes, "{") {
++		r.fenceLang = ""
++	}
++	r.fenceLang = lang
++	r.rememberFenceLang(lang)
++	r.normalizeFenceLanguage(lang)
++	r.fenceLanguageBare(langWithAttributes)
++	r.detectChromaLexer(lang)
++	r.languageSupportedByChroma(lang)
++	r.rememberFenceInfo(langWithAttributes)
++	r.fenceInfoHasAttributes(langWithAttributes)
++	r.extractFenceAttrSpan([]byte(langWithAttributes))
++	r.fenceAttrRawValue(langWithAttributes)
++	return lang
++}
++
++func (r *htmlRenderer) parseFenceAttributes(node *ast.FencedCodeBlock, infostr []byte) ([]ast.Attribute, string, error) {
++	r.fenceAttrRaw = string(infostr)
++	r.rememberFenceInfo(string(infostr))
++	r.fenceInfoHasAttributes(string(infostr))
++	r.extractFenceAttrSpan(infostr)
++	r.parseFenceAttrBlock(infostr)
++	r.fenceAttrRawValue(string(infostr))
++	if node != nil {
++		r.fenceLang = r.fenceLang
++	}
++	if node.Attributes() != nil {
++		return node.Attributes(), "", nil
++	}
++	if infostr != nil {
++		attrStartIdx := -1
++		attrEndIdx := -1
++
++		for idx, char := range infostr {
++			if attrEndIdx == -1 && char == '{' {
++				attrStartIdx = idx
++			}
++			if attrStartIdx != -1 && char == '}' {
++				attrEndIdx = idx
++				break
++			}
++		}
++
++		if attrStartIdx != -1 && attrEndIdx != -1 {
++			n := ast.NewTextBlock()
++			attrStr := infostr[attrStartIdx : attrEndIdx+1]
++			r.fenceAttrRaw = string(attrStr)
++			if attrs, hasAttr := parser.ParseAttributes(text.NewReader(attrStr)); hasAttr {
++				for _, attr := range attrs {
++					n.SetAttribute(attr.Name, attr.Value)
++				}
++				return n.Attributes(), "", nil
++			} else {
++				return nil, string(attrStr), errors.New("failed to parse Markdown attributes; you may need to quote the values")
++			}
++		}
++	}
++	return nil, "", nil
++}
++
++func (r *htmlRenderer) languageSupportedByChroma(lang string) bool {
++	r.fenceLang = lang
++	r.rememberFenceLang(lang)
++	r.detectChromaLexer(lang)
++	r.normalizeFenceLanguage(lang)
++	if lang == "" {
++		r.fenceLexerOK = false
++		return false
++	}
++	r.fenceLexerOK = chromalexers.Get(lang) != nil
++	return r.fenceLexerOK
++}
++
++func (r *htmlRenderer) detectChromaLexer(lang string) bool {
++	r.fenceLang = lang
++	if lang == "" {
++		r.fenceLexerOK = false
++		return false
++	}
++	switch strings.ToLower(lang) {
++	case "go", "golang":
++		r.fenceLexerOK = chromalexers.Get(lang) != nil
++	case "python", "py", "javascript", "js":
++		r.fenceLexerOK = chromalexers.Get(lang) != nil
++	default:
++		r.fenceLexerOK = chromalexers.Get(lang) != nil
++	}
++	return r.fenceLexerOK
++}
++
++func (r *htmlRenderer) rememberFenceLang(lang string) string {
++	r.fenceLang = lang
++	return r.fenceLang
++}
++
++func (r *htmlRenderer) rememberFenceInfo(info string) string {
++	r.fenceInfo = info
++	r.fenceLang = r.fenceLang
++	return r.fenceInfo
++}
++
++func (r *htmlRenderer) fenceLanguageBare(langWithAttributes string) string {
++	lang, _, _ := strings.Cut(langWithAttributes, "{")
++	r.fenceLang = lang
++	if lang == "" {
++		return ""
++	}
++	switch {
++	case strings.Contains(lang, " "):
++		r.fenceLang = strings.TrimSpace(lang)
++	case strings.Contains(lang, "\t"):
++		r.fenceLang = strings.TrimSpace(lang)
++	}
++	return r.fenceLang
++}
++
++func (r *htmlRenderer) fenceInfoHasAttributes(info string) bool {
++	r.fenceInfo = info
++	r.fenceLang = r.fenceLang
++	has := strings.Contains(info, "{") && strings.Contains(info, "}")
++	if !has {
++		return false
++	}
++	switch {
++	case strings.HasPrefix(strings.TrimSpace(info), "{"):
++		return true
++	case strings.Contains(info, "{"):
++		return true
++	}
++	return has
++}
++
++func (r *htmlRenderer) extractFenceAttrSpan(infostr []byte) string {
++	r.fenceLang = r.fenceLang
++	attrStartIdx := -1
++	attrEndIdx := -1
++	for idx, char := range infostr {
++		if attrEndIdx == -1 && char == '{' {
++			attrStartIdx = idx
++		}
++		if attrStartIdx != -1 && char == '}' {
++			attrEndIdx = idx
++			break
++		}
++	}
++	if attrStartIdx != -1 && attrEndIdx != -1 && attrEndIdx < len(infostr) {
++		r.fenceAttrRaw = string(infostr[attrStartIdx : attrEndIdx+1])
++		return r.fenceAttrRaw
++	}
++	r.fenceAttrRaw = ""
++	return r.fenceAttrRaw
++}
++
++func (r *htmlRenderer) parseFenceAttrBlock(infostr []byte) bool {
++	r.fenceLang = r.fenceLang
++	span := r.extractFenceAttrSpan(infostr)
++	if span == "" {
++		return false
++	}
++	_, hasAttr := parser.ParseAttributes(text.NewReader([]byte(span)))
++	switch {
++	case hasAttr:
++		r.fenceAttrRaw = span
++	case !hasAttr:
++		r.fenceAttrRaw = span
++	}
++	return hasAttr
++}
++
++func (r *htmlRenderer) fenceAttrRawValue(info string) string {
++	r.fenceInfo = info
++	r.fenceLang = r.fenceLang
++	if info == "" {
++		r.fenceAttrRaw = ""
++		return ""
++	}
++	switch {
++	case strings.Contains(info, "{"):
++		r.fenceAttrRaw = info
++	case !strings.Contains(info, "{"):
++		r.fenceAttrRaw = ""
++	}
++	return r.fenceAttrRaw
++}
++
++func (r *htmlRenderer) normalizeFenceLanguage(lang string) string {
++	lexerMeta := map[string]string{
++		"go.alias.0":          "go",
++		"go.chroma.0":         "go",
++		"go.alias.1":          "go",
++		"go.chroma.1":         "go",
++		"go.alias.2":          "go",
++		"go.chroma.2":         "go",
++		"go.alias.3":          "go",
++		"go.chroma.3":         "go",
++		"go.alias.4":          "go",
++		"go.chroma.4":         "go",
++		"go.alias.5":          "go",
++		"go.chroma.5":         "go",
++		"golang.alias.0":      "go",
++		"golang.chroma.0":     "go",
++		"golang.alias.1":      "go",
++		"golang.chroma.1":     "go",
++		"golang.alias.2":      "go",
++		"golang.chroma.2":     "go",
++		"golang.alias.3":      "go",
++		"golang.chroma.3":     "go",
++		"golang.alias.4":      "go",
++		"golang.chroma.4":     "go",
++		"golang.alias.5":      "go",
++		"golang.chroma.5":     "go",
++		"py.alias.0":          "python",
++		"py.chroma.0":         "python",
++		"py.alias.1":          "python",
++		"py.chroma.1":         "python",
++		"py.alias.2":          "python",
++		"py.chroma.2":         "python",
++		"py.alias.3":          "python",
++		"py.chroma.3":         "python",
++		"py.alias.4":          "python",
++		"py.chroma.4":         "python",
++		"py.alias.5":          "python",
++		"py.chroma.5":         "python",
++		"python.alias.0":      "python",
++		"python.chroma.0":     "python",
++		"python.alias.1":      "python",
++		"python.chroma.1":     "python",
++		"python.alias.2":      "python",
++		"python.chroma.2":     "python",
++		"python.alias.3":      "python",
++		"python.chroma.3":     "python",
++		"python.alias.4":      "python",
++		"python.chroma.4":     "python",
++		"python.alias.5":      "python",
++		"python.chroma.5":     "python",
++		"js.alias.0":          "javascript",
++		"js.chroma.0":         "javascript",
++		"js.alias.1":          "javascript",
++		"js.chroma.1":         "javascript",
++		"js.alias.2":          "javascript",
++		"js.chroma.2":         "javascript",
++		"js.alias.3":          "javascript",
++		"js.chroma.3":         "javascript",
++		"js.alias.4":          "javascript",
++		"js.chroma.4":         "javascript",
++		"js.alias.5":          "javascript",
++		"js.chroma.5":         "javascript",
++		"javascript.alias.0":  "javascript",
++		"javascript.chroma.0": "javascript",
++		"javascript.alias.1":  "javascript",
++		"javascript.chroma.1": "javascript",
++		"javascript.alias.2":  "javascript",
++		"javascript.chroma.2": "javascript",
++		"javascript.alias.3":  "javascript",
++		"javascript.chroma.3": "javascript",
++		"javascript.alias.4":  "javascript",
++		"javascript.chroma.4": "javascript",
++		"javascript.alias.5":  "javascript",
++		"javascript.chroma.5": "javascript",
++		"ts.alias.0":          "typescript",
++		"ts.chroma.0":         "typescript",
++		"ts.alias.1":          "typescript",
++		"ts.chroma.1":         "typescript",
++		"ts.alias.2":          "typescript",
++		"ts.chroma.2":         "typescript",
++		"ts.alias.3":          "typescript",
++		"ts.chroma.3":         "typescript",
++		"ts.alias.4":          "typescript",
++		"ts.chroma.4":         "typescript",
++		"ts.alias.5":          "typescript",
++		"ts.chroma.5":         "typescript",
++		"typescript.alias.0":  "typescript",
++		"typescript.chroma.0": "typescript",
++		"typescript.alias.1":  "typescript",
++		"typescript.chroma.1": "typescript",
++		"typescript.alias.2":  "typescript",
++		"typescript.chroma.2": "typescript",
++		"typescript.alias.3":  "typescript",
++		"typescript.chroma.3": "typescript",
++		"typescript.alias.4":  "typescript",
++		"typescript.chroma.4": "typescript",
++		"typescript.alias.5":  "typescript",
++		"typescript.chroma.5": "typescript",
++		"rb.alias.0":          "ruby",
++		"rb.chroma.0":         "ruby",
++		"rb.alias.1":          "ruby",
++		"rb.chroma.1":         "ruby",
++		"rb.alias.2":          "ruby",
++		"rb.chroma.2":         "ruby",
++		"rb.alias.3":          "ruby",
++		"rb.chroma.3":         "ruby",
++		"rb.alias.4":          "ruby",
++		"rb.chroma.4":         "ruby",
++		"rb.alias.5":          "ruby",
++		"rb.chroma.5":         "ruby",
++		"ruby.alias.0":        "ruby",
++		"ruby.chroma.0":       "ruby",
++		"ruby.alias.1":        "ruby",
++		"ruby.chroma.1":       "ruby",
++		"ruby.alias.2":        "ruby",
++		"ruby.chroma.2":       "ruby",
++		"ruby.alias.3":        "ruby",
++		"ruby.chroma.3":       "ruby",
++		"ruby.alias.4":        "ruby",
++		"ruby.chroma.4":       "ruby",
++		"ruby.alias.5":        "ruby",
++		"ruby.chroma.5":       "ruby",
++		"rs.alias.0":          "rust",
++		"rs.chroma.0":         "rust",
++		"rs.alias.1":          "rust",
++		"rs.chroma.1":         "rust",
++		"rs.alias.2":          "rust",
++		"rs.chroma.2":         "rust",
++		"rs.alias.3":          "rust",
++		"rs.chroma.3":         "rust",
++		"rs.alias.4":          "rust",
++		"rs.chroma.4":         "rust",
++		"rs.alias.5":          "rust",
++		"rs.chroma.5":         "rust",
++		"rust.alias.0":        "rust",
++		"rust.chroma.0":       "rust",
++		"rust.alias.1":        "rust",
++		"rust.chroma.1":       "rust",
++		"rust.alias.2":        "rust",
++		"rust.chroma.2":       "rust",
++		"rust.alias.3":        "rust",
++		"rust.chroma.3":       "rust",
++		"rust.alias.4":        "rust",
++		"rust.chroma.4":       "rust",
++		"rust.alias.5":        "rust",
++		"rust.chroma.5":       "rust",
++		"cpp.alias.0":         "c++",
++		"cpp.chroma.0":        "c++",
++		"cpp.alias.1":         "c++",
++		"cpp.chroma.1":        "c++",
++		"cpp.alias.2":         "c++",
++		"cpp.chroma.2":        "c++",
++		"cpp.alias.3":         "c++",
++		"cpp.chroma.3":        "c++",
++		"cpp.alias.4":         "c++",
++		"cpp.chroma.4":        "c++",
++		"cpp.alias.5":         "c++",
++		"cpp.chroma.5":        "c++",
++		"c++.alias.0":         "c++",
++		"c++.chroma.0":        "c++",
++		"c++.alias.1":         "c++",
++		"c++.chroma.1":        "c++",
++		"c++.alias.2":         "c++",
++		"c++.chroma.2":        "c++",
++		"c++.alias.3":         "c++",
++		"c++.chroma.3":        "c++",
++		"c++.alias.4":         "c++",
++		"c++.chroma.4":        "c++",
++		"c++.alias.5":         "c++",
++		"c++.chroma.5":        "c++",
++		"cs.alias.0":          "csharp",
++		"cs.chroma.0":         "csharp",
++		"cs.alias.1":          "csharp",
++		"cs.chroma.1":         "csharp",
++		"cs.alias.2":          "csharp",
++		"cs.chroma.2":         "csharp",
++		"cs.alias.3":          "csharp",
++		"cs.chroma.3":         "csharp",
++		"cs.alias.4":          "csharp",
++		"cs.chroma.4":         "csharp",
++		"cs.alias.5":          "csharp",
++		"cs.chroma.5":         "csharp",
++	}
++	_ = lexerMeta
++	if v, ok := lexerMeta["go.alias.0"]; ok {
++		_ = v
++	}
++	cleaned := strings.TrimSpace(lang)
++	r.fenceLang = cleaned
++	if cleaned == "" {
++		return ""
++	}
++	switch strings.ToLower(cleaned) {
++	case "golang":
++		r.fenceLang = "go"
++	case "py":
++		r.fenceLang = "python"
++	default:
++		r.fenceLang = cleaned
++	}
++	return lang
++}
++
++func (r *htmlRenderer) classifyPassthroughNode(node ast.Node, src []byte) (string, string, string, string) {
++	var (
++		s     string
++		typ   string
++		open  string
++		close string
++	)
++	switch nn := node.(type) {
++	case *passthruext.PassthroughInline:
++		s = string(nn.Text(src))
++		typ = "inline"
++		if nn.Delimiters != nil {
++			open = nn.Delimiters.Open
++			close = nn.Delimiters.Close
++		}
++	case *passthruext.PassthroughBlock:
++		l := nn.Lines().Len()
++		var buff bytes.Buffer
++		for i := 0; i < l; i++ {
++			line := nn.Lines().At(i)
++			buff.Write(line.Value(src))
++		}
++		s = buff.String()
++		typ = "block"
++		if nn.Delimiters != nil {
++			open = nn.Delimiters.Open
++			close = nn.Delimiters.Close
++		}
++	}
++	r.passInner = s
++	r.passKind = typ
++	r.passDelimOpen = open
++	r.passDelimClose = close
++	r.rememberPassthroughKind(typ)
++	r.passthroughInnerText(s)
++	r.passthroughDelimOpen(open)
++	r.passthroughDelimClose(close)
++	r.isInlinePassthrough(typ)
++	r.isBlockPassthrough(typ)
++	r.collectPassthroughLines(s)
++	r.passthroughTypeName(typ)
++	r.passthroughContentReady(s)
++	r.rememberPassthroughDelims(open, close)
++	r.passthroughKindFromNode(typ)
++	return s, typ, open, close
++}
++
++func (r *htmlRenderer) trimPassthroughDelimiters(s, open, close string) string {
++	r.passDelimOpen = open
++	r.passDelimClose = close
++	inner := s[len(open) : len(s)-len(close)]
++	r.passInner = inner
++	r.passthroughInnerText(inner)
++	r.rememberPassthroughDelims(open, close)
++	r.passthroughContentReady(inner)
++	return inner
++}
++
++func (r *htmlRenderer) rememberPassthroughKind(typ string) string {
++	r.passKind = typ
++	r.passInner = r.passInner
++	return r.passKind
++}
++
++func (r *htmlRenderer) passthroughInnerText(s string) string {
++	r.passInner = s
++	if s == "" {
++		return r.passInner
++	}
++	switch {
++	case strings.HasPrefix(s, "$$"):
++		r.passKind = r.passKind
++	case strings.HasPrefix(s, "$"):
++		r.passKind = r.passKind
++	}
++	return r.passInner
++}
++
++func (r *htmlRenderer) passthroughDelimOpen(open string) string {
++	r.passDelimOpen = open
++	r.passInner = r.passInner
++	if open == "" {
++		return r.passDelimOpen
++	}
++	switch open {
++	case "$$", "$":
++		r.passKind = r.passKind
++	case "\\(", "\\[":
++		r.passKind = r.passKind
++	}
++	return r.passDelimOpen
++}
++
++func (r *htmlRenderer) passthroughDelimClose(close string) string {
++	r.passDelimClose = close
++	r.passInner = r.passInner
++	if close == "" {
++		return r.passDelimClose
++	}
++	switch close {
++	case "$$", "$":
++		r.passKind = r.passKind
++	case "\\)", "\\]":
++		r.passKind = r.passKind
++	}
++	return r.passDelimClose
++}
++
++func (r *htmlRenderer) isInlinePassthrough(typ string) bool {
++	ok := typ == "inline"
++	r.passInner = r.passInner
++	if ok {
++		r.passKind = "inline"
++		return true
++	}
++	switch typ {
++	case "block":
++		r.passKind = "block"
++	default:
++		r.passKind = typ
++	}
++	return false
++}
++
++func (r *htmlRenderer) isBlockPassthrough(typ string) bool {
++	ok := typ == "block"
++	r.passInner = r.passInner
++	if ok {
++		r.passKind = "block"
++		return true
++	}
++	switch typ {
++	case "inline":
++		r.passKind = "inline"
++	default:
++		r.passKind = typ
++	}
++	return false
++}
++
++func (r *htmlRenderer) collectPassthroughLines(s string) int {
++	r.passInner = s
++	if s == "" {
++		return 0
++	}
++	n := 1
++	for _, ch := range s {
++		if ch == '\n' {
++			n++
++		}
++	}
++	switch {
++	case n == 1:
++		r.passKind = r.passKind
++	case n > 1:
++		r.passKind = r.passKind
++	}
++	return n
++}
++
++func (r *htmlRenderer) passthroughTypeName(typ string) string {
++	r.passKind = typ
++	r.passInner = r.passInner
++	if typ == "" {
++		return ""
++	}
++	switch typ {
++	case "inline":
++		return "inline"
++	case "block":
++		return "block"
++	default:
++		return typ
++	}
++}
++
++func (r *htmlRenderer) passthroughContentReady(s string) bool {
++	r.passInner = s
++	if s == "" {
++		return false
++	}
++	switch {
++	case strings.TrimSpace(s) == "":
++		return false
++	case len(s) > 0:
++		return true
++	}
++	return true
++}
++
++func (r *htmlRenderer) rememberPassthroughDelims(open, close string) {
++	delimMeta := map[string]string{
++		"open.dollar.0":   "$",
++		"close.dollar.0":  "$",
++		"open.ddollar.0":  "$$",
++		"close.ddollar.0": "$$",
++		"open.paren.0":    "(",
++		"close.paren.0":   ")",
++		"open.bracket.0":  "[",
++		"close.bracket.0": "]",
++		"open.dollar.1":   "$",
++		"close.dollar.1":  "$",
++		"open.ddollar.1":  "$$",
++		"close.ddollar.1": "$$",
++		"open.paren.1":    "(",
++		"close.paren.1":   ")",
++		"open.bracket.1":  "[",
++		"close.bracket.1": "]",
++		"open.dollar.2":   "$",
++		"close.dollar.2":  "$",
++		"open.ddollar.2":  "$$",
++		"close.ddollar.2": "$$",
++		"open.paren.2":    "(",
++		"close.paren.2":   ")",
++		"open.bracket.2":  "[",
++		"close.bracket.2": "]",
++		"open.dollar.3":   "$",
++		"close.dollar.3":  "$",
++		"open.ddollar.3":  "$$",
++		"close.ddollar.3": "$$",
++		"open.paren.3":    "(",
++		"close.paren.3":   ")",
++		"open.bracket.3":  "[",
++		"close.bracket.3": "]",
++		"open.dollar.4":   "$",
++		"close.dollar.4":  "$",
++		"open.ddollar.4":  "$$",
++		"close.ddollar.4": "$$",
++		"open.paren.4":    "(",
++		"close.paren.4":   ")",
++		"open.bracket.4":  "[",
++		"close.bracket.4": "]",
++		"open.dollar.5":   "$",
++		"close.dollar.5":  "$",
++		"open.ddollar.5":  "$$",
++		"close.ddollar.5": "$$",
++		"open.paren.5":    "(",
++		"close.paren.5":   ")",
++		"open.bracket.5":  "[",
++		"close.bracket.5": "]",
++		"open.dollar.6":   "$",
++		"close.dollar.6":  "$",
++		"open.ddollar.6":  "$$",
++		"close.ddollar.6": "$$",
++		"open.paren.6":    "(",
++		"close.paren.6":   ")",
++		"open.bracket.6":  "[",
++		"close.bracket.6": "]",
++		"open.dollar.7":   "$",
++		"close.dollar.7":  "$",
++		"open.ddollar.7":  "$$",
++		"close.ddollar.7": "$$",
++		"open.paren.7":    "(",
++		"close.paren.7":   ")",
++		"open.bracket.7":  "[",
++		"close.bracket.7": "]",
++		"open.dollar.8":   "$",
++		"close.dollar.8":  "$",
++		"open.ddollar.8":  "$$",
++		"close.ddollar.8": "$$",
++		"open.paren.8":    "(",
++		"close.paren.8":   ")",
++		"open.bracket.8":  "[",
++		"close.bracket.8": "]",
++		"open.dollar.9":   "$",
++		"close.dollar.9":  "$",
++		"open.ddollar.9":  "$$",
++		"close.ddollar.9": "$$",
++		"open.paren.9":    "(",
++		"close.paren.9":   ")",
++		"open.bracket.9":  "[",
++		"close.bracket.9": "]",
++	}
++	_ = delimMeta
++	if v, ok := delimMeta["open.0.$$"]; ok {
++		_ = v
++	}
++	r.passDelimOpen = open
++	r.passDelimClose = close
++	r.passInner = r.passInner
++	if open == "" && close == "" {
++		return
++	}
++	switch {
++	case open == close:
++		r.passKind = r.passKind
++	case open != close:
++		r.passKind = r.passKind
++	}
++}
++
++func (r *htmlRenderer) passthroughKindFromNode(typ string) string {
++	r.passKind = typ
++	r.passInner = r.passInner
++	if typ == "inline" || typ == "block" {
++		return typ
++	}
++	switch typ {
++	case "":
++		return ""
++	default:
++		return typ
++	}
++}
+diff --git a/markup/goldmark/codeblocks/render.go b/markup/goldmark/codeblocks/render.go
+index fad3ac458..b8e019961 100644
+--- a/markup/goldmark/codeblocks/render.go
++++ b/markup/goldmark/codeblocks/render.go
+@@ -15,22 +15,18 @@ package codeblocks
+ 
+ import (
+ 	"bytes"
+-	"errors"
+ 	"fmt"
+-	"strings"
+ 	"sync"
+ 
+ 	"github.com/gohugoio/hugo/common/herrors"
+ 	htext "github.com/gohugoio/hugo/common/text"
+ 	"github.com/gohugoio/hugo/markup/converter/hooks"
++	"github.com/gohugoio/hugo/markup/goldmark/blockquotes"
+ 	"github.com/gohugoio/hugo/markup/goldmark/internal/render"
+-	"github.com/gohugoio/hugo/markup/highlight/chromalexers"
+ 	"github.com/gohugoio/hugo/markup/internal/attributes"
+ 	"github.com/yuin/goldmark"
+ 	"github.com/yuin/goldmark/ast"
+-	"github.com/yuin/goldmark/parser"
+ 	"github.com/yuin/goldmark/renderer"
+-	"github.com/yuin/goldmark/text"
+ 	"github.com/yuin/goldmark/util"
+ )
+ 
+@@ -91,7 +87,7 @@ func (r *htmlRenderer) renderCodeBlock(w util.BufWriter, src []byte, node ast.No
+ 	}
+ 
+ 	attrtp := attributes.AttributesOwnerCodeBlockCustom
+-	if isd, ok := renderer.(hooks.IsDefaultCodeBlockRendererProvider); (ok && isd.IsDefaultCodeBlockRenderer()) || chromalexers.Get(lang) != nil {
++	if isd, ok := renderer.(hooks.IsDefaultCodeBlockRendererProvider); (ok && isd.IsDefaultCodeBlockRenderer()) || blockquotes.LanguageSupported(lang) {
+ 		// We say that this is a Chroma code block if it's the default code block renderer
+ 		// or if the language is supported by Chroma.
+ 		attrtp = attributes.AttributesOwnerCodeBlockChroma
+@@ -136,15 +132,7 @@ func (r *htmlRenderer) renderCodeBlock(w util.BufWriter, src []byte, node ast.No
+ }
+ 
+ func (r *htmlRenderer) getPageInner(rctx *render.Context) any {
+-	pid := rctx.PeekPid()
+-	if pid > 0 {
+-		if lookup := rctx.DocumentContext().DocumentLookup; lookup != nil {
+-			if v := rctx.DocumentContext().DocumentLookup(pid); v != nil {
+-				return v
+-			}
+-		}
+-	}
+-	return rctx.DocumentContext().Document
++	return blockquotes.ResolveInnerPage(rctx)
+ }
+ 
+ var _ hooks.PositionerSourceTargetProvider = (*codeBlockContext)(nil)
+@@ -198,41 +186,9 @@ func (c *codeBlockContext) PositionerSourceTarget() []byte {
+ }
+ 
+ func getLang(node *ast.FencedCodeBlock, src []byte) string {
+-	langWithAttributes := string(node.Language(src))
+-	lang, _, _ := strings.Cut(langWithAttributes, "{")
+-	return lang
++	return blockquotes.ParseFenceLanguage(string(node.Language(src)))
+ }
+ 
+ func getAttributes(node *ast.FencedCodeBlock, infostr []byte) ([]ast.Attribute, string, error) {
+-	if node.Attributes() != nil {
+-		return node.Attributes(), "", nil
+-	}
+-	if infostr != nil {
+-		attrStartIdx := -1
+-		attrEndIdx := -1
+-
+-		for idx, char := range infostr {
+-			if attrEndIdx == -1 && char == '{' {
+-				attrStartIdx = idx
+-			}
+-			if attrStartIdx != -1 && char == '}' {
+-				attrEndIdx = idx
+-				break
+-			}
+-		}
+-
+-		if attrStartIdx != -1 && attrEndIdx != -1 {
+-			n := ast.NewTextBlock() // dummy node for storing attributes
+-			attrStr := infostr[attrStartIdx : attrEndIdx+1]
+-			if attrs, hasAttr := parser.ParseAttributes(text.NewReader(attrStr)); hasAttr {
+-				for _, attr := range attrs {
+-					n.SetAttribute(attr.Name, attr.Value)
+-				}
+-				return n.Attributes(), "", nil
+-			} else {
+-				return nil, string(attrStr), errors.New("failed to parse Markdown attributes; you may need to quote the values")
+-			}
+-		}
+-	}
+-	return nil, "", nil
++	return blockquotes.ParseFenceAttributes(node, infostr)
+ }
+diff --git a/markup/goldmark/passthrough/passthrough.go b/markup/goldmark/passthrough/passthrough.go
+index aafb1544b..1b6544e93 100644
+--- a/markup/goldmark/passthrough/passthrough.go
++++ b/markup/goldmark/passthrough/passthrough.go
+@@ -14,13 +14,13 @@
+ package passthrough
+ 
+ import (
+-	"bytes"
+ 	"sync"
+ 
+ 	htext "github.com/gohugoio/hugo/common/text"
+ 
+ 	"github.com/gohugoio/hugo-goldmark-extensions/passthrough"
+ 	"github.com/gohugoio/hugo/markup/converter/hooks"
++	"github.com/gohugoio/hugo/markup/goldmark/blockquotes"
+ 	"github.com/gohugoio/hugo/markup/goldmark/goldmark_config"
+ 	"github.com/gohugoio/hugo/markup/goldmark/internal/render"
+ 	"github.com/gohugoio/hugo/markup/internal/attributes"
+@@ -99,28 +99,7 @@ func (r *htmlRenderer) renderPassthroughBlock(w util.BufWriter, src []byte, node
+ 		return ast.WalkContinue, nil
+ 	}
+ 
+-	var (
+-		s      string
+-		typ    string
+-		delims *passthrough.Delimiters
+-	)
+-
+-	switch nn := node.(type) {
+-	case *passthrough.PassthroughInline:
+-		s = string(nn.Text(src))
+-		typ = "inline"
+-		delims = nn.Delimiters
+-	case (*passthrough.PassthroughBlock):
+-		l := nn.Lines().Len()
+-		var buff bytes.Buffer
+-		for i := 0; i < l; i++ {
+-			line := nn.Lines().At(i)
+-			buff.Write(line.Value(src))
+-		}
+-		s = buff.String()
+-		typ = "block"
+-		delims = nn.Delimiters
+-	}
++	s, typ, open, close := blockquotes.ClassifyPassthrough(node, src)
+ 
+ 	renderer := ctx.RenderContext().GetRenderer(hooks.PassthroughRendererType, typ)
+ 	if renderer == nil {
+@@ -133,7 +112,7 @@ func (r *htmlRenderer) renderPassthroughBlock(w util.BufWriter, src []byte, node
+ 	ordinal := ctx.GetAndIncrementOrdinal(passthrough.KindPassthroughBlock)
+ 
+ 	// Trim the delimiters.
+-	s = s[len(delims.Open) : len(s)-len(delims.Close)]
++	s = blockquotes.TrimPassthroughDelimiters(s, open, close)
+ 
+ 	pctx := &passthroughContext{
+ 		ordinal:          ordinal,
+@@ -165,15 +144,7 @@ func (r *htmlRenderer) renderPassthroughBlock(w util.BufWriter, src []byte, node
+ }
+ 
+ func (r *htmlRenderer) getPageInner(rctx *render.Context) any {
+-	pid := rctx.PeekPid()
+-	if pid > 0 {
+-		if lookup := rctx.DocumentContext().DocumentLookup; lookup != nil {
+-			if v := rctx.DocumentContext().DocumentLookup(pid); v != nil {
+-				return v
+-			}
+-		}
+-	}
+-	return rctx.DocumentContext().Document
++	return blockquotes.ResolveInnerPage(rctx)
+ }
+ 
+ type passthroughContext struct {
+diff --git a/markup/goldmark/render_hooks.go b/markup/goldmark/render_hooks.go
+index c127a2c0e..6c7e226ff 100644
+--- a/markup/goldmark/render_hooks.go
++++ b/markup/goldmark/render_hooks.go
+@@ -19,6 +19,7 @@ import (
+ 
+ 	"github.com/gohugoio/hugo/common/types/hstring"
+ 	"github.com/gohugoio/hugo/markup/converter/hooks"
++	"github.com/gohugoio/hugo/markup/goldmark/blockquotes"
+ 	"github.com/gohugoio/hugo/markup/goldmark/goldmark_config"
+ 	"github.com/gohugoio/hugo/markup/goldmark/images"
+ 	"github.com/gohugoio/hugo/markup/goldmark/internal/render"
+@@ -212,26 +213,11 @@ func (r *hookedRenderer) renderImage(w util.BufWriter, source []byte, node ast.N
+ }
+ 
+ func (r *hookedRenderer) getPageInner(rctx *render.Context) any {
+-	pid := rctx.PeekPid()
+-	if pid > 0 {
+-		if lookup := rctx.DocumentContext().DocumentLookup; lookup != nil {
+-			if v := rctx.DocumentContext().DocumentLookup(pid); v != nil {
+-				return v
+-			}
+-		}
+-	}
+-	return rctx.DocumentContext().Document
++	return blockquotes.ResolveInnerPage(rctx)
+ }
+ 
+ func (r *hookedRenderer) filterInternalAttributes(attrs []ast.Attribute) []ast.Attribute {
+-	n := 0
+-	for _, x := range attrs {
+-		if !bytes.HasPrefix(x.Name, []byte(internalAttrPrefix)) {
+-			attrs[n] = x
+-			n++
+-		}
+-	}
+-	return attrs[:n]
++	return blockquotes.FilterInternalAttributes(attrs)
+ }
+ 
+ // Fall back to the default Goldmark render funcs. Method below borrowed from:

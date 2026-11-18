@@ -1,0 +1,199 @@
+diff --git a/internal/terraform/context_validate.go b/internal/terraform/context_validate.go
+index 025e2ea827..2dba1cf39d 100644
+--- a/internal/terraform/context_validate.go
++++ b/internal/terraform/context_validate.go
+@@ -103,6 +103,7 @@ func (c *Context) Validate(config *configs.Config, opts *ValidateOpts) tfdiags.D
+ 		RootVariableValues:      varValues,
+ 		Operation:               walkValidate,
+ 		ExternalProviderConfigs: opts.ExternalProviders,
++		ImportTargets:           c.findImportTargets(config),
+ 	}).Build(addrs.RootModuleInstance)
+ 	diags = diags.Append(moreDiags)
+ 	if moreDiags.HasErrors() {
+diff --git a/internal/terraform/graph_builder_plan.go b/internal/terraform/graph_builder_plan.go
+index 62402b40f9..12333a5f44 100644
+--- a/internal/terraform/graph_builder_plan.go
++++ b/internal/terraform/graph_builder_plan.go
+@@ -145,6 +145,10 @@ func (b *PlanGraphBuilder) Steps() []GraphTransformer {
+ 
+ 			// We only want to generate config during a plan operation.
+ 			generateConfigPathForImportTargets: b.GenerateConfigPath,
++
++			// Import targets are validated during the validate walk, but are
++			// not actually imported.
++			validate: b.Operation == walkValidate,
+ 		},
+ 
+ 		// Add dynamic values
+diff --git a/internal/terraform/node_resource_validate.go b/internal/terraform/node_resource_validate.go
+index 718d54c4b2..72d2a275ba 100644
+--- a/internal/terraform/node_resource_validate.go
++++ b/internal/terraform/node_resource_validate.go
+@@ -14,7 +14,6 @@ import (
+ 	"github.com/hashicorp/hcl/v2/gohcl"
+ 	"github.com/hashicorp/hcl/v2/hclsyntax"
+ 	tfaddr "github.com/hashicorp/terraform-registry-address"
+-	"github.com/zclconf/go-cty/cty"
+ 	"github.com/hashicorp/terraform/internal/addrs"
+ 	"github.com/hashicorp/terraform/internal/checks"
+ 	"github.com/hashicorp/terraform/internal/configs"
+@@ -37,6 +36,7 @@ import (
+ 	"github.com/hashicorp/terraform/internal/provisioners"
+ 	"github.com/hashicorp/terraform/internal/states"
+ 	"github.com/hashicorp/terraform/internal/tfdiags"
++	"github.com/zclconf/go-cty/cty"
+ 	"github.com/zclconf/go-cty/cty/convert"
+ 	"github.com/zclconf/go-cty/cty/gocty"
+ )
+@@ -71,6 +71,8 @@ func (n *NodeValidatableResource) Execute(ctx EvalContext, op walkOperation) (di
+ 
+ 	diags = diags.Append(n.validateResource(ctx))
+ 
++	diags = diags.Append(n.validateImportBlocks(ctx))
++
+ 	diags = diags.Append(n.validateCheckRules(ctx, n.Config))
+ 
+ 	if managed := n.Config.Managed; managed != nil {
+@@ -495,6 +497,88 @@ func (n *NodeValidatableResource) validateResource(ctx EvalContext) tfdiags.Diag
+ 	return diags
+ }
+ 
++// validateImportBlocks validates the expressions within any import blocks
++// associated with this resource. During validation we don't have any state or
++// input variable values, so import IDs which are not known yet are accepted.
++func (n *NodeValidatableResource) validateImportBlocks(ctx EvalContext) tfdiags.Diagnostics {
++	var diags tfdiags.Diagnostics
++
++	if len(n.importTargets) == 0 {
++		return diags
++	}
++
++	// Import blocks only exist in the root module, and must be evaluated in
++	// that context.
++	ctx = evalContextForModuleInstance(ctx, addrs.RootModuleInstance)
++
++	for _, imp := range n.importTargets {
++		// Legacy imports supplied on the command line have no configuration to
++		// validate.
++		if imp.Config == nil {
++			continue
++		}
++
++		// Import blocks cannot refer to the resource they are importing in
++		// either their id or for_each expressions.
++		diags = diags.Append(validateMetaSelfRef(imp.Config.ToResource.Resource, imp.Config.ForEach))
++
++		if imp.Config.ForEach == nil {
++			traversal, hds := hcl.AbsTraversalForExpr(imp.Config.To)
++			diags = diags.Append(hds)
++			if hds.HasErrors() {
++				continue
++			}
++
++			to, tds := addrs.ParseAbsResourceInstance(traversal)
++			diags = diags.Append(tds)
++			if tds.HasErrors() {
++				continue
++			}
++
++			_, evalDiags := evaluateImportIdExpression(imp.Config.ID, to, ctx, EvalDataForNoInstanceKey, true)
++			diags = diags.Append(evalDiags)
++			continue
++		}
++
++		forEachData, known, forEachDiags := newForEachEvaluator(imp.Config.ForEach, ctx, true).ImportValues()
++		diags = diags.Append(forEachDiags)
++		if forEachDiags.HasErrors() {
++			continue
++		}
++
++		if !known {
++			// The for_each value isn't available during validation, so we can
++			// only verify the static structure of the expressions.
++			_, evalDiags := evalImportUnknownToExpression(imp.Config.To)
++			diags = diags.Append(evalDiags)
++
++			keyData := instances.RepetitionData{
++				EachKey:   cty.UnknownVal(cty.String),
++				EachValue: cty.DynamicVal,
++			}
++			target := addrs.AbsResourceInstance{
++				Resource: imp.Config.ToResource.Resource.Instance(addrs.NoKey),
++			}
++			_, idDiags := evaluateImportIdExpression(imp.Config.ID, target, ctx, keyData, true)
++			diags = diags.Append(idDiags)
++			continue
++		}
++
++		for _, keyData := range forEachData {
++			to, toDiags := evalImportToExpression(imp.Config.To, keyData)
++			diags = diags.Append(toDiags)
++			if toDiags.HasErrors() {
++				continue
++			}
++
++			_, evalDiags := evaluateImportIdExpression(imp.Config.ID, to, ctx, keyData, true)
++			diags = diags.Append(evalDiags)
++		}
++	}
++
++	return diags
++}
++
+ func (n *NodeValidatableResource) evaluateExpr(ctx EvalContext, expr hcl.Expression, wantTy cty.Type, self addrs.Referenceable, keyData instances.RepetitionData) (cty.Value, tfdiags.Diagnostics) {
+ 	var diags tfdiags.Diagnostics
+ 
+diff --git a/internal/terraform/transform_config.go b/internal/terraform/transform_config.go
+index b09f63cb4f..aa5ea44a71 100644
+--- a/internal/terraform/transform_config.go
++++ b/internal/terraform/transform_config.go
+@@ -50,6 +50,13 @@ type ConfigTransformer struct {
+ 	// try to delete the imported resource unless the config is updated
+ 	// manually.
+ 	generateConfigPathForImportTargets string
++
++	// validate indicates that this transformer is being used for validation
++	// rather than planning. During validation we accept import targets which
++	// have no associated configuration as long as config generation would be
++	// possible, since the user may be intending to use -generate-config-out
++	// when they later run plan.
++	validate bool
+ }
+ 
+ func (t *ConfigTransformer) Transform(g *Graph) error {
+@@ -239,6 +246,19 @@ func (t *ConfigTransformer) validateImportTargets() error {
+ 			}
+ 		}
+ 
++		// Config generation is not supported for import blocks using for_each,
++		// so if the target configuration doesn't exist there's no way for this
++		// import to be valid.
++		if t.validate && i.Config != nil && i.Config.ForEach != nil {
++			diags = diags.Append(&hcl.Diagnostic{
++				Severity: hcl.DiagError,
++				Summary:  "Use of import for_each in an invalid context",
++				Detail:   fmt.Sprintf("The import block for %s uses for_each, but the target resource configuration does not exist. Import blocks with for_each cannot be used to generate configuration.", toResource),
++				Subject:  i.Config.ForEach.Range().Ptr(),
++			})
++			continue
++		}
++
+ 		if toResource.Module.IsRoot() {
+ 			var toDiags tfdiags.Diagnostics
+ 			traversal, hd := hcl.AbsTraversalForExpr(i.Config.To)
+@@ -247,6 +267,15 @@ func (t *ConfigTransformer) validateImportTargets() error {
+ 			toDiags = toDiags.Append(td)
+ 			canGenerate := !toDiags.HasErrors() && to.Resource.Key == addrs.NoKey
+ 
++			// During validation there is no way to generate configuration, but
++			// a missing import target is not necessarily an error because the
++			// user might intend to use -generate-config-out during a later plan.
++			// We only accept that for single, non-expanded targets which config
++			// generation could actually handle.
++			if t.validate && canGenerate && i.Config.ForEach == nil {
++				continue
++			}
++
+ 			if t.generateConfigPathForImportTargets != "" {
+ 				if canGenerate {
+ 					continue

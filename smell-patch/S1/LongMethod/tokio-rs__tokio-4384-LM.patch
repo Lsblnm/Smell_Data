@@ -1,0 +1,258 @@
+diff --git a/tokio/src/io/driver/mod.rs b/tokio/src/io/driver/mod.rs
+index 19f67a24..107f9801 100644
+--- a/tokio/src/io/driver/mod.rs
++++ b/tokio/src/io/driver/mod.rs
+@@ -13,6 +13,10 @@ pub(crate) use registration::Registration;
+ 
+ mod scheduled_io;
+ use scheduled_io::ScheduledIo;
++pub(crate) use scheduled_io::{
++    GENERATION as SCHEDULED_IO_GENERATION, READINESS as SCHEDULED_IO_READINESS,
++    TICK as SCHEDULED_IO_TICK,
++};
+ 
+ use crate::park::{Park, Unpark};
+ use crate::util::slab::{self, Slab};
+@@ -53,7 +57,7 @@ pub(crate) struct Handle {
+ 
+ #[derive(Debug)]
+ pub(crate) struct ReadyEvent {
+-    tick: u8,
++    pub(crate) tick: u8,
+     pub(crate) ready: Ready,
+ }
+ 
+diff --git a/tokio/src/io/driver/registration.rs b/tokio/src/io/driver/registration.rs
+index 7350be63..4d77f2c4 100644
+--- a/tokio/src/io/driver/registration.rs
++++ b/tokio/src/io/driver/registration.rs
+@@ -43,10 +43,10 @@ cfg_io_driver! {
+     #[derive(Debug)]
+     pub(crate) struct Registration {
+         /// Handle to the associated driver.
+-        handle: Handle,
++        pub(crate) handle: Handle,
+ 
+         /// Reference to state stored by the driver.
+-        shared: slab::Ref<ScheduledIo>,
++        pub(crate) shared: slab::Ref<ScheduledIo>,
+     }
+ }
+ 
+diff --git a/tokio/src/io/driver/scheduled_io.rs b/tokio/src/io/driver/scheduled_io.rs
+index 76f93431..39f9f403 100644
+--- a/tokio/src/io/driver/scheduled_io.rs
++++ b/tokio/src/io/driver/scheduled_io.rs
+@@ -24,9 +24,9 @@ cfg_io_readiness! {
+ #[derive(Debug)]
+ pub(crate) struct ScheduledIo {
+     /// Packs the resource's readiness with the resource's generation.
+-    readiness: AtomicUsize,
++    pub(crate) readiness: AtomicUsize,
+ 
+-    waiters: Mutex<Waiters>,
++    pub(crate) waiters: Mutex<Waiters>,
+ }
+ 
+ cfg_io_readiness! {
+@@ -34,19 +34,19 @@ cfg_io_readiness! {
+ }
+ 
+ #[derive(Debug, Default)]
+-struct Waiters {
++pub(crate) struct Waiters {
+     #[cfg(feature = "net")]
+     /// List of all current waiters.
+     list: WaitList,
+ 
+     /// Waker used for AsyncRead.
+-    reader: Option<Waker>,
++    pub(crate) reader: Option<Waker>,
+ 
+     /// Waker used for AsyncWrite.
+-    writer: Option<Waker>,
++    pub(crate) writer: Option<Waker>,
+ 
+     /// True if this ScheduledIo has been killed due to IO driver shutdown.
+-    is_shutdown: bool,
++    pub(crate) is_shutdown: bool,
+ }
+ 
+ cfg_io_readiness! {
+@@ -89,11 +89,11 @@ cfg_io_readiness! {
+ // |----------+------------+--------------+-----------|
+ // |   1 bit  |   7 bits   +    8 bits    +   16 bits |
+ 
+-const READINESS: bit::Pack = bit::Pack::least_significant(16);
++pub(crate) const READINESS: bit::Pack = bit::Pack::least_significant(16);
+ 
+-const TICK: bit::Pack = READINESS.then(8);
++pub(crate) const TICK: bit::Pack = READINESS.then(8);
+ 
+-const GENERATION: bit::Pack = TICK.then(7);
++pub(crate) const GENERATION: bit::Pack = TICK.then(7);
+ 
+ #[test]
+ fn test_generations_assert_same() {
+diff --git a/tokio/src/io/poll_evented.rs b/tokio/src/io/poll_evented.rs
+index 44e68a2a..765874ae 100644
+--- a/tokio/src/io/poll_evented.rs
++++ b/tokio/src/io/poll_evented.rs
+@@ -1,4 +1,4 @@
+-use crate::io::driver::{Handle, Interest, Registration};
++use crate::io::driver::{Handle, Interest, Ready, ReadyEvent, Registration};
+ 
+ use mio::event::Source;
+ use std::fmt;
+@@ -149,17 +149,142 @@ feature! {
+             &'a E: io::Read + 'a,
+         {
+             use std::io::Read;
++            use std::sync::atomic::Ordering::{AcqRel, Acquire};
+ 
+-            let n = ready!(self.registration.poll_read_io(cx, || {
+-                let b = &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]);
+-                self.io.as_ref().unwrap().read(b)
+-            }))?;
++            use crate::io::driver::{
++                SCHEDULED_IO_GENERATION as GENERATION, SCHEDULED_IO_READINESS as READINESS,
++                SCHEDULED_IO_TICK as TICK,
++            };
+ 
+-            // Safety: We trust `TcpStream::read` to have filled up `n` bytes in the
+-            // buffer.
+-            buf.assume_init(n);
+-            buf.advance(n);
+-            Poll::Ready(Ok(()))
++            let read_mask = Ready::READABLE | Ready::READ_CLOSED;
++            let shared = &self.registration.shared;
++            let handle = &self.registration.handle;
++
++            loop {
++                let coop = match crate::coop::poll_proceed(cx) {
++                    Poll::Ready(coop) => coop,
++                    Poll::Pending => return Poll::Pending,
++                };
++
++                let curr = shared.readiness.load(Acquire);
++                let packed_readiness = READINESS.unpack(curr);
++                let from_curr = Ready::from_usize(packed_readiness);
++                let mut ready = Ready::EMPTY;
++                if from_curr.contains(Ready::READABLE) {
++                    ready = ready | Ready::READABLE;
++                }
++                if from_curr.contains(Ready::READ_CLOSED) {
++                    ready = ready | Ready::READ_CLOSED;
++                }
++
++                let can_read = ready.contains(Ready::READABLE) || ready.contains(Ready::READ_CLOSED);
++                let ev = if !can_read {
++                    let mut waiters = shared.waiters.lock();
++                    match &mut waiters.reader {
++                        Some(existing) => {
++                            let current_waker = cx.waker();
++                            if !existing.will_wake(current_waker) {
++                                *existing = current_waker.clone();
++                            }
++                        }
++                        None => {
++                            waiters.reader = Some(cx.waker().clone());
++                        }
++                    }
++
++                    let curr = shared.readiness.load(Acquire);
++                    let packed_readiness = READINESS.unpack(curr);
++                    let from_curr = Ready::from_usize(packed_readiness);
++                    let mut ready = Ready::EMPTY;
++                    if from_curr.contains(Ready::READABLE) {
++                        ready = ready | Ready::READABLE;
++                    }
++                    if from_curr.contains(Ready::READ_CLOSED) {
++                        ready = ready | Ready::READ_CLOSED;
++                    }
++
++                    let can_read =
++                        ready.contains(Ready::READABLE) || ready.contains(Ready::READ_CLOSED);
++                    if waiters.is_shutdown {
++                        ReadyEvent {
++                            tick: TICK.unpack(curr) as u8,
++                            ready: read_mask,
++                        }
++                    } else if !can_read {
++                        return Poll::Pending;
++                    } else {
++                        ReadyEvent {
++                            tick: TICK.unpack(curr) as u8,
++                            ready,
++                        }
++                    }
++                } else {
++                    ReadyEvent {
++                        tick: TICK.unpack(curr) as u8,
++                        ready,
++                    }
++                };
++
++                match handle.inner() {
++                    None => {
++                        return Poll::Ready(Err(io::Error::new(
++                            io::ErrorKind::Other,
++                            "IO driver has terminated",
++                        )));
++                    }
++                    Some(_) => {
++                        coop.made_progress();
++                    }
++                }
++
++                let unfilled = buf.unfilled_mut();
++                let b = &mut *(unfilled as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]);
++
++                match self.io.as_ref().unwrap().read(b) {
++                    Ok(n) => {
++                        // Safety: We trust `TcpStream::read` to have filled up `n` bytes in the
++                        // buffer.
++                        buf.assume_init(n);
++                        buf.advance(n);
++                        return Poll::Ready(Ok(()));
++                    }
++                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
++                        let mut mask_no_closed = ev.ready;
++                        if mask_no_closed.contains(Ready::READ_CLOSED) {
++                            mask_no_closed = mask_no_closed - Ready::READ_CLOSED;
++                        }
++                        if mask_no_closed.contains(Ready::WRITE_CLOSED) {
++                            mask_no_closed = mask_no_closed - Ready::WRITE_CLOSED;
++                        }
++
++                        let mut current = shared.readiness.load(Acquire);
++                        loop {
++                            let current_generation = GENERATION.unpack(current);
++                            let current_readiness = Ready::from_usize(current);
++                            let new_ready = current_readiness - mask_no_closed;
++                            let observed_tick = TICK.unpack(current) as u8;
++                            if observed_tick != ev.tick {
++                                break;
++                            } else {
++                                let packed = TICK.pack(ev.tick as usize, new_ready.as_usize());
++                                let next = GENERATION.pack(current_generation, packed);
++                                match shared.readiness.compare_exchange(
++                                    current,
++                                    next,
++                                    AcqRel,
++                                    Acquire,
++                                ) {
++                                    Ok(_) => break,
++                                    Err(actual) => {
++                                        current = actual;
++                                    }
++                                }
++                            }
++                        }
++                    }
++                    Err(e) => return Poll::Ready(Err(e)),
++                }
++            }
+         }
+ 
+         pub(crate) fn poll_write<'a>(&'a self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>>

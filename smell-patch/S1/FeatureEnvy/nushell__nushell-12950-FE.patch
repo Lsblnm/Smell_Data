@@ -1,0 +1,233 @@
+diff --git a/crates/nu-command/src/system/run_external.rs b/crates/nu-command/src/system/run_external.rs
+index 15bf6ebfd..16d0bc34e 100644
+--- a/crates/nu-command/src/system/run_external.rs
++++ b/crates/nu-command/src/system/run_external.rs
+@@ -1,5 +1,6 @@
+ use nu_cmd_base::hook::eval_hook;
+-use nu_engine::{command_prelude::*, env_to_strings, get_eval_expression};
++use nu_engine::{command_prelude::*, env_to_strings, get_eval_expression, GlobExpansionRequest};
++use nu_glob::MatchOptions;
+ use nu_protocol::{
+     ast::{Expr, Expression},
+     did_you_mean,
+@@ -301,27 +302,56 @@ fn expand_tilde(arg: &str) -> String {
+ /// Note: This matches the default behavior of Bash, but is known to be
+ /// error-prone. We might want to change this behavior in the future.
+ fn expand_glob(arg: &str, cwd: &Path, span: Span) -> Result<Vec<String>, ShellError> {
+-    let Ok(paths) = nu_glob::glob_with_parent(arg, nu_glob::MatchOptions::default(), cwd) else {
+-        return Ok(vec![arg.into()]);
++    let request = GlobExpansionRequest::for_external_argument(cwd, span);
++    let mut expander = ExternalGlob {
++        expanded: Vec::new(),
++        literal: arg.to_string(),
+     };
++    expander.expand(&request)
++}
+ 
+-    let mut result = vec![];
+-    for path in paths {
+-        let path = path.map_err(|err| ShellError::IOErrorSpanned {
+-            msg: format!("{}: {:?}", err.path().display(), err.error()),
+-            span,
+-        })?;
+-        // Strip PWD from the resulting paths if possible.
+-        let path_stripped = path.strip_prefix(cwd).unwrap_or(&path);
+-        let path_string = path_stripped.to_string_lossy().to_string();
+-        result.push(path_string);
+-    }
++struct ExternalGlob {
++    expanded: Vec<String>,
++    literal: String,
++}
+ 
+-    if result.is_empty() {
+-        result.push(arg.to_string());
+-    }
++impl ExternalGlob {
++    fn expand(&mut self, request: &GlobExpansionRequest) -> Result<Vec<String>, ShellError> {
++        let options = MatchOptions {
++            case_sensitive: request.options.case_sensitive,
++            require_literal_separator: request.options.require_literal_separator,
++            require_literal_leading_dot: request.options.require_literal_leading_dot,
++            recursive_match_hidden_dir: request.options.recursive_match_hidden_dir,
++        };
+ 
+-    Ok(result)
++        let paths = match nu_glob::glob_with(&self.literal, options) {
++            Ok(mut paths) => {
++                paths.apply_parent(request.root_path());
++                paths
++            }
++            Err(_) => {
++                self.expanded.push(self.literal.clone());
++                return Ok(std::mem::take(&mut self.expanded));
++            }
++        };
++
++        for path in paths {
++            let path = path.map_err(|err| ShellError::IOErrorSpanned {
++                msg: format!("{}: {:?}", err.path().display(), err.error()),
++                span: request.span,
++            })?;
++            // Strip PWD from the resulting paths if possible.
++            let path_stripped = path.strip_prefix(request.root_path()).unwrap_or(&path);
++            let path_string = path_stripped.to_string_lossy().to_string();
++            self.expanded.push(path_string);
++        }
++
++        if self.expanded.is_empty() {
++            self.expanded.push(self.literal.clone());
++        }
++
++        Ok(std::mem::take(&mut self.expanded))
++    }
+ }
+ 
+ /// Transforms `--option="value"` into `--option=value`. `value` can be quoted
+diff --git a/crates/nu-engine/src/glob_from.rs b/crates/nu-engine/src/glob_from.rs
+index 2847a3c5b..0ffcb6508 100644
+--- a/crates/nu-engine/src/glob_from.rs
++++ b/crates/nu-engine/src/glob_from.rs
+@@ -1,5 +1,5 @@
+ use nu_glob::MatchOptions;
+-use nu_path::{canonicalize_with, expand_path_with};
++use nu_path::{canonicalize_with, expand_path_with, PathRoot};
+ use nu_protocol::{NuGlob, ShellError, Span, Spanned};
+ use std::{
+     fs,
+@@ -8,6 +8,29 @@ use std::{
+ 
+ const GLOB_CHARS: &[char] = &['*', '?', '['];
+ 
++/// Context for expanding a bare external argument against the current working directory.
++pub struct GlobExpansionRequest {
++    pub options: MatchOptions,
++    pub span: Span,
++    root: PathRoot,
++}
++
++impl GlobExpansionRequest {
++    /// Build a request that expands arguments relative to `cwd`.
++    pub fn for_external_argument(cwd: &Path, span: Span) -> Self {
++        Self {
++            options: MatchOptions::default(),
++            span,
++            root: PathRoot::from_working_directory(cwd),
++        }
++    }
++
++    /// Directory used both as the glob search root and as the prefix to strip from matches.
++    pub fn root_path(&self) -> &Path {
++        self.root.path()
++    }
++}
++
+ /// This function is like `nu_glob::glob` from the `glob` crate, except it is relative to a given cwd.
+ ///
+ /// It returns a tuple of two values: the first is an optional prefix that the expanded filenames share.
+diff --git a/crates/nu-engine/src/lib.rs b/crates/nu-engine/src/lib.rs
+index e3c8f8eed..2abdf37c7 100644
+--- a/crates/nu-engine/src/lib.rs
++++ b/crates/nu-engine/src/lib.rs
+@@ -19,4 +19,4 @@ pub use eval::{
+     eval_expression_with_input, eval_subexpression, eval_variable, redirect_env,
+ };
+ pub use eval_helpers::*;
+-pub use glob_from::glob_from;
++pub use glob_from::{glob_from, GlobExpansionRequest};
+diff --git a/crates/nu-glob/src/lib.rs b/crates/nu-glob/src/lib.rs
+index 2a3f86198..eedd97a5a 100644
+--- a/crates/nu-glob/src/lib.rs
++++ b/crates/nu-glob/src/lib.rs
+@@ -115,6 +115,15 @@ impl Paths {
+             scope: Some(relative_to.into()),
+         }
+     }
++
++    /// Use `parent` as the search root when the compiled pattern is relative.
++    pub fn apply_parent(&mut self, parent: &Path) {
++        self.scope = match self.scope.take() {
++            None => Some(parent.to_path_buf()),
++            Some(s) if s.to_string_lossy() == "." => Some(parent.to_path_buf()),
++            Some(s) => Some(s),
++        };
++    }
+ }
+ 
+ /// Return an iterator that produces all the `Path`s that match the given
+@@ -287,32 +296,6 @@ pub fn glob_with(pattern: &str, options: MatchOptions) -> Result<Paths, PatternE
+     })
+ }
+ 
+-/// Return an iterator that produces all the `Path`s that match the given
+-/// pattern relative to a specified parent directory and using specified match options.
+-/// Paths may be absolute or relative to the current working directory.
+-///
+-/// This is provided primarily for testability, so multithreaded test runners can
+-/// test pattern matches in different test directories at the same time without
+-/// having to append the parent to the pattern under test.
+-
+-pub fn glob_with_parent(
+-    pattern: &str,
+-    options: MatchOptions,
+-    parent: &Path,
+-) -> Result<Paths, PatternError> {
+-    match glob_with(pattern, options) {
+-        Ok(mut p) => {
+-            p.scope = match p.scope {
+-                None => Some(parent.to_path_buf()),
+-                Some(s) if &s.to_string_lossy() == "." => Some(parent.to_path_buf()),
+-                Some(s) => Some(s),
+-            };
+-            Ok(p)
+-        }
+-        Err(e) => Err(e),
+-    }
+-}
+-
+ /// A glob iteration error.
+ ///
+ /// This is typically returned when a particular path cannot be read
+diff --git a/crates/nu-path/src/expansions.rs b/crates/nu-path/src/expansions.rs
+index 8e99b8409..b0ee48da2 100644
+--- a/crates/nu-path/src/expansions.rs
++++ b/crates/nu-path/src/expansions.rs
+@@ -5,6 +5,25 @@ use super::dots::{expand_dots, expand_ndots};
+ use super::helpers;
+ use super::tilde::expand_tilde;
+ 
++/// Working directory used when expanding globs and stripping matched prefixes.
++pub struct PathRoot {
++    path: PathBuf,
++}
++
++impl PathRoot {
++    /// Normalize `path` the same way other path expansions do, then keep it as the glob root.
++    pub fn from_working_directory(path: impl AsRef<Path>) -> Self {
++        Self {
++            path: expand_path(path, true),
++        }
++    }
++
++    /// Filesystem path that glob matches should be interpreted relative to.
++    pub fn path(&self) -> &Path {
++        &self.path
++    }
++}
++
+ // Join a path relative to another path. Paths starting with tilde are considered as absolute.
+ fn join_path_relative<P, Q>(path: P, relative_to: Q, expand_tilde: bool) -> PathBuf
+ where
+diff --git a/crates/nu-path/src/lib.rs b/crates/nu-path/src/lib.rs
+index 6c064d4b5..bdaa7d952 100644
+--- a/crates/nu-path/src/lib.rs
++++ b/crates/nu-path/src/lib.rs
+@@ -7,7 +7,7 @@ mod tilde;
+ mod trailing_slash;
+ 
+ pub use components::components;
+-pub use expansions::{canonicalize_with, expand_path_with, expand_to_real_path, locate_in_dirs};
++pub use expansions::{canonicalize_with, expand_path_with, expand_to_real_path, locate_in_dirs, PathRoot};
+ pub use helpers::{config_dir, config_dir_old, home_dir};
+ pub use tilde::expand_tilde;
+ pub use trailing_slash::{has_trailing_slash, strip_trailing_slash};

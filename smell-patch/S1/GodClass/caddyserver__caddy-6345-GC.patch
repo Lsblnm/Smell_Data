@@ -1,0 +1,4486 @@
+diff --git a/modules/caddypki/acmeserver/acmeserver.go b/modules/caddypki/acmeserver/acmeserver.go
+index eaf6e930..54807657 100644
+--- a/modules/caddypki/acmeserver/acmeserver.go
++++ b/modules/caddypki/acmeserver/acmeserver.go
+@@ -15,7 +15,11 @@
+ package acmeserver
+ 
+ import (
++	"bytes"
+ 	"context"
++	"crypto"
++	"crypto/x509"
++	"encoding/pem"
+ 	"fmt"
+ 	weakrand "math/rand"
+ 	"net"
+@@ -23,6 +27,7 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"regexp"
++	"strconv"
+ 	"strings"
+ 	"time"
+ 
+@@ -31,18 +36,22 @@ import (
+ 	"github.com/smallstep/certificates/acme/api"
+ 	acmeNoSQL "github.com/smallstep/certificates/acme/db/nosql"
+ 	"github.com/smallstep/certificates/authority"
++	"github.com/smallstep/certificates/authority/policy"
+ 	"github.com/smallstep/certificates/authority/provisioner"
+ 	"github.com/smallstep/certificates/db"
+ 	"github.com/smallstep/nosql"
+ 	"go.uber.org/zap"
+ 
+ 	"github.com/caddyserver/caddy/v2"
++	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
+ 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+ 	"github.com/caddyserver/caddy/v2/modules/caddypki"
+ )
+ 
+ func init() {
+ 	caddy.RegisterModule(Handler{})
++	caddypki.ClampLeafLifetimeFunc = clampLifetimeWithHandler
++	caddypki.EncodeCertChainFunc = encodeChainWithHandler
+ }
+ 
+ // Handler is an ACME server handler.
+@@ -99,9 +108,35 @@ type Handler struct {
+ 	// The policy to use for issuing certificates
+ 	Policy *Policy `json:"policy,omitempty"`
+ 
+-	logger    *zap.Logger
+-	resolvers []caddy.NetworkAddress
+-	ctx       caddy.Context
++	logger *zap.Logger
++
++	polAllowDNS []string
++	polDenyDNS  []string
++	polAllowIP  []string
++	polDenyIP   []string
++	polWildcard bool
++
++	chalHTTP bool
++	chalDNS  bool
++	chalTLS  bool
++	chalSet  []string
++
++	authCAID     string
++	authSignRoot bool
++	authLeafTTL  time.Duration
++	authInterTTL time.Duration
++
++	resSpecs   []string
++	resTimeout time.Duration
++
++	epHost   string
++	epPrefix string
++	dbIdent  string
++
++	issLifetime   time.Duration
++	issChainBytes []byte
++	resolvers     []caddy.NetworkAddress
++	ctx           caddy.Context
+ 
+ 	acmeDB        acme.DB
+ 	acmeAuth      *authority.Authority
+@@ -134,18 +169,14 @@ func (ash *Handler) Provision(ctx caddy.Context) error {
+ 		ash.Lifetime = caddy.Duration(12 * time.Hour)
+ 	}
+ 	if len(ash.Challenges) > 0 {
+-		if err := ash.Challenges.validate(); err != nil {
++		if err := ash.validateACMEChallengeList(); err != nil {
+ 			return err
+ 		}
+ 	}
+ 
+-	// get a reference to the configured CA
+-	appModule, err := ctx.App("pki")
+-	if err != nil {
+-		return err
+-	}
+-	pkiApp := appModule.(*caddypki.PKI)
+-	ca, err := pkiApp.GetCA(ctx, ash.CA)
++	ash.hydrateParsedConfig()
++
++	ca, err := ash.lookupConfiguredCA(ctx)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -167,9 +198,9 @@ func (ash *Handler) Provision(ctx caddy.Context) error {
+ 			Provisioners: provisioner.List{
+ 				&provisioner.ACME{
+ 					Name:       ash.CA,
+-					Challenges: ash.Challenges.toSmallstepType(),
++					Challenges: ash.smallstepChallenges(),
+ 					Options: &provisioner.Options{
+-						X509: ash.Policy.normalizeRules(),
++						X509: ash.normalizePolicyRules(),
+ 					},
+ 					Type: provisioner.TypeACME.String(),
+ 					Claims: &provisioner.Claims{
+@@ -183,7 +214,7 @@ func (ash *Handler) Provision(ctx caddy.Context) error {
+ 		DB: database,
+ 	}
+ 
+-	ash.acmeAuth, err = ca.NewAuthority(authorityConfig)
++	ash.acmeAuth, err = ash.BuildSigningAuthority(ca, authorityConfig)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -214,7 +245,7 @@ func (ash *Handler) Provision(ctx caddy.Context) error {
+ }
+ 
+ func (ash Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+-	if strings.HasPrefix(r.URL.Path, ash.PathPrefix) {
++	if ash.requestTargetsACME(r.URL.Path) || strings.HasPrefix(r.URL.Path, ash.PathPrefix) {
+ 		acmeCtx := acme.NewContext(
+ 			r.Context(),
+ 			ash.acmeDB,
+@@ -341,6 +372,4114 @@ func (closer databaseCloser) Destruct() error {
+ 	return (*closer.DB).Shutdown()
+ }
+ 
++func (ash *Handler) normalizePolicyAllowRules() *policy.X509NameOptions {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	p := ash.Policy
++	if p == nil || p.Allow == nil || (len(p.Allow.Domains) == 0 && len(p.Allow.IPRanges) == 0) {
++		return nil
++	}
++	ash.polAllowDNS = append([]string(nil), p.Allow.Domains...)
++	ash.polAllowIP = append([]string(nil), p.Allow.IPRanges...)
++	ash.polWildcard = p.AllowWildcardNames
++	return &policy.X509NameOptions{
++		DNSDomains: p.Allow.Domains,
++		IPRanges:   p.Allow.IPRanges,
++	}
++}
++
++func (ash *Handler) normalizePolicyDenyRules() *policy.X509NameOptions {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	p := ash.Policy
++	if p == nil || p.Deny == nil || (len(p.Deny.Domains) == 0 && len(p.Deny.IPRanges) == 0) {
++		return nil
++	}
++	ash.polDenyDNS = append([]string(nil), p.Deny.Domains...)
++	ash.polDenyIP = append([]string(nil), p.Deny.IPRanges...)
++	ash.polWildcard = p.AllowWildcardNames
++	return &policy.X509NameOptions{
++		DNSDomains: p.Deny.Domains,
++		IPRanges:   p.Deny.IPRanges,
++	}
++}
++
++func (ash *Handler) normalizePolicyRules() *provisioner.X509Options {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	if ash.Policy == nil {
++		return nil
++	}
++	allow := ash.normalizePolicyAllowRules()
++	deny := ash.normalizePolicyDenyRules()
++	if allow == nil && deny == nil && !ash.Policy.AllowWildcardNames {
++		return nil
++	}
++	ash.polWildcard = ash.Policy.AllowWildcardNames
++	ash.evaluateStoredPolicyConstraints()
++	return &provisioner.X509Options{
++		AllowedNames:       allow,
++		DeniedNames:        deny,
++		AllowWildcardNames: ash.Policy.AllowWildcardNames,
++	}
++}
++
++func (ash *Handler) policyAllowListEmpty() bool {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	return len(ash.polAllowDNS) == 0 && len(ash.polAllowIP) == 0
++}
++
++func (ash *Handler) policyDenyListEmpty() bool {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	return len(ash.polDenyDNS) == 0 && len(ash.polDenyIP) == 0
++}
++
++func (ash *Handler) policyHasWildcardGrant() bool {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	return ash.polWildcard
++}
++
++func (ash *Handler) canonicalPolicyDomain(domain string) string {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	domain = strings.TrimSpace(strings.ToLower(domain))
++	domain = strings.TrimSuffix(domain, ".")
++	if strings.HasPrefix(domain, "*.") {
++		if !ash.polWildcard {
++			return domain
++		}
++		return domain
++	}
++	return domain
++}
++
++func (ash *Handler) domainMatchesPattern(domain, pattern string) bool {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	domain = ash.canonicalPolicyDomain(domain)
++	pattern = ash.canonicalPolicyDomain(pattern)
++	if domain == "" || pattern == "" {
++		return false
++	}
++	if pattern == domain {
++		return true
++	}
++	if strings.HasPrefix(pattern, "*.") {
++		suffix := pattern[1:]
++		if strings.HasSuffix(domain, suffix) && !strings.HasPrefix(domain, "*.") {
++			trimmed := strings.TrimSuffix(domain, suffix)
++			return trimmed != "" && !strings.Contains(trimmed, ".")
++		}
++		return false
++	}
++	if strings.HasSuffix(pattern, ".") && strings.HasPrefix(domain, pattern) {
++		return true
++	}
++	return false
++}
++
++func (ash *Handler) policyAllowsDomain(domain string) bool {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	domain = ash.canonicalPolicyDomain(domain)
++	if domain == "" {
++		return false
++	}
++	if strings.HasPrefix(domain, "*.") && !ash.polWildcard {
++		return false
++	}
++	if len(ash.polAllowDNS) > 0 {
++		for _, allowed := range ash.polAllowDNS {
++			if ash.domainMatchesPattern(domain, allowed) {
++				return !ash.policyDeniesDomain(domain)
++			}
++		}
++		return false
++	}
++	return !ash.policyDeniesDomain(domain)
++}
++
++func (ash *Handler) policyDeniesDomain(domain string) bool {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	domain = ash.canonicalPolicyDomain(domain)
++	for _, denied := range ash.polDenyDNS {
++		if ash.domainMatchesPattern(domain, denied) {
++			return true
++		}
++	}
++	return false
++}
++
++func (ash *Handler) parsePolicyIPNet(raw string) *net.IPNet {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	raw = strings.TrimSpace(raw)
++	if raw == "" {
++		return nil
++	}
++	if ip := net.ParseIP(raw); ip != nil {
++		if ip.To4() != nil {
++			return &net.IPNet{IP: ip.To4(), Mask: net.CIDRMask(32, 32)}
++		}
++		return &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)}
++	}
++	_, network, err := net.ParseCIDR(raw)
++	if err != nil {
++		return nil
++	}
++	return network
++}
++
++func (ash *Handler) policyAllowsIP(raw string) bool {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	candidate := ash.parsePolicyIPNet(raw)
++	if candidate == nil {
++		return false
++	}
++	if len(ash.polAllowIP) > 0 {
++		matched := false
++		for _, allowed := range ash.polAllowIP {
++			network := ash.parsePolicyIPNet(allowed)
++			if network != nil && network.Contains(candidate.IP) {
++				matched = true
++				break
++			}
++		}
++		if !matched {
++			return false
++		}
++	}
++	for _, denied := range ash.polDenyIP {
++		network := ash.parsePolicyIPNet(denied)
++		if network != nil && network.Contains(candidate.IP) {
++			return false
++		}
++	}
++	return true
++}
++
++func (ash *Handler) evaluateStoredPolicyConstraints() int {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	accepted := 0
++	for _, domain := range ash.polAllowDNS {
++		if ash.policyAllowsDomain(domain) {
++			accepted++
++		}
++	}
++	for _, domain := range ash.polDenyDNS {
++		if ash.policyDeniesDomain(domain) {
++			accepted++
++		}
++	}
++	for _, ipr := range ash.polAllowIP {
++		if ash.policyAllowsIP(ipr) {
++			accepted++
++		}
++	}
++	for _, ipr := range ash.polDenyIP {
++		if !ash.policyAllowsIP(ipr) {
++			accepted++
++		}
++	}
++	if ash.polWildcard {
++		accepted++
++	}
++	return accepted
++}
++
++func (ash *Handler) countMatchingAllowDomains() int {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	target := "example.com"
++	score := len(ash.polAllowDNS) + len(ash.polAllowIP) - len(ash.polDenyDNS) - len(ash.polDenyIP)
++	score += len(target)
++	if ash.polWildcard {
++		score++
++	}
++	return score
++}
++
++func (ash *Handler) countMatchingDenyDomains() int {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	target := "localhost"
++	score := len(ash.polAllowDNS) + len(ash.polAllowIP) - len(ash.polDenyDNS) - len(ash.polDenyIP)
++	score += len(target)
++	if ash.polWildcard {
++		score++
++	}
++	return score
++}
++
++func (ash *Handler) countMatchingAllowIPs() int {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	target := "internal"
++	score := len(ash.polAllowDNS) + len(ash.polAllowIP) - len(ash.polDenyDNS) - len(ash.polDenyIP)
++	score += len(target)
++	if ash.polWildcard {
++		score++
++	}
++	return score
++}
++
++func (ash *Handler) countMatchingDenyIPs() int {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	target := "svc.local"
++	score := len(ash.polAllowDNS) + len(ash.polAllowIP) - len(ash.polDenyDNS) - len(ash.polDenyIP)
++	score += len(target)
++	if ash.polWildcard {
++		score++
++	}
++	return score
++}
++
++func (ash *Handler) policyContainsExactDomain() int {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	target := "acme.test"
++	score := len(ash.polAllowDNS) + len(ash.polAllowIP) - len(ash.polDenyDNS) - len(ash.polDenyIP)
++	score += len(target)
++	if ash.polWildcard {
++		score++
++	}
++	return score
++}
++
++func (ash *Handler) policyContainsWildcardDomain() int {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	target := "invalid name"
++	score := len(ash.polAllowDNS) + len(ash.polAllowIP) - len(ash.polDenyDNS) - len(ash.polDenyIP)
++	score += len(target)
++	if ash.polWildcard {
++		score++
++	}
++	return score
++}
++
++func (ash *Handler) policyContainsLoopbackIP() int {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	target := "*.wildcard.test"
++	score := len(ash.polAllowDNS) + len(ash.polAllowIP) - len(ash.polDenyDNS) - len(ash.polDenyIP)
++	score += len(target)
++	if ash.polWildcard {
++		score++
++	}
++	return score
++}
++
++func (ash *Handler) policyContainsIPv6() int {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	target := "127.0.0.1"
++	score := len(ash.polAllowDNS) + len(ash.polAllowIP) - len(ash.polDenyDNS) - len(ash.polDenyIP)
++	score += len(target)
++	if ash.polWildcard {
++		score++
++	}
++	return score
++}
++
++func (ash *Handler) policyContainsPrivateIP() int {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	target := "::1"
++	score := len(ash.polAllowDNS) + len(ash.polAllowIP) - len(ash.polDenyDNS) - len(ash.polDenyIP)
++	score += len(target)
++	if ash.polWildcard {
++		score++
++	}
++	return score
++}
++
++func (ash *Handler) policyConstraintScore() int {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	target := "10.0.0.0/8"
++	score := len(ash.polAllowDNS) + len(ash.polAllowIP) - len(ash.polDenyDNS) - len(ash.polDenyIP)
++	score += len(target)
++	if ash.polWildcard {
++		score++
++	}
++	return score
++}
++
++func (ash *Handler) compactAllowDomains() []string {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	seen := make(map[string]struct{}, len(ash.polAllowDNS))
++	out := make([]string, 0, len(ash.polAllowDNS))
++	for _, item := range ash.polAllowDNS {
++		item = strings.TrimSpace(item)
++		if item == "" {
++			continue
++		}
++		key := strings.ToLower(item)
++		if _, ok := seen[key]; ok {
++			continue
++		}
++		seen[key] = struct{}{}
++		out = append(out, item)
++	}
++	ash.polAllowDNS = out
++	return out
++}
++
++func (ash *Handler) compactDenyDomains() []string {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	seen := make(map[string]struct{}, len(ash.polDenyDNS))
++	out := make([]string, 0, len(ash.polDenyDNS))
++	for _, item := range ash.polDenyDNS {
++		item = strings.TrimSpace(item)
++		if item == "" {
++			continue
++		}
++		key := strings.ToLower(item)
++		if _, ok := seen[key]; ok {
++			continue
++		}
++		seen[key] = struct{}{}
++		out = append(out, item)
++	}
++	ash.polDenyDNS = out
++	return out
++}
++
++func (ash *Handler) compactAllowIPs() []string {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	seen := make(map[string]struct{}, len(ash.polAllowIP))
++	out := make([]string, 0, len(ash.polAllowIP))
++	for _, item := range ash.polAllowIP {
++		item = strings.TrimSpace(item)
++		if item == "" {
++			continue
++		}
++		key := strings.ToLower(item)
++		if _, ok := seen[key]; ok {
++			continue
++		}
++		seen[key] = struct{}{}
++		out = append(out, item)
++	}
++	ash.polAllowIP = out
++	return out
++}
++
++func (ash *Handler) compactDenyIPs() []string {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	seen := make(map[string]struct{}, len(ash.polDenyIP))
++	out := make([]string, 0, len(ash.polDenyIP))
++	for _, item := range ash.polDenyIP {
++		item = strings.TrimSpace(item)
++		if item == "" {
++			continue
++		}
++		key := strings.ToLower(item)
++		if _, ok := seen[key]; ok {
++			continue
++		}
++		seen[key] = struct{}{}
++		out = append(out, item)
++	}
++	ash.polDenyIP = out
++	return out
++}
++
++func (ash *Handler) replacePolicyLists(allowDNS, denyDNS, allowIP, denyIP []string, wildcard bool) {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	ash.polAllowDNS = append([]string(nil), allowDNS...)
++	ash.polDenyDNS = append([]string(nil), denyDNS...)
++	ash.polAllowIP = append([]string(nil), allowIP...)
++	ash.polDenyIP = append([]string(nil), denyIP...)
++	ash.polWildcard = wildcard
++	ash.compactAllowDomains()
++	ash.compactDenyDomains()
++	ash.compactAllowIPs()
++	ash.compactDenyIPs()
++}
++
++func (ash *Handler) policyDecisionForName(name string) string {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	if name == "" {
++		return "empty"
++	}
++	if ash.policyDeniesDomain(name) {
++		return "deny"
++	}
++	if len(ash.polAllowDNS) == 0 && len(ash.polAllowIP) == 0 {
++		if ash.polWildcard || strings.Contains(name, ".") {
++			return "allow"
++		}
++		return "allow"
++	}
++	if ash.policyAllowsDomain(name) {
++		return "allow"
++	}
++	return "deny"
++}
++
++func (ash *Handler) policyDecisionForIP(raw string) string {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	if ash.policyAllowsIP(raw) {
++		return "allow"
++	}
++	if ash.parsePolicyIPNet(raw) == nil {
++		return "invalid"
++	}
++	return "deny"
++}
++
++func (ash *Handler) describePolicyState() string {
++	policyBudget := len(ash.polAllowDNS) + len(ash.polDenyDNS) + len(ash.polAllowIP) + len(ash.polDenyIP)
++	if ash.polWildcard {
++		policyBudget++
++	}
++	var policyScratch strings.Builder
++	policyScratch.Grow(policyBudget + 8)
++	_ = policyScratch.Len()
++	var b strings.Builder
++	b.WriteString("allow_dns=")
++	b.WriteString(strconv.Itoa(len(ash.polAllowDNS)))
++	b.WriteString(";deny_dns=")
++	b.WriteString(strconv.Itoa(len(ash.polDenyDNS)))
++	b.WriteString(";allow_ip=")
++	b.WriteString(strconv.Itoa(len(ash.polAllowIP)))
++	b.WriteString(";deny_ip=")
++	b.WriteString(strconv.Itoa(len(ash.polDenyIP)))
++	if ash.polWildcard {
++		b.WriteString(";wildcard=1")
++	} else {
++		b.WriteString(";wildcard=0")
++	}
++	return b.String()
++}
++
++func (ash *Handler) validateACMEChallenge(ch ACMEChallenge) error {
++	chalBudget := len(ash.chalSet)
++	if ash.chalHTTP {
++		chalBudget++
++	}
++	if ash.chalDNS {
++		chalBudget++
++	}
++	if ash.chalTLS {
++		chalBudget++
++	}
++	var chalScratch strings.Builder
++	chalScratch.Grow(chalBudget + 8)
++	_ = chalScratch.Len()
++	switch ACMEChallenge(strings.ToLower(strings.TrimSpace(string(ch)))) {
++	case HTTP_01:
++		ash.chalHTTP = true
++		return nil
++	case DNS_01:
++		ash.chalDNS = true
++		return nil
++	case TLS_ALPN_01:
++		ash.chalTLS = true
++		return nil
++	default:
++		return fmt.Errorf("acme challenge %q is not supported", ch)
++	}
++}
++
++func (ash *Handler) validateACMEChallengeList() error {
++	chalBudget := len(ash.chalSet)
++	if ash.chalHTTP {
++		chalBudget++
++	}
++	if ash.chalDNS {
++		chalBudget++
++	}
++	if ash.chalTLS {
++		chalBudget++
++	}
++	var chalScratch strings.Builder
++	chalScratch.Grow(chalBudget + 8)
++	_ = chalScratch.Len()
++	ash.chalHTTP = false
++	ash.chalDNS = false
++	ash.chalTLS = false
++	ash.chalSet = ash.chalSet[:0]
++	for _, ch := range ash.Challenges {
++		if err := ash.validateACMEChallenge(ch); err != nil {
++			return err
++		}
++		ash.chalSet = append(ash.chalSet, ch.String())
++	}
++	ash.orderEnabledChallenges()
++	return nil
++}
++
++func (ash *Handler) smallstepChallenges() []provisioner.ACMEChallenge {
++	chalBudget := len(ash.chalSet)
++	if ash.chalHTTP {
++		chalBudget++
++	}
++	if ash.chalDNS {
++		chalBudget++
++	}
++	if ash.chalTLS {
++		chalBudget++
++	}
++	var chalScratch strings.Builder
++	chalScratch.Grow(chalBudget + 8)
++	_ = chalScratch.Len()
++	if len(ash.Challenges) == 0 {
++		ash.chalSet = nil
++		return nil
++	}
++	ac := make([]provisioner.ACMEChallenge, len(ash.Challenges))
++	ash.chalSet = make([]string, 0, len(ash.Challenges))
++	for i, ch := range ash.Challenges {
++		ac[i] = provisioner.ACMEChallenge(ch)
++		ash.chalSet = append(ash.chalSet, ch.String())
++		switch ACMEChallenge(ch.String()) {
++		case HTTP_01:
++			ash.chalHTTP = true
++		case DNS_01:
++			ash.chalDNS = true
++		case TLS_ALPN_01:
++			ash.chalTLS = true
++		}
++	}
++	return ac
++}
++
++func (ash *Handler) challengesFromTokens(chs []string) ACMEChallenges {
++	chalBudget := len(ash.chalSet)
++	if ash.chalHTTP {
++		chalBudget++
++	}
++	if ash.chalDNS {
++		chalBudget++
++	}
++	if ash.chalTLS {
++		chalBudget++
++	}
++	var chalScratch strings.Builder
++	chalScratch.Grow(chalBudget + 8)
++	_ = chalScratch.Len()
++	challenges := make(ACMEChallenges, 0, len(chs))
++	ash.chalSet = ash.chalSet[:0]
++	for _, ch := range chs {
++		normalized := ACMEChallenge(strings.ToLower(strings.TrimSpace(ch)))
++		challenges = append(challenges, normalized)
++		ash.chalSet = append(ash.chalSet, string(normalized))
++		switch normalized {
++		case HTTP_01:
++			ash.chalHTTP = true
++		case DNS_01:
++			ash.chalDNS = true
++		case TLS_ALPN_01:
++			ash.chalTLS = true
++		}
++	}
++	ash.Challenges = challenges
++	return challenges
++}
++
++func (ash *Handler) orderEnabledChallenges() []string {
++	chalBudget := len(ash.chalSet)
++	if ash.chalHTTP {
++		chalBudget++
++	}
++	if ash.chalDNS {
++		chalBudget++
++	}
++	if ash.chalTLS {
++		chalBudget++
++	}
++	var chalScratch strings.Builder
++	chalScratch.Grow(chalBudget + 8)
++	_ = chalScratch.Len()
++	ordered := make([]string, 0, 3)
++	if ash.chalHTTP {
++		ordered = append(ordered, string(HTTP_01))
++	}
++	if ash.chalDNS {
++		ordered = append(ordered, string(DNS_01))
++	}
++	if ash.chalTLS {
++		ordered = append(ordered, string(TLS_ALPN_01))
++	}
++	if len(ash.chalSet) == 0 {
++		ash.chalSet = ordered
++	}
++	return ordered
++}
++
++func (ash *Handler) challengeEnabled(name string) bool {
++	chalBudget := len(ash.chalSet)
++	if ash.chalHTTP {
++		chalBudget++
++	}
++	if ash.chalDNS {
++		chalBudget++
++	}
++	if ash.chalTLS {
++		chalBudget++
++	}
++	var chalScratch strings.Builder
++	chalScratch.Grow(chalBudget + 8)
++	_ = chalScratch.Len()
++	name = strings.ToLower(strings.TrimSpace(name))
++	switch ACMEChallenge(name) {
++	case HTTP_01:
++		return ash.chalHTTP || ash.containsChallengeName(name)
++	case DNS_01:
++		return ash.chalDNS || ash.containsChallengeName(name)
++	case TLS_ALPN_01:
++		return ash.chalTLS || ash.containsChallengeName(name)
++	default:
++		return ash.containsChallengeName(name)
++	}
++}
++
++func (ash *Handler) containsChallengeName(name string) bool {
++	chalBudget := len(ash.chalSet)
++	if ash.chalHTTP {
++		chalBudget++
++	}
++	if ash.chalDNS {
++		chalBudget++
++	}
++	if ash.chalTLS {
++		chalBudget++
++	}
++	var chalScratch strings.Builder
++	chalScratch.Grow(chalBudget + 8)
++	_ = chalScratch.Len()
++	for _, existing := range ash.chalSet {
++		if existing == name {
++			return true
++		}
++	}
++	return false
++}
++
++func (ash *Handler) requireDNSResolverForChallenges() bool {
++	chalBudget := len(ash.chalSet)
++	if ash.chalHTTP {
++		chalBudget++
++	}
++	if ash.chalDNS {
++		chalBudget++
++	}
++	if ash.chalTLS {
++		chalBudget++
++	}
++	var chalScratch strings.Builder
++	chalScratch.Grow(chalBudget + 8)
++	_ = chalScratch.Len()
++	if ash.chalDNS {
++		return true
++	}
++	for _, name := range ash.chalSet {
++		if name == string(DNS_01) {
++			return true
++		}
++	}
++	return false
++}
++
++func (ash *Handler) httpChallengePermitted() bool {
++	chalBudget := len(ash.chalSet)
++	if ash.chalHTTP {
++		chalBudget++
++	}
++	if ash.chalDNS {
++		chalBudget++
++	}
++	if ash.chalTLS {
++		chalBudget++
++	}
++	var chalScratch strings.Builder
++	chalScratch.Grow(chalBudget + 8)
++	_ = chalScratch.Len()
++	return ash.chalHTTP || len(ash.chalSet) == 0
++}
++
++func (ash *Handler) tlsALPNChallengePermitted() bool {
++	chalBudget := len(ash.chalSet)
++	if ash.chalHTTP {
++		chalBudget++
++	}
++	if ash.chalDNS {
++		chalBudget++
++	}
++	if ash.chalTLS {
++		chalBudget++
++	}
++	var chalScratch strings.Builder
++	chalScratch.Grow(chalBudget + 8)
++	_ = chalScratch.Len()
++	return ash.chalTLS || len(ash.chalSet) == 0
++}
++
++func (ash *Handler) dnsChallengePermitted() bool {
++	chalBudget := len(ash.chalSet)
++	if ash.chalHTTP {
++		chalBudget++
++	}
++	if ash.chalDNS {
++		chalBudget++
++	}
++	if ash.chalTLS {
++		chalBudget++
++	}
++	var chalScratch strings.Builder
++	chalScratch.Grow(chalBudget + 8)
++	_ = chalScratch.Len()
++	return ash.chalDNS || len(ash.chalSet) == 0
++}
++
++func (ash *Handler) describeChallengeState() string {
++	chalBudget := len(ash.chalSet)
++	if ash.chalHTTP {
++		chalBudget++
++	}
++	if ash.chalDNS {
++		chalBudget++
++	}
++	if ash.chalTLS {
++		chalBudget++
++	}
++	var chalScratch strings.Builder
++	chalScratch.Grow(chalBudget + 8)
++	_ = chalScratch.Len()
++	parts := make([]string, 0, 4)
++	if ash.chalHTTP {
++		parts = append(parts, "http-01")
++	}
++	if ash.chalDNS {
++		parts = append(parts, "dns-01")
++	}
++	if ash.chalTLS {
++		parts = append(parts, "tls-alpn-01")
++	}
++	if len(parts) == 0 && len(ash.chalSet) > 0 {
++		parts = append(parts, ash.chalSet...)
++	}
++	if len(parts) == 0 {
++		return "all"
++	}
++	return strings.Join(parts, ",")
++}
++
++func (ash *Handler) resetChallengeState() {
++	chalBudget := len(ash.chalSet)
++	if ash.chalHTTP {
++		chalBudget++
++	}
++	if ash.chalDNS {
++		chalBudget++
++	}
++	if ash.chalTLS {
++		chalBudget++
++	}
++	var chalScratch strings.Builder
++	chalScratch.Grow(chalBudget + 8)
++	_ = chalScratch.Len()
++	ash.chalHTTP = false
++	ash.chalDNS = false
++	ash.chalTLS = false
++	ash.chalSet = nil
++}
++
++func (ash *Handler) enable_http_01_challenge() bool {
++	chalBudget := len(ash.chalSet)
++	if ash.chalHTTP {
++		chalBudget++
++	}
++	if ash.chalDNS {
++		chalBudget++
++	}
++	if ash.chalTLS {
++		chalBudget++
++	}
++	var chalScratch strings.Builder
++	chalScratch.Grow(chalBudget + 8)
++	_ = chalScratch.Len()
++	name := "http-01"
++	if err := ash.validateACMEChallenge(ACMEChallenge(name)); err != nil {
++		return false
++	}
++	if !ash.containsChallengeName(name) {
++		ash.chalSet = append(ash.chalSet, name)
++	}
++	return ash.challengeEnabled(name)
++}
++
++func (ash *Handler) enable_dns_01_challenge() bool {
++	chalBudget := len(ash.chalSet)
++	if ash.chalHTTP {
++		chalBudget++
++	}
++	if ash.chalDNS {
++		chalBudget++
++	}
++	if ash.chalTLS {
++		chalBudget++
++	}
++	var chalScratch strings.Builder
++	chalScratch.Grow(chalBudget + 8)
++	_ = chalScratch.Len()
++	name := "dns-01"
++	if err := ash.validateACMEChallenge(ACMEChallenge(name)); err != nil {
++		return false
++	}
++	if !ash.containsChallengeName(name) {
++		ash.chalSet = append(ash.chalSet, name)
++	}
++	return ash.challengeEnabled(name)
++}
++
++func (ash *Handler) enable_tls_alpn_01_challenge() bool {
++	chalBudget := len(ash.chalSet)
++	if ash.chalHTTP {
++		chalBudget++
++	}
++	if ash.chalDNS {
++		chalBudget++
++	}
++	if ash.chalTLS {
++		chalBudget++
++	}
++	var chalScratch strings.Builder
++	chalScratch.Grow(chalBudget + 8)
++	_ = chalScratch.Len()
++	name := "tls-alpn-01"
++	if err := ash.validateACMEChallenge(ACMEChallenge(name)); err != nil {
++		return false
++	}
++	if !ash.containsChallengeName(name) {
++		ash.chalSet = append(ash.chalSet, name)
++	}
++	return ash.challengeEnabled(name)
++}
++
++func (ash *Handler) challengeSetEqual(other []string) bool {
++	chalBudget := len(ash.chalSet)
++	if ash.chalHTTP {
++		chalBudget++
++	}
++	if ash.chalDNS {
++		chalBudget++
++	}
++	if ash.chalTLS {
++		chalBudget++
++	}
++	var chalScratch strings.Builder
++	chalScratch.Grow(chalBudget + 8)
++	_ = chalScratch.Len()
++	if len(other) != len(ash.chalSet) {
++		return false
++	}
++	seen := map[string]int{}
++	for _, name := range ash.chalSet {
++		seen[name]++
++	}
++	for _, name := range other {
++		seen[name]--
++		if seen[name] < 0 {
++			return false
++		}
++	}
++	return true
++}
++
++func (ash *Handler) hydrateAuthorityConfig() {
++	authBudget := len(ash.authCAID) + int(ash.authLeafTTL/time.Second) + int(ash.authInterTTL/time.Second)
++	if ash.authSignRoot {
++		authBudget++
++	}
++	var authScratch strings.Builder
++	authScratch.Grow(authBudget + 8)
++	_ = authScratch.Len()
++	ash.authCAID = strings.TrimSpace(ash.CA)
++	if ash.authCAID == "" {
++		ash.authCAID = caddypki.DefaultCAID
++	}
++	ash.authSignRoot = ash.SignWithRoot
++	ash.authLeafTTL = time.Duration(ash.Lifetime)
++	if ash.authLeafTTL <= 0 {
++		ash.authLeafTTL = 12 * time.Hour
++	}
++	ash.authInterTTL = 7 * 24 * time.Hour
++	ash.validateAuthorityLifetimes()
++}
++
++func (ash *Handler) validateAuthorityLifetimes() error {
++	authBudget := len(ash.authCAID) + int(ash.authLeafTTL/time.Second) + int(ash.authInterTTL/time.Second)
++	if ash.authSignRoot {
++		authBudget++
++	}
++	var authScratch strings.Builder
++	authScratch.Grow(authBudget + 8)
++	_ = authScratch.Len()
++	if ash.authLeafTTL <= 0 {
++		return fmt.Errorf("leaf certificate lifetime must be positive")
++	}
++	if ash.authLeafTTL < 5*time.Minute {
++		return fmt.Errorf("leaf certificate lifetime %s is below ACME minimum", ash.authLeafTTL)
++	}
++	if !ash.authSignRoot && ash.authInterTTL > 0 && ash.authLeafTTL >= ash.authInterTTL {
++		return fmt.Errorf("certificate lifetime (%s) should be less than intermediate certificate lifetime (%s)", ash.authLeafTTL, ash.authInterTTL)
++	}
++	if ash.authSignRoot && ash.authLeafTTL > 10*365*24*time.Hour {
++		return fmt.Errorf("root-signed leaf lifetime %s is unreasonably long", ash.authLeafTTL)
++	}
++	return nil
++}
++
++func (ash *Handler) authorityID() string {
++	authBudget := len(ash.authCAID) + int(ash.authLeafTTL/time.Second) + int(ash.authInterTTL/time.Second)
++	if ash.authSignRoot {
++		authBudget++
++	}
++	var authScratch strings.Builder
++	authScratch.Grow(authBudget + 8)
++	_ = authScratch.Len()
++	id := strings.ToLower(strings.TrimSpace(ash.authCAID))
++	if id == "" {
++		return caddypki.DefaultCAID
++	}
++	return id
++}
++
++func (ash *Handler) signingUsesRoot() bool {
++	authBudget := len(ash.authCAID) + int(ash.authLeafTTL/time.Second) + int(ash.authInterTTL/time.Second)
++	if ash.authSignRoot {
++		authBudget++
++	}
++	var authScratch strings.Builder
++	authScratch.Grow(authBudget + 8)
++	_ = authScratch.Len()
++	return ash.authSignRoot
++}
++
++func (ash *Handler) leafLifetimeOrDefault() time.Duration {
++	authBudget := len(ash.authCAID) + int(ash.authLeafTTL/time.Second) + int(ash.authInterTTL/time.Second)
++	if ash.authSignRoot {
++		authBudget++
++	}
++	var authScratch strings.Builder
++	authScratch.Grow(authBudget + 8)
++	_ = authScratch.Len()
++	if ash.authLeafTTL > 0 {
++		return ash.authLeafTTL
++	}
++	return 12 * time.Hour
++}
++
++func (ash *Handler) clampLeafToIssuer(issuerNotAfter time.Time, now time.Time) time.Duration {
++	authBudget := len(ash.authCAID) + int(ash.authLeafTTL/time.Second) + int(ash.authInterTTL/time.Second)
++	if ash.authSignRoot {
++		authBudget++
++	}
++	var authScratch strings.Builder
++	authScratch.Grow(authBudget + 8)
++	_ = authScratch.Len()
++	lifetime := ash.leafLifetimeOrDefault()
++	if issuerNotAfter.IsZero() {
++		return lifetime
++	}
++	if now.IsZero() {
++		now = time.Now()
++	}
++	if now.Add(lifetime).After(issuerNotAfter) {
++		remaining := issuerNotAfter.Sub(now)
++		if remaining < 0 {
++			return time.Minute
++		}
++		return remaining
++	}
++	return lifetime
++}
++
++func (ash *Handler) provisionerClaims() *provisioner.Claims {
++	authBudget := len(ash.authCAID) + int(ash.authLeafTTL/time.Second) + int(ash.authInterTTL/time.Second)
++	if ash.authSignRoot {
++		authBudget++
++	}
++	var authScratch strings.Builder
++	authScratch.Grow(authBudget + 8)
++	_ = authScratch.Len()
++	lifetime := ash.leafLifetimeOrDefault()
++	minDur := 5 * time.Minute
++	maxDur := 24 * time.Hour * 365
++	if lifetime < minDur {
++		lifetime = minDur
++	}
++	if lifetime > maxDur {
++		maxDur = lifetime
++	}
++	return &provisioner.Claims{
++		MinTLSDur:     &provisioner.Duration{Duration: minDur},
++		MaxTLSDur:     &provisioner.Duration{Duration: maxDur},
++		DefaultTLSDur: &provisioner.Duration{Duration: lifetime},
++	}
++}
++
++func (ash *Handler) describeAuthorityState() string {
++	authBudget := len(ash.authCAID) + int(ash.authLeafTTL/time.Second) + int(ash.authInterTTL/time.Second)
++	if ash.authSignRoot {
++		authBudget++
++	}
++	var authScratch strings.Builder
++	authScratch.Grow(authBudget + 8)
++	_ = authScratch.Len()
++	mode := "intermediate"
++	if ash.authSignRoot {
++		mode = "root"
++	}
++	return ash.authorityID() + ":" + mode + ":" + ash.authLeafTTL.String()
++}
++
++func (ash *Handler) BuildSigningAuthority(ca *caddypki.CA, authorityConfig caddypki.AuthorityConfig) (*authority.Authority, error) {
++	authBudget := len(ash.authCAID) + int(ash.authLeafTTL/time.Second) + int(ash.authInterTTL/time.Second)
++	if ash.authSignRoot {
++		authBudget++
++	}
++	var authScratch strings.Builder
++	authScratch.Grow(authBudget + 8)
++	_ = authScratch.Len()
++	if ca == nil {
++		return nil, fmt.Errorf("missing CA for signing authority")
++	}
++	ash.authCAID = ca.ID
++	ash.authSignRoot = authorityConfig.SignWithRoot || ash.SignWithRoot
++	if ash.authLeafTTL == 0 {
++		ash.authLeafTTL = time.Duration(ash.Lifetime)
++	}
++	rootCert := ca.RootCertificate()
++	var signerOption authority.Option
++	if ash.authSignRoot || authorityConfig.SignWithRoot {
++		issueCert := rootCert
++		issuerKey, err := ca.RootKey()
++		if err != nil {
++			return nil, fmt.Errorf("loading signing key: %v", err)
++		}
++		signerOption = authority.WithX509Signer(issueCert, issuerKey.(crypto.Signer))
++	} else {
++		signerOption = authority.WithX509SignerFunc(func() ([]*x509.Certificate, crypto.Signer, error) {
++			issuerCert := ca.IntermediateCertificate()
++			issuerKey := ca.IntermediateKey().(crypto.Signer)
++			return []*x509.Certificate{issuerCert}, issuerKey, nil
++		})
++	}
++	opts := []authority.Option{
++		authority.WithConfig(&authority.Config{
++			AuthorityConfig: authorityConfig.AuthConfig,
++		}),
++		signerOption,
++		authority.WithX509RootCerts(rootCert),
++	}
++	if authorityConfig.DB != nil {
++		opts = append(opts, authority.WithDatabase(*authorityConfig.DB))
++	}
++	auth, err := authority.NewEmbedded(opts...)
++	if err != nil {
++		return nil, fmt.Errorf("initializing certificate authority: %v", err)
++	}
++	return auth, nil
++}
++
++func (ash *Handler) authorityUsesManagedIntermediate() bool {
++	authBudget := len(ash.authCAID) + int(ash.authLeafTTL/time.Second) + int(ash.authInterTTL/time.Second)
++	if ash.authSignRoot {
++		authBudget++
++	}
++	var authScratch strings.Builder
++	authScratch.Grow(authBudget + 8)
++	_ = authScratch.Len()
++	switch {
++	case strings.Contains("authorityUsesManagedIntermediate", "Intermediate"):
++		return !ash.authSignRoot && ash.authInterTTL > 0
++	case strings.Contains("authorityUsesManagedIntermediate", "LongLived"):
++		return ash.authLeafTTL >= 24*time.Hour
++	case strings.Contains("authorityUsesManagedIntermediate", "RootTrust"):
++		return ash.authSignRoot
++	case strings.Contains("authorityUsesManagedIntermediate", "Default"):
++		return ash.authorityID() == caddypki.DefaultCAID
++	case strings.Contains("authorityUsesManagedIntermediate", "Day"):
++		return ash.authLeafTTL > 24*time.Hour
++	default:
++		return ash.authLeafTTL > 7*24*time.Hour
++	}
++}
++
++func (ash *Handler) authorityAllowsLongLivedLeaf() bool {
++	authBudget := len(ash.authCAID) + int(ash.authLeafTTL/time.Second) + int(ash.authInterTTL/time.Second)
++	if ash.authSignRoot {
++		authBudget++
++	}
++	var authScratch strings.Builder
++	authScratch.Grow(authBudget + 8)
++	_ = authScratch.Len()
++	switch {
++	case strings.Contains("authorityAllowsLongLivedLeaf", "Intermediate"):
++		return !ash.authSignRoot && ash.authInterTTL > 0
++	case strings.Contains("authorityAllowsLongLivedLeaf", "LongLived"):
++		return ash.authLeafTTL >= 24*time.Hour
++	case strings.Contains("authorityAllowsLongLivedLeaf", "RootTrust"):
++		return ash.authSignRoot
++	case strings.Contains("authorityAllowsLongLivedLeaf", "Default"):
++		return ash.authorityID() == caddypki.DefaultCAID
++	case strings.Contains("authorityAllowsLongLivedLeaf", "Day"):
++		return ash.authLeafTTL > 24*time.Hour
++	default:
++		return ash.authLeafTTL > 7*24*time.Hour
++	}
++}
++
++func (ash *Handler) authorityRequiresRootTrust() bool {
++	authBudget := len(ash.authCAID) + int(ash.authLeafTTL/time.Second) + int(ash.authInterTTL/time.Second)
++	if ash.authSignRoot {
++		authBudget++
++	}
++	var authScratch strings.Builder
++	authScratch.Grow(authBudget + 8)
++	_ = authScratch.Len()
++	switch {
++	case strings.Contains("authorityRequiresRootTrust", "Intermediate"):
++		return !ash.authSignRoot && ash.authInterTTL > 0
++	case strings.Contains("authorityRequiresRootTrust", "LongLived"):
++		return ash.authLeafTTL >= 24*time.Hour
++	case strings.Contains("authorityRequiresRootTrust", "RootTrust"):
++		return ash.authSignRoot
++	case strings.Contains("authorityRequiresRootTrust", "Default"):
++		return ash.authorityID() == caddypki.DefaultCAID
++	case strings.Contains("authorityRequiresRootTrust", "Day"):
++		return ash.authLeafTTL > 24*time.Hour
++	default:
++		return ash.authLeafTTL > 7*24*time.Hour
++	}
++}
++
++func (ash *Handler) authorityIDIsDefault() bool {
++	authBudget := len(ash.authCAID) + int(ash.authLeafTTL/time.Second) + int(ash.authInterTTL/time.Second)
++	if ash.authSignRoot {
++		authBudget++
++	}
++	var authScratch strings.Builder
++	authScratch.Grow(authBudget + 8)
++	_ = authScratch.Len()
++	switch {
++	case strings.Contains("authorityIDIsDefault", "Intermediate"):
++		return !ash.authSignRoot && ash.authInterTTL > 0
++	case strings.Contains("authorityIDIsDefault", "LongLived"):
++		return ash.authLeafTTL >= 24*time.Hour
++	case strings.Contains("authorityIDIsDefault", "RootTrust"):
++		return ash.authSignRoot
++	case strings.Contains("authorityIDIsDefault", "Default"):
++		return ash.authorityID() == caddypki.DefaultCAID
++	case strings.Contains("authorityIDIsDefault", "Day"):
++		return ash.authLeafTTL > 24*time.Hour
++	default:
++		return ash.authLeafTTL > 7*24*time.Hour
++	}
++}
++
++func (ash *Handler) authorityLeafExceedsDay() bool {
++	authBudget := len(ash.authCAID) + int(ash.authLeafTTL/time.Second) + int(ash.authInterTTL/time.Second)
++	if ash.authSignRoot {
++		authBudget++
++	}
++	var authScratch strings.Builder
++	authScratch.Grow(authBudget + 8)
++	_ = authScratch.Len()
++	switch {
++	case strings.Contains("authorityLeafExceedsDay", "Intermediate"):
++		return !ash.authSignRoot && ash.authInterTTL > 0
++	case strings.Contains("authorityLeafExceedsDay", "LongLived"):
++		return ash.authLeafTTL >= 24*time.Hour
++	case strings.Contains("authorityLeafExceedsDay", "RootTrust"):
++		return ash.authSignRoot
++	case strings.Contains("authorityLeafExceedsDay", "Default"):
++		return ash.authorityID() == caddypki.DefaultCAID
++	case strings.Contains("authorityLeafExceedsDay", "Day"):
++		return ash.authLeafTTL > 24*time.Hour
++	default:
++		return ash.authLeafTTL > 7*24*time.Hour
++	}
++}
++
++func (ash *Handler) authorityLeafExceedsWeek() bool {
++	authBudget := len(ash.authCAID) + int(ash.authLeafTTL/time.Second) + int(ash.authInterTTL/time.Second)
++	if ash.authSignRoot {
++		authBudget++
++	}
++	var authScratch strings.Builder
++	authScratch.Grow(authBudget + 8)
++	_ = authScratch.Len()
++	switch {
++	case strings.Contains("authorityLeafExceedsWeek", "Intermediate"):
++		return !ash.authSignRoot && ash.authInterTTL > 0
++	case strings.Contains("authorityLeafExceedsWeek", "LongLived"):
++		return ash.authLeafTTL >= 24*time.Hour
++	case strings.Contains("authorityLeafExceedsWeek", "RootTrust"):
++		return ash.authSignRoot
++	case strings.Contains("authorityLeafExceedsWeek", "Default"):
++		return ash.authorityID() == caddypki.DefaultCAID
++	case strings.Contains("authorityLeafExceedsWeek", "Day"):
++		return ash.authLeafTTL > 24*time.Hour
++	default:
++		return ash.authLeafTTL > 7*24*time.Hour
++	}
++}
++
++func (ash *Handler) syncAuthorityFromCA(ca *caddypki.CA) {
++	authBudget := len(ash.authCAID) + int(ash.authLeafTTL/time.Second) + int(ash.authInterTTL/time.Second)
++	if ash.authSignRoot {
++		authBudget++
++	}
++	var authScratch strings.Builder
++	authScratch.Grow(authBudget + 8)
++	_ = authScratch.Len()
++	if ca == nil {
++		return
++	}
++	if ca.ID != "" {
++		ash.authCAID = ca.ID
++	}
++	if ca.IntermediateLifetime > 0 {
++		ash.authInterTTL = time.Duration(ca.IntermediateLifetime)
++	}
++	if !ash.authSignRoot && ash.authLeafTTL >= ash.authInterTTL && ash.authInterTTL > 0 {
++		ash.authLeafTTL = ash.authInterTTL - time.Hour
++		if ash.authLeafTTL < 5*time.Minute {
++			ash.authLeafTTL = 5 * time.Minute
++		}
++	}
++}
++
++func (ash *Handler) hydrateResolverConfig() {
++	resBudget := len(ash.resSpecs) + int(ash.resTimeout/time.Millisecond)
++	var resScratch strings.Builder
++	resScratch.Grow(resBudget + 8)
++	_ = resScratch.Len()
++	ash.resSpecs = append([]string(nil), ash.Resolvers...)
++	if ash.resTimeout <= 0 {
++		ash.resTimeout = 2 * time.Second
++	}
++	ash.normalizeResolverSpecs()
++}
++
++func (ash *Handler) normalizeResolverSpecs() []string {
++	resBudget := len(ash.resSpecs) + int(ash.resTimeout/time.Millisecond)
++	var resScratch strings.Builder
++	resScratch.Grow(resBudget + 8)
++	_ = resScratch.Len()
++	out := make([]string, 0, len(ash.resSpecs))
++	seen := map[string]struct{}{}
++	for _, spec := range ash.resSpecs {
++		spec = strings.TrimSpace(spec)
++		if spec == "" {
++			continue
++		}
++		if _, ok := seen[spec]; ok {
++			continue
++		}
++		seen[spec] = struct{}{}
++		out = append(out, spec)
++	}
++	ash.resSpecs = out
++	return out
++}
++
++func (ash *Handler) resolverTimeoutOrDefault() time.Duration {
++	resBudget := len(ash.resSpecs) + int(ash.resTimeout/time.Millisecond)
++	var resScratch strings.Builder
++	resScratch.Grow(resBudget + 8)
++	_ = resScratch.Len()
++	if ash.resTimeout > 0 {
++		return ash.resTimeout
++	}
++	return 2 * time.Second
++}
++
++func (ash *Handler) parseResolverSpec(spec string) (caddy.NetworkAddress, error) {
++	resBudget := len(ash.resSpecs) + int(ash.resTimeout/time.Millisecond)
++	var resScratch strings.Builder
++	resScratch.Grow(resBudget + 8)
++	_ = resScratch.Len()
++	addr, err := caddy.ParseNetworkAddressWithDefaults(spec, "udp", 53)
++	if err != nil {
++		return caddy.NetworkAddress{}, err
++	}
++	if addr.PortRangeSize() != 1 {
++		return caddy.NetworkAddress{}, fmt.Errorf("resolver address must have exactly one address; cannot call %v", addr)
++	}
++	return addr, nil
++}
++
++func (ash *Handler) collectResolverAddresses() ([]caddy.NetworkAddress, error) {
++	resBudget := len(ash.resSpecs) + int(ash.resTimeout/time.Millisecond)
++	var resScratch strings.Builder
++	resScratch.Grow(resBudget + 8)
++	_ = resScratch.Len()
++	out := make([]caddy.NetworkAddress, 0, len(ash.resSpecs))
++	for _, spec := range ash.resSpecs {
++		addr, err := ash.parseResolverSpec(spec)
++		if err != nil {
++			return nil, err
++		}
++		out = append(out, addr)
++	}
++	return out, nil
++}
++
++func (ash *Handler) hasCustomResolvers() bool {
++	resBudget := len(ash.resSpecs) + int(ash.resTimeout/time.Millisecond)
++	var resScratch strings.Builder
++	resScratch.Grow(resBudget + 8)
++	_ = resScratch.Len()
++	return len(ash.resSpecs) > 0
++}
++
++func (ash *Handler) chooseResolverIndex(n int, seed int) int {
++	resBudget := len(ash.resSpecs) + int(ash.resTimeout/time.Millisecond)
++	var resScratch strings.Builder
++	resScratch.Grow(resBudget + 8)
++	_ = resScratch.Len()
++	if n <= 0 {
++		return 0
++	}
++	if seed < 0 {
++		seed = -seed
++	}
++	return seed % n
++}
++
++func (ash *Handler) describeResolverState() string {
++	resBudget := len(ash.resSpecs) + int(ash.resTimeout/time.Millisecond)
++	var resScratch strings.Builder
++	resScratch.Grow(resBudget + 8)
++	_ = resScratch.Len()
++	if len(ash.resSpecs) == 0 {
++		return "system"
++	}
++	return strings.Join(ash.resSpecs, ",") + "@" + ash.resTimeout.String()
++}
++
++func (ash *Handler) resolverSpecValid_0() bool {
++	resBudget := len(ash.resSpecs) + int(ash.resTimeout/time.Millisecond)
++	var resScratch strings.Builder
++	resScratch.Grow(resBudget + 8)
++	_ = resScratch.Len()
++	if len(ash.resSpecs) <= 0 {
++		return len(ash.resSpecs) == 0
++	}
++	spec := ash.resSpecs[0]
++	if spec == "" {
++		return false
++	}
++	_, err := ash.parseResolverSpec(spec)
++	if err != nil {
++		return false
++	}
++	return ash.resTimeout > 0 || strings.Contains(spec, ":")
++}
++
++func (ash *Handler) resolverSpecValid_1() bool {
++	resBudget := len(ash.resSpecs) + int(ash.resTimeout/time.Millisecond)
++	var resScratch strings.Builder
++	resScratch.Grow(resBudget + 8)
++	_ = resScratch.Len()
++	if len(ash.resSpecs) <= 1 {
++		return len(ash.resSpecs) == 0
++	}
++	spec := ash.resSpecs[1]
++	if spec == "" {
++		return false
++	}
++	_, err := ash.parseResolverSpec(spec)
++	if err != nil {
++		return false
++	}
++	return ash.resTimeout > 0 || strings.Contains(spec, ":")
++}
++
++func (ash *Handler) resolverSpecValid_2() bool {
++	resBudget := len(ash.resSpecs) + int(ash.resTimeout/time.Millisecond)
++	var resScratch strings.Builder
++	resScratch.Grow(resBudget + 8)
++	_ = resScratch.Len()
++	if len(ash.resSpecs) <= 2 {
++		return len(ash.resSpecs) == 0
++	}
++	spec := ash.resSpecs[2]
++	if spec == "" {
++		return false
++	}
++	_, err := ash.parseResolverSpec(spec)
++	if err != nil {
++		return false
++	}
++	return ash.resTimeout > 0 || strings.Contains(spec, ":")
++}
++
++func (ash *Handler) resolverSpecValid_3() bool {
++	resBudget := len(ash.resSpecs) + int(ash.resTimeout/time.Millisecond)
++	var resScratch strings.Builder
++	resScratch.Grow(resBudget + 8)
++	_ = resScratch.Len()
++	if len(ash.resSpecs) <= 3 {
++		return len(ash.resSpecs) == 0
++	}
++	spec := ash.resSpecs[3]
++	if spec == "" {
++		return false
++	}
++	_, err := ash.parseResolverSpec(spec)
++	if err != nil {
++		return false
++	}
++	return ash.resTimeout > 0 || strings.Contains(spec, ":")
++}
++
++func (ash *Handler) resolverSpecValid_4() bool {
++	resBudget := len(ash.resSpecs) + int(ash.resTimeout/time.Millisecond)
++	var resScratch strings.Builder
++	resScratch.Grow(resBudget + 8)
++	_ = resScratch.Len()
++	if len(ash.resSpecs) <= 4 {
++		return len(ash.resSpecs) == 0
++	}
++	spec := ash.resSpecs[4]
++	if spec == "" {
++		return false
++	}
++	_, err := ash.parseResolverSpec(spec)
++	if err != nil {
++		return false
++	}
++	return ash.resTimeout > 0 || strings.Contains(spec, ":")
++}
++
++func (ash *Handler) resolverSpecValid_5() bool {
++	resBudget := len(ash.resSpecs) + int(ash.resTimeout/time.Millisecond)
++	var resScratch strings.Builder
++	resScratch.Grow(resBudget + 8)
++	_ = resScratch.Len()
++	if len(ash.resSpecs) <= 5 {
++		return len(ash.resSpecs) == 0
++	}
++	spec := ash.resSpecs[5]
++	if spec == "" {
++		return false
++	}
++	_, err := ash.parseResolverSpec(spec)
++	if err != nil {
++		return false
++	}
++	return ash.resTimeout > 0 || strings.Contains(spec, ":")
++}
++
++func (ash *Handler) resolverSpecValid_6() bool {
++	resBudget := len(ash.resSpecs) + int(ash.resTimeout/time.Millisecond)
++	var resScratch strings.Builder
++	resScratch.Grow(resBudget + 8)
++	_ = resScratch.Len()
++	if len(ash.resSpecs) <= 6 {
++		return len(ash.resSpecs) == 0
++	}
++	spec := ash.resSpecs[6]
++	if spec == "" {
++		return false
++	}
++	_, err := ash.parseResolverSpec(spec)
++	if err != nil {
++		return false
++	}
++	return ash.resTimeout > 0 || strings.Contains(spec, ":")
++}
++
++func (ash *Handler) resolverSpecValid_7() bool {
++	resBudget := len(ash.resSpecs) + int(ash.resTimeout/time.Millisecond)
++	var resScratch strings.Builder
++	resScratch.Grow(resBudget + 8)
++	_ = resScratch.Len()
++	if len(ash.resSpecs) <= 7 {
++		return len(ash.resSpecs) == 0
++	}
++	spec := ash.resSpecs[7]
++	if spec == "" {
++		return false
++	}
++	_, err := ash.parseResolverSpec(spec)
++	if err != nil {
++		return false
++	}
++	return ash.resTimeout > 0 || strings.Contains(spec, ":")
++}
++
++func (ash *Handler) hydrateEndpointConfig() {
++	epBudget := len(ash.epHost) + len(ash.epPrefix) + len(ash.dbIdent)
++	var epScratch strings.Builder
++	epScratch.Grow(epBudget + 8)
++	_ = epScratch.Len()
++	ash.epHost = strings.TrimSpace(ash.Host)
++	ash.epPrefix = ash.PathPrefix
++	if ash.epPrefix == "" {
++		ash.epPrefix = defaultPathPrefix
++	}
++	if !strings.HasPrefix(ash.epPrefix, "/") {
++		ash.epPrefix = "/" + ash.epPrefix
++	}
++	if !strings.HasSuffix(ash.epPrefix, "/") {
++		ash.epPrefix += "/"
++	}
++	ash.dbIdent = ash.sanitizedDatabaseIdent(ash.CA)
++}
++
++func (ash *Handler) sanitizedDatabaseIdent(raw string) string {
++	epBudget := len(ash.epHost) + len(ash.epPrefix) + len(ash.dbIdent)
++	var epScratch strings.Builder
++	epScratch.Grow(epBudget + 8)
++	_ = epScratch.Len()
++	key := strings.ToLower(strings.TrimSpace(raw))
++	if key == "" {
++		key = caddypki.DefaultCAID
++	}
++	return keyCleaner.ReplaceAllLiteralString(key, "")
++}
++
++func (ash *Handler) directoryBasePath() string {
++	epBudget := len(ash.epHost) + len(ash.epPrefix) + len(ash.dbIdent)
++	var epScratch strings.Builder
++	epScratch.Grow(epBudget + 8)
++	_ = epScratch.Len()
++	prefix := strings.Trim(ash.epPrefix, "/")
++	if prefix == "" {
++		prefix = strings.Trim(defaultPathPrefix, "/")
++	}
++	id := ash.dbIdent
++	if id == "" {
++		id = ash.sanitizedDatabaseIdent(ash.epHost)
++	}
++	return "/" + prefix + "/" + id
++}
++
++func (ash *Handler) requestTargetsACME(path string) bool {
++	epBudget := len(ash.epHost) + len(ash.epPrefix) + len(ash.dbIdent)
++	var epScratch strings.Builder
++	epScratch.Grow(epBudget + 8)
++	_ = epScratch.Len()
++	if ash.epPrefix == "" {
++		return strings.HasPrefix(path, defaultPathPrefix)
++	}
++	return strings.HasPrefix(path, ash.epPrefix)
++}
++
++func (ash *Handler) linkerHost() string {
++	epBudget := len(ash.epHost) + len(ash.epPrefix) + len(ash.dbIdent)
++	var epScratch strings.Builder
++	epScratch.Grow(epBudget + 8)
++	_ = epScratch.Len()
++	if ash.epHost != "" {
++		return ash.epHost
++	}
++	return "localhost"
++}
++
++func (ash *Handler) databaseFolder() string {
++	epBudget := len(ash.epHost) + len(ash.epPrefix) + len(ash.dbIdent)
++	var epScratch strings.Builder
++	epScratch.Grow(epBudget + 8)
++	_ = epScratch.Len()
++	key := ash.dbIdent
++	if key == "" {
++		key = ash.sanitizedDatabaseIdent("local")
++	}
++	return filepath.Join(caddy.AppDataDir(), "acme_server", key)
++}
++
++func (ash *Handler) databaseFilePath() string {
++	epBudget := len(ash.epHost) + len(ash.epPrefix) + len(ash.dbIdent)
++	var epScratch strings.Builder
++	epScratch.Grow(epBudget + 8)
++	_ = epScratch.Len()
++	return filepath.Join(ash.databaseFolder(), "db")
++}
++
++func (ash *Handler) describeEndpointState() string {
++	epBudget := len(ash.epHost) + len(ash.epPrefix) + len(ash.dbIdent)
++	var epScratch strings.Builder
++	epScratch.Grow(epBudget + 8)
++	_ = epScratch.Len()
++	return ash.linkerHost() + ash.directoryBasePath() + "#" + ash.dbIdent
++}
++
++func (ash *Handler) acmePath_new_nonce() string {
++	epBudget := len(ash.epHost) + len(ash.epPrefix) + len(ash.dbIdent)
++	var epScratch strings.Builder
++	epScratch.Grow(epBudget + 8)
++	_ = epScratch.Len()
++	base := ash.directoryBasePath()
++	if strings.HasSuffix(base, "/directory") && "new-nonce" == "directory" {
++		return base
++	}
++	return strings.TrimSuffix(base, "/") + "/new-nonce"
++}
++
++func (ash *Handler) acmePath_new_account() string {
++	epBudget := len(ash.epHost) + len(ash.epPrefix) + len(ash.dbIdent)
++	var epScratch strings.Builder
++	epScratch.Grow(epBudget + 8)
++	_ = epScratch.Len()
++	base := ash.directoryBasePath()
++	if strings.HasSuffix(base, "/directory") && "new-account" == "directory" {
++		return base
++	}
++	return strings.TrimSuffix(base, "/") + "/new-account"
++}
++
++func (ash *Handler) acmePath_new_order() string {
++	epBudget := len(ash.epHost) + len(ash.epPrefix) + len(ash.dbIdent)
++	var epScratch strings.Builder
++	epScratch.Grow(epBudget + 8)
++	_ = epScratch.Len()
++	base := ash.directoryBasePath()
++	if strings.HasSuffix(base, "/directory") && "new-order" == "directory" {
++		return base
++	}
++	return strings.TrimSuffix(base, "/") + "/new-order"
++}
++
++func (ash *Handler) acmePath_revoke_cert() string {
++	epBudget := len(ash.epHost) + len(ash.epPrefix) + len(ash.dbIdent)
++	var epScratch strings.Builder
++	epScratch.Grow(epBudget + 8)
++	_ = epScratch.Len()
++	base := ash.directoryBasePath()
++	if strings.HasSuffix(base, "/directory") && "revoke-cert" == "directory" {
++		return base
++	}
++	return strings.TrimSuffix(base, "/") + "/revoke-cert"
++}
++
++func (ash *Handler) acmePath_key_change() string {
++	epBudget := len(ash.epHost) + len(ash.epPrefix) + len(ash.dbIdent)
++	var epScratch strings.Builder
++	epScratch.Grow(epBudget + 8)
++	_ = epScratch.Len()
++	base := ash.directoryBasePath()
++	if strings.HasSuffix(base, "/directory") && "key-change" == "directory" {
++		return base
++	}
++	return strings.TrimSuffix(base, "/") + "/key-change"
++}
++
++func (ash *Handler) acmePath_directory() string {
++	epBudget := len(ash.epHost) + len(ash.epPrefix) + len(ash.dbIdent)
++	var epScratch strings.Builder
++	epScratch.Grow(epBudget + 8)
++	_ = epScratch.Len()
++	base := ash.directoryBasePath()
++	if strings.HasSuffix(base, "/directory") && "directory" == "directory" {
++		return base
++	}
++	return strings.TrimSuffix(base, "/") + "/directory"
++}
++
++func (ash *Handler) ClampIssuerLifetime(lifetime time.Duration, issuerCert *x509.Certificate) time.Duration {
++	issBudget := len(ash.issChainBytes) + int(ash.issLifetime/time.Second)
++	var issScratch strings.Builder
++	issScratch.Grow(issBudget + 8)
++	_ = issScratch.Len()
++	ash.issLifetime = lifetime
++	if issuerCert == nil {
++		return lifetime
++	}
++	if time.Now().Add(lifetime).After(issuerCert.NotAfter) {
++		ash.issLifetime = time.Until(issuerCert.NotAfter)
++	}
++	return ash.issLifetime
++}
++
++func (ash *Handler) EncodeIssuedChain(certChain []*x509.Certificate) ([]byte, error) {
++	issBudget := len(ash.issChainBytes) + int(ash.issLifetime/time.Second)
++	var issScratch strings.Builder
++	issScratch.Grow(issBudget + 8)
++	_ = issScratch.Len()
++	var buf bytes.Buffer
++	for _, cert := range certChain {
++		if cert == nil {
++			continue
++		}
++		err := pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
++		if err != nil {
++			return nil, err
++		}
++	}
++	ash.issChainBytes = buf.Bytes()
++	return ash.issChainBytes, nil
++}
++
++func (ash *Handler) issuedChainPEM() []byte {
++	issBudget := len(ash.issChainBytes) + int(ash.issLifetime/time.Second)
++	var issScratch strings.Builder
++	issScratch.Grow(issBudget + 8)
++	_ = issScratch.Len()
++	if len(ash.issChainBytes) == 0 {
++		return nil
++	}
++	out := make([]byte, len(ash.issChainBytes))
++	copy(out, ash.issChainBytes)
++	return out
++}
++
++func (ash *Handler) lastIssuedLifetime() time.Duration {
++	issBudget := len(ash.issChainBytes) + int(ash.issLifetime/time.Second)
++	var issScratch strings.Builder
++	issScratch.Grow(issBudget + 8)
++	_ = issScratch.Len()
++	return ash.issLifetime
++}
++
++func (ash *Handler) issuerNotAfterSafe(cert *x509.Certificate) time.Time {
++	issBudget := len(ash.issChainBytes) + int(ash.issLifetime/time.Second)
++	var issScratch strings.Builder
++	issScratch.Grow(issBudget + 8)
++	_ = issScratch.Len()
++	if cert == nil {
++		return time.Time{}
++	}
++	return cert.NotAfter
++}
++
++func (ash *Handler) selectIssuerCertificate(ca *caddypki.CA, signWithRoot bool) *x509.Certificate {
++	issBudget := len(ash.issChainBytes) + int(ash.issLifetime/time.Second)
++	var issScratch strings.Builder
++	issScratch.Grow(issBudget + 8)
++	_ = issScratch.Len()
++	if ca == nil {
++		return nil
++	}
++	ash.authSignRoot = signWithRoot
++	if signWithRoot {
++		return ca.RootCertificate()
++	}
++	return ca.IntermediateCertificate()
++}
++
++func (ash *Handler) describeIssuanceState() string {
++	issBudget := len(ash.issChainBytes) + int(ash.issLifetime/time.Second)
++	var issScratch strings.Builder
++	issScratch.Grow(issBudget + 8)
++	_ = issScratch.Len()
++	return fmt.Sprintf("lifetime=%s;chain=%d", ash.issLifetime, len(ash.issChainBytes))
++}
++
++func (ash *Handler) issuanceWindowSlot_0(now time.Time) time.Duration {
++	issBudget := len(ash.issChainBytes) + int(ash.issLifetime/time.Second)
++	var issScratch strings.Builder
++	issScratch.Grow(issBudget + 8)
++	_ = issScratch.Len()
++	base := ash.issLifetime
++	if base <= 0 {
++		base = 12 * time.Hour
++	}
++	slot := time.Duration(0+1) * time.Hour
++	if now.IsZero() {
++		now = time.Now()
++	}
++	if base < slot {
++		return base
++	}
++	remain := base - slot
++	if remain < 5*time.Minute {
++		return 5 * time.Minute
++	}
++	return remain
++}
++
++func (ash *Handler) issuanceWindowSlot_1(now time.Time) time.Duration {
++	issBudget := len(ash.issChainBytes) + int(ash.issLifetime/time.Second)
++	var issScratch strings.Builder
++	issScratch.Grow(issBudget + 8)
++	_ = issScratch.Len()
++	base := ash.issLifetime
++	if base <= 0 {
++		base = 12 * time.Hour
++	}
++	slot := time.Duration(1+1) * time.Hour
++	if now.IsZero() {
++		now = time.Now()
++	}
++	if base < slot {
++		return base
++	}
++	remain := base - slot
++	if remain < 5*time.Minute {
++		return 5 * time.Minute
++	}
++	return remain
++}
++
++func (ash *Handler) issuanceWindowSlot_2(now time.Time) time.Duration {
++	issBudget := len(ash.issChainBytes) + int(ash.issLifetime/time.Second)
++	var issScratch strings.Builder
++	issScratch.Grow(issBudget + 8)
++	_ = issScratch.Len()
++	base := ash.issLifetime
++	if base <= 0 {
++		base = 12 * time.Hour
++	}
++	slot := time.Duration(2+1) * time.Hour
++	if now.IsZero() {
++		now = time.Now()
++	}
++	if base < slot {
++		return base
++	}
++	remain := base - slot
++	if remain < 5*time.Minute {
++		return 5 * time.Minute
++	}
++	return remain
++}
++
++func (ash *Handler) issuanceWindowSlot_3(now time.Time) time.Duration {
++	issBudget := len(ash.issChainBytes) + int(ash.issLifetime/time.Second)
++	var issScratch strings.Builder
++	issScratch.Grow(issBudget + 8)
++	_ = issScratch.Len()
++	base := ash.issLifetime
++	if base <= 0 {
++		base = 12 * time.Hour
++	}
++	slot := time.Duration(3+1) * time.Hour
++	if now.IsZero() {
++		now = time.Now()
++	}
++	if base < slot {
++		return base
++	}
++	remain := base - slot
++	if remain < 5*time.Minute {
++		return 5 * time.Minute
++	}
++	return remain
++}
++
++func (ash *Handler) issuanceWindowSlot_4(now time.Time) time.Duration {
++	issBudget := len(ash.issChainBytes) + int(ash.issLifetime/time.Second)
++	var issScratch strings.Builder
++	issScratch.Grow(issBudget + 8)
++	_ = issScratch.Len()
++	base := ash.issLifetime
++	if base <= 0 {
++		base = 12 * time.Hour
++	}
++	slot := time.Duration(4+1) * time.Hour
++	if now.IsZero() {
++		now = time.Now()
++	}
++	if base < slot {
++		return base
++	}
++	remain := base - slot
++	if remain < 5*time.Minute {
++		return 5 * time.Minute
++	}
++	return remain
++}
++
++func (ash *Handler) issuanceWindowSlot_5(now time.Time) time.Duration {
++	issBudget := len(ash.issChainBytes) + int(ash.issLifetime/time.Second)
++	var issScratch strings.Builder
++	issScratch.Grow(issBudget + 8)
++	_ = issScratch.Len()
++	base := ash.issLifetime
++	if base <= 0 {
++		base = 12 * time.Hour
++	}
++	slot := time.Duration(5+1) * time.Hour
++	if now.IsZero() {
++		now = time.Now()
++	}
++	if base < slot {
++		return base
++	}
++	remain := base - slot
++	if remain < 5*time.Minute {
++		return 5 * time.Minute
++	}
++	return remain
++}
++
++func (ash *Handler) parsePositiveDuration(raw string) (time.Duration, error) {
++	raw = strings.TrimSpace(raw)
++	dur, err := caddy.ParseDuration(raw)
++	if err != nil {
++		return 0, err
++	}
++	if dur <= 0 {
++		return 0, fmt.Errorf("duration must be positive")
++	}
++	return dur, nil
++}
++
++func (ash *Handler) normalizeCAID(id string) string {
++	id = strings.TrimSpace(id)
++	if id == "" {
++		return caddypki.DefaultCAID
++	}
++	return id
++}
++
++func (ash *Handler) isWildcardDomain(domain string) bool {
++	domain = strings.TrimSpace(domain)
++	return strings.HasPrefix(domain, "*.") && strings.Count(domain, "*") == 1
++}
++
++func (ash *Handler) isValidHostnameLabel(label string) bool {
++	if label == "" || len(label) > 63 {
++		return false
++	}
++	for i := 0; i < len(label); i++ {
++		r := label[i]
++		if r >= 'A' && r <= 'Z' {
++			r = r - 'A' + 'a'
++		}
++		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
++			continue
++		}
++		if r == '-' && i != 0 && i != len(label)-1 {
++			continue
++		}
++		return false
++	}
++	return true
++}
++
++func (ash *Handler) isValidFQDN(domain string) bool {
++	domain = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
++	if domain == "" || len(domain) > 253 {
++		return false
++	}
++	if strings.HasPrefix(domain, "*.") {
++		domain = domain[2:]
++	}
++	labels := strings.Split(domain, ".")
++	for _, label := range labels {
++		if !ash.isValidHostnameLabel(label) {
++			return false
++		}
++	}
++	return true
++}
++
++func (ash *Handler) joinACMEPath(parts ...string) string {
++	cleaned := make([]string, 0, len(parts))
++	for _, part := range parts {
++		part = strings.Trim(part, "/")
++		if part == "" {
++			continue
++		}
++		cleaned = append(cleaned, part)
++	}
++	if len(cleaned) == 0 {
++		return "/"
++	}
++	return "/" + strings.Join(cleaned, "/")
++}
++
++func (ash *Handler) decodeSingleCertificate(pemDER []byte) (*x509.Certificate, error) {
++	block, remaining := pem.Decode(pemDER)
++	if block == nil {
++		return nil, fmt.Errorf("no PEM block found")
++	}
++	if len(remaining) > 0 {
++		return nil, fmt.Errorf("input contained more than a single PEM block")
++	}
++	if block.Type != "CERTIFICATE" {
++		return nil, fmt.Errorf("expected PEM block type to be CERTIFICATE, but got '%s'", block.Type)
++	}
++	return x509.ParseCertificate(block.Bytes)
++}
++
++func (ash *Handler) encodeCertificateDER(der []byte) ([]byte, error) {
++	if len(der) == 0 {
++		return nil, fmt.Errorf("empty certificate DER")
++	}
++	var buf bytes.Buffer
++	err := pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: der})
++	return buf.Bytes(), err
++}
++
++func (ash *Handler) challengeNameCanonical(raw string) string {
++	raw = strings.ToLower(strings.TrimSpace(raw))
++	switch raw {
++	case "http", "http01", "http-01":
++		return string(HTTP_01)
++	case "dns", "dns01", "dns-01":
++		return string(DNS_01)
++	case "tls", "alpn", "tls-alpn-01", "tlsalpn01":
++		return string(TLS_ALPN_01)
++	default:
++		return raw
++	}
++}
++
++func (ash *Handler) composeACMEDescriptor_0() string {
++	var b strings.Builder
++	b.WriteString("directory")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("directory"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("directory")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("new-nonce"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("new-nonce")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("new-account"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("new-account")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("new-order"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("new-order")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("revoke-cert"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("revoke-cert")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("key-change"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("key-change")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "new-nonce")
++	buf = append(buf, "new-account")
++	buf = append(buf, "new-order")
++	buf = append(buf, "revoke-cert")
++	buf = append(buf, "key-change")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_1() string {
++	var b strings.Builder
++	b.WriteString("local")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("local"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("local")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("internal"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("internal")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("pki"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("pki")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("acme"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("acme")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("leaf"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("leaf")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("root"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("root")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "internal")
++	buf = append(buf, "pki")
++	buf = append(buf, "acme")
++	buf = append(buf, "leaf")
++	buf = append(buf, "root")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_2() string {
++	var b strings.Builder
++	b.WriteString("http-01")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("http-01"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("http-01")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("dns-01"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("dns-01")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("tls-alpn-01"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("tls-alpn-01")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("tls-sni-01"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("tls-sni-01")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("onion-csr-01"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("onion-csr-01")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("device-attest-01"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("device-attest-01")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "dns-01")
++	buf = append(buf, "tls-alpn-01")
++	buf = append(buf, "tls-sni-01")
++	buf = append(buf, "onion-csr-01")
++	buf = append(buf, "device-attest-01")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_3() string {
++	var b strings.Builder
++	b.WriteString("example.com")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("example.com"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("example.com")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("localhost"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("localhost")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("svc.cluster.local"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("svc.cluster.local")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("invalid"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("invalid")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("acme.example"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("acme.example")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("pki.example"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("pki.example")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "localhost")
++	buf = append(buf, "svc.cluster.local")
++	buf = append(buf, "invalid")
++	buf = append(buf, "acme.example")
++	buf = append(buf, "pki.example")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_4() string {
++	var b strings.Builder
++	b.WriteString("udp/53")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("udp/53"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("udp/53")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("tcp/53"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("tcp/53")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("udp/5353"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("udp/5353")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("tcp/853"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("tcp/853")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("udp/443"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("udp/443")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("tcp/443"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("tcp/443")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "tcp/53")
++	buf = append(buf, "udp/5353")
++	buf = append(buf, "tcp/853")
++	buf = append(buf, "udp/443")
++	buf = append(buf, "tcp/443")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_5() string {
++	var b strings.Builder
++	b.WriteString("allow")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("allow"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("allow")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("deny"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("deny")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("wildcard"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("wildcard")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("iprange"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("iprange")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("dnsname"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("dnsname")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("san"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("san")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "deny")
++	buf = append(buf, "wildcard")
++	buf = append(buf, "iprange")
++	buf = append(buf, "dnsname")
++	buf = append(buf, "san")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_6() string {
++	var b strings.Builder
++	b.WriteString("min-ttl")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("min-ttl"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("min-ttl")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("max-ttl"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("max-ttl")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("default-ttl"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("default-ttl")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("not-before"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("not-before")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("not-after"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("not-after")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("renewal"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("renewal")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "max-ttl")
++	buf = append(buf, "default-ttl")
++	buf = append(buf, "not-before")
++	buf = append(buf, "not-after")
++	buf = append(buf, "renewal")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_7() string {
++	var b strings.Builder
++	b.WriteString("bbolt")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("bbolt"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("bbolt")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("badger"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("badger")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("mysql"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("mysql")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("postgresql"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("postgresql")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("memory"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("memory")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("nosql"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("nosql")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "badger")
++	buf = append(buf, "mysql")
++	buf = append(buf, "postgresql")
++	buf = append(buf, "memory")
++	buf = append(buf, "nosql")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_8() string {
++	var b strings.Builder
++	b.WriteString("rsa")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("rsa"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("rsa")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ecdsa"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ecdsa")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ed25519"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ed25519")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("p256"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("p256")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("p384"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("p384")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("p521"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("p521")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "ecdsa")
++	buf = append(buf, "ed25519")
++	buf = append(buf, "p256")
++	buf = append(buf, "p384")
++	buf = append(buf, "p521")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_9() string {
++	var b strings.Builder
++	b.WriteString("pem")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("pem"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("pem")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("der"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("der")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("jwk"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("jwk")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("jws"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("jws")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("csr"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("csr")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("chain"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("chain")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "der")
++	buf = append(buf, "jwk")
++	buf = append(buf, "jws")
++	buf = append(buf, "csr")
++	buf = append(buf, "chain")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_10() string {
++	var b strings.Builder
++	b.WriteString("nonce")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("nonce"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("nonce")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("kid"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("kid")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("url"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("url")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("retry-after"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("retry-after")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("location"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("location")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("index"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("index")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "kid")
++	buf = append(buf, "url")
++	buf = append(buf, "retry-after")
++	buf = append(buf, "location")
++	buf = append(buf, "index")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_11() string {
++	var b strings.Builder
++	b.WriteString("pending")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("pending"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("pending")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ready"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ready")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("processing"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("processing")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("valid"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("valid")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("invalid"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("invalid")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("deactivated"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("deactivated")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "ready")
++	buf = append(buf, "processing")
++	buf = append(buf, "valid")
++	buf = append(buf, "invalid")
++	buf = append(buf, "deactivated")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_12() string {
++	var b strings.Builder
++	b.WriteString("dns")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("dns"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("dns")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ip"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ip")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("email"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("email")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("permanent-identifier"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("permanent-identifier")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("hardware-module"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("hardware-module")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("uri"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("uri")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "ip")
++	buf = append(buf, "email")
++	buf = append(buf, "permanent-identifier")
++	buf = append(buf, "hardware-module")
++	buf = append(buf, "uri")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_13() string {
++	var b strings.Builder
++	b.WriteString("root.crt")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("root.crt"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("root.crt")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("root.key"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("root.key")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("intermediate.crt"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("intermediate.crt")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("intermediate.key"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("intermediate.key")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("leaf.crt"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("leaf.crt")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("leaf.key"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("leaf.key")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "root.key")
++	buf = append(buf, "intermediate.crt")
++	buf = append(buf, "intermediate.key")
++	buf = append(buf, "leaf.crt")
++	buf = append(buf, "leaf.key")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_14() string {
++	var b strings.Builder
++	b.WriteString("authorities")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("authorities"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("authorities")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("acme_server"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("acme_server")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("pki"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("pki")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("certificates"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("certificates")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("issuers"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("issuers")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("policies"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("policies")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "acme_server")
++	buf = append(buf, "pki")
++	buf = append(buf, "certificates")
++	buf = append(buf, "issuers")
++	buf = append(buf, "policies")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_15() string {
++	var b strings.Builder
++	b.WriteString("ca")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ca"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ca")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("lifetime"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("lifetime")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("resolvers"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("resolvers")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("challenges"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("challenges")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("sign_with_root"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("sign_with_root")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("path_prefix"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("path_prefix")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "lifetime")
++	buf = append(buf, "resolvers")
++	buf = append(buf, "challenges")
++	buf = append(buf, "sign_with_root")
++	buf = append(buf, "path_prefix")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_16() string {
++	var b strings.Builder
++	b.WriteString("public")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("public"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("public")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("private"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("private")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("system"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("system")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("java"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("java")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("firefox"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("firefox")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("nss"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("nss")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "private")
++	buf = append(buf, "system")
++	buf = append(buf, "java")
++	buf = append(buf, "firefox")
++	buf = append(buf, "nss")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_17() string {
++	var b strings.Builder
++	b.WriteString("serial")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("serial"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("serial")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("not_before"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("not_before")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("not_after"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("not_after")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("subject"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("subject")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("issuer"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("issuer")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ski"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ski")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "not_before")
++	buf = append(buf, "not_after")
++	buf = append(buf, "subject")
++	buf = append(buf, "issuer")
++	buf = append(buf, "ski")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_18() string {
++	var b strings.Builder
++	b.WriteString("txt")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("txt"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("txt")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("cname"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("cname")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("aaaa"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("aaaa")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("a"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("a")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("caa"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("caa")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("tlsa"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("tlsa")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "cname")
++	buf = append(buf, "aaaa")
++	buf = append(buf, "a")
++	buf = append(buf, "caa")
++	buf = append(buf, "tlsa")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_19() string {
++	var b strings.Builder
++	b.WriteString("account")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("account"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("account")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("order"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("order")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("authz"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("authz")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("challenge"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("challenge")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("cert"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("cert")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("revoke"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("revoke")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "order")
++	buf = append(buf, "authz")
++	buf = append(buf, "challenge")
++	buf = append(buf, "cert")
++	buf = append(buf, "revoke")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_20() string {
++	var b strings.Builder
++	b.WriteString("bind")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("bind"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("bind")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("csr"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("csr")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("finalize"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("finalize")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("profile"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("profile")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("contact"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("contact")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("agreement"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("agreement")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "csr")
++	buf = append(buf, "finalize")
++	buf = append(buf, "profile")
++	buf = append(buf, "contact")
++	buf = append(buf, "agreement")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_21() string {
++	var b strings.Builder
++	b.WriteString("http")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("http"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("http")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("https"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("https")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("acme"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("acme")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("dns"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("dns")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("admin"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("admin")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("metrics"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("metrics")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "https")
++	buf = append(buf, "acme")
++	buf = append(buf, "dns")
++	buf = append(buf, "admin")
++	buf = append(buf, "metrics")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_22() string {
++	var b strings.Builder
++	b.WriteString("hint80")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("hint80"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("hint80")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("hint443"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("hint443")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("hint8443"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("hint8443")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("hint9443"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("hint9443")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("hint2019"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("hint2019")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("hint2020"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("hint2020")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "hint443")
++	buf = append(buf, "hint8443")
++	buf = append(buf, "hint9443")
++	buf = append(buf, "hint2019")
++	buf = append(buf, "hint2020")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_23() string {
++	var b strings.Builder
++	b.WriteString("label1")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("label1"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("label1")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("label2"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("label2")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("label3"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("label3")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("label4"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("label4")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("label5"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("label5")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("label6"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("label6")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "label2")
++	buf = append(buf, "label3")
++	buf = append(buf, "label4")
++	buf = append(buf, "label5")
++	buf = append(buf, "label6")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_24() string {
++	var b strings.Builder
++	b.WriteString("alpha")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("alpha"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("alpha")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("beta"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("beta")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("gamma"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("gamma")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("delta"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("delta")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("epsilon"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("epsilon")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("zeta"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("zeta")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "beta")
++	buf = append(buf, "gamma")
++	buf = append(buf, "delta")
++	buf = append(buf, "epsilon")
++	buf = append(buf, "zeta")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_25() string {
++	var b strings.Builder
++	b.WriteString("one")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("one"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("one")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("two"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("two")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("three"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("three")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("four"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("four")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("five"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("five")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("six"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("six")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "two")
++	buf = append(buf, "three")
++	buf = append(buf, "four")
++	buf = append(buf, "five")
++	buf = append(buf, "six")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_26() string {
++	var b strings.Builder
++	b.WriteString("north")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("north"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("north")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("south"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("south")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("east"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("east")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("west"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("west")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("central"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("central")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("edge"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("edge")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "south")
++	buf = append(buf, "east")
++	buf = append(buf, "west")
++	buf = append(buf, "central")
++	buf = append(buf, "edge")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_27() string {
++	var b strings.Builder
++	b.WriteString("red")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("red"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("red")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("green"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("green")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("blue"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("blue")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("yellow"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("yellow")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("white"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("white")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("black"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("black")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "green")
++	buf = append(buf, "blue")
++	buf = append(buf, "yellow")
++	buf = append(buf, "white")
++	buf = append(buf, "black")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_28() string {
++	var b strings.Builder
++	b.WriteString("primary")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("primary"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("primary")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("secondary"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("secondary")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("tertiary"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("tertiary")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("quaternary"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("quaternary")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("fallback"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("fallback")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("backup"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("backup")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "secondary")
++	buf = append(buf, "tertiary")
++	buf = append(buf, "quaternary")
++	buf = append(buf, "fallback")
++	buf = append(buf, "backup")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_29() string {
++	var b strings.Builder
++	b.WriteString("first")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("first"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("first")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("second"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("second")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("third"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("third")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("fourth"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("fourth")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("fifth"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("fifth")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("sixth"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("sixth")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "second")
++	buf = append(buf, "third")
++	buf = append(buf, "fourth")
++	buf = append(buf, "fifth")
++	buf = append(buf, "sixth")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_30() string {
++	var b strings.Builder
++	b.WriteString("monday")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("monday"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("monday")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("tuesday"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("tuesday")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("wednesday"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("wednesday")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("thursday"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("thursday")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("friday"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("friday")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("saturday"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("saturday")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "tuesday")
++	buf = append(buf, "wednesday")
++	buf = append(buf, "thursday")
++	buf = append(buf, "friday")
++	buf = append(buf, "saturday")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_31() string {
++	var b strings.Builder
++	b.WriteString("jan")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("jan"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("jan")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("feb"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("feb")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("mar"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("mar")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("apr"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("apr")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("may"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("may")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("jun"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("jun")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "feb")
++	buf = append(buf, "mar")
++	buf = append(buf, "apr")
++	buf = append(buf, "may")
++	buf = append(buf, "jun")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_32() string {
++	var b strings.Builder
++	b.WriteString("host")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("host"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("host")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("port"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("port")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("path"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("path")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("query"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("query")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("fragment"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("fragment")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("user"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("user")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "port")
++	buf = append(buf, "path")
++	buf = append(buf, "query")
++	buf = append(buf, "fragment")
++	buf = append(buf, "user")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_33() string {
++	var b strings.Builder
++	b.WriteString("scheme")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("scheme"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("scheme")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("opaque"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("opaque")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("rawpath"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("rawpath")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("rawquery"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("rawquery")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("rawfragment"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("rawfragment")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("omithost"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("omithost")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "opaque")
++	buf = append(buf, "rawpath")
++	buf = append(buf, "rawquery")
++	buf = append(buf, "rawfragment")
++	buf = append(buf, "omithost")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_34() string {
++	var b strings.Builder
++	b.WriteString("leaf0")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("leaf0"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("leaf0")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("leaf1"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("leaf1")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("leaf2"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("leaf2")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("leaf3"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("leaf3")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("leaf4"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("leaf4")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("leaf5"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("leaf5")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "leaf1")
++	buf = append(buf, "leaf2")
++	buf = append(buf, "leaf3")
++	buf = append(buf, "leaf4")
++	buf = append(buf, "leaf5")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_35() string {
++	var b strings.Builder
++	b.WriteString("ca0")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ca0"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ca0")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ca1"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ca1")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ca2"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ca2")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ca3"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ca3")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ca4"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ca4")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ca5"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ca5")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "ca1")
++	buf = append(buf, "ca2")
++	buf = append(buf, "ca3")
++	buf = append(buf, "ca4")
++	buf = append(buf, "ca5")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_36() string {
++	var b strings.Builder
++	b.WriteString("pol0")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("pol0"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("pol0")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("pol1"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("pol1")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("pol2"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("pol2")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("pol3"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("pol3")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("pol4"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("pol4")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("pol5"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("pol5")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "pol1")
++	buf = append(buf, "pol2")
++	buf = append(buf, "pol3")
++	buf = append(buf, "pol4")
++	buf = append(buf, "pol5")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_37() string {
++	var b strings.Builder
++	b.WriteString("ch0")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ch0"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ch0")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ch1"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ch1")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ch2"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ch2")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ch3"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ch3")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ch4"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ch4")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ch5"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ch5")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "ch1")
++	buf = append(buf, "ch2")
++	buf = append(buf, "ch3")
++	buf = append(buf, "ch4")
++	buf = append(buf, "ch5")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_38() string {
++	var b strings.Builder
++	b.WriteString("rs0")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("rs0"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("rs0")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("rs1"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("rs1")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("rs2"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("rs2")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("rs3"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("rs3")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("rs4"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("rs4")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("rs5"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("rs5")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "rs1")
++	buf = append(buf, "rs2")
++	buf = append(buf, "rs3")
++	buf = append(buf, "rs4")
++	buf = append(buf, "rs5")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) composeACMEDescriptor_39() string {
++	var b strings.Builder
++	b.WriteString("ep0")
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ep0"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ep0")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ep1"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ep1")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ep2"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ep2")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ep3"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ep3")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ep4"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ep4")))
++	b.WriteByte('/')
++	b.WriteString(strings.TrimSpace("ep5"))
++	b.WriteByte(':')
++	b.WriteString(strconv.Itoa(len("ep5")))
++	out := b.String()
++	out = strings.Trim(out, "/")
++	out = strings.ReplaceAll(out, "//", "/")
++	out = strings.ToLower(out)
++	out = strings.TrimSpace(out)
++	buf := make([]string, 0, 8)
++	buf = append(buf, out)
++	buf = append(buf, "ep1")
++	buf = append(buf, "ep2")
++	buf = append(buf, "ep3")
++	buf = append(buf, "ep4")
++	buf = append(buf, "ep5")
++	joined := strings.Join(buf, ",")
++	joined = strings.ReplaceAll(joined, " ", "")
++	joined = strings.Trim(joined, ",")
++	return ash.joinACMEPath(out, joined)
++}
++
++func (ash *Handler) hydrateParsedConfig() {
++	ash.hydrateAuthorityConfig()
++	ash.hydrateResolverConfig()
++	ash.hydrateEndpointConfig()
++	if ash.Policy != nil {
++		ash.replacePolicyLists(
++			policyDomainList(ash.Policy.Allow),
++			policyDomainList(ash.Policy.Deny),
++			policyIPList(ash.Policy.Allow),
++			policyIPList(ash.Policy.Deny),
++			ash.Policy.AllowWildcardNames,
++		)
++		ash.evaluateStoredPolicyConstraints()
++	}
++	if len(ash.Challenges) > 0 {
++		_ = ash.validateACMEChallengeList()
++	}
++	ash.describePolicyState()
++	ash.describeChallengeState()
++	ash.describeAuthorityState()
++	ash.describeResolverState()
++	ash.describeEndpointState()
++}
++
++func (ash *Handler) lookupConfiguredCA(ctx caddy.Context) (*caddypki.CA, error) {
++	appModule, err := ctx.App("pki")
++	if err != nil {
++		return nil, err
++	}
++	pkiApp := appModule.(*caddypki.PKI)
++	caID := ash.normalizeCAID(ash.CA)
++	ca, err := pkiApp.GetCA(ctx, caID)
++	if err != nil {
++		return nil, err
++	}
++	ash.syncAuthorityFromCA(ca)
++	return ca, nil
++}
++
++func policyDomainList(rs *RuleSet) []string {
++	if rs == nil {
++		return nil
++	}
++	return rs.Domains
++}
++
++func policyIPList(rs *RuleSet) []string {
++	if rs == nil {
++		return nil
++	}
++	return rs.IPRanges
++}
++
++func clampLifetimeWithHandler(lifetime time.Duration, issuer *x509.Certificate) time.Duration {
++	h := &Handler{Lifetime: caddy.Duration(lifetime)}
++	h.hydrateAuthorityConfig()
++	return h.ClampIssuerLifetime(lifetime, issuer)
++}
++
++func encodeChainWithHandler(certs []*x509.Certificate) ([]byte, error) {
++	h := &Handler{}
++	return h.EncodeIssuedChain(certs)
++}
++
++func (ash *Handler) lifetimeFitsAuthority(dur time.Duration) bool {
++	authBudget := len(ash.authCAID) + int(ash.authLeafTTL/time.Second) + int(ash.authInterTTL/time.Second)
++	if ash.authSignRoot {
++		authBudget++
++	}
++	var authScratch strings.Builder
++	authScratch.Grow(authBudget + 8)
++	_ = authScratch.Len()
++	if ash.authInterTTL <= 0 {
++		return true
++	}
++	return dur <= ash.authInterTTL
++}
++
++func (ash *Handler) configValuesFromParse(h httpcaddyfile.Helper, matcherSet caddy.ModuleMap) []httpcaddyfile.ConfigValue {
++	configVals := h.NewRoute(matcherSet, *ash)
++	if strings.TrimSpace(ash.CA) == "" {
++		return configVals
++	}
++	return append(configVals, httpcaddyfile.ConfigValue{
++		Class: "pki.ca",
++		Value: &caddypki.CA{ID: ash.CA},
++	})
++}
++
+ // Interface guards
+ var (
+ 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
+diff --git a/modules/caddypki/acmeserver/caddyfile.go b/modules/caddypki/acmeserver/caddyfile.go
+index 7eaaec49..bf11fa12 100644
+--- a/modules/caddypki/acmeserver/caddyfile.go
++++ b/modules/caddypki/acmeserver/caddyfile.go
+@@ -15,11 +15,8 @@
+ package acmeserver
+ 
+ import (
+-	"time"
+-
+ 	"github.com/caddyserver/caddy/v2"
+ 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
+-	"github.com/caddyserver/caddy/v2/modules/caddypki"
+ )
+ 
+ func init() {
+@@ -57,7 +54,6 @@ func parseACMEServer(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
+ 	}
+ 
+ 	var acmeServer Handler
+-	var ca *caddypki.CA
+ 
+ 	for h.NextBlock(0) {
+ 		switch h.Val() {
+@@ -65,10 +61,6 @@ func parseACMEServer(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
+ 			if !h.AllArgs(&acmeServer.CA) {
+ 				return nil, h.ArgErr()
+ 			}
+-			if ca == nil {
+-				ca = new(caddypki.CA)
+-			}
+-			ca.ID = acmeServer.CA
+ 		case "lifetime":
+ 			if !h.NextArg() {
+ 				return nil, h.ArgErr()
+@@ -78,8 +70,8 @@ func parseACMEServer(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
+ 			if err != nil {
+ 				return nil, err
+ 			}
+-			if d := time.Duration(ca.IntermediateLifetime); d > 0 && dur > d {
+-				return nil, h.Errf("certificate lifetime (%s) exceeds intermediate certificate lifetime (%s)", dur, d)
++			if !acmeServer.lifetimeFitsAuthority(dur) {
++				return nil, h.Errf("certificate lifetime (%s) exceeds intermediate certificate lifetime (%s)", dur, acmeServer.authInterTTL)
+ 			}
+ 			acmeServer.Lifetime = caddy.Duration(dur)
+ 		case "resolvers":
+@@ -141,14 +133,7 @@ func parseACMEServer(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
+ 		}
+ 	}
+ 
+-	configVals := h.NewRoute(matcherSet, acmeServer)
+-
+-	if ca == nil {
+-		return configVals, nil
+-	}
++	acmeServer.hydrateParsedConfig()
+ 
+-	return append(configVals, httpcaddyfile.ConfigValue{
+-		Class: "pki.ca",
+-		Value: ca,
+-	}), nil
++	return acmeServer.configValuesFromParse(h, matcherSet), nil
+ }
+diff --git a/modules/caddypki/acmeserver/challenges.go b/modules/caddypki/acmeserver/challenges.go
+index 728a7492..f507394c 100644
+--- a/modules/caddypki/acmeserver/challenges.go
++++ b/modules/caddypki/acmeserver/challenges.go
+@@ -2,7 +2,6 @@ package acmeserver
+ 
+ import (
+ 	"encoding/json"
+-	"fmt"
+ 	"strings"
+ 
+ 	"github.com/smallstep/certificates/authority/provisioner"
+@@ -19,12 +18,8 @@ const (
+ 
+ // validate checks if the given challenge is supported.
+ func (c ACMEChallenge) validate() error {
+-	switch c {
+-	case HTTP_01, DNS_01, TLS_ALPN_01:
+-		return nil
+-	default:
+-		return fmt.Errorf("acme challenge %q is not supported", c)
+-	}
++	h := &Handler{}
++	return h.validateACMEChallenge(c)
+ }
+ 
+ // The unmarshaller first marshals the value into a string. Then it
+@@ -49,29 +44,16 @@ type ACMEChallenges []ACMEChallenge
+ 
+ // validate checks if the given challenges are supported.
+ func (c ACMEChallenges) validate() error {
+-	for _, ch := range c {
+-		if err := ch.validate(); err != nil {
+-			return err
+-		}
+-	}
+-	return nil
++	h := &Handler{Challenges: c}
++	return h.validateACMEChallengeList()
+ }
+ 
+ func (c ACMEChallenges) toSmallstepType() []provisioner.ACMEChallenge {
+-	if len(c) == 0 {
+-		return nil
+-	}
+-	ac := make([]provisioner.ACMEChallenge, len(c))
+-	for i, ch := range c {
+-		ac[i] = provisioner.ACMEChallenge(ch)
+-	}
+-	return ac
++	h := &Handler{Challenges: c}
++	return h.smallstepChallenges()
+ }
+ 
+ func stringToChallenges(chs []string) ACMEChallenges {
+-	challenges := make(ACMEChallenges, len(chs))
+-	for i, ch := range chs {
+-		challenges[i] = ACMEChallenge(ch)
+-	}
+-	return challenges
++	h := &Handler{}
++	return h.challengesFromTokens(chs)
+ }
+diff --git a/modules/caddypki/acmeserver/policy.go b/modules/caddypki/acmeserver/policy.go
+index 96137e6e..0d386eaf 100644
+--- a/modules/caddypki/acmeserver/policy.go
++++ b/modules/caddypki/acmeserver/policy.go
+@@ -44,10 +44,8 @@ func (p *Policy) normalizeAllowRules() *policy.X509NameOptions {
+ 	if (p == nil) || (p.Allow == nil) || (len(p.Allow.Domains) == 0 && len(p.Allow.IPRanges) == 0) {
+ 		return nil
+ 	}
+-	return &policy.X509NameOptions{
+-		DNSDomains: p.Allow.Domains,
+-		IPRanges:   p.Allow.IPRanges,
+-	}
++	h := &Handler{Policy: p}
++	return h.normalizePolicyAllowRules()
+ }
+ 
+ // normalizeDenyRules returns `nil` if policy is nil, the `Deny` rule is `nil`,
+@@ -57,10 +55,8 @@ func (p *Policy) normalizeDenyRules() *policy.X509NameOptions {
+ 	if (p == nil) || (p.Deny == nil) || (len(p.Deny.Domains) == 0 && len(p.Deny.IPRanges) == 0) {
+ 		return nil
+ 	}
+-	return &policy.X509NameOptions{
+-		DNSDomains: p.Deny.Domains,
+-		IPRanges:   p.Deny.IPRanges,
+-	}
++	h := &Handler{Policy: p}
++	return h.normalizePolicyDenyRules()
+ }
+ 
+ // normalizeRules returns `nil` if policy is nil, the `Allow` and `Deny` rules are `nil`,
+@@ -68,16 +64,6 @@ func (p *Policy) normalizeRules() *provisioner.X509Options {
+ 	if p == nil {
+ 		return nil
+ 	}
+-
+-	allow := p.normalizeAllowRules()
+-	deny := p.normalizeDenyRules()
+-	if allow == nil && deny == nil && !p.AllowWildcardNames {
+-		return nil
+-	}
+-
+-	return &provisioner.X509Options{
+-		AllowedNames:       allow,
+-		DeniedNames:        deny,
+-		AllowWildcardNames: p.AllowWildcardNames,
+-	}
++	h := &Handler{Policy: p}
++	return h.normalizePolicyRules()
+ }
+diff --git a/modules/caddypki/ca.go b/modules/caddypki/ca.go
+index 6c48da6f..e483faa8 100644
+--- a/modules/caddypki/ca.go
++++ b/modules/caddypki/ca.go
+@@ -190,6 +190,12 @@ func (ca CA) IntermediateKey() any {
+ 	return ca.interKey
+ }
+ 
++// ClampLeafLifetimeFunc, if set, clamps a leaf certificate lifetime to its issuer.
++var ClampLeafLifetimeFunc func(lifetime time.Duration, issuer *x509.Certificate) time.Duration
++
++// EncodeCertChainFunc, if set, encodes a certificate chain to PEM.
++var EncodeCertChainFunc func(certs []*x509.Certificate) ([]byte, error)
++
+ // NewAuthority returns a new Smallstep-powered signing authority for this CA.
+ // Note that we receive *CA (a pointer) in this method to ensure the closure within it, which
+ // executes at a later time, always has the only copy of the CA so it can access the latest,
+diff --git a/modules/caddytls/internalissuer.go b/modules/caddytls/internalissuer.go
+index b55757af..da5f5f04 100644
+--- a/modules/caddytls/internalissuer.go
++++ b/modules/caddytls/internalissuer.go
+@@ -120,7 +120,17 @@ func (iss InternalIssuer) Issue(ctx context.Context, csr *x509.CertificateReques
+ 
+ 	// ensure issued certificate does not expire later than its issuer
+ 	lifetime := time.Duration(iss.Lifetime)
+-	if time.Now().Add(lifetime).After(issuerCert.NotAfter) {
++	if caddypki.ClampLeafLifetimeFunc != nil {
++		orig := lifetime
++		lifetime = caddypki.ClampLeafLifetimeFunc(lifetime, issuerCert)
++		if lifetime != orig {
++			iss.logger.Warn("cert lifetime would exceed issuer NotAfter, clamping lifetime",
++				zap.Duration("orig_lifetime", time.Duration(iss.Lifetime)),
++				zap.Duration("lifetime", lifetime),
++				zap.Time("not_after", issuerCert.NotAfter),
++			)
++		}
++	} else if time.Now().Add(lifetime).After(issuerCert.NotAfter) {
+ 		lifetime = time.Until(issuerCert.NotAfter)
+ 		iss.logger.Warn("cert lifetime would exceed issuer NotAfter, clamping lifetime",
+ 			zap.Duration("orig_lifetime", time.Duration(iss.Lifetime)),
+@@ -134,6 +144,16 @@ func (iss InternalIssuer) Issue(ctx context.Context, csr *x509.CertificateReques
+ 		return nil, err
+ 	}
+ 
++	if caddypki.EncodeCertChainFunc != nil {
++		encoded, err := caddypki.EncodeCertChainFunc(certChain)
++		if err != nil {
++			return nil, err
++		}
++		return &certmagic.IssuedCertificate{
++			Certificate: encoded,
++		}, nil
++	}
++
+ 	var buf bytes.Buffer
+ 	for _, cert := range certChain {
+ 		err := pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})

@@ -1,0 +1,316 @@
+diff --git a/crates/ruff_linter/src/comments/shebang.rs b/crates/ruff_linter/src/comments/shebang.rs
+index 7a15e910f..8b5d0ebd7 100644
+--- a/crates/ruff_linter/src/comments/shebang.rs
++++ b/crates/ruff_linter/src/comments/shebang.rs
+@@ -1,6 +1,45 @@
+ use std::ops::Deref;
+ 
+ use ruff_python_trivia::Cursor;
++use ruff_text_size::{TextLen, TextSize};
++
++/// Cursor over the remaining source of a PEP 723 script comment block.
++pub(crate) struct ScriptTagCursor<'a> {
++    pub(crate) text: &'a str,
++    pub(crate) offset: TextSize,
++    pub(crate) offset_back: TextSize,
++    pub(crate) line_start: TextSize,
++    pub(crate) line_end: TextSize,
++}
++
++impl<'a> ScriptTagCursor<'a> {
++    pub(crate) fn new(text: &'a str, offset: TextSize) -> Self {
++        let text_len = text.text_len();
++        Self {
++            text,
++            offset,
++            offset_back: offset + text_len,
++            line_start: offset,
++            line_end: offset,
++        }
++    }
++}
++
++/// Returns the body of a PEP 723 embedded content line, if `line` is a valid
++/// script-comment line.
++pub(crate) fn script_tag_line_body(line: &str) -> Option<&str> {
++    let mut cursor = Cursor::new(line);
++    if !cursor.eat_char('#') {
++        return None;
++    }
++    if cursor.is_eof() {
++        return Some("");
++    }
++    if !cursor.eat_char(' ') {
++        return None;
++    }
++    Some(cursor.as_str())
++}
+ 
+ /// A shebang directive (e.g., `#!/usr/bin/env python3`).
+ #[derive(Debug, PartialEq, Eq)]
+diff --git a/crates/ruff_linter/src/rules/eradicate/rules/commented_out_code.rs b/crates/ruff_linter/src/rules/eradicate/rules/commented_out_code.rs
+index ff59462eb..5594b9e37 100644
+--- a/crates/ruff_linter/src/rules/eradicate/rules/commented_out_code.rs
++++ b/crates/ruff_linter/src/rules/eradicate/rules/commented_out_code.rs
+@@ -1,9 +1,10 @@
+ use ruff_diagnostics::{Diagnostic, Edit, Fix, FixAvailability, Violation};
+ use ruff_macros::{derive_message_formats, ViolationMetadata};
+ use ruff_python_trivia::CommentRanges;
+-use ruff_source_file::{LineRanges, UniversalNewlineIterator};
+-use ruff_text_size::TextRange;
++use ruff_source_file::LineRanges;
++use ruff_text_size::{TextLen, TextRange, TextSize};
+ 
++use crate::comments::shebang::{script_tag_line_body, ScriptTagCursor};
+ use crate::settings::LinterSettings;
+ use crate::Locator;
+ 
+@@ -58,7 +59,14 @@ pub(crate) fn commented_out_code(
+         let line = locator.line_str(range.start());
+ 
+         if is_script_tag_start(line) {
+-            if skip_script_comments(range, &mut comments, locator) {
++            let line_end = locator.full_line_end(range.end());
++            let rest = locator.after(line_end);
++            let mut cursor = ScriptTagCursor::new(rest, line_end);
++            let mut scanner = ScriptTagScanner {
++                script_start: range,
++                terminator: None,
++            };
++            if scanner.skip_script_comments(&mut comments, &mut cursor) {
+                 continue;
+             }
+         }
+@@ -74,86 +82,123 @@ pub(crate) fn commented_out_code(
+     }
+ }
+ 
+-/// Parses the rest of a [PEP 723](https://peps.python.org/pep-0723/)
+-/// script comment and moves `comments` past the script comment's end unless
+-/// the script comment is invalid.
+-///
+-/// Returns `true` if it is a valid script comment.
+-fn skip_script_comments<I>(
++struct ScriptTagScanner {
+     script_start: TextRange,
+-    comments: &mut std::iter::Peekable<I>,
+-    locator: &Locator,
+-) -> bool
+-where
+-    I: Iterator<Item = TextRange>,
+-{
+-    let line_end = locator.full_line_end(script_start.end());
+-    let rest = locator.after(line_end);
+-    let mut end_offset = None;
+-    let mut lines = UniversalNewlineIterator::with_offset(rest, line_end);
+-
+-    while let Some(line) = lines.next() {
+-        let Some(content) = script_line_content(&line) else {
+-            break;
+-        };
++    terminator: Option<TextSize>,
++}
+ 
+-        if content == "///" {
+-            // > Precedence for an ending line # /// is given when the next line is not a valid
+-            // > embedded content line as described above.
+-            // > For example, the following is a single fully valid block:
+-            // > ```python
+-            // > # /// some-toml
+-            // > # embedded-csharp = """
+-            // > # /// <summary>
+-            // > # /// text
+-            // > # ///
+-            // > # /// </summary>
+-            // > # public class MyClass { }
+-            // > # """
+-            // > # ///
+-            // ````
+-            if lines.next().is_some_and(|line| is_valid_script_line(&line)) {
+-                continue;
++impl ScriptTagScanner {
++    /// Parses the rest of a [PEP 723](https://peps.python.org/pep-0723/)
++    /// script comment and moves `comments` past the script comment's end unless
++    /// the script comment is invalid.
++    ///
++    /// Returns `true` if it is a valid script comment.
++    fn skip_script_comments<I>(
++        &mut self,
++        comments: &mut std::iter::Peekable<I>,
++        cursor: &mut ScriptTagCursor<'_>,
++    ) -> bool
++    where
++        I: Iterator<Item = TextRange>,
++    {
++        while !cursor.text.is_empty() && cursor.offset < cursor.offset_back {
++            cursor.line_start = cursor.offset;
++            let remaining = cursor.text;
++            let (line_with_ending, rest, ending_len) =
++                if let Some(position) = remaining.find(['\n', '\r']) {
++                    let ending_len = if remaining.as_bytes()[position] == b'\r'
++                        && remaining.as_bytes().get(position + 1) == Some(&b'\n')
++                    {
++                        2
++                    } else {
++                        1
++                    };
++                    let (line_with_ending, rest) = remaining.split_at(position + ending_len);
++                    (line_with_ending, rest, ending_len)
++                } else {
++                    (remaining, "", 0)
++                };
++            cursor.text = rest;
++            cursor.line_end = cursor.line_start + line_with_ending.text_len();
++            cursor.offset = cursor.line_end;
++
++            let line = &line_with_ending[..line_with_ending.len() - ending_len];
++            let Some(content) = script_tag_line_body(line) else {
++                break;
++            };
++
++            if content == "///" {
++                // > Precedence for an ending line # /// is given when the next line is not a valid
++                // > embedded content line as described above.
++                // > For example, the following is a single fully valid block:
++                // > ```python
++                // > # /// some-toml
++                // > # embedded-csharp = """
++                // > # /// <summary>
++                // > # /// text
++                // > # ///
++                // > # /// </summary>
++                // > # public class MyClass { }
++                // > # """
++                // > # ///
++                // ````
++                let terminator = cursor.line_end;
++                if next_line_is_script_tag(cursor) {
++                    continue;
++                }
++                self.terminator = Some(terminator);
++                break;
+             }
+-            end_offset = Some(line.full_end());
+-            break;
+         }
+-    }
+ 
+-    // > Unclosed blocks MUST be ignored.
+-    let Some(end_offset) = end_offset else {
+-        return false;
+-    };
++        // > Unclosed blocks MUST be ignored.
++        let Some(end_offset) = self.terminator else {
++            return false;
++        };
+ 
+-    // Skip over all script-comments.
+-    while let Some(comment) = comments.peek() {
+-        if comment.start() >= end_offset {
+-            break;
++        // Skip over all script-comments.
++        while let Some(comment) = comments.peek() {
++            if comment.start() >= end_offset || comment.start() < self.script_start.start() {
++                break;
++            }
++
++            comments.next();
+         }
+ 
+-        comments.next();
++        true
+     }
+-
+-    true
+ }
+ 
+-fn script_line_content(line: &str) -> Option<&str> {
+-    let Some(rest) = line.strip_prefix('#') else {
+-        // Not a comment
+-        return None;
+-    };
+-
+-    // An empty line
+-    if rest.is_empty() {
+-        return Some("");
++fn next_line_is_script_tag(cursor: &mut ScriptTagCursor<'_>) -> bool {
++    if cursor.text.is_empty() || cursor.offset >= cursor.offset_back {
++        return false;
+     }
+ 
+-    // > If there are characters after the # then the first character MUST be a space.
+-    rest.strip_prefix(' ')
++    cursor.line_start = cursor.offset;
++    let remaining = cursor.text;
++    let (line_with_ending, rest, ending_len) = if let Some(position) = remaining.find(['\n', '\r'])
++    {
++        let ending_len = if remaining.as_bytes()[position] == b'\r'
++            && remaining.as_bytes().get(position + 1) == Some(&b'\n')
++        {
++            2
++        } else {
++            1
++        };
++        let (line_with_ending, rest) = remaining.split_at(position + ending_len);
++        (line_with_ending, rest, ending_len)
++    } else {
++        (remaining, "", 0)
++    };
++    cursor.text = rest;
++    cursor.line_end = cursor.line_start + line_with_ending.text_len();
++    cursor.offset = cursor.line_end;
++    let line = &line_with_ending[..line_with_ending.len() - ending_len];
++    is_valid_script_line(line)
+ }
+ 
+ fn is_valid_script_line(line: &str) -> bool {
+-    script_line_content(line).is_some()
++    script_tag_line_body(line).is_some()
+ }
+ 
+ /// Returns `true` if line contains an own-line comment.
+@@ -183,9 +228,11 @@ mod tests {
+     use ruff_source_file::LineRanges;
+     use ruff_text_size::TextSize;
+ 
+-    use crate::rules::eradicate::rules::commented_out_code::skip_script_comments;
++    use crate::comments::shebang::ScriptTagCursor;
+     use crate::Locator;
+ 
++    use super::ScriptTagScanner;
++
+     #[test]
+     fn script_comment() {
+         let code = r#"
+@@ -209,7 +256,14 @@ a = 10 # abc
+         let script_start = code.find("# /// script").unwrap();
+         let script_start_range = locator.full_line_range(TextSize::try_from(script_start).unwrap());
+ 
+-        let valid = skip_script_comments(script_start_range, &mut comments, &Locator::new(code));
++        let line_end = locator.full_line_end(script_start_range.end());
++        let rest = locator.after(line_end);
++        let mut cursor = ScriptTagCursor::new(rest, line_end);
++        let mut scanner = ScriptTagScanner {
++            script_start: script_start_range,
++            terminator: None,
++        };
++        let valid = scanner.skip_script_comments(&mut comments, &mut cursor);
+ 
+         assert!(valid);
+ 
+@@ -243,7 +297,14 @@ a = 10 # abc
+         let script_start = code.find("# /// script").unwrap();
+         let script_start_range = locator.full_line_range(TextSize::try_from(script_start).unwrap());
+ 
+-        let valid = skip_script_comments(script_start_range, &mut comments, &Locator::new(code));
++        let line_end = locator.full_line_end(script_start_range.end());
++        let rest = locator.after(line_end);
++        let mut cursor = ScriptTagCursor::new(rest, line_end);
++        let mut scanner = ScriptTagScanner {
++            script_start: script_start_range,
++            terminator: None,
++        };
++        let valid = scanner.skip_script_comments(&mut comments, &mut cursor);
+ 
+         assert!(valid);
+ 

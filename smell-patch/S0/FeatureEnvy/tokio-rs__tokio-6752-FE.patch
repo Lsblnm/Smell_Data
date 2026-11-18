@@ -1,0 +1,237 @@
+diff --git a/tokio-util/src/time/delay_queue.rs b/tokio-util/src/time/delay_queue.rs
+index 2b33e361..2135f94c 100644
+--- a/tokio-util/src/time/delay_queue.rs
++++ b/tokio-util/src/time/delay_queue.rs
+@@ -704,6 +704,39 @@ impl<T> DelayQueue<T> {
+         self.start + Duration::from_millis(self.slab[*key].when)
+     }
+ 
++    fn key_is_expired(&self, key: &Key) -> bool {
++        self.slab[*key].expired
++    }
++
++    fn remove_from_expired(&mut self, key: &Key) {
++        use crate::time::wheel::Stack;
++
++        self.expired.remove(key, &mut self.slab);
++    }
++
++    fn take_stored(&mut self, key: &Key) -> Data<T> {
++        self.slab.remove(key)
++    }
++
++    fn sync_delay(&mut self, prev_deadline: Option<Instant>) {
++        let next_deadline = self.next_deadline();
++        if prev_deadline != next_deadline {
++            match (next_deadline, &mut self.delay) {
++                (None, _) => self.delay = None,
++                (Some(deadline), Some(delay)) => delay.as_mut().reset(deadline),
++                (Some(deadline), None) => self.delay = Some(Box::pin(sleep_until(deadline))),
++            }
++        }
++    }
++
++    fn into_expired(&self, key: &Key, data: Data<T>) -> Expired<T> {
++        Expired {
++            key: Key::new(key.index),
++            data: data.inner,
++            deadline: self.start + Duration::from_millis(data.when),
++        }
++    }
++
+     /// Removes the key from the expired queue or the timer wheel
+     /// depending on its expiration status.
+     ///
+@@ -712,13 +745,34 @@ impl<T> DelayQueue<T> {
+     /// Panics if the key is not contained in the expired queue or the wheel.
+     #[track_caller]
+     fn remove_key(&mut self, key: &Key) {
+-        use crate::time::wheel::Stack;
+-
+-        // Special case the `expired` queue
+-        if self.slab[*key].expired {
+-            self.expired.remove(key, &mut self.slab);
++        if self.key_is_expired(key) {
++            self.remove_from_expired(key);
+         } else {
+-            self.wheel.remove(key, &mut self.slab);
++            self.unlink_wheel_entry(key);
++        }
++    }
++
++    /// Unlink `key` from the hashed timing wheel.
++    #[track_caller]
++    fn unlink_wheel_entry(&mut self, key: &Key) {
++        use crate::time::wheel::Stack as WheelStack;
++
++        let when = <Stack<T> as WheelStack>::when(key, &self.slab);
++        assert!(
++            self.wheel.elapsed <= when,
++            "elapsed={}; when={}",
++            self.wheel.elapsed,
++            when
++        );
++
++        let level_idx = self.wheel.level_for(when);
++        let level = &mut self.wheel.levels[level_idx];
++        let slot = ((when >> (level.level * 6)) % 64) as usize;
++        level.slot[slot].remove(key, &mut self.slab);
++
++        if level.slot[slot].is_empty() {
++            debug_assert!(level.occupied & (1u64 << slot) != 0);
++            level.occupied ^= 1u64 << slot;
+         }
+     }
+ 
+@@ -752,25 +806,35 @@ impl<T> DelayQueue<T> {
+     /// ```
+     #[track_caller]
+     pub fn remove(&mut self, key: &Key) -> Expired<T> {
+-        let prev_deadline = self.next_deadline();
++        use crate::time::wheel::Stack as WheelStack;
+ 
+-        self.remove_key(key);
+-        let data = self.slab.remove(key);
++        let prev_deadline = self.next_deadline();
+ 
+-        let next_deadline = self.next_deadline();
+-        if prev_deadline != next_deadline {
+-            match (next_deadline, &mut self.delay) {
+-                (None, _) => self.delay = None,
+-                (Some(deadline), Some(delay)) => delay.as_mut().reset(deadline),
+-                (Some(deadline), None) => self.delay = Some(Box::pin(sleep_until(deadline))),
++        if self.key_is_expired(key) {
++            self.remove_from_expired(key);
++        } else {
++            let when = <Stack<T> as WheelStack>::when(key, &self.slab);
++            assert!(
++                self.wheel.elapsed <= when,
++                "elapsed={}; when={}",
++                self.wheel.elapsed,
++                when
++            );
++
++            let level_idx = self.wheel.level_for(when);
++            let level = &mut self.wheel.levels[level_idx];
++            let slot = ((when >> (level.level * 6)) % 64) as usize;
++            level.slot[slot].remove(key, &mut self.slab);
++
++            if level.slot[slot].is_empty() {
++                debug_assert!(level.occupied & (1u64 << slot) != 0);
++                level.occupied ^= 1u64 << slot;
+             }
+         }
+ 
+-        Expired {
+-            key: Key::new(key.index),
+-            data: data.inner,
+-            deadline: self.start + Duration::from_millis(data.when),
+-        }
++        let data = self.take_stored(key);
++        self.sync_delay(prev_deadline);
++        self.into_expired(key, data)
+     }
+ 
+     /// Attempts to remove the item associated with `key` from the queue.
+diff --git a/tokio-util/src/time/wheel/level.rs b/tokio-util/src/time/wheel/level.rs
+index a69aee91..550d7924 100644
+--- a/tokio-util/src/time/wheel/level.rs
++++ b/tokio-util/src/time/wheel/level.rs
+@@ -4,7 +4,7 @@ use std::fmt;
+ 
+ /// Wheel for a single level in the timer. This wheel contains 64 slots.
+ pub(crate) struct Level<T> {
+-    level: usize,
++    pub(crate) level: usize,
+ 
+     /// Bit field tracking which slots currently contain entries.
+     ///
+@@ -13,10 +13,10 @@ pub(crate) struct Level<T> {
+     /// removed from a slot.
+     ///
+     /// The least-significant bit represents slot zero.
+-    occupied: u64,
++    pub(crate) occupied: u64,
+ 
+     /// Slots
+-    slot: [T; LEVEL_MULT],
++    pub(crate) slot: [T; LEVEL_MULT],
+ }
+ 
+ /// Indicates when a slot must be processed next.
+@@ -200,20 +200,6 @@ impl<T: Stack> Level<T> {
+         self.occupied |= occupied_bit(slot);
+     }
+ 
+-    pub(crate) fn remove_entry(&mut self, when: u64, item: &T::Borrowed, store: &mut T::Store) {
+-        let slot = slot_for(when, self.level);
+-
+-        self.slot[slot].remove(item, store);
+-
+-        if self.slot[slot].is_empty() {
+-            // The bit is currently set
+-            debug_assert!(self.occupied & occupied_bit(slot) != 0);
+-
+-            // Unset the bit
+-            self.occupied ^= occupied_bit(slot);
+-        }
+-    }
+-
+     pub(crate) fn pop_entry_slot(&mut self, slot: usize, store: &mut T::Store) -> Option<T::Owned> {
+         let ret = self.slot[slot].pop(store);
+ 
+diff --git a/tokio-util/src/time/wheel/mod.rs b/tokio-util/src/time/wheel/mod.rs
+index d81611c9..19937bf9 100644
+--- a/tokio-util/src/time/wheel/mod.rs
++++ b/tokio-util/src/time/wheel/mod.rs
+@@ -22,7 +22,7 @@ use std::fmt::Debug;
+ #[derive(Debug)]
+ pub(crate) struct Wheel<T> {
+     /// The number of milliseconds elapsed since the wheel started.
+-    elapsed: u64,
++    pub(crate) elapsed: u64,
+ 
+     /// Timer wheel.
+     ///
+@@ -34,7 +34,7 @@ pub(crate) struct Wheel<T> {
+     /// * ~ 4 min slots / ~ 4 hr range
+     /// * ~ 4 hr slots / ~ 12 day range
+     /// * ~ 12 day slots / ~ 2 yr range
+-    levels: Vec<Level<T>>,
++    pub(crate) levels: Vec<Level<T>>,
+ }
+ 
+ /// Number of levels. Each level has 64 slots. By using 6 levels with 64 slots
+@@ -116,23 +116,6 @@ where
+         Ok(())
+     }
+ 
+-    /// Remove `item` from the timing wheel.
+-    #[track_caller]
+-    pub(crate) fn remove(&mut self, item: &T::Borrowed, store: &mut T::Store) {
+-        let when = T::when(item, store);
+-
+-        assert!(
+-            self.elapsed <= when,
+-            "elapsed={}; when={}",
+-            self.elapsed,
+-            when
+-        );
+-
+-        let level = self.level_for(when);
+-
+-        self.levels[level].remove_entry(when, item, store);
+-    }
+-
+     /// Instant at which to poll
+     pub(crate) fn poll_at(&self) -> Option<u64> {
+         self.next_expiration().map(|expiration| expiration.deadline)
+@@ -253,7 +236,7 @@ where
+         self.levels[expiration.level].peek_entry_slot(expiration.slot)
+     }
+ 
+-    fn level_for(&self, when: u64) -> usize {
++    pub(crate) fn level_for(&self, when: u64) -> usize {
+         level_for(self.elapsed, when)
+     }
+ }

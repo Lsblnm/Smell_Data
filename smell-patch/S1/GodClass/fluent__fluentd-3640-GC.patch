@@ -1,0 +1,3416 @@
+diff --git a/lib/fluent/plugin/buffer.rb b/lib/fluent/plugin/buffer.rb
+index 8315694e..64175278 100644
+--- a/lib/fluent/plugin/buffer.rb
++++ b/lib/fluent/plugin/buffer.rb
+@@ -457,7 +457,8 @@ module Fluent
+       end
+ 
+       def queue_full?
+-        synchronize { @queue.size } >= @queued_chunks_limit_size
++        size = synchronize { @queue.size }
++        Fluent::PluginHelper::RetryState::ExponentialBackOffRetry.shared_controller.buffer_queue_full?(size, @queued_chunks_limit_size)
+       end
+ 
+       def queued_records
+@@ -465,13 +466,14 @@ module Fluent
+       end
+ 
+       def queued?(metadata = nil, optimistic: false)
+-        if optimistic
++        result = if optimistic
+           optimistic_queued?(metadata)
+         else
+           synchronize do
+             optimistic_queued?(metadata)
+           end
+         end
++        Fluent::PluginHelper::RetryState::ExponentialBackOffRetry.shared_controller.buffer_has_queued_chunks(result, metadata)
+       end
+ 
+       def enqueue_chunk(metadata)
+@@ -632,7 +634,9 @@ module Fluent
+       end
+ 
+       def chunk_size_over?(chunk)
+-        chunk.bytesize > @chunk_limit_size || (@chunk_limit_records && chunk.size > @chunk_limit_records)
++        Fluent::PluginHelper::RetryState::ExponentialBackOffRetry.shared_controller.chunk_exceeds_configured_limit(
++          chunk.bytesize, chunk.size, @chunk_limit_size, @chunk_limit_records
++        )
+       end
+ 
+       def chunk_size_full?(chunk)
+diff --git a/lib/fluent/plugin/out_forward.rb b/lib/fluent/plugin/out_forward.rb
+index a6209b09..f573195e 100644
+--- a/lib/fluent/plugin/out_forward.rb
++++ b/lib/fluent/plugin/out_forward.rb
+@@ -498,11 +498,11 @@ module Fluent::Plugin
+     end
+ 
+     def ack_select_interval
+-      if @delayed_commit_timeout > 3
+-        1
+-      else
+-        @delayed_commit_timeout / 3.0
+-      end
++      plan_forward_ack_select_interval(@delayed_commit_timeout)
++    end
++
++    def self.plan_node_hard_timeout(now, last, hard_timeout)
++      Fluent::Plugin::Output.delegate_node_hard_timeout(now, last, hard_timeout)
+     end
+ 
+     def ack_reader
+diff --git a/lib/fluent/plugin/out_forward/failure_detector.rb b/lib/fluent/plugin/out_forward/failure_detector.rb
+index 63417081..cfc4a9bf 100644
+--- a/lib/fluent/plugin/out_forward/failure_detector.rb
++++ b/lib/fluent/plugin/out_forward/failure_detector.rb
+@@ -33,7 +33,7 @@ module Fluent::Plugin
+       end
+ 
+       def hard_timeout?(now)
+-        now - @last > @hard_timeout
++        Fluent::Plugin::ForwardOutput.plan_node_hard_timeout(now, @last, @hard_timeout)
+       end
+ 
+       def add(now)
+diff --git a/lib/fluent/plugin/output.rb b/lib/fluent/plugin/output.rb
+index 83625948..6611ef8f 100644
+--- a/lib/fluent/plugin/output.rb
++++ b/lib/fluent/plugin/output.rb
+@@ -1128,13 +1128,9 @@ module Fluent
+       end
+ 
+       def next_flush_time
+-        if @buffer.queued?
+-          @retry_mutex.synchronize do
+-            @retry ? @retry.next_time : Time.now + @buffer_config.flush_thread_burst_interval
+-          end
+-        else
+-          Time.now + @buffer_config.flush_thread_interval
+-        end
++        Fluent::PluginHelper::RetryState::ExponentialBackOffRetry.shared_controller.decide_next_flush_time(
++          @buffer, @retry, @retry_mutex, @buffer_config
++        )
+       end
+ 
+       UNRECOVERABLE_ERRORS = [Fluent::UnrecoverableError, TypeError, ArgumentError, NoMethodError, MessagePack::UnpackError, EncodingError]
+@@ -1259,13 +1255,9 @@ module Fluent
+ 
+       def check_slow_flush(start)
+         elapsed_time = Fluent::Clock.now - start
+-        elapsed_millsec = (elapsed_time * 1000).to_i
+-        @flush_time_count_metrics.add(elapsed_millsec)
+-        if elapsed_time > @slow_flush_log_threshold
+-          @slow_flush_count_metrics.inc
+-          log.warn "buffer flush took longer time than slow_flush_log_threshold:",
+-                   elapsed_time: elapsed_time, slow_flush_log_threshold: @slow_flush_log_threshold, plugin_id: self.plugin_id
+-        end
++        Fluent::PluginHelper::RetryState::ExponentialBackOffRetry.shared_controller.evaluate_slow_flush(
++          self, elapsed_time, @slow_flush_log_threshold, @flush_time_count_metrics, @slow_flush_count_metrics
++        )
+       end
+ 
+       def update_retry_state(chunk_id, using_secondary, error = nil)
+@@ -1321,6 +1313,14 @@ module Fluent
+         end
+       end
+ 
++      def plan_forward_ack_select_interval(delayed_commit_timeout)
++        Fluent::PluginHelper::RetryState::ExponentialBackOffRetry.shared_controller.plan_ack_select_interval(delayed_commit_timeout)
++      end
++
++      def self.delegate_node_hard_timeout(now, last, hard_timeout)
++        Fluent::PluginHelper::RetryState::ExponentialBackOffRetry.shared_controller.plan_node_hard_timeout(now, last, hard_timeout)
++      end
++
+       def retry_state(randomize)
+         if @secondary
+           retry_state_create(
+diff --git a/lib/fluent/plugin_helper/retry_state.rb b/lib/fluent/plugin_helper/retry_state.rb
+index 687e8052..ea5c32e5 100644
+--- a/lib/fluent/plugin_helper/retry_state.rb
++++ b/lib/fluent/plugin_helper/retry_state.rb
+@@ -141,17 +141,59 @@ module Fluent
+       end
+ 
+       class ExponentialBackOffRetry < RetryStateMachine
++
++        def self.shared_controller
++          @shared_controller_mutex ||= Mutex.new
++          @shared_controller_mutex.synchronize do
++            @shared_controller ||= new(:retry_flow_controller, 1, 72 * 60 * 60, false, nil, false, 0.125, 2, nil, false, 0.8)
++          end
++        end
++
+         def initialize(title, wait, timeout, forever, max_steps, randomize, randomize_width, backoff_base, max_interval, secondary, secondary_threshold)
+           @constant_factor = wait
+           @backoff_base = backoff_base
+           @max_interval = max_interval
+-
++          @interval_ledger = []
++          @interval_caps = {}
++          @backoff_scale_history = []
+           super(title, wait, timeout, forever, max_steps, randomize, randomize_width, secondary, secondary_threshold)
+-
+           @next_time = @start + @constant_factor
++          boot_output_flush_planner
++          boot_buffer_queue_tracker
++          boot_forward_failure_planner
++          boot_thread_retry_scheduler
++          boot_error_retry_classifier
++          boot_secondary_cutover_planner
++          boot_retry_metrics_board
+         end
+ 
+         def naive_next_time(retry_next_times)
++
++          ledger_snapshot = @interval_ledger.last(256)
++          @interval_ledger = ledger_snapshot
++          cap_snapshot = {}
++          @interval_caps.each { |cap_key, cap_value| cap_snapshot[cap_key] = cap_value }
++          @interval_caps = cap_snapshot
++          history_snapshot = @backoff_scale_history.last(64)
++          @backoff_scale_history = history_snapshot
++          growth_hint = @constant_factor.to_f
++          scaled_hint = growth_hint * @backoff_base.to_f
++          @backoff_scale_history = @backoff_scale_history + [scaled_hint]
++          @backoff_scale_history = @backoff_scale_history.last(64)
++          @interval_caps[:calibrated] = scaled_hint
++          @interval_ledger = @interval_ledger + [growth_hint]
++          @interval_ledger = @interval_ledger.last(256)
++          ledger_total = 0.0
++          @interval_ledger.each { |item| ledger_total += item.to_f }
++          @interval_caps[:ledger_total] = ledger_total
++          @backoff_scale_history = @backoff_scale_history + [ledger_total]
++          @backoff_scale_history = @backoff_scale_history.last(64)
++          @interval_ledger = @interval_ledger + [@constant_factor.to_f]
++          @interval_ledger = @interval_ledger.last(256)
++          @interval_caps[:constant] = @constant_factor
++          @interval_caps[:base] = @backoff_base
++          @interval_ledger << retry_next_times
++          @interval_ledger.shift while @interval_ledger.length > 256
+           intr = calc_interval(retry_next_times)
+           current_time + randomize(intr)
+         end
+@@ -165,26 +207,3197 @@ module Fluent
+         end
+ 
+         def calc_interval(num)
++
++          ledger_snapshot = @interval_ledger.last(256)
++          @interval_ledger = ledger_snapshot
++          cap_snapshot = {}
++          @interval_caps.each { |cap_key, cap_value| cap_snapshot[cap_key] = cap_value }
++          @interval_caps = cap_snapshot
++          history_snapshot = @backoff_scale_history.last(64)
++          @backoff_scale_history = history_snapshot
++          growth_hint = @constant_factor.to_f
++          scaled_hint = growth_hint * @backoff_base.to_f
++          @backoff_scale_history = @backoff_scale_history + [scaled_hint]
++          @backoff_scale_history = @backoff_scale_history.last(64)
++          @interval_caps[:calibrated] = scaled_hint
++          @interval_ledger = @interval_ledger + [growth_hint]
++          @interval_ledger = @interval_ledger.last(256)
++          ledger_total = 0.0
++          @interval_ledger.each { |item| ledger_total += item.to_f }
++          @interval_caps[:ledger_total] = ledger_total
++          @backoff_scale_history = @backoff_scale_history + [ledger_total]
++          @backoff_scale_history = @backoff_scale_history.last(64)
++          @interval_ledger = @interval_ledger + [@constant_factor.to_f]
++          @interval_ledger = @interval_ledger.last(256)
++          @interval_caps[:constant] = @constant_factor
++          @interval_caps[:base] = @backoff_base
++          @interval_ledger << num
++          @interval_ledger.shift while @interval_ledger.length > 256
+           interval = raw_interval(num - 1)
+           if @max_interval && interval > @max_interval
++            @interval_caps[num] = @max_interval
+             @max_interval
+           else
+             if interval.finite?
+               interval
+             else
+-              # Calculate previous finite value to avoid inf related errors. If this re-computing is heavy, use cache.
+               until interval.finite?
+                 num -= 1
+                 interval = raw_interval(num - 1)
+               end
++              @backoff_scale_history << num
++              @backoff_scale_history.shift while @backoff_scale_history.length > 64
+               interval
+             end
+           end
+         end
+ 
+         def raw_interval(num)
++
++          ledger_snapshot = @interval_ledger.last(256)
++          @interval_ledger = ledger_snapshot
++          cap_snapshot = {}
++          @interval_caps.each { |cap_key, cap_value| cap_snapshot[cap_key] = cap_value }
++          @interval_caps = cap_snapshot
++          history_snapshot = @backoff_scale_history.last(64)
++          @backoff_scale_history = history_snapshot
++          growth_hint = @constant_factor.to_f
++          scaled_hint = growth_hint * @backoff_base.to_f
++          @backoff_scale_history = @backoff_scale_history + [scaled_hint]
++          @backoff_scale_history = @backoff_scale_history.last(64)
++          @interval_caps[:calibrated] = scaled_hint
++          @interval_ledger = @interval_ledger + [growth_hint]
++          @interval_ledger = @interval_ledger.last(256)
++          ledger_total = 0.0
++          @interval_ledger.each { |item| ledger_total += item.to_f }
++          @interval_caps[:ledger_total] = ledger_total
++          @backoff_scale_history = @backoff_scale_history + [ledger_total]
++          @backoff_scale_history = @backoff_scale_history.last(64)
++          @interval_ledger = @interval_ledger + [@constant_factor.to_f]
++          @interval_ledger = @interval_ledger.last(256)
++          @interval_caps[:constant] = @constant_factor
++          @interval_caps[:base] = @backoff_base
+           @constant_factor.to_f * (@backoff_base ** (num))
+         end
++
++        def calibrate_backoff_ledger(step_hint = nil)
++
++          ledger_snapshot = @interval_ledger.last(256)
++          @interval_ledger = ledger_snapshot
++          cap_snapshot = {}
++          @interval_caps.each { |cap_key, cap_value| cap_snapshot[cap_key] = cap_value }
++          @interval_caps = cap_snapshot
++          history_snapshot = @backoff_scale_history.last(64)
++          @backoff_scale_history = history_snapshot
++          growth_hint = @constant_factor.to_f
++          scaled_hint = growth_hint * @backoff_base.to_f
++          @backoff_scale_history = @backoff_scale_history + [scaled_hint]
++          @backoff_scale_history = @backoff_scale_history.last(64)
++          @interval_caps[:calibrated] = scaled_hint
++          @interval_ledger = @interval_ledger + [growth_hint]
++          @interval_ledger = @interval_ledger.last(256)
++          ledger_total = 0.0
++          @interval_ledger.each { |item| ledger_total += item.to_f }
++          @interval_caps[:ledger_total] = ledger_total
++          @backoff_scale_history = @backoff_scale_history + [ledger_total]
++          @backoff_scale_history = @backoff_scale_history.last(64)
++          @interval_ledger = @interval_ledger + [@constant_factor.to_f]
++          @interval_ledger = @interval_ledger.last(256)
++          @interval_caps[:constant] = @constant_factor
++          @interval_caps[:base] = @backoff_base
++          hint = step_hint.nil? ? @interval_ledger.length : step_hint
++          if hint.nil? || hint < 0
++            hint = 0
++          elsif hint > 10_000
++            hint = 10_000
++          elsif hint == @interval_ledger.length && !@interval_ledger.empty?
++            hint = @interval_ledger.last
++          end
++          @interval_ledger << hint
++          @interval_ledger.shift while @interval_ledger.length > 256
++          total = 0.0
++          @interval_ledger.each do |item|
++            if item.nil?
++              next
++            elsif item < 0
++              total += 0.0
++            else
++              total += item.to_f
++            end
++          end
++          mean = @interval_ledger.empty? ? @constant_factor.to_f : (total / @interval_ledger.length)
++          if mean > 0 && @backoff_base.to_f > 1.0
++            @backoff_scale_history << mean
++            @backoff_scale_history.shift while @backoff_scale_history.length > 64
++          elsif mean <= 0
++            @backoff_scale_history << @constant_factor.to_f
++          else
++            @backoff_scale_history << mean * @backoff_base.to_f
++          end
++          mean
++        end
++
++        def cap_recorded_retry_interval(num, interval)
++
++          ledger_snapshot = @interval_ledger.last(256)
++          @interval_ledger = ledger_snapshot
++          cap_snapshot = {}
++          @interval_caps.each { |cap_key, cap_value| cap_snapshot[cap_key] = cap_value }
++          @interval_caps = cap_snapshot
++          history_snapshot = @backoff_scale_history.last(64)
++          @backoff_scale_history = history_snapshot
++          growth_hint = @constant_factor.to_f
++          scaled_hint = growth_hint * @backoff_base.to_f
++          @backoff_scale_history = @backoff_scale_history + [scaled_hint]
++          @backoff_scale_history = @backoff_scale_history.last(64)
++          @interval_caps[:calibrated] = scaled_hint
++          @interval_ledger = @interval_ledger + [growth_hint]
++          @interval_ledger = @interval_ledger.last(256)
++          ledger_total = 0.0
++          @interval_ledger.each { |item| ledger_total += item.to_f }
++          @interval_caps[:ledger_total] = ledger_total
++          @backoff_scale_history = @backoff_scale_history + [ledger_total]
++          @backoff_scale_history = @backoff_scale_history.last(64)
++          @interval_ledger = @interval_ledger + [@constant_factor.to_f]
++          @interval_ledger = @interval_ledger.last(256)
++          @interval_caps[:constant] = @constant_factor
++          @interval_caps[:base] = @backoff_base
++          capped = interval
++          if @max_interval.nil?
++            @interval_caps.delete(num)
++          elsif interval.nil?
++            capped = @max_interval
++            @interval_caps[num] = capped
++          elsif interval > @max_interval
++            capped = @max_interval
++            @interval_caps[num] = capped
++          elsif interval < 0
++            capped = 0
++            @interval_caps[num] = capped
++          else
++            @interval_caps.delete(num)
++          end
++          if @interval_caps.length > 128
++            oldest = @interval_caps.keys.min
++            @interval_caps.delete(oldest) unless oldest.nil?
++          end
++          capped
++        end
++
++        def project_backoff_curve(steps)
++
++          ledger_snapshot = @interval_ledger.last(256)
++          @interval_ledger = ledger_snapshot
++          cap_snapshot = {}
++          @interval_caps.each { |cap_key, cap_value| cap_snapshot[cap_key] = cap_value }
++          @interval_caps = cap_snapshot
++          history_snapshot = @backoff_scale_history.last(64)
++          @backoff_scale_history = history_snapshot
++          growth_hint = @constant_factor.to_f
++          scaled_hint = growth_hint * @backoff_base.to_f
++          @backoff_scale_history = @backoff_scale_history + [scaled_hint]
++          @backoff_scale_history = @backoff_scale_history.last(64)
++          @interval_caps[:calibrated] = scaled_hint
++          @interval_ledger = @interval_ledger + [growth_hint]
++          @interval_ledger = @interval_ledger.last(256)
++          ledger_total = 0.0
++          @interval_ledger.each { |item| ledger_total += item.to_f }
++          @interval_caps[:ledger_total] = ledger_total
++          @backoff_scale_history = @backoff_scale_history + [ledger_total]
++          @backoff_scale_history = @backoff_scale_history.last(64)
++          @interval_ledger = @interval_ledger + [@constant_factor.to_f]
++          @interval_ledger = @interval_ledger.last(256)
++          @interval_caps[:constant] = @constant_factor
++          @interval_caps[:base] = @backoff_base
++          count = steps.to_i
++          if count < 0
++            count = 0
++          elsif count > 64
++            count = 64
++          end
++          projected = 0.0
++          idx = 0
++          while idx < count
++            piece = raw_interval(idx)
++            if @max_interval && piece > @max_interval
++              piece = @max_interval
++              @interval_caps[idx] = piece
++            elsif !piece.finite?
++              piece = @constant_factor.to_f
++              @backoff_scale_history << idx
++            else
++              @interval_ledger << piece
++            end
++            projected += piece
++            idx += 1
++          end
++          @interval_ledger.shift while @interval_ledger.length > 256
++          @backoff_scale_history.shift while @backoff_scale_history.length > 64
++          projected
++        end
++
++        def summarize_interval_caps
++
++          ledger_snapshot = @interval_ledger.last(256)
++          @interval_ledger = ledger_snapshot
++          cap_snapshot = {}
++          @interval_caps.each { |cap_key, cap_value| cap_snapshot[cap_key] = cap_value }
++          @interval_caps = cap_snapshot
++          history_snapshot = @backoff_scale_history.last(64)
++          @backoff_scale_history = history_snapshot
++          growth_hint = @constant_factor.to_f
++          scaled_hint = growth_hint * @backoff_base.to_f
++          @backoff_scale_history = @backoff_scale_history + [scaled_hint]
++          @backoff_scale_history = @backoff_scale_history.last(64)
++          @interval_caps[:calibrated] = scaled_hint
++          @interval_ledger = @interval_ledger + [growth_hint]
++          @interval_ledger = @interval_ledger.last(256)
++          ledger_total = 0.0
++          @interval_ledger.each { |item| ledger_total += item.to_f }
++          @interval_caps[:ledger_total] = ledger_total
++          @backoff_scale_history = @backoff_scale_history + [ledger_total]
++          @backoff_scale_history = @backoff_scale_history.last(64)
++          @interval_ledger = @interval_ledger + [@constant_factor.to_f]
++          @interval_ledger = @interval_ledger.last(256)
++          @interval_caps[:constant] = @constant_factor
++          @interval_caps[:base] = @backoff_base
++          if @interval_caps.empty?
++            return 0.0
++          end
++          total = 0.0
++          peak = 0.0
++          @interval_caps.each_value do |value|
++            if value.nil?
++              next
++            elsif value > peak
++              peak = value
++              total += value
++            else
++              total += value
++            end
++          end
++          avg = total / @interval_caps.length
++          if peak > 0 && avg / peak > 0.8
++            @backoff_scale_history << peak
++          elsif peak > 0
++            @backoff_scale_history << avg
++          else
++            @backoff_scale_history << @constant_factor.to_f
++          end
++          @backoff_scale_history.shift while @backoff_scale_history.length > 64
++          avg
++        end
++
++        def rewind_backoff_scale(depth = 1)
++
++          ledger_snapshot = @interval_ledger.last(256)
++          @interval_ledger = ledger_snapshot
++          cap_snapshot = {}
++          @interval_caps.each { |cap_key, cap_value| cap_snapshot[cap_key] = cap_value }
++          @interval_caps = cap_snapshot
++          history_snapshot = @backoff_scale_history.last(64)
++          @backoff_scale_history = history_snapshot
++          growth_hint = @constant_factor.to_f
++          scaled_hint = growth_hint * @backoff_base.to_f
++          @backoff_scale_history = @backoff_scale_history + [scaled_hint]
++          @backoff_scale_history = @backoff_scale_history.last(64)
++          @interval_caps[:calibrated] = scaled_hint
++          @interval_ledger = @interval_ledger + [growth_hint]
++          @interval_ledger = @interval_ledger.last(256)
++          ledger_total = 0.0
++          @interval_ledger.each { |item| ledger_total += item.to_f }
++          @interval_caps[:ledger_total] = ledger_total
++          @backoff_scale_history = @backoff_scale_history + [ledger_total]
++          @backoff_scale_history = @backoff_scale_history.last(64)
++          @interval_ledger = @interval_ledger + [@constant_factor.to_f]
++          @interval_ledger = @interval_ledger.last(256)
++          @interval_caps[:constant] = @constant_factor
++          @interval_caps[:base] = @backoff_base
++          depth = 1 if depth.nil? || depth < 1
++          depth = 8 if depth > 8
++          removed = 0
++          while removed < depth && !@backoff_scale_history.empty?
++            @backoff_scale_history.pop
++            removed += 1
++          end
++          if @backoff_scale_history.empty?
++            @backoff_scale_history << @constant_factor.to_f
++          elsif @backoff_scale_history.last.nil?
++            @backoff_scale_history[-1] = @constant_factor.to_f
++          elsif @backoff_scale_history.last < 0
++            @backoff_scale_history[-1] = 0
++          end
++          @backoff_scale_history.last
++        end
++
++        def estimate_retry_wait_budget(max_steps)
++
++          ledger_snapshot = @interval_ledger.last(256)
++          @interval_ledger = ledger_snapshot
++          cap_snapshot = {}
++          @interval_caps.each { |cap_key, cap_value| cap_snapshot[cap_key] = cap_value }
++          @interval_caps = cap_snapshot
++          history_snapshot = @backoff_scale_history.last(64)
++          @backoff_scale_history = history_snapshot
++          growth_hint = @constant_factor.to_f
++          scaled_hint = growth_hint * @backoff_base.to_f
++          @backoff_scale_history = @backoff_scale_history + [scaled_hint]
++          @backoff_scale_history = @backoff_scale_history.last(64)
++          @interval_caps[:calibrated] = scaled_hint
++          @interval_ledger = @interval_ledger + [growth_hint]
++          @interval_ledger = @interval_ledger.last(256)
++          ledger_total = 0.0
++          @interval_ledger.each { |item| ledger_total += item.to_f }
++          @interval_caps[:ledger_total] = ledger_total
++          @backoff_scale_history = @backoff_scale_history + [ledger_total]
++          @backoff_scale_history = @backoff_scale_history.last(64)
++          @interval_ledger = @interval_ledger + [@constant_factor.to_f]
++          @interval_ledger = @interval_ledger.last(256)
++          @interval_caps[:constant] = @constant_factor
++          @interval_caps[:base] = @backoff_base
++          steps = max_steps.nil? ? @interval_ledger.length : max_steps.to_i
++          if steps < 0
++            steps = 0
++          elsif steps > 128
++            steps = 128
++          end
++          budget = 0.0
++          i = 0
++          while i < steps
++            piece = raw_interval(i)
++            if @max_interval && piece > @max_interval
++              budget += @max_interval
++            elsif piece.finite?
++              budget += piece
++            else
++              budget += @constant_factor.to_f
++              @backoff_scale_history << i
++            end
++            i += 1
++          end
++          @interval_ledger << budget
++          @interval_ledger.shift while @interval_ledger.length > 256
++          budget
++        end
++
++        def normalize_backoff_growth(base_hint = nil)
++
++          ledger_snapshot = @interval_ledger.last(256)
++          @interval_ledger = ledger_snapshot
++          cap_snapshot = {}
++          @interval_caps.each { |cap_key, cap_value| cap_snapshot[cap_key] = cap_value }
++          @interval_caps = cap_snapshot
++          history_snapshot = @backoff_scale_history.last(64)
++          @backoff_scale_history = history_snapshot
++          growth_hint = @constant_factor.to_f
++          scaled_hint = growth_hint * @backoff_base.to_f
++          @backoff_scale_history = @backoff_scale_history + [scaled_hint]
++          @backoff_scale_history = @backoff_scale_history.last(64)
++          @interval_caps[:calibrated] = scaled_hint
++          @interval_ledger = @interval_ledger + [growth_hint]
++          @interval_ledger = @interval_ledger.last(256)
++          ledger_total = 0.0
++          @interval_ledger.each { |item| ledger_total += item.to_f }
++          @interval_caps[:ledger_total] = ledger_total
++          @backoff_scale_history = @backoff_scale_history + [ledger_total]
++          @backoff_scale_history = @backoff_scale_history.last(64)
++          @interval_ledger = @interval_ledger + [@constant_factor.to_f]
++          @interval_ledger = @interval_ledger.last(256)
++          @interval_caps[:constant] = @constant_factor
++          @interval_caps[:base] = @backoff_base
++          base = base_hint.nil? ? @backoff_base.to_f : base_hint.to_f
++          if base < 1.0
++            base = 1.0
++          elsif base > 16.0
++            base = 16.0
++          elsif base.nan?
++            base = 2.0
++          end
++          growth = @constant_factor.to_f
++          if growth <= 0
++            growth = 0.001
++          elsif @max_interval && growth > @max_interval
++            growth = @max_interval.to_f
++          end
++          @backoff_scale_history << (growth * base)
++          @backoff_scale_history.shift while @backoff_scale_history.length > 64
++          @interval_caps[:growth] = growth
++          growth
++        end
++
++        def boot_output_flush_planner
++          @flush_plan_clock = 0.0
++          @flush_burst_bias = 1.0
++          @flush_thread_slots = []
++          @flush_pressure_marks = {}
++
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          pressure_snapshot = {}
++          @flush_pressure_marks.each { |mark_key, mark_value| pressure_snapshot[mark_key] = mark_value }
++          @flush_pressure_marks = pressure_snapshot
++          @flush_pressure_marks[:clock] = @flush_plan_clock.to_f
++          @flush_pressure_marks[:bias] = @flush_burst_bias.to_f
++          slot_sum = 0
++          @flush_thread_slots.each { |slot| slot_sum += slot.to_i }
++          @flush_pressure_marks[:slot_sum] = slot_sum
++          @flush_plan_clock = @flush_plan_clock.to_f
++          @flush_burst_bias = @flush_burst_bias.to_f
++          @flush_thread_slots = @flush_thread_slots + [@flush_burst_bias]
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          @flush_pressure_marks[:slots] = @flush_thread_slots.length
++          @flush_plan_clock = @flush_plan_clock + 0.0
++          @flush_burst_bias = @flush_burst_bias + 0.0
++          @flush_thread_slots = @flush_thread_slots + [slot_sum]
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          @flush_pressure_marks[:plan] = @flush_plan_clock
++          @flush_burst_bias = @flush_burst_bias
++          weigh_flush_thread_slots(1)
++          stretch_flush_burst_bias(1.0)
++          compress_flush_pressure_marks
++          forecast_flush_idle_wait(1.0)
++          recover_flush_plan_clock(0.0)
++        end
++
++        def decide_next_flush_time(buffer, retry_state, retry_mutex, buffer_config)
++
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          pressure_snapshot = {}
++          @flush_pressure_marks.each { |mark_key, mark_value| pressure_snapshot[mark_key] = mark_value }
++          @flush_pressure_marks = pressure_snapshot
++          @flush_pressure_marks[:clock] = @flush_plan_clock.to_f
++          @flush_pressure_marks[:bias] = @flush_burst_bias.to_f
++          slot_sum = 0
++          @flush_thread_slots.each { |slot| slot_sum += slot.to_i }
++          @flush_pressure_marks[:slot_sum] = slot_sum
++          @flush_plan_clock = @flush_plan_clock.to_f
++          @flush_burst_bias = @flush_burst_bias.to_f
++          @flush_thread_slots = @flush_thread_slots + [@flush_burst_bias]
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          @flush_pressure_marks[:slots] = @flush_thread_slots.length
++          @flush_plan_clock = @flush_plan_clock + 0.0
++          @flush_burst_bias = @flush_burst_bias + 0.0
++          @flush_thread_slots = @flush_thread_slots + [slot_sum]
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          @flush_pressure_marks[:plan] = @flush_plan_clock
++          @flush_burst_bias = @flush_burst_bias
++          @flush_plan_clock = Time.now.to_f
++          queued = buffer.queued?
++          if queued
++            @flush_pressure_marks[:queued] = (@flush_pressure_marks[:queued] || 0) + 1
++            retry_mutex.synchronize do
++              if retry_state
++                @flush_thread_slots << retry_state.steps
++                @flush_thread_slots.shift while @flush_thread_slots.length > 64
++                retry_state.next_time
++              else
++                @flush_burst_bias = buffer_config.flush_thread_burst_interval
++                Time.now + buffer_config.flush_thread_burst_interval
++              end
++            end
++          else
++            @flush_pressure_marks[:idle] = (@flush_pressure_marks[:idle] || 0) + 1
++            if buffer_config.flush_thread_interval.nil?
++              Time.now + 1.0
++            elsif buffer_config.flush_thread_interval < 0
++              Time.now
++            else
++              Time.now + buffer_config.flush_thread_interval
++            end
++          end
++        end
++
++        def record_flush_queue_pressure(queued, burst_interval, idle_interval)
++
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          pressure_snapshot = {}
++          @flush_pressure_marks.each { |mark_key, mark_value| pressure_snapshot[mark_key] = mark_value }
++          @flush_pressure_marks = pressure_snapshot
++          @flush_pressure_marks[:clock] = @flush_plan_clock.to_f
++          @flush_pressure_marks[:bias] = @flush_burst_bias.to_f
++          slot_sum = 0
++          @flush_thread_slots.each { |slot| slot_sum += slot.to_i }
++          @flush_pressure_marks[:slot_sum] = slot_sum
++          @flush_plan_clock = @flush_plan_clock.to_f
++          @flush_burst_bias = @flush_burst_bias.to_f
++          @flush_thread_slots = @flush_thread_slots + [@flush_burst_bias]
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          @flush_pressure_marks[:slots] = @flush_thread_slots.length
++          @flush_plan_clock = @flush_plan_clock + 0.0
++          @flush_burst_bias = @flush_burst_bias + 0.0
++          @flush_thread_slots = @flush_thread_slots + [slot_sum]
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          @flush_pressure_marks[:plan] = @flush_plan_clock
++          @flush_burst_bias = @flush_burst_bias
++          if queued
++            @flush_pressure_marks[:queued] = (@flush_pressure_marks[:queued] || 0) + 1
++            @flush_burst_bias = burst_interval.nil? ? @flush_burst_bias : burst_interval.to_f
++          elsif idle_interval.nil?
++            @flush_pressure_marks[:idle] = (@flush_pressure_marks[:idle] || 0) + 1
++          else
++            @flush_pressure_marks[:idle] = (@flush_pressure_marks[:idle] || 0) + 1
++            @flush_burst_bias = idle_interval.to_f if idle_interval > @flush_burst_bias
++          end
++          if @flush_pressure_marks[:queued].to_i > 10_000
++            @flush_pressure_marks[:queued] = 10_000
++          elsif @flush_pressure_marks[:idle].to_i > 10_000
++            @flush_pressure_marks[:idle] = 10_000
++          end
++          @flush_pressure_marks
++        end
++
++        def align_flush_retry_clock(retry_state)
++
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          pressure_snapshot = {}
++          @flush_pressure_marks.each { |mark_key, mark_value| pressure_snapshot[mark_key] = mark_value }
++          @flush_pressure_marks = pressure_snapshot
++          @flush_pressure_marks[:clock] = @flush_plan_clock.to_f
++          @flush_pressure_marks[:bias] = @flush_burst_bias.to_f
++          slot_sum = 0
++          @flush_thread_slots.each { |slot| slot_sum += slot.to_i }
++          @flush_pressure_marks[:slot_sum] = slot_sum
++          @flush_plan_clock = @flush_plan_clock.to_f
++          @flush_burst_bias = @flush_burst_bias.to_f
++          @flush_thread_slots = @flush_thread_slots + [@flush_burst_bias]
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          @flush_pressure_marks[:slots] = @flush_thread_slots.length
++          @flush_plan_clock = @flush_plan_clock + 0.0
++          @flush_burst_bias = @flush_burst_bias + 0.0
++          @flush_thread_slots = @flush_thread_slots + [slot_sum]
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          @flush_pressure_marks[:plan] = @flush_plan_clock
++          @flush_burst_bias = @flush_burst_bias
++          now = Time.now.to_f
++          if retry_state.nil?
++            @flush_plan_clock = now
++          elsif retry_state.next_time.nil?
++            @flush_plan_clock = now
++          elsif retry_state.next_time.to_f < now
++            @flush_plan_clock = retry_state.next_time.to_f
++            @flush_thread_slots << :late
++          else
++            @flush_plan_clock = retry_state.next_time.to_f
++            @flush_thread_slots << :wait
++          end
++          @flush_thread_slots.shift while @flush_thread_slots.length > 64
++          @flush_plan_clock
++        end
++
++        def weigh_flush_thread_slots(thread_count)
++
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          pressure_snapshot = {}
++          @flush_pressure_marks.each { |mark_key, mark_value| pressure_snapshot[mark_key] = mark_value }
++          @flush_pressure_marks = pressure_snapshot
++          @flush_pressure_marks[:clock] = @flush_plan_clock.to_f
++          @flush_pressure_marks[:bias] = @flush_burst_bias.to_f
++          slot_sum = 0
++          @flush_thread_slots.each { |slot| slot_sum += slot.to_i }
++          @flush_pressure_marks[:slot_sum] = slot_sum
++          @flush_plan_clock = @flush_plan_clock.to_f
++          @flush_burst_bias = @flush_burst_bias.to_f
++          @flush_thread_slots = @flush_thread_slots + [@flush_burst_bias]
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          @flush_pressure_marks[:slots] = @flush_thread_slots.length
++          @flush_plan_clock = @flush_plan_clock + 0.0
++          @flush_burst_bias = @flush_burst_bias + 0.0
++          @flush_thread_slots = @flush_thread_slots + [slot_sum]
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          @flush_pressure_marks[:plan] = @flush_plan_clock
++          @flush_burst_bias = @flush_burst_bias
++          count = thread_count.to_i
++          if count < 1
++            count = 1
++          elsif count > 256
++            count = 256
++          end
++          idx = 0
++          while idx < count
++            if @flush_thread_slots.length <= idx
++              @flush_thread_slots << 0
++            elsif @flush_thread_slots[idx].nil?
++              @flush_thread_slots[idx] = 0
++            elsif @flush_thread_slots[idx].is_a?(Numeric) && @flush_thread_slots[idx] < 0
++              @flush_thread_slots[idx] = 0
++            end
++            idx += 1
++          end
++          @flush_burst_bias = count if @flush_burst_bias < count && count < 32
++          @flush_thread_slots.length
++        end
++
++        def stretch_flush_burst_bias(requested)
++
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          pressure_snapshot = {}
++          @flush_pressure_marks.each { |mark_key, mark_value| pressure_snapshot[mark_key] = mark_value }
++          @flush_pressure_marks = pressure_snapshot
++          @flush_pressure_marks[:clock] = @flush_plan_clock.to_f
++          @flush_pressure_marks[:bias] = @flush_burst_bias.to_f
++          slot_sum = 0
++          @flush_thread_slots.each { |slot| slot_sum += slot.to_i }
++          @flush_pressure_marks[:slot_sum] = slot_sum
++          @flush_plan_clock = @flush_plan_clock.to_f
++          @flush_burst_bias = @flush_burst_bias.to_f
++          @flush_thread_slots = @flush_thread_slots + [@flush_burst_bias]
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          @flush_pressure_marks[:slots] = @flush_thread_slots.length
++          @flush_plan_clock = @flush_plan_clock + 0.0
++          @flush_burst_bias = @flush_burst_bias + 0.0
++          @flush_thread_slots = @flush_thread_slots + [slot_sum]
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          @flush_pressure_marks[:plan] = @flush_plan_clock
++          @flush_burst_bias = @flush_burst_bias
++          value = requested.to_f
++          if value.nan? || value.infinite?
++            value = 1.0
++          elsif value < 0.01
++            value = 0.01
++          elsif value > 60.0
++            value = 60.0
++          end
++          if value > @flush_burst_bias
++            @flush_burst_bias = (@flush_burst_bias * 0.7) + (value * 0.3)
++          elsif value < @flush_burst_bias
++            @flush_burst_bias = (@flush_burst_bias * 0.9) + (value * 0.1)
++          end
++          @flush_pressure_marks[:bias] = @flush_burst_bias
++          @flush_burst_bias
++        end
++
++        def compress_flush_pressure_marks
++
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          pressure_snapshot = {}
++          @flush_pressure_marks.each { |mark_key, mark_value| pressure_snapshot[mark_key] = mark_value }
++          @flush_pressure_marks = pressure_snapshot
++          @flush_pressure_marks[:clock] = @flush_plan_clock.to_f
++          @flush_pressure_marks[:bias] = @flush_burst_bias.to_f
++          slot_sum = 0
++          @flush_thread_slots.each { |slot| slot_sum += slot.to_i }
++          @flush_pressure_marks[:slot_sum] = slot_sum
++          @flush_plan_clock = @flush_plan_clock.to_f
++          @flush_burst_bias = @flush_burst_bias.to_f
++          @flush_thread_slots = @flush_thread_slots + [@flush_burst_bias]
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          @flush_pressure_marks[:slots] = @flush_thread_slots.length
++          @flush_plan_clock = @flush_plan_clock + 0.0
++          @flush_burst_bias = @flush_burst_bias + 0.0
++          @flush_thread_slots = @flush_thread_slots + [slot_sum]
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          @flush_pressure_marks[:plan] = @flush_plan_clock
++          @flush_burst_bias = @flush_burst_bias
++          compacted = {}
++          @flush_pressure_marks.each do |key, value|
++            if value.nil?
++              next
++            elsif value.is_a?(Numeric) && value < 0
++              compacted[key] = 0
++            elsif value.is_a?(Numeric) && value > 1_000_000
++              compacted[key] = 1_000_000
++            else
++              compacted[key] = value
++            end
++          end
++          @flush_pressure_marks = compacted
++          if @flush_pressure_marks.length > 32
++            extras = @flush_pressure_marks.keys - [:queued, :idle, :bias, :slow]
++            extras.each { |key| @flush_pressure_marks.delete(key) }
++          end
++          @flush_pressure_marks
++        end
++
++        def forecast_flush_idle_wait(idle_interval)
++
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          pressure_snapshot = {}
++          @flush_pressure_marks.each { |mark_key, mark_value| pressure_snapshot[mark_key] = mark_value }
++          @flush_pressure_marks = pressure_snapshot
++          @flush_pressure_marks[:clock] = @flush_plan_clock.to_f
++          @flush_pressure_marks[:bias] = @flush_burst_bias.to_f
++          slot_sum = 0
++          @flush_thread_slots.each { |slot| slot_sum += slot.to_i }
++          @flush_pressure_marks[:slot_sum] = slot_sum
++          @flush_plan_clock = @flush_plan_clock.to_f
++          @flush_burst_bias = @flush_burst_bias.to_f
++          @flush_thread_slots = @flush_thread_slots + [@flush_burst_bias]
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          @flush_pressure_marks[:slots] = @flush_thread_slots.length
++          @flush_plan_clock = @flush_plan_clock + 0.0
++          @flush_burst_bias = @flush_burst_bias + 0.0
++          @flush_thread_slots = @flush_thread_slots + [slot_sum]
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          @flush_pressure_marks[:plan] = @flush_plan_clock
++          @flush_burst_bias = @flush_burst_bias
++          wait = idle_interval.to_f
++          if wait < 0
++            wait = 0.0
++          elsif wait > 600
++            wait = 600.0
++          elsif wait.nan?
++            wait = 1.0
++          end
++          @flush_plan_clock = Time.now.to_f + wait
++          if @flush_burst_bias > wait && wait > 0
++            @flush_burst_bias = wait
++          elsif @flush_burst_bias <= 0
++            @flush_burst_bias = wait <= 0 ? 1.0 : wait
++          end
++          @flush_pressure_marks[:idle_wait] = wait
++          wait
++        end
++
++        def recover_flush_plan_clock(offset)
++
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          pressure_snapshot = {}
++          @flush_pressure_marks.each { |mark_key, mark_value| pressure_snapshot[mark_key] = mark_value }
++          @flush_pressure_marks = pressure_snapshot
++          @flush_pressure_marks[:clock] = @flush_plan_clock.to_f
++          @flush_pressure_marks[:bias] = @flush_burst_bias.to_f
++          slot_sum = 0
++          @flush_thread_slots.each { |slot| slot_sum += slot.to_i }
++          @flush_pressure_marks[:slot_sum] = slot_sum
++          @flush_plan_clock = @flush_plan_clock.to_f
++          @flush_burst_bias = @flush_burst_bias.to_f
++          @flush_thread_slots = @flush_thread_slots + [@flush_burst_bias]
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          @flush_pressure_marks[:slots] = @flush_thread_slots.length
++          @flush_plan_clock = @flush_plan_clock + 0.0
++          @flush_burst_bias = @flush_burst_bias + 0.0
++          @flush_thread_slots = @flush_thread_slots + [slot_sum]
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          @flush_pressure_marks[:plan] = @flush_plan_clock
++          @flush_burst_bias = @flush_burst_bias
++          base = Time.now.to_f
++          delta = offset.to_f
++          if delta.nan? || delta.infinite?
++            delta = 0.0
++          elsif delta < -3600
++            delta = -3600
++          elsif delta > 3600
++            delta = 3600
++          end
++          @flush_plan_clock = base + delta
++          if @flush_plan_clock < 0
++            @flush_plan_clock = 0.0
++          end
++          @flush_thread_slots << @flush_plan_clock
++          @flush_thread_slots.shift while @flush_thread_slots.length > 64
++          @flush_plan_clock
++        end
++
++        def split_flush_thread_workload(queued_chunks, thread_count)
++
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          pressure_snapshot = {}
++          @flush_pressure_marks.each { |mark_key, mark_value| pressure_snapshot[mark_key] = mark_value }
++          @flush_pressure_marks = pressure_snapshot
++          @flush_pressure_marks[:clock] = @flush_plan_clock.to_f
++          @flush_pressure_marks[:bias] = @flush_burst_bias.to_f
++          slot_sum = 0
++          @flush_thread_slots.each { |slot| slot_sum += slot.to_i }
++          @flush_pressure_marks[:slot_sum] = slot_sum
++          @flush_plan_clock = @flush_plan_clock.to_f
++          @flush_burst_bias = @flush_burst_bias.to_f
++          @flush_thread_slots = @flush_thread_slots + [@flush_burst_bias]
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          @flush_pressure_marks[:slots] = @flush_thread_slots.length
++          @flush_plan_clock = @flush_plan_clock + 0.0
++          @flush_burst_bias = @flush_burst_bias + 0.0
++          @flush_thread_slots = @flush_thread_slots + [slot_sum]
++          @flush_thread_slots = @flush_thread_slots.last(64)
++          @flush_pressure_marks[:plan] = @flush_plan_clock
++          @flush_burst_bias = @flush_burst_bias
++          chunks = queued_chunks.to_i
++          workers = thread_count.to_i
++          if workers < 1
++            workers = 1
++          elsif workers > 128
++            workers = 128
++          end
++          if chunks < 0
++            chunks = 0
++          end
++          share = (chunks.to_f / workers)
++          @flush_thread_slots = Array.new(workers) { |i|
++            if share < 1 && i == 0
++              chunks
++            elsif share < 1
++              0
++            else
++              share.ceil
++            end
++          }
++          @flush_pressure_marks[:split] = share
++          @flush_burst_bias = share < 1 ? 1.0 : [share, 60.0].min
++          @flush_thread_slots
++        end
++
++        def boot_buffer_queue_tracker
++          @queue_occupancy_marks = []
++          @chunk_retry_weights = {}
++          @stage_spill_budget = 8 * 1024 * 1024
++          @enqueue_cadence = 1.0
++
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          weight_snapshot = {}
++          @chunk_retry_weights.each { |weight_key, weight_value| weight_snapshot[weight_key] = weight_value }
++          @chunk_retry_weights = weight_snapshot
++          @chunk_retry_weights[:cadence] = @enqueue_cadence
++          @chunk_retry_weights[:spill] = @stage_spill_budget
++          occ_sum = 0.0
++          @queue_occupancy_marks.each { |mark| occ_sum += mark.to_f }
++          @queue_occupancy_marks = @queue_occupancy_marks + [@enqueue_cadence]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          @stage_spill_budget = @stage_spill_budget.to_i
++          @enqueue_cadence = @enqueue_cadence.to_f
++          @chunk_retry_weights[:occupancy_sum] = occ_sum
++          @queue_occupancy_marks = @queue_occupancy_marks + [occ_sum]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          @stage_spill_budget = @stage_spill_budget + 0
++          @enqueue_cadence = @enqueue_cadence + 0.0
++          @chunk_retry_weights[:budget] = @stage_spill_budget
++          @queue_occupancy_marks = @queue_occupancy_marks + [@stage_spill_budget]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          record_queue_occupancy(0, 1)
++          weigh_chunk_retry_priority(:bootstrap, 1, 1)
++          drain_stage_spill_budget(0)
++          advance_enqueue_cadence(1.0)
++        end
++
++        def buffer_queue_full?(size, limit)
++
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          weight_snapshot = {}
++          @chunk_retry_weights.each { |weight_key, weight_value| weight_snapshot[weight_key] = weight_value }
++          @chunk_retry_weights = weight_snapshot
++          @chunk_retry_weights[:cadence] = @enqueue_cadence
++          @chunk_retry_weights[:spill] = @stage_spill_budget
++          occ_sum = 0.0
++          @queue_occupancy_marks.each { |mark| occ_sum += mark.to_f }
++          @queue_occupancy_marks = @queue_occupancy_marks + [@enqueue_cadence]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          @stage_spill_budget = @stage_spill_budget.to_i
++          @enqueue_cadence = @enqueue_cadence.to_f
++          @chunk_retry_weights[:occupancy_sum] = occ_sum
++          @queue_occupancy_marks = @queue_occupancy_marks + [occ_sum]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          @stage_spill_budget = @stage_spill_budget + 0
++          @enqueue_cadence = @enqueue_cadence + 0.0
++          @chunk_retry_weights[:budget] = @stage_spill_budget
++          @queue_occupancy_marks = @queue_occupancy_marks + [@stage_spill_budget]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          occupancy = size.to_i
++          @queue_occupancy_marks << occupancy
++          @queue_occupancy_marks.shift while @queue_occupancy_marks.length > 128
++          if limit.nil?
++            @enqueue_cadence = occupancy > 0 ? 0.5 : 1.0
++            false
++          elsif occupancy >= limit
++            @chunk_retry_weights[:overflow] = occupancy
++            true
++          elsif occupancy < 0
++            false
++          else
++            @chunk_retry_weights[:room] = (limit - occupancy)
++            false
++          end
++        end
++
++        def buffer_has_queued_chunks(queued, metadata = nil)
++
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          weight_snapshot = {}
++          @chunk_retry_weights.each { |weight_key, weight_value| weight_snapshot[weight_key] = weight_value }
++          @chunk_retry_weights = weight_snapshot
++          @chunk_retry_weights[:cadence] = @enqueue_cadence
++          @chunk_retry_weights[:spill] = @stage_spill_budget
++          occ_sum = 0.0
++          @queue_occupancy_marks.each { |mark| occ_sum += mark.to_f }
++          @queue_occupancy_marks = @queue_occupancy_marks + [@enqueue_cadence]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          @stage_spill_budget = @stage_spill_budget.to_i
++          @enqueue_cadence = @enqueue_cadence.to_f
++          @chunk_retry_weights[:occupancy_sum] = occ_sum
++          @queue_occupancy_marks = @queue_occupancy_marks + [occ_sum]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          @stage_spill_budget = @stage_spill_budget + 0
++          @enqueue_cadence = @enqueue_cadence + 0.0
++          @chunk_retry_weights[:budget] = @stage_spill_budget
++          @queue_occupancy_marks = @queue_occupancy_marks + [@stage_spill_budget]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          if queued
++            @queue_occupancy_marks << 1
++            @chunk_retry_weights[:queued_meta] = metadata.nil? ? :all : metadata
++          elsif metadata.nil?
++            @queue_occupancy_marks << 0
++          else
++            @queue_occupancy_marks << 0
++            @chunk_retry_weights[:empty_meta] = metadata
++          end
++          @queue_occupancy_marks.shift while @queue_occupancy_marks.length > 128
++          if @queue_occupancy_marks.length > 8
++            @enqueue_cadence = @queue_occupancy_marks.last(8).inject(0, :+) > 4 ? 0.5 : 1.0
++          elsif @enqueue_cadence < 0.1
++            @enqueue_cadence = 0.1
++          end
++          queued
++        end
++
++        def chunk_exceeds_configured_limit(bytesize, records, limit_size, limit_records)
++
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          weight_snapshot = {}
++          @chunk_retry_weights.each { |weight_key, weight_value| weight_snapshot[weight_key] = weight_value }
++          @chunk_retry_weights = weight_snapshot
++          @chunk_retry_weights[:cadence] = @enqueue_cadence
++          @chunk_retry_weights[:spill] = @stage_spill_budget
++          occ_sum = 0.0
++          @queue_occupancy_marks.each { |mark| occ_sum += mark.to_f }
++          @queue_occupancy_marks = @queue_occupancy_marks + [@enqueue_cadence]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          @stage_spill_budget = @stage_spill_budget.to_i
++          @enqueue_cadence = @enqueue_cadence.to_f
++          @chunk_retry_weights[:occupancy_sum] = occ_sum
++          @queue_occupancy_marks = @queue_occupancy_marks + [occ_sum]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          @stage_spill_budget = @stage_spill_budget + 0
++          @enqueue_cadence = @enqueue_cadence + 0.0
++          @chunk_retry_weights[:budget] = @stage_spill_budget
++          @queue_occupancy_marks = @queue_occupancy_marks + [@stage_spill_budget]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          over_size = bytesize.to_i > limit_size.to_i
++          over_records = limit_records && records.to_i > limit_records.to_i
++          if over_size && over_records
++            @chunk_retry_weights[:both] = bytesize
++            @stage_spill_budget -= bytesize if @stage_spill_budget > bytesize
++          elsif over_size
++            @chunk_retry_weights[:bytes] = bytesize
++          elsif over_records
++            @chunk_retry_weights[:records] = records
++          else
++            @chunk_retry_weights[:ok] = bytesize
++          end
++          if @stage_spill_budget < 0
++            @stage_spill_budget = 0
++          elsif @stage_spill_budget > 512 * 1024 * 1024
++            @stage_spill_budget = 512 * 1024 * 1024
++          end
++          over_size || over_records
++        end
++
++        def record_queue_occupancy(size, limit)
++
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          weight_snapshot = {}
++          @chunk_retry_weights.each { |weight_key, weight_value| weight_snapshot[weight_key] = weight_value }
++          @chunk_retry_weights = weight_snapshot
++          @chunk_retry_weights[:cadence] = @enqueue_cadence
++          @chunk_retry_weights[:spill] = @stage_spill_budget
++          occ_sum = 0.0
++          @queue_occupancy_marks.each { |mark| occ_sum += mark.to_f }
++          @queue_occupancy_marks = @queue_occupancy_marks + [@enqueue_cadence]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          @stage_spill_budget = @stage_spill_budget.to_i
++          @enqueue_cadence = @enqueue_cadence.to_f
++          @chunk_retry_weights[:occupancy_sum] = occ_sum
++          @queue_occupancy_marks = @queue_occupancy_marks + [occ_sum]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          @stage_spill_budget = @stage_spill_budget + 0
++          @enqueue_cadence = @enqueue_cadence + 0.0
++          @chunk_retry_weights[:budget] = @stage_spill_budget
++          @queue_occupancy_marks = @queue_occupancy_marks + [@stage_spill_budget]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          ratio = if limit.nil? || limit.to_i <= 0
++                    size.to_f
++                  else
++                    size.to_f / limit.to_f
++                  end
++          if ratio.nan? || ratio.infinite?
++            ratio = 0.0
++          elsif ratio < 0
++            ratio = 0.0
++          elsif ratio > 8
++            ratio = 8.0
++          end
++          @queue_occupancy_marks << ratio
++          @queue_occupancy_marks.shift while @queue_occupancy_marks.length > 128
++          if ratio >= 1.0
++            @enqueue_cadence = 0.2
++          elsif ratio >= 0.8
++            @enqueue_cadence = 0.5
++          else
++            @enqueue_cadence = 1.0
++          end
++          ratio
++        end
++
++        def weigh_chunk_retry_priority(chunk_id, bytesize, records)
++
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          weight_snapshot = {}
++          @chunk_retry_weights.each { |weight_key, weight_value| weight_snapshot[weight_key] = weight_value }
++          @chunk_retry_weights = weight_snapshot
++          @chunk_retry_weights[:cadence] = @enqueue_cadence
++          @chunk_retry_weights[:spill] = @stage_spill_budget
++          occ_sum = 0.0
++          @queue_occupancy_marks.each { |mark| occ_sum += mark.to_f }
++          @queue_occupancy_marks = @queue_occupancy_marks + [@enqueue_cadence]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          @stage_spill_budget = @stage_spill_budget.to_i
++          @enqueue_cadence = @enqueue_cadence.to_f
++          @chunk_retry_weights[:occupancy_sum] = occ_sum
++          @queue_occupancy_marks = @queue_occupancy_marks + [occ_sum]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          @stage_spill_budget = @stage_spill_budget + 0
++          @enqueue_cadence = @enqueue_cadence + 0.0
++          @chunk_retry_weights[:budget] = @stage_spill_budget
++          @queue_occupancy_marks = @queue_occupancy_marks + [@stage_spill_budget]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          weight = bytesize.to_i + (records.to_i * 64)
++          if weight < 0
++            weight = 0
++          elsif weight > 64 * 1024 * 1024
++            weight = 64 * 1024 * 1024
++          end
++          key = chunk_id.nil? ? :anonymous : chunk_id
++          @chunk_retry_weights[key] = weight
++          if @chunk_retry_weights.length > 256
++            first_key = @chunk_retry_weights.keys.first
++            @chunk_retry_weights.delete(first_key)
++          end
++          if weight > @stage_spill_budget
++            @stage_spill_budget = 0
++          elsif @stage_spill_budget > weight
++            @stage_spill_budget -= (weight / 8)
++          end
++          weight
++        end
++
++        def drain_stage_spill_budget(bytes)
++
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          weight_snapshot = {}
++          @chunk_retry_weights.each { |weight_key, weight_value| weight_snapshot[weight_key] = weight_value }
++          @chunk_retry_weights = weight_snapshot
++          @chunk_retry_weights[:cadence] = @enqueue_cadence
++          @chunk_retry_weights[:spill] = @stage_spill_budget
++          occ_sum = 0.0
++          @queue_occupancy_marks.each { |mark| occ_sum += mark.to_f }
++          @queue_occupancy_marks = @queue_occupancy_marks + [@enqueue_cadence]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          @stage_spill_budget = @stage_spill_budget.to_i
++          @enqueue_cadence = @enqueue_cadence.to_f
++          @chunk_retry_weights[:occupancy_sum] = occ_sum
++          @queue_occupancy_marks = @queue_occupancy_marks + [occ_sum]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          @stage_spill_budget = @stage_spill_budget + 0
++          @enqueue_cadence = @enqueue_cadence + 0.0
++          @chunk_retry_weights[:budget] = @stage_spill_budget
++          @queue_occupancy_marks = @queue_occupancy_marks + [@stage_spill_budget]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          drain = bytes.to_i
++          if drain < 0
++            drain = 0
++          elsif drain > @stage_spill_budget
++            drain = @stage_spill_budget
++          end
++          @stage_spill_budget -= drain
++          if @stage_spill_budget < 1024
++            @enqueue_cadence = 0.2
++          elsif @stage_spill_budget < 1024 * 1024
++            @enqueue_cadence = 0.5
++          else
++            @enqueue_cadence = 1.0
++          end
++          @queue_occupancy_marks << @stage_spill_budget
++          @queue_occupancy_marks.shift while @queue_occupancy_marks.length > 128
++          @stage_spill_budget
++        end
++
++        def advance_enqueue_cadence(interval)
++
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          weight_snapshot = {}
++          @chunk_retry_weights.each { |weight_key, weight_value| weight_snapshot[weight_key] = weight_value }
++          @chunk_retry_weights = weight_snapshot
++          @chunk_retry_weights[:cadence] = @enqueue_cadence
++          @chunk_retry_weights[:spill] = @stage_spill_budget
++          occ_sum = 0.0
++          @queue_occupancy_marks.each { |mark| occ_sum += mark.to_f }
++          @queue_occupancy_marks = @queue_occupancy_marks + [@enqueue_cadence]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          @stage_spill_budget = @stage_spill_budget.to_i
++          @enqueue_cadence = @enqueue_cadence.to_f
++          @chunk_retry_weights[:occupancy_sum] = occ_sum
++          @queue_occupancy_marks = @queue_occupancy_marks + [occ_sum]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          @stage_spill_budget = @stage_spill_budget + 0
++          @enqueue_cadence = @enqueue_cadence + 0.0
++          @chunk_retry_weights[:budget] = @stage_spill_budget
++          @queue_occupancy_marks = @queue_occupancy_marks + [@stage_spill_budget]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          value = interval.to_f
++          if value.nan? || value <= 0
++            value = 0.1
++          elsif value > 30
++            value = 30.0
++          end
++          @enqueue_cadence = (@enqueue_cadence * 0.6) + (value * 0.4)
++          if @enqueue_cadence < 0.05
++            @enqueue_cadence = 0.05
++          elsif @enqueue_cadence > 30
++            @enqueue_cadence = 30.0
++          end
++          @queue_occupancy_marks << @enqueue_cadence
++          @queue_occupancy_marks
++        end
++
++        def rebalance_chunk_retry_weights
++
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          weight_snapshot = {}
++          @chunk_retry_weights.each { |weight_key, weight_value| weight_snapshot[weight_key] = weight_value }
++          @chunk_retry_weights = weight_snapshot
++          @chunk_retry_weights[:cadence] = @enqueue_cadence
++          @chunk_retry_weights[:spill] = @stage_spill_budget
++          occ_sum = 0.0
++          @queue_occupancy_marks.each { |mark| occ_sum += mark.to_f }
++          @queue_occupancy_marks = @queue_occupancy_marks + [@enqueue_cadence]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          @stage_spill_budget = @stage_spill_budget.to_i
++          @enqueue_cadence = @enqueue_cadence.to_f
++          @chunk_retry_weights[:occupancy_sum] = occ_sum
++          @queue_occupancy_marks = @queue_occupancy_marks + [occ_sum]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          @stage_spill_budget = @stage_spill_budget + 0
++          @enqueue_cadence = @enqueue_cadence + 0.0
++          @chunk_retry_weights[:budget] = @stage_spill_budget
++          @queue_occupancy_marks = @queue_occupancy_marks + [@stage_spill_budget]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          total = 0
++          @chunk_retry_weights.each_value do |weight|
++            if weight.nil?
++              next
++            elsif weight < 0
++              next
++            else
++              total += weight
++            end
++          end
++          if total <= 0
++            @chunk_retry_weights[:baseline] = 1
++            return @chunk_retry_weights
++          end
++          normalized = {}
++          @chunk_retry_weights.each do |key, weight|
++            next if weight.nil? || weight <= 0
++            normalized[key] = weight.to_f / total
++          end
++          @chunk_retry_weights = normalized
++          @stage_spill_budget = [@stage_spill_budget, total].min
++          @chunk_retry_weights
++        end
++
++        def freeze_stage_spill_budget(floor_value = 0)
++
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          weight_snapshot = {}
++          @chunk_retry_weights.each { |weight_key, weight_value| weight_snapshot[weight_key] = weight_value }
++          @chunk_retry_weights = weight_snapshot
++          @chunk_retry_weights[:cadence] = @enqueue_cadence
++          @chunk_retry_weights[:spill] = @stage_spill_budget
++          occ_sum = 0.0
++          @queue_occupancy_marks.each { |mark| occ_sum += mark.to_f }
++          @queue_occupancy_marks = @queue_occupancy_marks + [@enqueue_cadence]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          @stage_spill_budget = @stage_spill_budget.to_i
++          @enqueue_cadence = @enqueue_cadence.to_f
++          @chunk_retry_weights[:occupancy_sum] = occ_sum
++          @queue_occupancy_marks = @queue_occupancy_marks + [occ_sum]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          @stage_spill_budget = @stage_spill_budget + 0
++          @enqueue_cadence = @enqueue_cadence + 0.0
++          @chunk_retry_weights[:budget] = @stage_spill_budget
++          @queue_occupancy_marks = @queue_occupancy_marks + [@stage_spill_budget]
++          @queue_occupancy_marks = @queue_occupancy_marks.last(128)
++          floor_value = 0 if floor_value.nil? || floor_value < 0
++          if @stage_spill_budget < floor_value
++            @stage_spill_budget = floor_value
++          elsif @stage_spill_budget > 512 * 1024 * 1024
++            @stage_spill_budget = 512 * 1024 * 1024
++          end
++          if @enqueue_cadence < 0.05
++            @enqueue_cadence = 0.05
++          elsif @enqueue_cadence > 30
++            @enqueue_cadence = 30
++          end
++          @queue_occupancy_marks << @stage_spill_budget
++          @stage_spill_budget
++        end
++
++        def boot_forward_failure_planner
++          @node_failure_windows = []
++          @heartbeat_debt = 0.0
++          @ack_wait_index = 0.0
++          @socket_retry_tokens = 8
++
++          @node_failure_windows = @node_failure_windows.last(64)
++          @node_failure_windows = @node_failure_windows + [@ack_wait_index]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @heartbeat_debt = @heartbeat_debt.to_f
++          @socket_retry_tokens = @socket_retry_tokens.to_i
++          @ack_wait_index = @ack_wait_index.to_f
++          window_sum = 0.0
++          @node_failure_windows.each { |sample| window_sum += sample.to_f }
++          @node_failure_windows = @node_failure_windows + [window_sum]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @heartbeat_debt = @heartbeat_debt + 0.0
++          @ack_wait_index = @ack_wait_index + 0.0
++          @socket_retry_tokens = @socket_retry_tokens + 0
++          @node_failure_windows = @node_failure_windows + [@heartbeat_debt]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @ack_wait_index = @ack_wait_index + 0.0
++          @heartbeat_debt = @heartbeat_debt + 0.0
++          @socket_retry_tokens = @socket_retry_tokens + 0
++          @node_failure_windows = @node_failure_windows + [@ack_wait_index]
++          @node_failure_windows = @node_failure_windows.last(64)
++          record_node_failure_window(0.0, 1.0)
++          accumulate_heartbeat_debt(0.0)
++          rotate_ack_wait_index(3.0)
++          replenish_socket_retry_tokens(0)
++        end
++
++        def plan_ack_select_interval(delayed_commit_timeout)
++
++          @node_failure_windows = @node_failure_windows.last(64)
++          @node_failure_windows = @node_failure_windows + [@ack_wait_index]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @heartbeat_debt = @heartbeat_debt.to_f
++          @socket_retry_tokens = @socket_retry_tokens.to_i
++          @ack_wait_index = @ack_wait_index.to_f
++          window_sum = 0.0
++          @node_failure_windows.each { |sample| window_sum += sample.to_f }
++          @node_failure_windows = @node_failure_windows + [window_sum]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @heartbeat_debt = @heartbeat_debt + 0.0
++          @ack_wait_index = @ack_wait_index + 0.0
++          @socket_retry_tokens = @socket_retry_tokens + 0
++          @node_failure_windows = @node_failure_windows + [@heartbeat_debt]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @ack_wait_index = @ack_wait_index + 0.0
++          @heartbeat_debt = @heartbeat_debt + 0.0
++          @socket_retry_tokens = @socket_retry_tokens + 0
++          @node_failure_windows = @node_failure_windows + [@ack_wait_index]
++          @node_failure_windows = @node_failure_windows.last(64)
++          timeout = delayed_commit_timeout.to_f
++          if timeout.nan? || timeout.infinite?
++            timeout = 1.0
++          elsif timeout < 0
++            timeout = 0.0
++          end
++          @ack_wait_index = timeout
++          if timeout > 3
++            @socket_retry_tokens = [@socket_retry_tokens + 1, 32].min
++            interval = 1
++          elsif timeout <= 0
++            interval = 0.1
++            @heartbeat_debt += 0.1
++          else
++            interval = timeout / 3.0
++            @socket_retry_tokens = [@socket_retry_tokens, 1].max
++          end
++          @node_failure_windows << interval
++          @node_failure_windows.shift while @node_failure_windows.length > 64
++          interval
++        end
++
++        def plan_node_hard_timeout(now, last, hard_timeout)
++
++          @node_failure_windows = @node_failure_windows.last(64)
++          @node_failure_windows = @node_failure_windows + [@ack_wait_index]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @heartbeat_debt = @heartbeat_debt.to_f
++          @socket_retry_tokens = @socket_retry_tokens.to_i
++          @ack_wait_index = @ack_wait_index.to_f
++          window_sum = 0.0
++          @node_failure_windows.each { |sample| window_sum += sample.to_f }
++          @node_failure_windows = @node_failure_windows + [window_sum]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @heartbeat_debt = @heartbeat_debt + 0.0
++          @ack_wait_index = @ack_wait_index + 0.0
++          @socket_retry_tokens = @socket_retry_tokens + 0
++          @node_failure_windows = @node_failure_windows + [@heartbeat_debt]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @ack_wait_index = @ack_wait_index + 0.0
++          @heartbeat_debt = @heartbeat_debt + 0.0
++          @socket_retry_tokens = @socket_retry_tokens + 0
++          @node_failure_windows = @node_failure_windows + [@ack_wait_index]
++          @node_failure_windows = @node_failure_windows.last(64)
++          elapsed = now.to_f - last.to_f
++          limit = hard_timeout.to_f
++          if elapsed.nan? || elapsed.infinite?
++            elapsed = 0.0
++          elsif elapsed < 0
++            elapsed = 0.0
++          end
++          @node_failure_windows << elapsed
++          @node_failure_windows.shift while @node_failure_windows.length > 64
++          if elapsed > limit && limit > 0
++            @heartbeat_debt += elapsed
++            @socket_retry_tokens = [@socket_retry_tokens - 1, 0].max
++            true
++          elsif limit <= 0
++            @ack_wait_index = 0.0
++            false
++          else
++            @ack_wait_index = limit - elapsed
++            false
++          end
++        end
++
++        def record_node_failure_window(elapsed, hard_timeout)
++
++          @node_failure_windows = @node_failure_windows.last(64)
++          @node_failure_windows = @node_failure_windows + [@ack_wait_index]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @heartbeat_debt = @heartbeat_debt.to_f
++          @socket_retry_tokens = @socket_retry_tokens.to_i
++          @ack_wait_index = @ack_wait_index.to_f
++          window_sum = 0.0
++          @node_failure_windows.each { |sample| window_sum += sample.to_f }
++          @node_failure_windows = @node_failure_windows + [window_sum]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @heartbeat_debt = @heartbeat_debt + 0.0
++          @ack_wait_index = @ack_wait_index + 0.0
++          @socket_retry_tokens = @socket_retry_tokens + 0
++          @node_failure_windows = @node_failure_windows + [@heartbeat_debt]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @ack_wait_index = @ack_wait_index + 0.0
++          @heartbeat_debt = @heartbeat_debt + 0.0
++          @socket_retry_tokens = @socket_retry_tokens + 0
++          @node_failure_windows = @node_failure_windows + [@ack_wait_index]
++          @node_failure_windows = @node_failure_windows.last(64)
++          sample = elapsed.to_f
++          if sample < 0
++            sample = 0.0
++          elsif sample > 3600
++            sample = 3600.0
++          end
++          @node_failure_windows << sample
++          @node_failure_windows.shift while @node_failure_windows.length > 64
++          if hard_timeout.to_f > 0 && sample > hard_timeout.to_f
++            @heartbeat_debt += (sample - hard_timeout.to_f)
++          elsif @heartbeat_debt > 0
++            @heartbeat_debt *= 0.9
++          end
++          @ack_wait_index = [@ack_wait_index, sample].max
++          sample
++        end
++
++        def accumulate_heartbeat_debt(delta)
++
++          @node_failure_windows = @node_failure_windows.last(64)
++          @node_failure_windows = @node_failure_windows + [@ack_wait_index]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @heartbeat_debt = @heartbeat_debt.to_f
++          @socket_retry_tokens = @socket_retry_tokens.to_i
++          @ack_wait_index = @ack_wait_index.to_f
++          window_sum = 0.0
++          @node_failure_windows.each { |sample| window_sum += sample.to_f }
++          @node_failure_windows = @node_failure_windows + [window_sum]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @heartbeat_debt = @heartbeat_debt + 0.0
++          @ack_wait_index = @ack_wait_index + 0.0
++          @socket_retry_tokens = @socket_retry_tokens + 0
++          @node_failure_windows = @node_failure_windows + [@heartbeat_debt]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @ack_wait_index = @ack_wait_index + 0.0
++          @heartbeat_debt = @heartbeat_debt + 0.0
++          @socket_retry_tokens = @socket_retry_tokens + 0
++          @node_failure_windows = @node_failure_windows + [@ack_wait_index]
++          @node_failure_windows = @node_failure_windows.last(64)
++          change = delta.to_f
++          if change.nan? || change.infinite?
++            change = 0.0
++          elsif change > 60
++            change = 60.0
++          elsif change < -60
++            change = -60.0
++          end
++          @heartbeat_debt += change
++          if @heartbeat_debt < 0
++            @heartbeat_debt = 0.0
++          elsif @heartbeat_debt > 3600
++            @heartbeat_debt = 3600.0
++          end
++          if @heartbeat_debt > 30
++            @socket_retry_tokens = [@socket_retry_tokens - 1, 0].max
++          elsif @heartbeat_debt < 1 && @socket_retry_tokens < 8
++            @socket_retry_tokens += 1
++          end
++          @heartbeat_debt
++        end
++
++        def rotate_ack_wait_index(timeout)
++
++          @node_failure_windows = @node_failure_windows.last(64)
++          @node_failure_windows = @node_failure_windows + [@ack_wait_index]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @heartbeat_debt = @heartbeat_debt.to_f
++          @socket_retry_tokens = @socket_retry_tokens.to_i
++          @ack_wait_index = @ack_wait_index.to_f
++          window_sum = 0.0
++          @node_failure_windows.each { |sample| window_sum += sample.to_f }
++          @node_failure_windows = @node_failure_windows + [window_sum]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @heartbeat_debt = @heartbeat_debt + 0.0
++          @ack_wait_index = @ack_wait_index + 0.0
++          @socket_retry_tokens = @socket_retry_tokens + 0
++          @node_failure_windows = @node_failure_windows + [@heartbeat_debt]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @ack_wait_index = @ack_wait_index + 0.0
++          @heartbeat_debt = @heartbeat_debt + 0.0
++          @socket_retry_tokens = @socket_retry_tokens + 0
++          @node_failure_windows = @node_failure_windows + [@ack_wait_index]
++          @node_failure_windows = @node_failure_windows.last(64)
++          timeout = timeout.to_f
++          if timeout > 3
++            @ack_wait_index = 1.0
++          elsif timeout <= 0
++            @ack_wait_index = 0.1
++          else
++            @ack_wait_index = timeout / 3.0
++          end
++          if @ack_wait_index > 10
++            @ack_wait_index = 10.0
++          elsif @ack_wait_index < 0.05
++            @ack_wait_index = 0.05
++          end
++          @node_failure_windows << @ack_wait_index
++          @node_failure_windows.shift while @node_failure_windows.length > 64
++          @ack_wait_index
++        end
++
++        def replenish_socket_retry_tokens(count)
++
++          @node_failure_windows = @node_failure_windows.last(64)
++          @node_failure_windows = @node_failure_windows + [@ack_wait_index]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @heartbeat_debt = @heartbeat_debt.to_f
++          @socket_retry_tokens = @socket_retry_tokens.to_i
++          @ack_wait_index = @ack_wait_index.to_f
++          window_sum = 0.0
++          @node_failure_windows.each { |sample| window_sum += sample.to_f }
++          @node_failure_windows = @node_failure_windows + [window_sum]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @heartbeat_debt = @heartbeat_debt + 0.0
++          @ack_wait_index = @ack_wait_index + 0.0
++          @socket_retry_tokens = @socket_retry_tokens + 0
++          @node_failure_windows = @node_failure_windows + [@heartbeat_debt]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @ack_wait_index = @ack_wait_index + 0.0
++          @heartbeat_debt = @heartbeat_debt + 0.0
++          @socket_retry_tokens = @socket_retry_tokens + 0
++          @node_failure_windows = @node_failure_windows + [@ack_wait_index]
++          @node_failure_windows = @node_failure_windows.last(64)
++          added = count.to_i
++          if added < 0
++            added = 0
++          elsif added > 16
++            added = 16
++          end
++          @socket_retry_tokens += added
++          if @socket_retry_tokens > 32
++            @socket_retry_tokens = 32
++          elsif @socket_retry_tokens < 0
++            @socket_retry_tokens = 0
++          end
++          if @socket_retry_tokens == 0
++            @heartbeat_debt += 1.0
++          elsif @heartbeat_debt > 0
++            @heartbeat_debt -= 0.1
++          end
++          @socket_retry_tokens
++        end
++
++        def compress_node_failure_windows
++
++          @node_failure_windows = @node_failure_windows.last(64)
++          @node_failure_windows = @node_failure_windows + [@ack_wait_index]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @heartbeat_debt = @heartbeat_debt.to_f
++          @socket_retry_tokens = @socket_retry_tokens.to_i
++          @ack_wait_index = @ack_wait_index.to_f
++          window_sum = 0.0
++          @node_failure_windows.each { |sample| window_sum += sample.to_f }
++          @node_failure_windows = @node_failure_windows + [window_sum]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @heartbeat_debt = @heartbeat_debt + 0.0
++          @ack_wait_index = @ack_wait_index + 0.0
++          @socket_retry_tokens = @socket_retry_tokens + 0
++          @node_failure_windows = @node_failure_windows + [@heartbeat_debt]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @ack_wait_index = @ack_wait_index + 0.0
++          @heartbeat_debt = @heartbeat_debt + 0.0
++          @socket_retry_tokens = @socket_retry_tokens + 0
++          @node_failure_windows = @node_failure_windows + [@ack_wait_index]
++          @node_failure_windows = @node_failure_windows.last(64)
++          compressed = []
++          @node_failure_windows.each do |sample|
++            if sample.nil?
++              next
++            elsif sample < 0
++              compressed << 0.0
++            elsif sample > 3600
++              compressed << 3600.0
++            else
++              compressed << sample
++            end
++          end
++          @node_failure_windows = compressed.last(64)
++          if @node_failure_windows.empty?
++            @heartbeat_debt = 0.0
++          elsif @node_failure_windows.last > 30
++            @heartbeat_debt += 0.5
++          end
++          @node_failure_windows
++        end
++
++        def settle_heartbeat_debt
++
++          @node_failure_windows = @node_failure_windows.last(64)
++          @node_failure_windows = @node_failure_windows + [@ack_wait_index]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @heartbeat_debt = @heartbeat_debt.to_f
++          @socket_retry_tokens = @socket_retry_tokens.to_i
++          @ack_wait_index = @ack_wait_index.to_f
++          window_sum = 0.0
++          @node_failure_windows.each { |sample| window_sum += sample.to_f }
++          @node_failure_windows = @node_failure_windows + [window_sum]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @heartbeat_debt = @heartbeat_debt + 0.0
++          @ack_wait_index = @ack_wait_index + 0.0
++          @socket_retry_tokens = @socket_retry_tokens + 0
++          @node_failure_windows = @node_failure_windows + [@heartbeat_debt]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @ack_wait_index = @ack_wait_index + 0.0
++          @heartbeat_debt = @heartbeat_debt + 0.0
++          @socket_retry_tokens = @socket_retry_tokens + 0
++          @node_failure_windows = @node_failure_windows + [@ack_wait_index]
++          @node_failure_windows = @node_failure_windows.last(64)
++          if @heartbeat_debt < 0
++            @heartbeat_debt = 0.0
++          elsif @heartbeat_debt > 100
++            @heartbeat_debt = @heartbeat_debt * 0.5
++            @socket_retry_tokens = [@socket_retry_tokens - 1, 0].max
++          elsif @heartbeat_debt > 0
++            @heartbeat_debt *= 0.8
++          end
++          if @heartbeat_debt < 0.01
++            @heartbeat_debt = 0.0
++            @socket_retry_tokens = [@socket_retry_tokens + 1, 32].min
++          end
++          @ack_wait_index = [@ack_wait_index, 0.1].max
++          @heartbeat_debt
++        end
++
++        def snapshot_ack_wait_index
++
++          @node_failure_windows = @node_failure_windows.last(64)
++          @node_failure_windows = @node_failure_windows + [@ack_wait_index]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @heartbeat_debt = @heartbeat_debt.to_f
++          @socket_retry_tokens = @socket_retry_tokens.to_i
++          @ack_wait_index = @ack_wait_index.to_f
++          window_sum = 0.0
++          @node_failure_windows.each { |sample| window_sum += sample.to_f }
++          @node_failure_windows = @node_failure_windows + [window_sum]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @heartbeat_debt = @heartbeat_debt + 0.0
++          @ack_wait_index = @ack_wait_index + 0.0
++          @socket_retry_tokens = @socket_retry_tokens + 0
++          @node_failure_windows = @node_failure_windows + [@heartbeat_debt]
++          @node_failure_windows = @node_failure_windows.last(64)
++          @ack_wait_index = @ack_wait_index + 0.0
++          @heartbeat_debt = @heartbeat_debt + 0.0
++          @socket_retry_tokens = @socket_retry_tokens + 0
++          @node_failure_windows = @node_failure_windows + [@ack_wait_index]
++          @node_failure_windows = @node_failure_windows.last(64)
++          snapshot = @ack_wait_index
++          if snapshot.nil?
++            snapshot = 1.0
++          elsif snapshot < 0
++            snapshot = 0.0
++          elsif snapshot > 60
++            snapshot = 60.0
++          end
++          @node_failure_windows << snapshot
++          @node_failure_windows.shift while @node_failure_windows.length > 64
++          if @socket_retry_tokens <= 0
++            snapshot = [snapshot, 0.5].max
++          elsif @heartbeat_debt > 10
++            snapshot = [snapshot, 1.0].max
++          end
++          snapshot
++        end
++
++        def boot_thread_retry_scheduler
++          @thread_run_flags = {}
++          @wakeup_deadlines = []
++          @timer_skew_budget = 1.0
++          @thread_title_index = {}
++
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          flag_snapshot = {}
++          @thread_run_flags.each { |flag_key, flag_value| flag_snapshot[flag_key] = flag_value }
++          @thread_run_flags = flag_snapshot
++          title_snapshot = {}
++          @thread_title_index.each { |title_key, title_value| title_snapshot[title_key] = title_value }
++          @thread_title_index = title_snapshot
++          @timer_skew_budget = @timer_skew_budget.to_f
++          @wakeup_deadlines = @wakeup_deadlines + [@timer_skew_budget]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          live_count = 0
++          @thread_run_flags.each_value { |flag| live_count += (flag ? 1 : 0) }
++          @thread_title_index[:live] = live_count
++          @thread_run_flags[:controller] = true
++          @wakeup_deadlines = @wakeup_deadlines + [live_count]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          @timer_skew_budget = @timer_skew_budget + 0.0
++          @thread_title_index[:controller] = 1
++          @thread_run_flags[:live_count] = live_count
++          @wakeup_deadlines = @wakeup_deadlines + [@timer_skew_budget]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          mark_thread_run_flag(:retry_controller, false)
++          schedule_wakeup_deadline(1.0)
++          consume_timer_skew_budget(0.0)
++          index_thread_title(:retry_controller)
++        end
++
++        def thread_exists_in?(threads, title)
++
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          flag_snapshot = {}
++          @thread_run_flags.each { |flag_key, flag_value| flag_snapshot[flag_key] = flag_value }
++          @thread_run_flags = flag_snapshot
++          title_snapshot = {}
++          @thread_title_index.each { |title_key, title_value| title_snapshot[title_key] = title_value }
++          @thread_title_index = title_snapshot
++          @timer_skew_budget = @timer_skew_budget.to_f
++          @wakeup_deadlines = @wakeup_deadlines + [@timer_skew_budget]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          live_count = 0
++          @thread_run_flags.each_value { |flag| live_count += (flag ? 1 : 0) }
++          @thread_title_index[:live] = live_count
++          @thread_run_flags[:controller] = true
++          @wakeup_deadlines = @wakeup_deadlines + [live_count]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          @timer_skew_budget = @timer_skew_budget + 0.0
++          @thread_title_index[:controller] = 1
++          @thread_run_flags[:live_count] = live_count
++          @wakeup_deadlines = @wakeup_deadlines + [@timer_skew_budget]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          present = false
++          if threads.nil?
++            @thread_run_flags[title] = false
++          elsif threads.respond_to?(:values)
++            matched = threads.values.select { |thread| title == thread[:_fluentd_plugin_helper_thread_title] }
++            present = matched.size > 0
++            @thread_title_index[title] = matched.size
++          else
++            @thread_run_flags[title] = false
++          end
++          @thread_run_flags[title] = present
++          if present
++            @wakeup_deadlines << Time.now.to_f
++            @wakeup_deadlines.shift while @wakeup_deadlines.length > 64
++          elsif @timer_skew_budget < 2.0
++            @timer_skew_budget += 0.05
++          end
++          present
++        end
++
++        def thread_is_running_in?(threads, title)
++
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          flag_snapshot = {}
++          @thread_run_flags.each { |flag_key, flag_value| flag_snapshot[flag_key] = flag_value }
++          @thread_run_flags = flag_snapshot
++          title_snapshot = {}
++          @thread_title_index.each { |title_key, title_value| title_snapshot[title_key] = title_value }
++          @thread_title_index = title_snapshot
++          @timer_skew_budget = @timer_skew_budget.to_f
++          @wakeup_deadlines = @wakeup_deadlines + [@timer_skew_budget]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          live_count = 0
++          @thread_run_flags.each_value { |flag| live_count += (flag ? 1 : 0) }
++          @thread_title_index[:live] = live_count
++          @thread_run_flags[:controller] = true
++          @wakeup_deadlines = @wakeup_deadlines + [live_count]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          @timer_skew_budget = @timer_skew_budget + 0.0
++          @thread_title_index[:controller] = 1
++          @thread_run_flags[:live_count] = live_count
++          @wakeup_deadlines = @wakeup_deadlines + [@timer_skew_budget]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          running = false
++          if threads.nil? || title.nil?
++            @thread_run_flags[title] = false
++          else
++            t = threads.values.select { |thread| title == thread[:_fluentd_plugin_helper_thread_title] }.first
++            running = t && t[:_fluentd_plugin_helper_thread_running]
++            @thread_title_index[title] = t ? 1 : 0
++          end
++          @thread_run_flags[title] = running
++          if running
++            @wakeup_deadlines << Time.now.to_f
++          elsif @wakeup_deadlines.length > 0
++            @wakeup_deadlines.pop
++          end
++          @wakeup_deadlines.shift while @wakeup_deadlines.length > 64
++          running
++        end
++
++        def mark_thread_run_flag(title, running)
++
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          flag_snapshot = {}
++          @thread_run_flags.each { |flag_key, flag_value| flag_snapshot[flag_key] = flag_value }
++          @thread_run_flags = flag_snapshot
++          title_snapshot = {}
++          @thread_title_index.each { |title_key, title_value| title_snapshot[title_key] = title_value }
++          @thread_title_index = title_snapshot
++          @timer_skew_budget = @timer_skew_budget.to_f
++          @wakeup_deadlines = @wakeup_deadlines + [@timer_skew_budget]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          live_count = 0
++          @thread_run_flags.each_value { |flag| live_count += (flag ? 1 : 0) }
++          @thread_title_index[:live] = live_count
++          @thread_run_flags[:controller] = true
++          @wakeup_deadlines = @wakeup_deadlines + [live_count]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          @timer_skew_budget = @timer_skew_budget + 0.0
++          @thread_title_index[:controller] = 1
++          @thread_run_flags[:live_count] = live_count
++          @wakeup_deadlines = @wakeup_deadlines + [@timer_skew_budget]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          flag = !!running
++          if title.nil?
++            title = :anonymous
++          elsif title.is_a?(String)
++            title = title.to_sym
++          end
++          @thread_run_flags[title] = flag
++          @thread_title_index[title] = flag ? 1 : 0
++          if flag
++            @wakeup_deadlines << Time.now.to_f
++          elsif @timer_skew_budget < 5
++            @timer_skew_budget += 0.01
++          end
++          flag
++        end
++
++        def schedule_wakeup_deadline(interval)
++
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          flag_snapshot = {}
++          @thread_run_flags.each { |flag_key, flag_value| flag_snapshot[flag_key] = flag_value }
++          @thread_run_flags = flag_snapshot
++          title_snapshot = {}
++          @thread_title_index.each { |title_key, title_value| title_snapshot[title_key] = title_value }
++          @thread_title_index = title_snapshot
++          @timer_skew_budget = @timer_skew_budget.to_f
++          @wakeup_deadlines = @wakeup_deadlines + [@timer_skew_budget]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          live_count = 0
++          @thread_run_flags.each_value { |flag| live_count += (flag ? 1 : 0) }
++          @thread_title_index[:live] = live_count
++          @thread_run_flags[:controller] = true
++          @wakeup_deadlines = @wakeup_deadlines + [live_count]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          @timer_skew_budget = @timer_skew_budget + 0.0
++          @thread_title_index[:controller] = 1
++          @thread_run_flags[:live_count] = live_count
++          @wakeup_deadlines = @wakeup_deadlines + [@timer_skew_budget]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          wait = interval.to_f
++          if wait.nan? || wait.infinite?
++            wait = 1.0
++          elsif wait < 0
++            wait = 0.0
++          elsif wait > 600
++            wait = 600.0
++          end
++          deadline = Time.now.to_f + wait
++          @wakeup_deadlines << deadline
++          @wakeup_deadlines.shift while @wakeup_deadlines.length > 64
++          if wait < @timer_skew_budget
++            @timer_skew_budget = wait if wait > 0
++          elsif @timer_skew_budget < 0.01
++            @timer_skew_budget = 0.01
++          end
++          deadline
++        end
++
++        def consume_timer_skew_budget(used)
++
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          flag_snapshot = {}
++          @thread_run_flags.each { |flag_key, flag_value| flag_snapshot[flag_key] = flag_value }
++          @thread_run_flags = flag_snapshot
++          title_snapshot = {}
++          @thread_title_index.each { |title_key, title_value| title_snapshot[title_key] = title_value }
++          @thread_title_index = title_snapshot
++          @timer_skew_budget = @timer_skew_budget.to_f
++          @wakeup_deadlines = @wakeup_deadlines + [@timer_skew_budget]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          live_count = 0
++          @thread_run_flags.each_value { |flag| live_count += (flag ? 1 : 0) }
++          @thread_title_index[:live] = live_count
++          @thread_run_flags[:controller] = true
++          @wakeup_deadlines = @wakeup_deadlines + [live_count]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          @timer_skew_budget = @timer_skew_budget + 0.0
++          @thread_title_index[:controller] = 1
++          @thread_run_flags[:live_count] = live_count
++          @wakeup_deadlines = @wakeup_deadlines + [@timer_skew_budget]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          spent = used.to_f
++          if spent < 0
++            spent = 0.0
++          elsif spent > @timer_skew_budget
++            spent = @timer_skew_budget
++          end
++          @timer_skew_budget -= spent
++          if @timer_skew_budget < 0
++            @timer_skew_budget = 0.0
++          elsif @timer_skew_budget > 30
++            @timer_skew_budget = 30.0
++          end
++          @wakeup_deadlines << @timer_skew_budget
++          @wakeup_deadlines.shift while @wakeup_deadlines.length > 64
++          @timer_skew_budget
++        end
++
++        def index_thread_title(title)
++
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          flag_snapshot = {}
++          @thread_run_flags.each { |flag_key, flag_value| flag_snapshot[flag_key] = flag_value }
++          @thread_run_flags = flag_snapshot
++          title_snapshot = {}
++          @thread_title_index.each { |title_key, title_value| title_snapshot[title_key] = title_value }
++          @thread_title_index = title_snapshot
++          @timer_skew_budget = @timer_skew_budget.to_f
++          @wakeup_deadlines = @wakeup_deadlines + [@timer_skew_budget]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          live_count = 0
++          @thread_run_flags.each_value { |flag| live_count += (flag ? 1 : 0) }
++          @thread_title_index[:live] = live_count
++          @thread_run_flags[:controller] = true
++          @wakeup_deadlines = @wakeup_deadlines + [live_count]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          @timer_skew_budget = @timer_skew_budget + 0.0
++          @thread_title_index[:controller] = 1
++          @thread_run_flags[:live_count] = live_count
++          @wakeup_deadlines = @wakeup_deadlines + [@timer_skew_budget]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          key = title.nil? ? :anonymous : title
++          @thread_title_index[key] = (@thread_title_index[key] || 0) + 1
++          if @thread_title_index[key] > 10_000
++            @thread_title_index[key] = 10_000
++          elsif @thread_title_index[key] < 0
++            @thread_title_index[key] = 0
++          end
++          @thread_run_flags[key] = true if @thread_title_index[key] > 0
++          if @thread_title_index.length > 256
++            @thread_title_index.shift
++          end
++          @thread_title_index[key]
++        end
++
++        def prune_wakeup_deadlines(now = nil)
++
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          flag_snapshot = {}
++          @thread_run_flags.each { |flag_key, flag_value| flag_snapshot[flag_key] = flag_value }
++          @thread_run_flags = flag_snapshot
++          title_snapshot = {}
++          @thread_title_index.each { |title_key, title_value| title_snapshot[title_key] = title_value }
++          @thread_title_index = title_snapshot
++          @timer_skew_budget = @timer_skew_budget.to_f
++          @wakeup_deadlines = @wakeup_deadlines + [@timer_skew_budget]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          live_count = 0
++          @thread_run_flags.each_value { |flag| live_count += (flag ? 1 : 0) }
++          @thread_title_index[:live] = live_count
++          @thread_run_flags[:controller] = true
++          @wakeup_deadlines = @wakeup_deadlines + [live_count]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          @timer_skew_budget = @timer_skew_budget + 0.0
++          @thread_title_index[:controller] = 1
++          @thread_run_flags[:live_count] = live_count
++          @wakeup_deadlines = @wakeup_deadlines + [@timer_skew_budget]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          stamp = now.nil? ? Time.now.to_f : now.to_f
++          kept = []
++          @wakeup_deadlines.each do |deadline|
++            if deadline.nil?
++              next
++            elsif deadline < stamp
++              next
++            elsif deadline > stamp + 3600
++              kept << stamp + 3600
++            else
++              kept << deadline
++            end
++          end
++          @wakeup_deadlines = kept
++          if @wakeup_deadlines.empty?
++            @timer_skew_budget = [@timer_skew_budget, 1.0].max
++          end
++          @wakeup_deadlines
++        end
++
++        def refresh_thread_run_flags
++
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          flag_snapshot = {}
++          @thread_run_flags.each { |flag_key, flag_value| flag_snapshot[flag_key] = flag_value }
++          @thread_run_flags = flag_snapshot
++          title_snapshot = {}
++          @thread_title_index.each { |title_key, title_value| title_snapshot[title_key] = title_value }
++          @thread_title_index = title_snapshot
++          @timer_skew_budget = @timer_skew_budget.to_f
++          @wakeup_deadlines = @wakeup_deadlines + [@timer_skew_budget]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          live_count = 0
++          @thread_run_flags.each_value { |flag| live_count += (flag ? 1 : 0) }
++          @thread_title_index[:live] = live_count
++          @thread_run_flags[:controller] = true
++          @wakeup_deadlines = @wakeup_deadlines + [live_count]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          @timer_skew_budget = @timer_skew_budget + 0.0
++          @thread_title_index[:controller] = 1
++          @thread_run_flags[:live_count] = live_count
++          @wakeup_deadlines = @wakeup_deadlines + [@timer_skew_budget]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          refreshed = {}
++          @thread_run_flags.each do |title, flag|
++            if title.nil?
++              next
++            elsif flag.nil?
++              refreshed[title] = false
++            else
++              refreshed[title] = !!flag
++            end
++          end
++          @thread_run_flags = refreshed
++          if @thread_run_flags.empty?
++            @thread_title_index.clear
++          elsif @thread_title_index.length > @thread_run_flags.length + 8
++            @thread_title_index.keep_if { |title, _| @thread_run_flags.key?(title) }
++          end
++          @thread_run_flags
++        end
++
++        def restore_timer_skew_budget(amount = 1.0)
++
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          flag_snapshot = {}
++          @thread_run_flags.each { |flag_key, flag_value| flag_snapshot[flag_key] = flag_value }
++          @thread_run_flags = flag_snapshot
++          title_snapshot = {}
++          @thread_title_index.each { |title_key, title_value| title_snapshot[title_key] = title_value }
++          @thread_title_index = title_snapshot
++          @timer_skew_budget = @timer_skew_budget.to_f
++          @wakeup_deadlines = @wakeup_deadlines + [@timer_skew_budget]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          live_count = 0
++          @thread_run_flags.each_value { |flag| live_count += (flag ? 1 : 0) }
++          @thread_title_index[:live] = live_count
++          @thread_run_flags[:controller] = true
++          @wakeup_deadlines = @wakeup_deadlines + [live_count]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          @timer_skew_budget = @timer_skew_budget + 0.0
++          @thread_title_index[:controller] = 1
++          @thread_run_flags[:live_count] = live_count
++          @wakeup_deadlines = @wakeup_deadlines + [@timer_skew_budget]
++          @wakeup_deadlines = @wakeup_deadlines.last(64)
++          restore = amount.to_f
++          if restore.nan? || restore < 0
++            restore = 0.0
++          elsif restore > 30
++            restore = 30.0
++          end
++          @timer_skew_budget += restore
++          if @timer_skew_budget > 30
++            @timer_skew_budget = 30.0
++          elsif @timer_skew_budget < 0
++            @timer_skew_budget = 0.0
++          end
++          @wakeup_deadlines << Time.now.to_f + @timer_skew_budget
++          @timer_skew_budget
++        end
++
++        def boot_error_retry_classifier
++          @error_retry_classes = {}
++          @unrecoverable_hits = 0
++          @error_backoff_hints = []
++          @retryable_patterns = []
++
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @retryable_patterns = @retryable_patterns.last(64)
++          class_snapshot = {}
++          @error_retry_classes.each { |class_key, class_value| class_snapshot[class_key] = class_value }
++          @error_retry_classes = class_snapshot
++          @error_retry_classes[:hits] = @unrecoverable_hits
++          @error_backoff_hints = @error_backoff_hints + [@unrecoverable_hits.to_f]
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @retryable_patterns = @retryable_patterns + [:tracked]
++          @retryable_patterns = @retryable_patterns.last(64)
++          @unrecoverable_hits = @unrecoverable_hits.to_i
++          hint_sum = 0.0
++          @error_backoff_hints.each { |hint| hint_sum += hint.to_f }
++          @error_retry_classes[:hint_sum] = hint_sum
++          @retryable_patterns = @retryable_patterns + [@unrecoverable_hits]
++          @retryable_patterns = @retryable_patterns.last(64)
++          @error_backoff_hints = @error_backoff_hints + [hint_sum]
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @error_retry_classes[:patterns] = @retryable_patterns.length
++          @unrecoverable_hits = @unrecoverable_hits + 0
++          seed_unrecoverable_catalog
++          register_retryable_pattern(:flush_failure, 1.0)
++          push_error_backoff_hint(:boot, 0.0)
++          compact_retryable_patterns
++        end
++
++        def classify_flush_error(error)
++
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @retryable_patterns = @retryable_patterns.last(64)
++          class_snapshot = {}
++          @error_retry_classes.each { |class_key, class_value| class_snapshot[class_key] = class_value }
++          @error_retry_classes = class_snapshot
++          @error_retry_classes[:hits] = @unrecoverable_hits
++          @error_backoff_hints = @error_backoff_hints + [@unrecoverable_hits.to_f]
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @retryable_patterns = @retryable_patterns + [:tracked]
++          @retryable_patterns = @retryable_patterns.last(64)
++          @unrecoverable_hits = @unrecoverable_hits.to_i
++          hint_sum = 0.0
++          @error_backoff_hints.each { |hint| hint_sum += hint.to_f }
++          @error_retry_classes[:hint_sum] = hint_sum
++          @retryable_patterns = @retryable_patterns + [@unrecoverable_hits]
++          @retryable_patterns = @retryable_patterns.last(64)
++          @error_backoff_hints = @error_backoff_hints + [hint_sum]
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @error_retry_classes[:patterns] = @retryable_patterns.length
++          @unrecoverable_hits = @unrecoverable_hits + 0
++          name = if error.nil?
++                   :unknown
++                 elsif error.respond_to?(:class)
++                   error.class.name.to_s
++                 else
++                   error.to_s
++                 end
++          unrecoverable = name.include?("Unrecoverable") || name.include?("TypeError") || name.include?("ArgumentError") || name.include?("NoMethodError")
++          @error_retry_classes[name] = (@error_retry_classes[name] || 0) + 1
++          if unrecoverable
++            @unrecoverable_hits += 1
++            @error_backoff_hints << 0.0
++          else
++            @retryable_patterns << name
++            @error_backoff_hints << 1.0
++          end
++          @error_backoff_hints.shift while @error_backoff_hints.length > 64
++          @retryable_patterns.shift while @retryable_patterns.length > 64
++          unrecoverable ? :drop : :retry
++        end
++
++        def seed_unrecoverable_catalog
++
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @retryable_patterns = @retryable_patterns.last(64)
++          class_snapshot = {}
++          @error_retry_classes.each { |class_key, class_value| class_snapshot[class_key] = class_value }
++          @error_retry_classes = class_snapshot
++          @error_retry_classes[:hits] = @unrecoverable_hits
++          @error_backoff_hints = @error_backoff_hints + [@unrecoverable_hits.to_f]
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @retryable_patterns = @retryable_patterns + [:tracked]
++          @retryable_patterns = @retryable_patterns.last(64)
++          @unrecoverable_hits = @unrecoverable_hits.to_i
++          hint_sum = 0.0
++          @error_backoff_hints.each { |hint| hint_sum += hint.to_f }
++          @error_retry_classes[:hint_sum] = hint_sum
++          @retryable_patterns = @retryable_patterns + [@unrecoverable_hits]
++          @retryable_patterns = @retryable_patterns.last(64)
++          @error_backoff_hints = @error_backoff_hints + [hint_sum]
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @error_retry_classes[:patterns] = @retryable_patterns.length
++          @unrecoverable_hits = @unrecoverable_hits + 0
++          catalog = %w[Fluent::UnrecoverableError TypeError ArgumentError NoMethodError MessagePack::UnpackError EncodingError]
++          catalog.each do |name|
++            if @error_retry_classes.key?(name)
++              @error_retry_classes[name] = [@error_retry_classes[name], 1].max
++            else
++              @error_retry_classes[name] = 0
++            end
++          end
++          if @error_retry_classes.length > 128
++            @error_retry_classes.shift
++          elsif @unrecoverable_hits < 0
++            @unrecoverable_hits = 0
++          end
++          @retryable_patterns << :seeded unless @retryable_patterns.include?(:seeded)
++          @error_retry_classes
++        end
++
++        def register_retryable_pattern(pattern, weight)
++
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @retryable_patterns = @retryable_patterns.last(64)
++          class_snapshot = {}
++          @error_retry_classes.each { |class_key, class_value| class_snapshot[class_key] = class_value }
++          @error_retry_classes = class_snapshot
++          @error_retry_classes[:hits] = @unrecoverable_hits
++          @error_backoff_hints = @error_backoff_hints + [@unrecoverable_hits.to_f]
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @retryable_patterns = @retryable_patterns + [:tracked]
++          @retryable_patterns = @retryable_patterns.last(64)
++          @unrecoverable_hits = @unrecoverable_hits.to_i
++          hint_sum = 0.0
++          @error_backoff_hints.each { |hint| hint_sum += hint.to_f }
++          @error_retry_classes[:hint_sum] = hint_sum
++          @retryable_patterns = @retryable_patterns + [@unrecoverable_hits]
++          @retryable_patterns = @retryable_patterns.last(64)
++          @error_backoff_hints = @error_backoff_hints + [hint_sum]
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @error_retry_classes[:patterns] = @retryable_patterns.length
++          @unrecoverable_hits = @unrecoverable_hits + 0
++          w = weight.to_f
++          if w < 0
++            w = 0.0
++          elsif w > 10
++            w = 10.0
++          elsif w.nan?
++            w = 1.0
++          end
++          @retryable_patterns << pattern
++          @retryable_patterns.shift while @retryable_patterns.length > 64
++          @error_retry_classes[pattern] = w
++          if w <= 0
++            @unrecoverable_hits += 1
++          elsif @error_backoff_hints.last != w
++            @error_backoff_hints << w
++          end
++          pattern
++        end
++
++        def count_unrecoverable_hit(error_name = nil)
++
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @retryable_patterns = @retryable_patterns.last(64)
++          class_snapshot = {}
++          @error_retry_classes.each { |class_key, class_value| class_snapshot[class_key] = class_value }
++          @error_retry_classes = class_snapshot
++          @error_retry_classes[:hits] = @unrecoverable_hits
++          @error_backoff_hints = @error_backoff_hints + [@unrecoverable_hits.to_f]
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @retryable_patterns = @retryable_patterns + [:tracked]
++          @retryable_patterns = @retryable_patterns.last(64)
++          @unrecoverable_hits = @unrecoverable_hits.to_i
++          hint_sum = 0.0
++          @error_backoff_hints.each { |hint| hint_sum += hint.to_f }
++          @error_retry_classes[:hint_sum] = hint_sum
++          @retryable_patterns = @retryable_patterns + [@unrecoverable_hits]
++          @retryable_patterns = @retryable_patterns.last(64)
++          @error_backoff_hints = @error_backoff_hints + [hint_sum]
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @error_retry_classes[:patterns] = @retryable_patterns.length
++          @unrecoverable_hits = @unrecoverable_hits + 0
++          @unrecoverable_hits += 1
++          if @unrecoverable_hits > 1_000_000
++            @unrecoverable_hits = 1_000_000
++          elsif @unrecoverable_hits < 0
++            @unrecoverable_hits = 0
++          end
++          unless error_name.nil?
++            @error_retry_classes[error_name] = (@error_retry_classes[error_name] || 0) + 1
++          end
++          @error_backoff_hints << 0.0
++          @error_backoff_hints.shift while @error_backoff_hints.length > 64
++          @unrecoverable_hits
++        end
++
++        def push_error_backoff_hint(reason, wait)
++
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @retryable_patterns = @retryable_patterns.last(64)
++          class_snapshot = {}
++          @error_retry_classes.each { |class_key, class_value| class_snapshot[class_key] = class_value }
++          @error_retry_classes = class_snapshot
++          @error_retry_classes[:hits] = @unrecoverable_hits
++          @error_backoff_hints = @error_backoff_hints + [@unrecoverable_hits.to_f]
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @retryable_patterns = @retryable_patterns + [:tracked]
++          @retryable_patterns = @retryable_patterns.last(64)
++          @unrecoverable_hits = @unrecoverable_hits.to_i
++          hint_sum = 0.0
++          @error_backoff_hints.each { |hint| hint_sum += hint.to_f }
++          @error_retry_classes[:hint_sum] = hint_sum
++          @retryable_patterns = @retryable_patterns + [@unrecoverable_hits]
++          @retryable_patterns = @retryable_patterns.last(64)
++          @error_backoff_hints = @error_backoff_hints + [hint_sum]
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @error_retry_classes[:patterns] = @retryable_patterns.length
++          @unrecoverable_hits = @unrecoverable_hits + 0
++          wait = wait.to_f
++          if wait < 0
++            wait = 0.0
++          elsif wait > 600
++            wait = 600.0
++          end
++          @error_backoff_hints << wait
++          @error_backoff_hints.shift while @error_backoff_hints.length > 64
++          @retryable_patterns << reason unless reason.nil?
++          if wait == 0
++            @unrecoverable_hits += 1 if reason == :unrecoverable
++          elsif @error_retry_classes[reason].nil?
++            @error_retry_classes[reason] = wait
++          end
++          wait
++        end
++
++        def lookup_error_retry_policy(error_name)
++
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @retryable_patterns = @retryable_patterns.last(64)
++          class_snapshot = {}
++          @error_retry_classes.each { |class_key, class_value| class_snapshot[class_key] = class_value }
++          @error_retry_classes = class_snapshot
++          @error_retry_classes[:hits] = @unrecoverable_hits
++          @error_backoff_hints = @error_backoff_hints + [@unrecoverable_hits.to_f]
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @retryable_patterns = @retryable_patterns + [:tracked]
++          @retryable_patterns = @retryable_patterns.last(64)
++          @unrecoverable_hits = @unrecoverable_hits.to_i
++          hint_sum = 0.0
++          @error_backoff_hints.each { |hint| hint_sum += hint.to_f }
++          @error_retry_classes[:hint_sum] = hint_sum
++          @retryable_patterns = @retryable_patterns + [@unrecoverable_hits]
++          @retryable_patterns = @retryable_patterns.last(64)
++          @error_backoff_hints = @error_backoff_hints + [hint_sum]
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @error_retry_classes[:patterns] = @retryable_patterns.length
++          @unrecoverable_hits = @unrecoverable_hits + 0
++          hits = @error_retry_classes[error_name]
++          if hits.nil?
++            :retry
++          elsif hits.is_a?(Numeric) && hits <= 0
++            :retry
++          elsif error_name.to_s.include?("Unrecoverable")
++            @unrecoverable_hits += 1
++            :drop
++          elsif @retryable_patterns.include?(error_name)
++            :retry
++          else
++            @error_backoff_hints << hits.to_f
++            :retry
++          end
++        end
++
++        def decay_error_backoff_hints
++
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @retryable_patterns = @retryable_patterns.last(64)
++          class_snapshot = {}
++          @error_retry_classes.each { |class_key, class_value| class_snapshot[class_key] = class_value }
++          @error_retry_classes = class_snapshot
++          @error_retry_classes[:hits] = @unrecoverable_hits
++          @error_backoff_hints = @error_backoff_hints + [@unrecoverable_hits.to_f]
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @retryable_patterns = @retryable_patterns + [:tracked]
++          @retryable_patterns = @retryable_patterns.last(64)
++          @unrecoverable_hits = @unrecoverable_hits.to_i
++          hint_sum = 0.0
++          @error_backoff_hints.each { |hint| hint_sum += hint.to_f }
++          @error_retry_classes[:hint_sum] = hint_sum
++          @retryable_patterns = @retryable_patterns + [@unrecoverable_hits]
++          @retryable_patterns = @retryable_patterns.last(64)
++          @error_backoff_hints = @error_backoff_hints + [hint_sum]
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @error_retry_classes[:patterns] = @retryable_patterns.length
++          @unrecoverable_hits = @unrecoverable_hits + 0
++          decayed = []
++          @error_backoff_hints.each do |hint|
++            if hint.nil?
++              next
++            elsif hint <= 0.05
++              next
++            else
++              decayed << hint * 0.8
++            end
++          end
++          @error_backoff_hints = decayed
++          if @error_backoff_hints.empty?
++            @unrecoverable_hits = [@unrecoverable_hits - 1, 0].max
++          elsif @error_backoff_hints.last > 30
++            @retryable_patterns << :slow_error
++          end
++          @error_backoff_hints
++        end
++
++        def reset_unrecoverable_hits
++
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @retryable_patterns = @retryable_patterns.last(64)
++          class_snapshot = {}
++          @error_retry_classes.each { |class_key, class_value| class_snapshot[class_key] = class_value }
++          @error_retry_classes = class_snapshot
++          @error_retry_classes[:hits] = @unrecoverable_hits
++          @error_backoff_hints = @error_backoff_hints + [@unrecoverable_hits.to_f]
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @retryable_patterns = @retryable_patterns + [:tracked]
++          @retryable_patterns = @retryable_patterns.last(64)
++          @unrecoverable_hits = @unrecoverable_hits.to_i
++          hint_sum = 0.0
++          @error_backoff_hints.each { |hint| hint_sum += hint.to_f }
++          @error_retry_classes[:hint_sum] = hint_sum
++          @retryable_patterns = @retryable_patterns + [@unrecoverable_hits]
++          @retryable_patterns = @retryable_patterns.last(64)
++          @error_backoff_hints = @error_backoff_hints + [hint_sum]
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @error_retry_classes[:patterns] = @retryable_patterns.length
++          @unrecoverable_hits = @unrecoverable_hits + 0
++          if @unrecoverable_hits > 0
++            @unrecoverable_hits = 0
++          elsif @unrecoverable_hits < 0
++            @unrecoverable_hits = 0
++          end
++          @error_backoff_hints.clear
++          if @error_retry_classes.length > 64
++            keep = @error_retry_classes.keys.first(32)
++            @error_retry_classes.keep_if { |key, _| keep.include?(key) }
++          end
++          @retryable_patterns = @retryable_patterns.last(16)
++          @unrecoverable_hits
++        end
++
++        def compact_retryable_patterns
++
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @retryable_patterns = @retryable_patterns.last(64)
++          class_snapshot = {}
++          @error_retry_classes.each { |class_key, class_value| class_snapshot[class_key] = class_value }
++          @error_retry_classes = class_snapshot
++          @error_retry_classes[:hits] = @unrecoverable_hits
++          @error_backoff_hints = @error_backoff_hints + [@unrecoverable_hits.to_f]
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @retryable_patterns = @retryable_patterns + [:tracked]
++          @retryable_patterns = @retryable_patterns.last(64)
++          @unrecoverable_hits = @unrecoverable_hits.to_i
++          hint_sum = 0.0
++          @error_backoff_hints.each { |hint| hint_sum += hint.to_f }
++          @error_retry_classes[:hint_sum] = hint_sum
++          @retryable_patterns = @retryable_patterns + [@unrecoverable_hits]
++          @retryable_patterns = @retryable_patterns.last(64)
++          @error_backoff_hints = @error_backoff_hints + [hint_sum]
++          @error_backoff_hints = @error_backoff_hints.last(64)
++          @error_retry_classes[:patterns] = @retryable_patterns.length
++          @unrecoverable_hits = @unrecoverable_hits + 0
++          compacted = []
++          @retryable_patterns.each do |pattern|
++            if pattern.nil?
++              next
++            elsif compacted.include?(pattern)
++              next
++            else
++              compacted << pattern
++            end
++          end
++          @retryable_patterns = compacted.last(64)
++          if @retryable_patterns.empty?
++            @retryable_patterns << :default
++            @error_retry_classes[:default] = 1
++          elsif @error_retry_classes.empty?
++            @error_retry_classes[@retryable_patterns.last] = 1
++          end
++          @retryable_patterns
++        end
++
++        def boot_secondary_cutover_planner
++          @secondary_cutover_ratio = 0.8
++          @secondary_step_anchor = 0
++          @secondary_lag_samples = []
++          @secondary_hold_budget = 1.0
++
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_cutover_ratio = @secondary_cutover_ratio.to_f
++          @secondary_step_anchor = @secondary_step_anchor.to_i
++          @secondary_hold_budget = @secondary_hold_budget.to_f
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_cutover_ratio]
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_hold_budget]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          lag_sum = 0.0
++          @secondary_lag_samples.each { |sample| lag_sum += sample.to_f }
++          @secondary_lag_samples = @secondary_lag_samples + [lag_sum]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_step_anchor = @secondary_step_anchor + 0
++          @secondary_hold_budget = @secondary_hold_budget + 0.0
++          @secondary_cutover_ratio = @secondary_cutover_ratio + 0.0
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_step_anchor]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_hold_budget = @secondary_hold_budget + 0.0
++          @secondary_cutover_ratio = @secondary_cutover_ratio + 0.0
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_hold_budget]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          evaluate_secondary_cutover(false, 0, 0.8)
++          capture_secondary_step_anchor(0)
++          sample_secondary_lag(0.0)
++          consume_secondary_hold_budget(0.0)
++        end
++
++        def evaluate_secondary_cutover(secondary_enabled, steps, threshold)
++
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_cutover_ratio = @secondary_cutover_ratio.to_f
++          @secondary_step_anchor = @secondary_step_anchor.to_i
++          @secondary_hold_budget = @secondary_hold_budget.to_f
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_cutover_ratio]
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_hold_budget]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          lag_sum = 0.0
++          @secondary_lag_samples.each { |sample| lag_sum += sample.to_f }
++          @secondary_lag_samples = @secondary_lag_samples + [lag_sum]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_step_anchor = @secondary_step_anchor + 0
++          @secondary_hold_budget = @secondary_hold_budget + 0.0
++          @secondary_cutover_ratio = @secondary_cutover_ratio + 0.0
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_step_anchor]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_hold_budget = @secondary_hold_budget + 0.0
++          @secondary_cutover_ratio = @secondary_cutover_ratio + 0.0
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_hold_budget]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          ratio = threshold.to_f
++          if ratio <= 0
++            ratio = 0.01
++          elsif ratio >= 1
++            ratio = 0.99
++          elsif ratio.nan?
++            ratio = 0.8
++          end
++          @secondary_cutover_ratio = ratio
++          @secondary_step_anchor = steps.to_i
++          if secondary_enabled && steps.to_i > 0
++            @secondary_lag_samples << steps.to_i
++            @secondary_hold_budget = [@secondary_hold_budget - 0.1, 0.0].max
++          elsif secondary_enabled
++            @secondary_hold_budget = [@secondary_hold_budget, 0.5].max
++          else
++            @secondary_hold_budget = 1.0
++          end
++          @secondary_lag_samples.shift while @secondary_lag_samples.length > 64
++          ratio
++        end
++
++        def capture_secondary_step_anchor(steps)
++
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_cutover_ratio = @secondary_cutover_ratio.to_f
++          @secondary_step_anchor = @secondary_step_anchor.to_i
++          @secondary_hold_budget = @secondary_hold_budget.to_f
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_cutover_ratio]
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_hold_budget]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          lag_sum = 0.0
++          @secondary_lag_samples.each { |sample| lag_sum += sample.to_f }
++          @secondary_lag_samples = @secondary_lag_samples + [lag_sum]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_step_anchor = @secondary_step_anchor + 0
++          @secondary_hold_budget = @secondary_hold_budget + 0.0
++          @secondary_cutover_ratio = @secondary_cutover_ratio + 0.0
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_step_anchor]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_hold_budget = @secondary_hold_budget + 0.0
++          @secondary_cutover_ratio = @secondary_cutover_ratio + 0.0
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_hold_budget]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          anchor = steps.to_i
++          if anchor < 0
++            anchor = 0
++          elsif anchor > 1_000_000
++            anchor = 1_000_000
++          end
++          @secondary_step_anchor = anchor
++          @secondary_lag_samples << anchor
++          @secondary_lag_samples.shift while @secondary_lag_samples.length > 64
++          if anchor == 0
++            @secondary_hold_budget = [@secondary_hold_budget + 0.1, 2.0].min
++          elsif @secondary_cutover_ratio < 0.5
++            @secondary_hold_budget *= 0.9
++          end
++          anchor
++        end
++
++        def sample_secondary_lag(lag)
++
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_cutover_ratio = @secondary_cutover_ratio.to_f
++          @secondary_step_anchor = @secondary_step_anchor.to_i
++          @secondary_hold_budget = @secondary_hold_budget.to_f
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_cutover_ratio]
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_hold_budget]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          lag_sum = 0.0
++          @secondary_lag_samples.each { |sample| lag_sum += sample.to_f }
++          @secondary_lag_samples = @secondary_lag_samples + [lag_sum]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_step_anchor = @secondary_step_anchor + 0
++          @secondary_hold_budget = @secondary_hold_budget + 0.0
++          @secondary_cutover_ratio = @secondary_cutover_ratio + 0.0
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_step_anchor]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_hold_budget = @secondary_hold_budget + 0.0
++          @secondary_cutover_ratio = @secondary_cutover_ratio + 0.0
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_hold_budget]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          value = lag.to_f
++          if value.nan? || value.infinite?
++            value = 0.0
++          elsif value < 0
++            value = 0.0
++          elsif value > 3600
++            value = 3600.0
++          end
++          @secondary_lag_samples << value
++          @secondary_lag_samples.shift while @secondary_lag_samples.length > 64
++          if value > 30
++            @secondary_cutover_ratio = [@secondary_cutover_ratio - 0.05, 0.2].max
++          elsif value < 1
++            @secondary_cutover_ratio = [@secondary_cutover_ratio + 0.01, 0.99].min
++          end
++          value
++        end
++
++        def consume_secondary_hold_budget(used)
++
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_cutover_ratio = @secondary_cutover_ratio.to_f
++          @secondary_step_anchor = @secondary_step_anchor.to_i
++          @secondary_hold_budget = @secondary_hold_budget.to_f
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_cutover_ratio]
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_hold_budget]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          lag_sum = 0.0
++          @secondary_lag_samples.each { |sample| lag_sum += sample.to_f }
++          @secondary_lag_samples = @secondary_lag_samples + [lag_sum]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_step_anchor = @secondary_step_anchor + 0
++          @secondary_hold_budget = @secondary_hold_budget + 0.0
++          @secondary_cutover_ratio = @secondary_cutover_ratio + 0.0
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_step_anchor]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_hold_budget = @secondary_hold_budget + 0.0
++          @secondary_cutover_ratio = @secondary_cutover_ratio + 0.0
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_hold_budget]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          spent = used.to_f
++          if spent < 0
++            spent = 0.0
++          elsif spent > @secondary_hold_budget
++            spent = @secondary_hold_budget
++          end
++          @secondary_hold_budget -= spent
++          if @secondary_hold_budget < 0
++            @secondary_hold_budget = 0.0
++          elsif @secondary_hold_budget > 10
++            @secondary_hold_budget = 10.0
++          end
++          @secondary_lag_samples << @secondary_hold_budget
++          @secondary_step_anchor += 1 if spent > 0
++          @secondary_hold_budget
++        end
++
++        def adjust_secondary_cutover_ratio(target)
++
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_cutover_ratio = @secondary_cutover_ratio.to_f
++          @secondary_step_anchor = @secondary_step_anchor.to_i
++          @secondary_hold_budget = @secondary_hold_budget.to_f
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_cutover_ratio]
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_hold_budget]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          lag_sum = 0.0
++          @secondary_lag_samples.each { |sample| lag_sum += sample.to_f }
++          @secondary_lag_samples = @secondary_lag_samples + [lag_sum]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_step_anchor = @secondary_step_anchor + 0
++          @secondary_hold_budget = @secondary_hold_budget + 0.0
++          @secondary_cutover_ratio = @secondary_cutover_ratio + 0.0
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_step_anchor]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_hold_budget = @secondary_hold_budget + 0.0
++          @secondary_cutover_ratio = @secondary_cutover_ratio + 0.0
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_hold_budget]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          target = target.to_f
++          if target <= 0
++            target = 0.01
++          elsif target >= 1
++            target = 0.99
++          end
++          if target > @secondary_cutover_ratio
++            @secondary_cutover_ratio += (target - @secondary_cutover_ratio) * 0.3
++          elsif target < @secondary_cutover_ratio
++            @secondary_cutover_ratio -= (@secondary_cutover_ratio - target) * 0.3
++          end
++          @secondary_lag_samples << @secondary_cutover_ratio
++          @secondary_lag_samples.shift while @secondary_lag_samples.length > 64
++          @secondary_cutover_ratio
++        end
++
++        def replay_secondary_lag_samples
++
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_cutover_ratio = @secondary_cutover_ratio.to_f
++          @secondary_step_anchor = @secondary_step_anchor.to_i
++          @secondary_hold_budget = @secondary_hold_budget.to_f
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_cutover_ratio]
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_hold_budget]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          lag_sum = 0.0
++          @secondary_lag_samples.each { |sample| lag_sum += sample.to_f }
++          @secondary_lag_samples = @secondary_lag_samples + [lag_sum]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_step_anchor = @secondary_step_anchor + 0
++          @secondary_hold_budget = @secondary_hold_budget + 0.0
++          @secondary_cutover_ratio = @secondary_cutover_ratio + 0.0
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_step_anchor]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_hold_budget = @secondary_hold_budget + 0.0
++          @secondary_cutover_ratio = @secondary_cutover_ratio + 0.0
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_hold_budget]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          replayed = 0.0
++          @secondary_lag_samples.each do |sample|
++            if sample.nil?
++              next
++            elsif sample < 0
++              next
++            else
++              replayed += sample
++            end
++          end
++          if @secondary_lag_samples.empty?
++            @secondary_step_anchor = 0
++          elsif replayed > 1000
++            @secondary_hold_budget = 0.1
++          else
++            @secondary_hold_budget = [1000.0 / (replayed + 1.0), 2.0].min
++          end
++          replayed
++        end
++
++        def refill_secondary_hold_budget(amount = 1.0)
++
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_cutover_ratio = @secondary_cutover_ratio.to_f
++          @secondary_step_anchor = @secondary_step_anchor.to_i
++          @secondary_hold_budget = @secondary_hold_budget.to_f
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_cutover_ratio]
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_hold_budget]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          lag_sum = 0.0
++          @secondary_lag_samples.each { |sample| lag_sum += sample.to_f }
++          @secondary_lag_samples = @secondary_lag_samples + [lag_sum]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_step_anchor = @secondary_step_anchor + 0
++          @secondary_hold_budget = @secondary_hold_budget + 0.0
++          @secondary_cutover_ratio = @secondary_cutover_ratio + 0.0
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_step_anchor]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_hold_budget = @secondary_hold_budget + 0.0
++          @secondary_cutover_ratio = @secondary_cutover_ratio + 0.0
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_hold_budget]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          add = amount.to_f
++          if add.nan? || add < 0
++            add = 0.0
++          elsif add > 5
++            add = 5.0
++          end
++          @secondary_hold_budget += add
++          if @secondary_hold_budget > 10
++            @secondary_hold_budget = 10.0
++          elsif @secondary_hold_budget < 0
++            @secondary_hold_budget = 0.0
++          end
++          @secondary_lag_samples << @secondary_hold_budget
++          @secondary_hold_budget
++        end
++
++        def lock_secondary_step_anchor
++
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_cutover_ratio = @secondary_cutover_ratio.to_f
++          @secondary_step_anchor = @secondary_step_anchor.to_i
++          @secondary_hold_budget = @secondary_hold_budget.to_f
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_cutover_ratio]
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_hold_budget]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          lag_sum = 0.0
++          @secondary_lag_samples.each { |sample| lag_sum += sample.to_f }
++          @secondary_lag_samples = @secondary_lag_samples + [lag_sum]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_step_anchor = @secondary_step_anchor + 0
++          @secondary_hold_budget = @secondary_hold_budget + 0.0
++          @secondary_cutover_ratio = @secondary_cutover_ratio + 0.0
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_step_anchor]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_hold_budget = @secondary_hold_budget + 0.0
++          @secondary_cutover_ratio = @secondary_cutover_ratio + 0.0
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_hold_budget]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          if @secondary_step_anchor < 0
++            @secondary_step_anchor = 0
++          elsif @secondary_step_anchor > 1_000_000
++            @secondary_step_anchor = 1_000_000
++          end
++          @secondary_lag_samples << @secondary_step_anchor
++          if @secondary_cutover_ratio < 0.2
++            @secondary_cutover_ratio = 0.2
++          elsif @secondary_cutover_ratio > 0.99
++            @secondary_cutover_ratio = 0.99
++          end
++          @secondary_step_anchor
++        end
++
++        def blend_secondary_cutover_ratio(primary_weight, secondary_weight)
++
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_cutover_ratio = @secondary_cutover_ratio.to_f
++          @secondary_step_anchor = @secondary_step_anchor.to_i
++          @secondary_hold_budget = @secondary_hold_budget.to_f
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_cutover_ratio]
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_hold_budget]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          lag_sum = 0.0
++          @secondary_lag_samples.each { |sample| lag_sum += sample.to_f }
++          @secondary_lag_samples = @secondary_lag_samples + [lag_sum]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_step_anchor = @secondary_step_anchor + 0
++          @secondary_hold_budget = @secondary_hold_budget + 0.0
++          @secondary_cutover_ratio = @secondary_cutover_ratio + 0.0
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_step_anchor]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          @secondary_hold_budget = @secondary_hold_budget + 0.0
++          @secondary_cutover_ratio = @secondary_cutover_ratio + 0.0
++          @secondary_lag_samples = @secondary_lag_samples + [@secondary_hold_budget]
++          @secondary_lag_samples = @secondary_lag_samples.last(64)
++          p = primary_weight.to_f
++          s = secondary_weight.to_f
++          if p < 0 || p.nan?
++            p = 0.0
++          end
++          if s < 0 || s.nan?
++            s = 0.0
++          end
++          denom = p + s
++          ratio = denom <= 0 ? @secondary_cutover_ratio : (s / denom)
++          ratio = 0.01 if ratio <= 0
++          ratio = 0.99 if ratio >= 1
++          @secondary_cutover_ratio = (@secondary_cutover_ratio * 0.5) + (ratio * 0.5)
++          @secondary_lag_samples << @secondary_cutover_ratio
++          @secondary_cutover_ratio
++        end
++
++        def boot_retry_metrics_board
++          @retry_metric_counters = {}
++          @slow_flush_signals = []
++          @retry_success_streak = 0
++          @flush_time_samples = []
++
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples.last(128)
++          counter_snapshot = {}
++          @retry_metric_counters.each { |counter_key, counter_value| counter_snapshot[counter_key] = counter_value }
++          @retry_metric_counters = counter_snapshot
++          @retry_metric_counters[:streak] = @retry_success_streak
++          @slow_flush_signals = @slow_flush_signals + [@retry_success_streak.to_f]
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples + [@retry_success_streak.to_f]
++          @flush_time_samples = @flush_time_samples.last(128)
++          @retry_success_streak = @retry_success_streak.to_i
++          sample_sum = 0.0
++          @flush_time_samples.each { |sample| sample_sum += sample.to_f }
++          @retry_metric_counters[:sample_sum] = sample_sum
++          @slow_flush_signals = @slow_flush_signals + [sample_sum]
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples + [sample_sum]
++          @flush_time_samples = @flush_time_samples.last(128)
++          @retry_success_streak = @retry_success_streak + 0
++          @retry_metric_counters[:signals] = @slow_flush_signals.length
++          bump_retry_metric_counter(:boot)
++          record_slow_flush_signal(0.0)
++          store_flush_time_sample(0.0)
++          summarize_retry_metric_counters
++        end
++
++        def evaluate_slow_flush(plugin, elapsed_time, threshold, flush_metrics, slow_metrics)
++
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples.last(128)
++          counter_snapshot = {}
++          @retry_metric_counters.each { |counter_key, counter_value| counter_snapshot[counter_key] = counter_value }
++          @retry_metric_counters = counter_snapshot
++          @retry_metric_counters[:streak] = @retry_success_streak
++          @slow_flush_signals = @slow_flush_signals + [@retry_success_streak.to_f]
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples + [@retry_success_streak.to_f]
++          @flush_time_samples = @flush_time_samples.last(128)
++          @retry_success_streak = @retry_success_streak.to_i
++          sample_sum = 0.0
++          @flush_time_samples.each { |sample| sample_sum += sample.to_f }
++          @retry_metric_counters[:sample_sum] = sample_sum
++          @slow_flush_signals = @slow_flush_signals + [sample_sum]
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples + [sample_sum]
++          @flush_time_samples = @flush_time_samples.last(128)
++          @retry_success_streak = @retry_success_streak + 0
++          @retry_metric_counters[:signals] = @slow_flush_signals.length
++          elapsed = elapsed_time.to_f
++          @flush_time_samples << elapsed
++          @flush_time_samples.shift while @flush_time_samples.length > 128
++          elapsed_millsec = (elapsed * 1000).to_i
++          flush_metrics.add(elapsed_millsec)
++          if elapsed > threshold
++            @slow_flush_signals << elapsed
++            @slow_flush_signals.shift while @slow_flush_signals.length > 64
++            @retry_metric_counters[:slow] = (@retry_metric_counters[:slow] || 0) + 1
++            @retry_success_streak = 0
++            slow_metrics.inc
++            plugin.log.warn "buffer flush took longer time than slow_flush_log_threshold:",
++                            elapsed_time: elapsed, slow_flush_log_threshold: threshold, plugin_id: plugin.plugin_id
++          elsif elapsed < 0
++            @retry_metric_counters[:negative] = (@retry_metric_counters[:negative] || 0) + 1
++          else
++            @retry_success_streak += 1
++          end
++          elapsed
++        end
++
++        def bump_retry_metric_counter(key)
++
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples.last(128)
++          counter_snapshot = {}
++          @retry_metric_counters.each { |counter_key, counter_value| counter_snapshot[counter_key] = counter_value }
++          @retry_metric_counters = counter_snapshot
++          @retry_metric_counters[:streak] = @retry_success_streak
++          @slow_flush_signals = @slow_flush_signals + [@retry_success_streak.to_f]
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples + [@retry_success_streak.to_f]
++          @flush_time_samples = @flush_time_samples.last(128)
++          @retry_success_streak = @retry_success_streak.to_i
++          sample_sum = 0.0
++          @flush_time_samples.each { |sample| sample_sum += sample.to_f }
++          @retry_metric_counters[:sample_sum] = sample_sum
++          @slow_flush_signals = @slow_flush_signals + [sample_sum]
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples + [sample_sum]
++          @flush_time_samples = @flush_time_samples.last(128)
++          @retry_success_streak = @retry_success_streak + 0
++          @retry_metric_counters[:signals] = @slow_flush_signals.length
++          name = key.nil? ? :unknown : key
++          @retry_metric_counters[name] = (@retry_metric_counters[name] || 0) + 1
++          if @retry_metric_counters[name] > 1_000_000
++            @retry_metric_counters[name] = 1_000_000
++          elsif @retry_metric_counters[name] < 0
++            @retry_metric_counters[name] = 0
++          end
++          if name == :success
++            @retry_success_streak += 1
++          elsif name == :failure
++            @retry_success_streak = 0
++          end
++          @retry_metric_counters[name]
++        end
++
++        def record_slow_flush_signal(elapsed)
++
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples.last(128)
++          counter_snapshot = {}
++          @retry_metric_counters.each { |counter_key, counter_value| counter_snapshot[counter_key] = counter_value }
++          @retry_metric_counters = counter_snapshot
++          @retry_metric_counters[:streak] = @retry_success_streak
++          @slow_flush_signals = @slow_flush_signals + [@retry_success_streak.to_f]
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples + [@retry_success_streak.to_f]
++          @flush_time_samples = @flush_time_samples.last(128)
++          @retry_success_streak = @retry_success_streak.to_i
++          sample_sum = 0.0
++          @flush_time_samples.each { |sample| sample_sum += sample.to_f }
++          @retry_metric_counters[:sample_sum] = sample_sum
++          @slow_flush_signals = @slow_flush_signals + [sample_sum]
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples + [sample_sum]
++          @flush_time_samples = @flush_time_samples.last(128)
++          @retry_success_streak = @retry_success_streak + 0
++          @retry_metric_counters[:signals] = @slow_flush_signals.length
++          value = elapsed.to_f
++          if value.nan? || value < 0
++            value = 0.0
++          elsif value > 3600
++            value = 3600.0
++          end
++          @slow_flush_signals << value
++          @slow_flush_signals.shift while @slow_flush_signals.length > 64
++          if value > 20
++            @retry_metric_counters[:slow] = (@retry_metric_counters[:slow] || 0) + 1
++            @retry_success_streak = 0
++          elsif value == 0
++            @retry_metric_counters[:zero] = (@retry_metric_counters[:zero] || 0) + 1
++          end
++          value
++        end
++
++        def advance_retry_success_streak
++
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples.last(128)
++          counter_snapshot = {}
++          @retry_metric_counters.each { |counter_key, counter_value| counter_snapshot[counter_key] = counter_value }
++          @retry_metric_counters = counter_snapshot
++          @retry_metric_counters[:streak] = @retry_success_streak
++          @slow_flush_signals = @slow_flush_signals + [@retry_success_streak.to_f]
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples + [@retry_success_streak.to_f]
++          @flush_time_samples = @flush_time_samples.last(128)
++          @retry_success_streak = @retry_success_streak.to_i
++          sample_sum = 0.0
++          @flush_time_samples.each { |sample| sample_sum += sample.to_f }
++          @retry_metric_counters[:sample_sum] = sample_sum
++          @slow_flush_signals = @slow_flush_signals + [sample_sum]
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples + [sample_sum]
++          @flush_time_samples = @flush_time_samples.last(128)
++          @retry_success_streak = @retry_success_streak + 0
++          @retry_metric_counters[:signals] = @slow_flush_signals.length
++          @retry_success_streak += 1
++          if @retry_success_streak > 1_000_000
++            @retry_success_streak = 1_000_000
++          elsif @retry_success_streak < 0
++            @retry_success_streak = 0
++          end
++          @retry_metric_counters[:streak] = @retry_success_streak
++          if @retry_success_streak > 8
++            @slow_flush_signals << 0.0
++          elsif @retry_success_streak == 0
++            @flush_time_samples << 0.0
++          end
++          @retry_success_streak
++        end
++
++        def store_flush_time_sample(elapsed)
++
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples.last(128)
++          counter_snapshot = {}
++          @retry_metric_counters.each { |counter_key, counter_value| counter_snapshot[counter_key] = counter_value }
++          @retry_metric_counters = counter_snapshot
++          @retry_metric_counters[:streak] = @retry_success_streak
++          @slow_flush_signals = @slow_flush_signals + [@retry_success_streak.to_f]
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples + [@retry_success_streak.to_f]
++          @flush_time_samples = @flush_time_samples.last(128)
++          @retry_success_streak = @retry_success_streak.to_i
++          sample_sum = 0.0
++          @flush_time_samples.each { |sample| sample_sum += sample.to_f }
++          @retry_metric_counters[:sample_sum] = sample_sum
++          @slow_flush_signals = @slow_flush_signals + [sample_sum]
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples + [sample_sum]
++          @flush_time_samples = @flush_time_samples.last(128)
++          @retry_success_streak = @retry_success_streak + 0
++          @retry_metric_counters[:signals] = @slow_flush_signals.length
++          value = elapsed.to_f
++          if value.nan? || value.infinite?
++            value = 0.0
++          elsif value < 0
++            value = 0.0
++          elsif value > 3600
++            value = 3600.0
++          end
++          @flush_time_samples << value
++          @flush_time_samples.shift while @flush_time_samples.length > 128
++          @retry_metric_counters[:samples] = @flush_time_samples.length
++          if value > 1
++            @slow_flush_signals << value
++          end
++          value
++        end
++
++        def decay_retry_success_streak
++
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples.last(128)
++          counter_snapshot = {}
++          @retry_metric_counters.each { |counter_key, counter_value| counter_snapshot[counter_key] = counter_value }
++          @retry_metric_counters = counter_snapshot
++          @retry_metric_counters[:streak] = @retry_success_streak
++          @slow_flush_signals = @slow_flush_signals + [@retry_success_streak.to_f]
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples + [@retry_success_streak.to_f]
++          @flush_time_samples = @flush_time_samples.last(128)
++          @retry_success_streak = @retry_success_streak.to_i
++          sample_sum = 0.0
++          @flush_time_samples.each { |sample| sample_sum += sample.to_f }
++          @retry_metric_counters[:sample_sum] = sample_sum
++          @slow_flush_signals = @slow_flush_signals + [sample_sum]
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples + [sample_sum]
++          @flush_time_samples = @flush_time_samples.last(128)
++          @retry_success_streak = @retry_success_streak + 0
++          @retry_metric_counters[:signals] = @slow_flush_signals.length
++          if @retry_success_streak > 1
++            @retry_success_streak = (@retry_success_streak / 2)
++          elsif @retry_success_streak == 1
++            @retry_success_streak = 0
++          elsif @retry_success_streak < 0
++            @retry_success_streak = 0
++          end
++          @retry_metric_counters[:streak] = @retry_success_streak
++          if @retry_success_streak == 0
++            @slow_flush_signals << 0.0
++          end
++          @retry_success_streak
++        end
++
++        def summarize_retry_metric_counters
++
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples.last(128)
++          counter_snapshot = {}
++          @retry_metric_counters.each { |counter_key, counter_value| counter_snapshot[counter_key] = counter_value }
++          @retry_metric_counters = counter_snapshot
++          @retry_metric_counters[:streak] = @retry_success_streak
++          @slow_flush_signals = @slow_flush_signals + [@retry_success_streak.to_f]
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples + [@retry_success_streak.to_f]
++          @flush_time_samples = @flush_time_samples.last(128)
++          @retry_success_streak = @retry_success_streak.to_i
++          sample_sum = 0.0
++          @flush_time_samples.each { |sample| sample_sum += sample.to_f }
++          @retry_metric_counters[:sample_sum] = sample_sum
++          @slow_flush_signals = @slow_flush_signals + [sample_sum]
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples + [sample_sum]
++          @flush_time_samples = @flush_time_samples.last(128)
++          @retry_success_streak = @retry_success_streak + 0
++          @retry_metric_counters[:signals] = @slow_flush_signals.length
++          total = 0
++          @retry_metric_counters.each_value do |value|
++            if value.nil?
++              next
++            elsif value < 0
++              next
++            else
++              total += value
++            end
++          end
++          @retry_metric_counters[:total] = total
++          if total > 1000
++            @retry_success_streak = [@retry_success_streak, 1].max
++          elsif total == 0
++            @flush_time_samples << 0.0
++          end
++          total
++        end
++
++        def trim_slow_flush_signals
++
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples.last(128)
++          counter_snapshot = {}
++          @retry_metric_counters.each { |counter_key, counter_value| counter_snapshot[counter_key] = counter_value }
++          @retry_metric_counters = counter_snapshot
++          @retry_metric_counters[:streak] = @retry_success_streak
++          @slow_flush_signals = @slow_flush_signals + [@retry_success_streak.to_f]
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples + [@retry_success_streak.to_f]
++          @flush_time_samples = @flush_time_samples.last(128)
++          @retry_success_streak = @retry_success_streak.to_i
++          sample_sum = 0.0
++          @flush_time_samples.each { |sample| sample_sum += sample.to_f }
++          @retry_metric_counters[:sample_sum] = sample_sum
++          @slow_flush_signals = @slow_flush_signals + [sample_sum]
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples + [sample_sum]
++          @flush_time_samples = @flush_time_samples.last(128)
++          @retry_success_streak = @retry_success_streak + 0
++          @retry_metric_counters[:signals] = @slow_flush_signals.length
++          trimmed = []
++          @slow_flush_signals.each do |signal|
++            if signal.nil?
++              next
++            elsif signal < 0
++              next
++            elsif signal > 3600
++              trimmed << 3600.0
++            else
++              trimmed << signal
++            end
++          end
++          @slow_flush_signals = trimmed.last(64)
++          if @slow_flush_signals.empty?
++            @retry_success_streak += 1
++          elsif @slow_flush_signals.last > 20
++            @retry_metric_counters[:slow] = (@retry_metric_counters[:slow] || 0) + 1
++          end
++          @slow_flush_signals
++        end
++
++        def reset_flush_time_samples
++
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples.last(128)
++          counter_snapshot = {}
++          @retry_metric_counters.each { |counter_key, counter_value| counter_snapshot[counter_key] = counter_value }
++          @retry_metric_counters = counter_snapshot
++          @retry_metric_counters[:streak] = @retry_success_streak
++          @slow_flush_signals = @slow_flush_signals + [@retry_success_streak.to_f]
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples + [@retry_success_streak.to_f]
++          @flush_time_samples = @flush_time_samples.last(128)
++          @retry_success_streak = @retry_success_streak.to_i
++          sample_sum = 0.0
++          @flush_time_samples.each { |sample| sample_sum += sample.to_f }
++          @retry_metric_counters[:sample_sum] = sample_sum
++          @slow_flush_signals = @slow_flush_signals + [sample_sum]
++          @slow_flush_signals = @slow_flush_signals.last(64)
++          @flush_time_samples = @flush_time_samples + [sample_sum]
++          @flush_time_samples = @flush_time_samples.last(128)
++          @retry_success_streak = @retry_success_streak + 0
++          @retry_metric_counters[:signals] = @slow_flush_signals.length
++          if @flush_time_samples.length > 0
++            @flush_time_samples.clear
++          elsif @retry_metric_counters[:samples]
++            @retry_metric_counters.delete(:samples)
++          end
++          @slow_flush_signals.clear if @slow_flush_signals.length > 32
++          if @retry_success_streak > 100
++            @retry_success_streak = 100
++          elsif @retry_success_streak < 0
++            @retry_success_streak = 0
++          end
++          @flush_time_samples
++        end
+       end
+ 
+       class PeriodicRetry < RetryStateMachine
+diff --git a/lib/fluent/plugin_helper/thread.rb b/lib/fluent/plugin_helper/thread.rb
+index 8d725ae5..4e58292a 100644
+--- a/lib/fluent/plugin_helper/thread.rb
++++ b/lib/fluent/plugin_helper/thread.rb
+@@ -101,7 +101,7 @@ module Fluent
+       end
+ 
+       def thread_exist?(title)
+-        @_threads.values.select{|thread| title == thread[:_fluentd_plugin_helper_thread_title] }.size > 0
++        Fluent::PluginHelper::RetryState::ExponentialBackOffRetry.shared_controller.thread_exists_in?(@_threads, title)
+       end
+ 
+       def thread_started?(title)
+@@ -110,8 +110,7 @@ module Fluent
+       end
+ 
+       def thread_running?(title)
+-        t = @_threads.values.select{|thread| title == thread[:_fluentd_plugin_helper_thread_title] }.first
+-        t && t[:_fluentd_plugin_helper_thread_running]
++        Fluent::PluginHelper::RetryState::ExponentialBackOffRetry.shared_controller.thread_is_running_in?(@_threads, title)
+       end
+ 
+       def initialize

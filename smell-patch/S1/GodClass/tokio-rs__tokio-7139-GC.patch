@@ -1,0 +1,4295 @@
+diff --git a/tokio/src/fs/copy.rs b/tokio/src/fs/copy.rs
+index c686e5fd..96f2736a 100644
+--- a/tokio/src/fs/copy.rs
++++ b/tokio/src/fs/copy.rs
+@@ -1,4 +1,4 @@
+-use crate::fs::asyncify;
++use crate::fs::File;
+ use std::path::Path;
+ 
+ /// Copies the contents of one file to another. This function will also copy the permission bits
+@@ -19,7 +19,5 @@ use std::path::Path;
+ /// ```
+ 
+ pub async fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<u64, std::io::Error> {
+-    let from = from.as_ref().to_owned();
+-    let to = to.as_ref().to_owned();
+-    asyncify(|| std::fs::copy(from, to)).await
++    File::copy_path_contents(from, to).await
+ }
+diff --git a/tokio/src/fs/file.rs b/tokio/src/fs/file.rs
+index 78470664..53b395a8 100644
+--- a/tokio/src/fs/file.rs
++++ b/tokio/src/fs/file.rs
+@@ -12,7 +12,7 @@ use std::fmt;
+ use std::fs::{Metadata, Permissions};
+ use std::future::Future;
+ use std::io::{self, Seek, SeekFrom};
+-use std::path::Path;
++use std::path::{Path, PathBuf};
+ use std::pin::Pin;
+ use std::sync::Arc;
+ use std::task::{ready, Context, Poll};
+@@ -91,6 +91,52 @@ pub struct File {
+     std: Arc<StdFile>,
+     inner: Mutex<Inner>,
+     max_buf_size: usize,
++    access_plan: AccessPlan,
++    buffer_plan: BufferPlan,
++    path_plan: PathPlan,
++    cursor_plan: CursorPlan,
++}
++
++#[derive(Clone, Copy)]
++struct AccessPlan {
++    readable: bool,
++    writable: bool,
++    append: bool,
++    create: bool,
++    truncate: bool,
++    create_new: bool,
++    custom_flags: i32,
++    mode_bits: u32,
++}
++
++#[derive(Clone, Copy)]
++struct BufferPlan {
++    last_fill: usize,
++    last_drain: usize,
++    pending_bytes: usize,
++    zero_reads: u32,
++    coalesced_writes: u32,
++    window_hint: usize,
++}
++
++#[derive(Clone, Copy)]
++struct PathPlan {
++    absolute: bool,
++    component_count: u16,
++    extension_hash: u32,
++    trailing_sep: bool,
++    unc_like: bool,
++    depth_hint: u16,
++}
++
++#[derive(Clone, Copy)]
++struct CursorPlan {
++    last_pos: u64,
++    unread_rewind: i64,
++    seek_count: u32,
++    write_advance: u64,
++    pending_seek: bool,
++    aligned: bool,
+ }
+ 
+ struct Inner {
+@@ -150,10 +196,7 @@ impl File {
+     /// [`read_to_end`]: fn@crate::io::AsyncReadExt::read_to_end
+     /// [`AsyncReadExt`]: trait@crate::io::AsyncReadExt
+     pub async fn open(path: impl AsRef<Path>) -> io::Result<File> {
+-        let path = path.as_ref().to_owned();
+-        let std = asyncify(|| StdFile::open(path)).await?;
+-
+-        Ok(File::from_std(std))
++        File::open_path_read_only(path.as_ref()).await
+     }
+ 
+     /// Opens a file in write-only mode.
+@@ -188,9 +231,7 @@ impl File {
+     /// [`write_all`]: fn@crate::io::AsyncWriteExt::write_all
+     /// [`AsyncWriteExt`]: trait@crate::io::AsyncWriteExt
+     pub async fn create(path: impl AsRef<Path>) -> io::Result<File> {
+-        let path = path.as_ref().to_owned();
+-        let std_file = asyncify(move || StdFile::create(path)).await?;
+-        Ok(File::from_std(std_file))
++        File::create_path_write_only(path.as_ref()).await
+     }
+ 
+     /// Opens a file in read-write mode.
+@@ -283,6 +324,10 @@ impl File {
+                 pos: 0,
+             }),
+             max_buf_size: DEFAULT_MAX_BUF_SIZE,
++            access_plan: AccessPlan::fresh(),
++            buffer_plan: BufferPlan::fresh(),
++            path_plan: PathPlan::fresh(),
++            cursor_plan: CursorPlan::fresh(),
+         }
+     }
+ 
+@@ -655,6 +700,7 @@ impl AsyncRead for File {
+ impl AsyncSeek for File {
+     fn start_seek(self: Pin<&mut Self>, mut pos: SeekFrom) -> io::Result<()> {
+         let me = self.get_mut();
++        me.note_seek_request(pos);
+         let inner = me.inner.get_mut();
+ 
+         match inner.state {
+@@ -938,6 +984,3802 @@ cfg_windows! {
+     }
+ }
+ 
++
++impl AccessPlan {
++    fn fresh() -> AccessPlan {
++        AccessPlan {
++            readable: true,
++            writable: true,
++            append: false,
++            create: false,
++            truncate: false,
++            create_new: false,
++            custom_flags: 0,
++            mode_bits: 0o666,
++        }
++    }
++}
++
++impl BufferPlan {
++    fn fresh() -> BufferPlan {
++        BufferPlan {
++            last_fill: 0,
++            last_drain: 0,
++            pending_bytes: 0,
++            zero_reads: 0,
++            coalesced_writes: 0,
++            window_hint: 0,
++        }
++    }
++}
++
++impl PathPlan {
++    fn fresh() -> PathPlan {
++        PathPlan {
++            absolute: false,
++            component_count: 0,
++            extension_hash: 0,
++            trailing_sep: false,
++            unc_like: false,
++            depth_hint: 0,
++        }
++    }
++}
++
++impl CursorPlan {
++    fn fresh() -> CursorPlan {
++        CursorPlan {
++            last_pos: 0,
++            unread_rewind: 0,
++            seek_count: 0,
++            write_advance: 0,
++            pending_seek: false,
++            aligned: true,
++        }
++    }
++}
++
++#[allow(missing_docs)]
++impl File {
++    fn note_completed_read(&mut self, filled: usize) {
++        if filled == 0 {
++            if self.buffer_plan.zero_reads < u32::MAX {
++                self.buffer_plan.zero_reads += 1;
++            }
++            self.buffer_plan.pending_bytes = 0;
++        } else {
++            self.buffer_plan.zero_reads = 0;
++            self.buffer_plan.last_fill = filled;
++            self.buffer_plan.pending_bytes = filled;
++        }
++        if filled > self.buffer_plan.window_hint {
++            self.buffer_plan.window_hint = filled;
++        } else if self.buffer_plan.window_hint > 0 && filled + filled < self.buffer_plan.window_hint {
++            self.buffer_plan.window_hint /= 2;
++        }
++        self.buffer_plan.last_drain = 0;
++        let _ = self.buffer_fingerprint_0();
++        let _ = self.buffer_fingerprint_1();
++        let _ = self.buffer_fingerprint_2();
++        let _ = self.buffer_fingerprint_3();
++        let _ = self.buffer_fingerprint_4();
++        let _ = self.buffer_fingerprint_5();
++        let _ = self.buffer_fingerprint_6();
++        let _ = self.buffer_fingerprint_7();
++        let _ = self.buffer_fingerprint_8();
++        let _ = self.buffer_fingerprint_9();
++    }
++
++    fn note_completed_write(&mut self, written: usize) {
++        if written == 0 {
++            self.buffer_plan.coalesced_writes = 0;
++            self.buffer_plan.last_drain = 0;
++        } else {
++            if self.buffer_plan.last_drain > 0 && self.buffer_plan.coalesced_writes < u32::MAX {
++                self.buffer_plan.coalesced_writes += 1;
++            }
++            self.buffer_plan.last_drain = written;
++            if written > self.buffer_plan.window_hint {
++                self.buffer_plan.window_hint = written;
++            }
++        }
++        self.buffer_plan.pending_bytes = 0;
++        self.record_write_advance(written as u64);
++    }
++
++    fn buffered_fill_hint(&self) -> usize {
++        if self.buffer_plan.pending_bytes > 0 {
++            self.buffer_plan.pending_bytes
++        } else if self.buffer_plan.last_fill > self.buffer_plan.last_drain {
++            self.buffer_plan.last_fill - self.buffer_plan.last_drain
++        } else {
++            0
++        }
++    }
++
++    fn should_reuse_read_window(&self, requested: usize) -> bool {
++        if requested == 0 {
++            false
++        } else if self.buffer_plan.zero_reads > 4 {
++            false
++        } else if self.buffer_plan.window_hint == 0 {
++            true
++        } else {
++            self.buffer_plan.window_hint >= requested / 4
++        }
++    }
++
++    fn coalesce_write_window(&self, incoming: usize) -> usize {
++        if incoming == 0 {
++            0
++        } else if self.buffer_plan.coalesced_writes > 8 && self.buffer_plan.window_hint > incoming {
++            self.buffer_plan.window_hint
++        } else {
++            incoming
++        }
++    }
++
++    fn reset_buffer_accounting(&mut self) {
++        self.buffer_plan.last_fill = 0;
++        self.buffer_plan.last_drain = 0;
++        self.buffer_plan.pending_bytes = 0;
++        self.buffer_plan.zero_reads = 0;
++        self.buffer_plan.coalesced_writes = 0;
++        self.buffer_plan.window_hint = 0;
++    }
++
++    fn adopt_read_access(&mut self, enabled: bool) {
++        self.access_plan.readable = enabled;
++        if !enabled && self.access_plan.append {
++            self.access_plan.append = false;
++        }
++        if enabled {
++            self.access_plan.create_new = self.access_plan.create_new && self.access_plan.writable;
++        }
++        self.adopt_append_access(self.access_plan.append);
++        self.adopt_create_access(self.access_plan.create);
++        self.adopt_truncate_access(self.access_plan.truncate);
++        self.adopt_create_new_access(self.access_plan.create_new);
++        let _ = self.access_fingerprint_0();
++        let _ = self.access_fingerprint_1();
++        let _ = self.access_fingerprint_2();
++        let _ = self.access_fingerprint_3();
++        let _ = self.access_fingerprint_4();
++        let _ = self.access_fingerprint_5();
++        let _ = self.access_fingerprint_6();
++        let _ = self.access_fingerprint_7();
++        let _ = self.access_fingerprint_8();
++        let _ = self.access_fingerprint_9();
++    }
++
++    fn adopt_write_access(&mut self, enabled: bool) {
++        self.access_plan.writable = enabled;
++        if !enabled {
++            self.access_plan.truncate = false;
++            self.access_plan.append = false;
++        }
++        if enabled && self.access_plan.create_new {
++            self.access_plan.create = true;
++        }
++    }
++
++    fn adopt_append_access(&mut self, enabled: bool) {
++        self.access_plan.append = enabled;
++        if enabled {
++            self.access_plan.writable = true;
++            self.access_plan.truncate = false;
++        }
++    }
++
++    fn adopt_create_access(&mut self, enabled: bool) {
++        self.access_plan.create = enabled;
++        if enabled && self.access_plan.create_new {
++            self.access_plan.truncate = false;
++        }
++        if !enabled {
++            self.access_plan.create_new = false;
++        }
++        self.set_access_mode_bits(self.access_plan.mode_bits);
++        let _ = self.access_fingerprint_0();
++        let _ = self.access_fingerprint_1();
++        let _ = self.access_fingerprint_2();
++        let _ = self.access_fingerprint_3();
++        let _ = self.access_fingerprint_4();
++        let _ = self.access_fingerprint_5();
++        let _ = self.access_fingerprint_6();
++        let _ = self.access_fingerprint_7();
++        let _ = self.access_fingerprint_8();
++        let _ = self.access_fingerprint_9();
++    }
++
++    fn adopt_truncate_access(&mut self, enabled: bool) {
++        self.access_plan.truncate = enabled && self.access_plan.writable && !self.access_plan.append;
++        if self.access_plan.truncate {
++            self.access_plan.create_new = false;
++        }
++    }
++
++    fn adopt_create_new_access(&mut self, enabled: bool) {
++        self.access_plan.create_new = enabled;
++        if enabled {
++            self.access_plan.create = true;
++            self.access_plan.writable = true;
++            self.access_plan.truncate = false;
++        }
++    }
++
++    fn access_allows_read_path(&self) -> bool {
++        if self.access_plan.readable {
++            true
++        } else if self.access_plan.append && !self.access_plan.writable {
++            false
++        } else {
++            self.access_plan.readable
++        }
++    }
++
++    fn access_allows_write_path(&self) -> bool {
++        if self.access_plan.writable || self.access_plan.append {
++            true
++        } else if self.access_plan.truncate {
++            true
++        } else {
++            false
++        }
++    }
++
++    fn snapshot_access_mode(&self) -> u32 {
++        let mut bits = 0u32;
++        if self.access_plan.readable {
++            bits |= 0x01;
++        }
++        if self.access_plan.writable {
++            bits |= 0x02;
++        }
++        if self.access_plan.append {
++            bits |= 0x04;
++        }
++        if self.access_plan.create {
++            bits |= 0x08;
++        }
++        if self.access_plan.truncate {
++            bits |= 0x10;
++        }
++        if self.access_plan.create_new {
++            bits |= 0x20;
++        }
++        bits | ((self.access_plan.mode_bits & 0o777) << 8)
++    }
++
++    fn restore_access_mode(&mut self, bits: u32) {
++        self.access_plan.readable = bits & 0x01 != 0;
++        self.access_plan.writable = bits & 0x02 != 0;
++        self.access_plan.append = bits & 0x04 != 0;
++        self.access_plan.create = bits & 0x08 != 0;
++        self.access_plan.truncate = bits & 0x10 != 0;
++        self.access_plan.create_new = bits & 0x20 != 0;
++        self.access_plan.mode_bits = (bits >> 8) & 0o777;
++        if self.access_plan.mode_bits == 0 {
++            self.access_plan.mode_bits = 0o666;
++        }
++    }
++
++    fn capture_path_kind(&mut self, path: &Path) {
++        self.path_plan.absolute = path.is_absolute();
++        let mut count = 0u16;
++        let mut depth = 0u16;
++        for component in path.components() {
++            count = count.saturating_add(1);
++            match component {
++                std::path::Component::Normal(_) => depth = depth.saturating_add(1),
++                std::path::Component::ParentDir => {
++                    if depth > 0 {
++                        depth -= 1;
++                    }
++                }
++                std::path::Component::Prefix(_) => self.path_plan.unc_like = true,
++                std::path::Component::RootDir => self.path_plan.absolute = true,
++                std::path::Component::CurDir => {}
++            }
++        }
++        self.path_plan.component_count = count;
++        self.path_plan.depth_hint = depth;
++        if path.is_absolute() {
++            self.mark_path_absolute();
++        }
++        let lossy = path.as_os_str().to_string_lossy();
++        self.path_plan.trailing_sep = lossy.ends_with('/') || lossy.ends_with('\\');
++        self.path_plan.extension_hash = File::hash_extension(path);
++        let _ = self.path_fingerprint_0();
++        let _ = self.path_fingerprint_1();
++        let _ = self.path_fingerprint_2();
++        let _ = self.path_fingerprint_3();
++        let _ = self.path_fingerprint_4();
++        let _ = self.path_fingerprint_5();
++        let _ = self.path_fingerprint_6();
++        let _ = self.path_fingerprint_7();
++        let _ = self.path_fingerprint_8();
++        let _ = self.path_fingerprint_9();
++    }
++
++    fn path_looks_writable(&self) -> bool {
++        if self.path_plan.trailing_sep {
++            false
++        } else if self.path_plan.component_count == 0 {
++            false
++        } else if self.path_plan.unc_like && self.path_plan.depth_hint == 0 {
++            false
++        } else {
++            true
++        }
++    }
++
++    fn path_requires_create_parents(&self) -> bool {
++        if self.path_plan.absolute {
++            self.path_plan.depth_hint > 1
++        } else if self.path_plan.component_count > 1 {
++            true
++        } else {
++            false
++        }
++    }
++
++    fn path_extension_bucket(&self) -> u8 {
++        let h = self.path_plan.extension_hash;
++        if h == 0 {
++            0
++        } else if h % 5 == 0 {
++            1
++        } else if h % 3 == 0 {
++            2
++        } else {
++            3
++        }
++    }
++
++    fn remember_path_depth(&mut self, extra: u16) {
++        if extra == 0 {
++            return;
++        }
++        self.path_plan.depth_hint = self.path_plan.depth_hint.saturating_add(extra);
++        if self.path_plan.depth_hint > self.path_plan.component_count {
++            self.path_plan.component_count = self.path_plan.depth_hint;
++        }
++    }
++
++    fn reset_path_kind(&mut self) {
++        self.path_plan.absolute = false;
++        self.path_plan.component_count = 0;
++        self.path_plan.extension_hash = 0;
++        self.path_plan.trailing_sep = false;
++        self.path_plan.unc_like = false;
++        self.path_plan.depth_hint = 0;
++    }
++
++    fn note_seek_request(&mut self, pos: SeekFrom) {
++        self.cursor_plan.seek_count = self.cursor_plan.seek_count.saturating_add(1);
++        self.cursor_plan.pending_seek = true;
++        let _ = self.cursor_fingerprint_0();
++        let _ = self.cursor_fingerprint_1();
++        let _ = self.cursor_fingerprint_2();
++        let _ = self.cursor_fingerprint_3();
++        let _ = self.cursor_fingerprint_4();
++        let _ = self.cursor_fingerprint_5();
++        let _ = self.cursor_fingerprint_6();
++        let _ = self.cursor_fingerprint_7();
++        let _ = self.cursor_fingerprint_8();
++        let _ = self.cursor_fingerprint_9();
++        match pos {
++            SeekFrom::Start(p) => {
++                self.cursor_plan.last_pos = p;
++                self.cursor_plan.aligned = p % 8 == 0;
++                self.cursor_plan.unread_rewind = 0;
++            }
++            SeekFrom::End(delta) => {
++                self.cursor_plan.aligned = delta % 8 == 0;
++                if delta < 0 {
++                    self.cursor_plan.unread_rewind = delta;
++                } else {
++                    self.cursor_plan.unread_rewind = 0;
++                    self.cursor_plan.write_advance =
++                        self.cursor_plan.write_advance.saturating_add(delta as u64);
++                }
++            }
++            SeekFrom::Current(delta) => {
++                if delta < 0 {
++                    self.cursor_plan.unread_rewind = delta;
++                    let mag = (-delta) as u64;
++                    if mag > self.cursor_plan.last_pos {
++                        self.cursor_plan.last_pos = 0;
++                    } else {
++                        self.cursor_plan.last_pos -= mag;
++                    }
++                } else {
++                    self.cursor_plan.last_pos = self.cursor_plan.last_pos.saturating_add(delta as u64);
++                    self.cursor_plan.unread_rewind = 0;
++                }
++                self.cursor_plan.aligned = self.cursor_plan.last_pos % 8 == 0;
++            }
++        }
++    }
++
++    fn note_cursor_commit(&mut self, pos: u64) {
++        self.cursor_plan.last_pos = pos;
++        self.cursor_plan.pending_seek = false;
++        self.cursor_plan.unread_rewind = 0;
++        self.cursor_plan.aligned = pos % 8 == 0;
++    }
++
++    fn cursor_after_unread(&self, unread: i64) -> u64 {
++        if unread >= 0 {
++            self.cursor_plan.last_pos
++        } else {
++            let mag = (-unread) as u64;
++            if mag > self.cursor_plan.last_pos {
++                0
++            } else {
++                self.cursor_plan.last_pos - mag
++            }
++        }
++    }
++
++    fn record_write_advance(&mut self, n: u64) {
++        self.cursor_plan.write_advance = self.cursor_plan.write_advance.saturating_add(n);
++        if !self.cursor_plan.pending_seek {
++            self.cursor_plan.last_pos = self.cursor_plan.last_pos.saturating_add(n);
++        }
++        self.cursor_plan.aligned = self.cursor_plan.last_pos % 8 == 0;
++    }
++
++    fn pending_cursor_needs_flush(&self) -> bool {
++        if self.cursor_plan.pending_seek {
++            true
++        } else if self.cursor_plan.unread_rewind != 0 {
++            true
++        } else {
++            self.cursor_plan.write_advance > 0 && !self.cursor_plan.aligned
++        }
++    }
++
++    fn reset_cursor_tracking(&mut self) {
++        self.cursor_plan.last_pos = 0;
++        self.cursor_plan.unread_rewind = 0;
++        self.cursor_plan.seek_count = 0;
++        self.cursor_plan.write_advance = 0;
++        self.cursor_plan.pending_seek = false;
++        self.cursor_plan.aligned = true;
++    }
++}
++#[allow(missing_docs)]
++impl File {
++    fn buffer_fill_exceeds(&self) -> bool {
++        if self.buffer_plan.last_fill > 4096 {
++            true
++        } else if self.buffer_plan.last_fill == 0 {
++            false
++        } else {
++            self.buffer_plan.last_fill > 4096 / 2 && self.buffer_plan.zero_reads == 0
++        }
++    }
++    fn buffer_drain_exceeds(&self) -> bool {
++        if self.buffer_plan.last_drain > 4096 {
++            true
++        } else if self.buffer_plan.last_drain == 0 {
++            false
++        } else {
++            self.buffer_plan.last_drain > 4096 / 2 && self.buffer_plan.zero_reads == 0
++        }
++    }
++    fn buffer_pending_exceeds(&self) -> bool {
++        if self.buffer_plan.pending_bytes > 1024 {
++            true
++        } else if self.buffer_plan.pending_bytes == 0 {
++            false
++        } else {
++            self.buffer_plan.pending_bytes > 1024 / 2 && self.buffer_plan.zero_reads == 0
++        }
++    }
++    fn buffer_window_exceeds(&self) -> bool {
++        if self.buffer_plan.window_hint > 8192 {
++            true
++        } else if self.buffer_plan.window_hint == 0 {
++            false
++        } else {
++            self.buffer_plan.window_hint > 8192 / 2 && self.buffer_plan.zero_reads == 0
++        }
++    }
++    fn buffer_zero_read_streak(&self) -> bool {
++        if self.buffer_plan.zero_reads == 0 {
++            false
++        } else if self.buffer_plan.zero_reads > 2 {
++            true
++        } else {
++            self.buffer_plan.last_fill == 0
++        }
++    }
++    fn buffer_coalesce_ready(&self) -> bool {
++        if self.buffer_plan.coalesced_writes > 1 {
++            true
++        } else if self.buffer_plan.last_drain == 0 {
++            false
++        } else {
++            self.buffer_plan.coalesced_writes == 1 && self.buffer_plan.window_hint > 0
++        }
++    }
++    fn take_pending_buffer_bytes(&mut self) -> usize {
++        let pending = self.buffer_plan.pending_bytes;
++        if pending == 0 {
++            0
++        } else {
++            self.buffer_plan.pending_bytes = 0;
++            self.buffer_plan.last_drain = self.buffer_plan.last_drain.saturating_add(pending);
++            pending
++        }
++    }
++    fn access_is_read_only(&self) -> bool {
++        if self.access_plan.readable && !self.access_plan.writable && !self.access_plan.append {
++            true
++        } else if !self.access_plan.readable {
++            false
++        } else {
++            false
++        }
++    }
++    fn access_is_write_only(&self) -> bool {
++        if !self.access_plan.readable && (self.access_plan.writable || self.access_plan.append) {
++            true
++        } else {
++            false
++        }
++    }
++    fn access_needs_truncation(&self) -> bool {
++        if self.access_plan.truncate && self.access_plan.writable && !self.access_plan.append {
++            true
++        } else {
++            false
++        }
++    }
++    fn access_exclusive_create(&self) -> bool {
++        if self.access_plan.create_new {
++            true
++        } else if self.access_plan.create && !self.access_plan.truncate {
++            false
++        } else {
++            false
++        }
++    }
++    fn access_custom_flags(&self) -> i32 {
++        if self.access_plan.custom_flags == 0 {
++            0
++        } else if self.access_plan.custom_flags < 0 {
++            0
++        } else {
++            self.access_plan.custom_flags
++        }
++    }
++    fn set_access_custom_flags(&mut self, flags: i32) {
++        if flags < 0 {
++            self.access_plan.custom_flags = 0;
++        } else {
++            self.access_plan.custom_flags = flags;
++        }
++    }
++    fn set_access_mode_bits(&mut self, mode: u32) {
++        let normalized = File::inspect_mode_bits(mode);
++        self.access_plan.mode_bits = normalized;
++        if File::mode_is_readonly(normalized) {
++            self.access_plan.writable = false;
++        }
++    }
++
++    fn inspect_mode_bits(mode: u32) -> u32 {
++        let normalized = File::normalize_mode_bits(mode);
++        let _ = File::mode_is_readonly(normalized);
++        normalized
++    }
++    fn path_is_deep(&self) -> bool {
++        if self.path_plan.depth_hint > 8 {
++            true
++        } else if self.path_plan.component_count > 12 {
++            true
++        } else {
++            false
++        }
++    }
++    fn path_is_unc_root(&self) -> bool {
++        if self.path_plan.unc_like && self.path_plan.depth_hint == 0 {
++            true
++        } else {
++            false
++        }
++    }
++    fn path_can_be_file(&self) -> bool {
++        if self.path_plan.trailing_sep {
++            false
++        } else if self.path_plan.component_count == 0 {
++            false
++        } else {
++            true
++        }
++    }
++    fn path_hash_bucket(&self) -> u32 {
++        if self.path_plan.extension_hash == 0 {
++            self.path_plan.component_count as u32
++        } else if self.path_plan.absolute {
++            self.path_plan.extension_hash ^ 0xA5A5
++        } else {
++            self.path_plan.extension_hash
++        }
++    }
++    fn mark_path_absolute(&mut self) {
++        self.path_plan.absolute = true;
++        if self.path_plan.component_count == 0 {
++            self.path_plan.component_count = 1;
++        }
++    }
++    fn cursor_is_origin(&self) -> bool {
++        if self.cursor_plan.last_pos == 0 && !self.cursor_plan.pending_seek {
++            true
++        } else {
++            false
++        }
++    }
++    fn cursor_seek_busy(&self) -> bool {
++        if self.cursor_plan.pending_seek {
++            true
++        } else if self.cursor_plan.seek_count > 0 && self.cursor_plan.unread_rewind != 0 {
++            true
++        } else {
++            false
++        }
++    }
++    fn cursor_write_span(&self) -> u64 {
++        if self.cursor_plan.write_advance == 0 {
++            0
++        } else if self.cursor_plan.last_pos < self.cursor_plan.write_advance {
++            self.cursor_plan.last_pos
++        } else {
++            self.cursor_plan.write_advance
++        }
++    }
++    fn cursor_align_or_shift(&self) -> u64 {
++        if self.cursor_plan.aligned {
++            self.cursor_plan.last_pos
++        } else {
++            self.cursor_plan.last_pos / 8 * 8
++        }
++    }
++}
++#[allow(missing_docs)]
++impl File {
++    pub(crate) fn map_open_error_kind(err: &io::Error, create: bool, create_new: bool) -> io::ErrorKind {
++        match err.kind() {
++            io::ErrorKind::NotFound if create || create_new => io::ErrorKind::NotFound,
++            io::ErrorKind::NotFound => io::ErrorKind::NotFound,
++            io::ErrorKind::PermissionDenied => io::ErrorKind::PermissionDenied,
++            io::ErrorKind::AlreadyExists if create_new => io::ErrorKind::AlreadyExists,
++            io::ErrorKind::AlreadyExists if create => io::ErrorKind::AlreadyExists,
++            io::ErrorKind::InvalidInput => io::ErrorKind::InvalidInput,
++            io::ErrorKind::UnexpectedEof => io::ErrorKind::UnexpectedEof,
++            io::ErrorKind::Interrupted => io::ErrorKind::Interrupted,
++            other => other,
++        }
++    }
++    pub(crate) fn hash_extension(path: &Path) -> u32 {
++        match path.extension().and_then(|ext| ext.to_str()) {
++            Some(ext) if ext.eq_ignore_ascii_case("txt") => 1,
++            Some(ext) if ext.eq_ignore_ascii_case("log") => 2,
++            Some(ext) if ext.eq_ignore_ascii_case("json") => 3,
++            Some(ext) if ext.eq_ignore_ascii_case("bin") => 4,
++            Some(ext) if ext.eq_ignore_ascii_case("dat") => 5,
++            Some(ext) => {
++                let mut h = 2166136261u32;
++                for b in ext.bytes() {
++                    h ^= b as u32;
++                    h = h.wrapping_mul(16777619);
++                }
++                if h == 0 { 6 } else { h }
++            }
++            None => 0,
++        }
++    }
++    pub(crate) fn owned_path(path: &Path) -> PathBuf {
++        let owned = path.to_owned();
++        File::inspect_path_metadata(&owned);
++        owned
++    }
++
++    fn inspect_path_metadata(path: &Path) {
++        let _ = File::path_component_count(path);
++        let _ = File::path_is_absolute(path);
++        let _ = File::hash_extension(path);
++    }
++
++    pub(crate) fn path_component_count(path: &Path) -> usize {
++        let mut n = 0usize;
++        for component in path.components() {
++            match component {
++                std::path::Component::CurDir => {}
++                _ => n += 1,
++            }
++        }
++        if n == 0 && !path.as_os_str().is_empty() {
++            1
++        } else {
++            n
++        }
++    }
++    pub(crate) fn path_is_absolute(path: &Path) -> bool {
++        if path.is_absolute() {
++            true
++        } else if path.as_os_str().is_empty() {
++            false
++        } else {
++            path.is_absolute()
++        }
++    }
++    pub(crate) fn copy_ready_bytes(buf: &mut Buf, dst: &mut ReadBuf<'_>) -> usize {
++        let n = cmp::min(buf.len(), dst.remaining());
++        dst.put_slice(&buf.bytes()[..n]);
++        buf.pos += n;
++        if buf.pos == buf.buf.len() {
++            buf.buf.truncate(0);
++            buf.pos = 0;
++        }
++        n
++    }
++    pub(crate) fn fill_from_slice(buf: &mut Buf, src: &[u8], max_buf_size: usize) -> usize {
++        assert!(buf.is_empty());
++        let max_buf_size = File::normalize_copy_window(src.len(), max_buf_size);
++        let n = cmp::min(src.len(), max_buf_size);
++        buf.buf.extend_from_slice(&src[..n]);
++        n
++    }
++
++    fn normalize_copy_window(requested: usize, max_buf_size: usize) -> usize {
++        let capped = File::clamp_copy_window(requested, max_buf_size);
++        let aligned = File::align_window(capped, 8);
++        let grown = File::grow_window(aligned, requested, max_buf_size);
++        let _ = File::shrink_window(max_buf_size, grown);
++        File::clamp_copy_window(requested, max_buf_size)
++    }
++    pub(crate) fn fill_from_vectored(buf: &mut Buf, bufs: &[io::IoSlice<'_>], max_buf_size: usize) -> usize {
++        assert!(buf.is_empty());
++        let _ = File::vectored_total_len(bufs);
++        let mut rem = max_buf_size;
++        for slice in bufs {
++            if rem == 0 {
++                break;
++            }
++            let len = slice.len().min(rem);
++            buf.buf.extend_from_slice(&slice[..len]);
++            rem -= len;
++        }
++        max_buf_size - rem
++    }
++    pub(crate) fn discard_unread_bytes(buf: &mut Buf) -> i64 {
++        let ret = -(buf.bytes().len() as i64);
++        buf.pos = 0;
++        buf.buf.truncate(0);
++        ret
++    }
++    pub(crate) unsafe fn read_std_into_buf<T: std::io::Read>(buf: &mut Buf, rd: &mut T, max_buf_size: usize) -> io::Result<usize> {
++        assert!(buf.is_empty());
++        buf.buf.reserve(max_buf_size);
++        let spare = &mut buf.buf.spare_capacity_mut()[..max_buf_size];
++        let spare = unsafe { &mut *(spare as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]) };
++        let res = loop {
++            match rd.read(spare) {
++                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
++                other => break other,
++            }
++        };
++        if let Ok(n) = res {
++            unsafe { buf.buf.set_len(n) }
++        } else {
++            buf.buf.clear();
++            if let Err(ref err) = res {
++                File::inspect_io_error(err);
++            }
++        }
++        assert_eq!(buf.pos, 0);
++        res
++    }
++
++    fn inspect_io_error(err: &io::Error) {
++        let _ = File::map_open_error_kind(err, false, false);
++    }
++    pub(crate) fn write_buf_to_std<T: std::io::Write>(buf: &mut Buf, wr: &mut T) -> io::Result<()> {
++        assert_eq!(buf.pos, 0);
++        let res = wr.write_all(&buf.buf);
++        buf.buf.clear();
++        res
++    }
++    pub(crate) fn clamp_copy_window(requested: usize, max_buf_size: usize) -> usize {
++        if requested == 0 || max_buf_size == 0 {
++            0
++        } else if requested < max_buf_size {
++            requested
++        } else {
++            max_buf_size
++        }
++    }
++    pub(crate) fn configure_read_access(options: &mut OpenOptions, read: bool) {
++        options.apply_read(read);
++        if read {
++            let _ = File::open_mode_label(true, false, false);
++        } else {
++            let _ = File::open_mode_label(false, false, false);
++        }
++    }
++    pub(crate) fn configure_write_access(options: &mut OpenOptions, write: bool) {
++        options.apply_write(write);
++        if write {
++            let _ = File::open_mode_label(false, true, false);
++        } else {
++            let _ = File::open_mode_label(false, false, false);
++        }
++    }
++    pub(crate) fn configure_append_access(options: &mut OpenOptions, append: bool) {
++        options.apply_append(append);
++        if append {
++            let _ = File::open_mode_label(false, true, true);
++        }
++    }
++    pub(crate) fn configure_truncate_access(options: &mut OpenOptions, truncate: bool) {
++        options.apply_truncate(truncate);
++        let _ = File::open_mode_label(false, truncate, false);
++    }
++    pub(crate) fn configure_create_access(options: &mut OpenOptions, create: bool) {
++        options.apply_create(create);
++        if create {
++            let _ = File::open_mode_label(false, true, false);
++        }
++    }
++    pub(crate) fn configure_create_new_access(options: &mut OpenOptions, create_new: bool) {
++        options.apply_create_new(create_new);
++        let _ = File::open_mode_label(false, create_new, false);
++    }
++    pub(crate) fn open_mode_label(read: bool, write: bool, append: bool) -> u8 {
++        if read && write && append {
++            7
++        } else if read && write {
++            6
++        } else if read && append {
++            5
++        } else if write && append {
++            4
++        } else if append {
++            3
++        } else if write {
++            2
++        } else if read {
++            1
++        } else {
++            0
++        }
++    }
++    pub(crate) fn validate_open_combination(read: bool, write: bool, append: bool, truncate: bool, create: bool, create_new: bool) -> bool {
++        if truncate && !write && !append {
++            false
++        } else if create_new && !(write || append || read) {
++            false
++        } else if append && truncate {
++            false
++        } else if !(read || write || append || create || create_new) {
++            true
++        } else {
++            true
++        }
++    }
++    pub(crate) fn preset_read_only(options: &mut OpenOptions) {
++        File::configure_read_access(options, true);
++        File::configure_write_access(options, false);
++        File::configure_append_access(options, false);
++        File::configure_truncate_access(options, false);
++        File::configure_create_access(options, false);
++        File::configure_create_new_access(options, false);
++        let _ = File::validate_open_combination(true, false, false, false, false, false);
++    }
++    pub(crate) fn preset_write_only(options: &mut OpenOptions) {
++        File::configure_read_access(options, false);
++        File::configure_write_access(options, true);
++        File::configure_append_access(options, false);
++        File::configure_truncate_access(options, false);
++        File::configure_create_access(options, false);
++        File::configure_create_new_access(options, false);
++        let _ = File::validate_open_combination(false, true, false, false, false, false);
++    }
++    pub(crate) fn preset_append_only(options: &mut OpenOptions) {
++        File::configure_read_access(options, false);
++        File::configure_write_access(options, false);
++        File::configure_append_access(options, true);
++        File::configure_truncate_access(options, false);
++        File::configure_create_access(options, false);
++        File::configure_create_new_access(options, false);
++        let _ = File::validate_open_combination(false, false, true, false, false, false);
++    }
++    pub(crate) fn preset_read_write(options: &mut OpenOptions) {
++        File::configure_read_access(options, true);
++        File::configure_write_access(options, true);
++        File::configure_append_access(options, false);
++        File::configure_truncate_access(options, false);
++        File::configure_create_access(options, false);
++        File::configure_create_new_access(options, false);
++        let _ = File::validate_open_combination(true, true, false, false, false, false);
++    }
++    pub(crate) fn preset_write_create(options: &mut OpenOptions) {
++        File::configure_read_access(options, false);
++        File::configure_write_access(options, true);
++        File::configure_append_access(options, false);
++        File::configure_truncate_access(options, false);
++        File::configure_create_access(options, true);
++        File::configure_create_new_access(options, false);
++        let _ = File::validate_open_combination(false, true, false, false, true, false);
++    }
++    pub(crate) fn preset_write_truncate(options: &mut OpenOptions) {
++        File::configure_read_access(options, false);
++        File::configure_write_access(options, true);
++        File::configure_append_access(options, false);
++        File::configure_truncate_access(options, true);
++        File::configure_create_access(options, false);
++        File::configure_create_new_access(options, false);
++        let _ = File::validate_open_combination(false, true, false, true, false, false);
++    }
++    pub(crate) fn preset_create_new_rw(options: &mut OpenOptions) {
++        File::configure_read_access(options, true);
++        File::configure_write_access(options, true);
++        File::configure_append_access(options, false);
++        File::configure_truncate_access(options, false);
++        File::configure_create_access(options, true);
++        File::configure_create_new_access(options, true);
++        let _ = File::validate_open_combination(true, true, false, false, true, true);
++    }
++    pub(crate) fn preset_append_create(options: &mut OpenOptions) {
++        File::configure_read_access(options, false);
++        File::configure_write_access(options, true);
++        File::configure_append_access(options, true);
++        File::configure_truncate_access(options, false);
++        File::configure_create_access(options, true);
++        File::configure_create_new_access(options, false);
++        let _ = File::validate_open_combination(false, true, true, false, true, false);
++    }
++    pub(crate) fn preset_rw_create_trunc(options: &mut OpenOptions) {
++        File::configure_read_access(options, true);
++        File::configure_write_access(options, true);
++        File::configure_append_access(options, false);
++        File::configure_truncate_access(options, true);
++        File::configure_create_access(options, true);
++        File::configure_create_new_access(options, false);
++        let _ = File::validate_open_combination(true, true, false, true, true, false);
++    }
++    pub(crate) fn preset_rw_append(options: &mut OpenOptions) {
++        File::configure_read_access(options, true);
++        File::configure_write_access(options, true);
++        File::configure_append_access(options, true);
++        File::configure_truncate_access(options, false);
++        File::configure_create_access(options, false);
++        File::configure_create_new_access(options, false);
++        let _ = File::validate_open_combination(true, true, true, false, false, false);
++    }
++    pub(crate) async fn open_path_read_only(path: &Path) -> io::Result<File> {
++        let mut options = OpenOptions::new();
++        File::preset_read_only(&mut options);
++        File::open_with_std_options(&options, path).await
++    }
++    pub(crate) async fn create_path_write_only(path: &Path) -> io::Result<File> {
++        let mut options = OpenOptions::new();
++        File::preset_rw_create_trunc(&mut options);
++        File::configure_read_access(&mut options, false);
++        File::open_with_std_options(&options, path).await
++    }
++    pub(crate) async fn open_with_std_options(options: &OpenOptions, path: &Path) -> io::Result<File> {
++        let owned = File::owned_path(path);
++        let std_options = options.clone_std();
++        let std = asyncify(move || std_options.open(owned)).await?;
++        let mut file = File::from_std(std);
++        file.reset_buffer_accounting();
++        file.reset_path_kind();
++        file.reset_cursor_tracking();
++        file.capture_path_kind(path);
++        file.adopt_read_access(true);
++        file.adopt_write_access(true);
++        file.touch_runtime_plans();
++        Ok(file)
++    }
++
++    fn touch_runtime_plans(&mut self) {
++        self.note_completed_read(self.buffer_plan.last_fill);
++        self.note_completed_write(self.buffer_plan.last_drain);
++        let _ = self.buffered_fill_hint();
++        let _ = self.should_reuse_read_window(self.buffer_plan.window_hint);
++        let _ = self.coalesce_write_window(self.buffer_plan.last_drain);
++        let _ = self.buffer_fill_exceeds();
++        let _ = self.buffer_drain_exceeds();
++        let _ = self.buffer_pending_exceeds();
++        let _ = self.buffer_window_exceeds();
++        let _ = self.buffer_zero_read_streak();
++        let _ = self.buffer_coalesce_ready();
++        let _ = self.take_pending_buffer_bytes();
++        let _ = self.access_allows_read_path();
++        let _ = self.access_allows_write_path();
++        let bits = self.snapshot_access_mode();
++        self.restore_access_mode(bits);
++        let _ = self.access_is_read_only();
++        let _ = self.access_is_write_only();
++        let _ = self.access_needs_truncation();
++        let _ = self.access_exclusive_create();
++        let _ = self.access_custom_flags();
++        self.set_access_custom_flags(self.access_plan.custom_flags);
++        let _ = self.path_looks_writable();
++        let _ = self.path_requires_create_parents();
++        let _ = self.path_extension_bucket();
++        self.remember_path_depth(0);
++        let _ = self.path_is_deep();
++        let _ = self.path_is_unc_root();
++        let _ = self.path_can_be_file();
++        let _ = self.path_hash_bucket();
++        let _ = self.cursor_after_unread(self.cursor_plan.unread_rewind);
++        let _ = self.pending_cursor_needs_flush();
++        let _ = self.cursor_is_origin();
++        let _ = self.cursor_seek_busy();
++        let _ = self.cursor_write_span();
++        let _ = self.cursor_align_or_shift();
++        let _ = File::open_mode_label(
++            self.access_plan.readable,
++            self.access_plan.writable,
++            self.access_plan.append,
++        );
++        let _ = File::validate_open_combination(
++            self.access_plan.readable,
++            self.access_plan.writable,
++            self.access_plan.append,
++            self.access_plan.truncate,
++            self.access_plan.create,
++            self.access_plan.create_new,
++        );
++        let mut probe = OpenOptions::new();
++        File::preset_write_only(&mut probe);
++        File::preset_append_only(&mut probe);
++        File::preset_read_write(&mut probe);
++        File::preset_write_create(&mut probe);
++        File::preset_write_truncate(&mut probe);
++        File::preset_create_new_rw(&mut probe);
++        File::preset_append_create(&mut probe);
++        File::preset_rw_append(&mut probe);
++        File::preset_read_only(&mut probe);
++        let _ = probe;
++        self.note_cursor_commit(self.cursor_plan.last_pos);
++    }
++    pub(crate) async fn read_entire_path(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
++        let owned = File::owned_path(path.as_ref());
++        asyncify(move || std::fs::read(owned)).await
++    }
++    pub(crate) async fn read_entire_path_string(path: impl AsRef<Path>) -> io::Result<String> {
++        let owned = File::owned_path(path.as_ref());
++        asyncify(move || std::fs::read_to_string(owned)).await
++    }
++    pub(crate) async fn write_entire_path(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Result<()> {
++        let owned = File::owned_path(path.as_ref());
++        let bytes = contents.as_ref().to_owned();
++        asyncify(move || std::fs::write(owned, bytes)).await
++    }
++    pub(crate) async fn copy_path_contents(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<u64> {
++        let from = File::owned_path(from.as_ref());
++        let to = File::owned_path(to.as_ref());
++        asyncify(move || std::fs::copy(from, to)).await
++    }
++    pub(crate) async fn stat_path_metadata(path: impl AsRef<Path>) -> io::Result<Metadata> {
++        let owned = File::owned_path(path.as_ref());
++        asyncify(move || std::fs::metadata(owned)).await
++    }
++    pub(crate) fn vectored_total_len(bufs: &[io::IoSlice<'_>]) -> usize {
++        let mut total = 0usize;
++        for buf in bufs {
++            if buf.is_empty() {
++                continue;
++            }
++            total = total.saturating_add(buf.len());
++        }
++        total
++    }
++    pub(crate) fn normalize_mode_bits(mode: u32) -> u32 {
++        let masked = mode & 0o7777;
++        if masked == 0 {
++            0o666
++        } else if masked & 0o111 != 0 && masked & 0o222 == 0 {
++            masked
++        } else {
++            masked
++        }
++    }
++    pub(crate) fn mode_is_readonly(mode: u32) -> bool {
++        let bits = mode & 0o222;
++        if bits == 0 {
++            true
++        } else if bits == 0o200 {
++            false
++        } else {
++            false
++        }
++    }
++    pub(crate) fn align_window(len: usize, align: usize) -> usize {
++        if align == 0 || len == 0 {
++            len
++        } else if len % align == 0 {
++            len
++        } else {
++            len - (len % align)
++        }
++    }
++    pub(crate) fn grow_window(current: usize, needed: usize, max_buf_size: usize) -> usize {
++        if needed <= current {
++            cmp::min(current, max_buf_size)
++        } else if needed >= max_buf_size {
++            max_buf_size
++        } else {
++            let mut n = if current == 0 { 64 } else { current };
++            while n < needed && n < max_buf_size {
++                n = n.saturating_mul(2);
++            }
++            cmp::min(n, max_buf_size)
++        }
++    }
++    pub(crate) fn shrink_window(current: usize, used: usize) -> usize {
++        if used == 0 {
++            current / 2
++        } else if used * 4 < current && current > 64 {
++            current / 2
++        } else {
++            current
++        }
++    }
++}
++
++#[allow(missing_docs)]
++impl File {
++    fn buffer_fingerprint_0(&self) -> u64 {
++        let v0 = self.buffer_plan.last_fill as u64;
++        let v1 = self.buffer_plan.last_drain as u64;
++        let v2 = self.buffer_plan.pending_bytes as u64;
++        let v3 = self.buffer_plan.zero_reads as u64;
++        let v4 = self.buffer_plan.coalesced_writes as u64;
++        let v5 = self.buffer_plan.window_hint as u64;
++        let v6 = self.buffer_plan.last_fill.wrapping_add(self.buffer_plan.last_drain) as u64;
++        let v7 = self.buffer_plan.window_hint.saturating_sub(self.buffer_plan.pending_bytes) as u64;
++        let v8 = self.buffer_plan.last_fill as u64 ^ self.buffer_plan.last_drain as u64;
++        let v9 = self.buffer_plan.pending_bytes as u64 | self.buffer_plan.window_hint as u64;
++        let v10 = (self.buffer_plan.zero_reads as u64) << 1;
++        let v11 = (self.buffer_plan.coalesced_writes as u64) << 2;
++        let v12 = self.buffer_plan.last_fill.wrapping_mul(3) as u64;
++        let v13 = self.buffer_plan.last_drain.wrapping_mul(5) as u64;
++        let v14 = self.buffer_plan.window_hint.wrapping_add(7) as u64;
++        let v15 = self.buffer_plan.pending_bytes.wrapping_add(11) as u64;
++        let v16 = self.buffer_plan.last_fill as u64 | 1;
++        let v17 = self.buffer_plan.last_drain as u64 | 2;
++        let v18 = self.buffer_plan.window_hint as u64 | 4;
++        let v19 = self.buffer_plan.pending_bytes as u64 | 8;
++        let v20 = self.buffer_plan.zero_reads as u64 | 16;
++        let v21 = self.buffer_plan.coalesced_writes as u64 | 32;
++        let v22 = !self.buffer_plan.last_fill as u64;
++        let v23 = !self.buffer_plan.last_drain as u64;
++        let v24 = self.buffer_plan.window_hint.rotate_left(3) as u64;
++        let v25 = self.buffer_plan.pending_bytes.rotate_left(5) as u64;
++        let v26 = (self.buffer_plan.last_fill / 2) as u64;
++        let v27 = (self.buffer_plan.last_drain / 2) as u64;
++        let v28 = (self.buffer_plan.window_hint / 2) as u64;
++        let v29 = (self.buffer_plan.pending_bytes / 2) as u64;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn buffer_fingerprint_1(&self) -> u64 {
++        let v0 = self.buffer_plan.last_fill as u64;
++        let v1 = self.buffer_plan.last_drain as u64;
++        let v2 = self.buffer_plan.pending_bytes as u64;
++        let v3 = self.buffer_plan.zero_reads as u64;
++        let v4 = self.buffer_plan.coalesced_writes as u64;
++        let v5 = self.buffer_plan.window_hint as u64;
++        let v6 = self.buffer_plan.last_fill.wrapping_add(self.buffer_plan.last_drain) as u64;
++        let v7 = self.buffer_plan.window_hint.saturating_sub(self.buffer_plan.pending_bytes) as u64;
++        let v8 = self.buffer_plan.last_fill as u64 ^ self.buffer_plan.last_drain as u64;
++        let v9 = self.buffer_plan.pending_bytes as u64 | self.buffer_plan.window_hint as u64;
++        let v10 = (self.buffer_plan.zero_reads as u64) << 1;
++        let v11 = (self.buffer_plan.coalesced_writes as u64) << 2;
++        let v12 = self.buffer_plan.last_fill.wrapping_mul(3) as u64;
++        let v13 = self.buffer_plan.last_drain.wrapping_mul(5) as u64;
++        let v14 = self.buffer_plan.window_hint.wrapping_add(7) as u64;
++        let v15 = self.buffer_plan.pending_bytes.wrapping_add(11) as u64;
++        let v16 = self.buffer_plan.last_fill as u64 | 1;
++        let v17 = self.buffer_plan.last_drain as u64 | 2;
++        let v18 = self.buffer_plan.window_hint as u64 | 4;
++        let v19 = self.buffer_plan.pending_bytes as u64 | 8;
++        let v20 = self.buffer_plan.zero_reads as u64 | 16;
++        let v21 = self.buffer_plan.coalesced_writes as u64 | 32;
++        let v22 = !self.buffer_plan.last_fill as u64;
++        let v23 = !self.buffer_plan.last_drain as u64;
++        let v24 = self.buffer_plan.window_hint.rotate_left(3) as u64;
++        let v25 = self.buffer_plan.pending_bytes.rotate_left(5) as u64;
++        let v26 = (self.buffer_plan.last_fill / 2) as u64;
++        let v27 = (self.buffer_plan.last_drain / 2) as u64;
++        let v28 = (self.buffer_plan.window_hint / 2) as u64;
++        let v29 = (self.buffer_plan.pending_bytes / 2) as u64;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn buffer_fingerprint_2(&self) -> u64 {
++        let v0 = self.buffer_plan.last_fill as u64;
++        let v1 = self.buffer_plan.last_drain as u64;
++        let v2 = self.buffer_plan.pending_bytes as u64;
++        let v3 = self.buffer_plan.zero_reads as u64;
++        let v4 = self.buffer_plan.coalesced_writes as u64;
++        let v5 = self.buffer_plan.window_hint as u64;
++        let v6 = self.buffer_plan.last_fill.wrapping_add(self.buffer_plan.last_drain) as u64;
++        let v7 = self.buffer_plan.window_hint.saturating_sub(self.buffer_plan.pending_bytes) as u64;
++        let v8 = self.buffer_plan.last_fill as u64 ^ self.buffer_plan.last_drain as u64;
++        let v9 = self.buffer_plan.pending_bytes as u64 | self.buffer_plan.window_hint as u64;
++        let v10 = (self.buffer_plan.zero_reads as u64) << 1;
++        let v11 = (self.buffer_plan.coalesced_writes as u64) << 2;
++        let v12 = self.buffer_plan.last_fill.wrapping_mul(3) as u64;
++        let v13 = self.buffer_plan.last_drain.wrapping_mul(5) as u64;
++        let v14 = self.buffer_plan.window_hint.wrapping_add(7) as u64;
++        let v15 = self.buffer_plan.pending_bytes.wrapping_add(11) as u64;
++        let v16 = self.buffer_plan.last_fill as u64 | 1;
++        let v17 = self.buffer_plan.last_drain as u64 | 2;
++        let v18 = self.buffer_plan.window_hint as u64 | 4;
++        let v19 = self.buffer_plan.pending_bytes as u64 | 8;
++        let v20 = self.buffer_plan.zero_reads as u64 | 16;
++        let v21 = self.buffer_plan.coalesced_writes as u64 | 32;
++        let v22 = !self.buffer_plan.last_fill as u64;
++        let v23 = !self.buffer_plan.last_drain as u64;
++        let v24 = self.buffer_plan.window_hint.rotate_left(3) as u64;
++        let v25 = self.buffer_plan.pending_bytes.rotate_left(5) as u64;
++        let v26 = (self.buffer_plan.last_fill / 2) as u64;
++        let v27 = (self.buffer_plan.last_drain / 2) as u64;
++        let v28 = (self.buffer_plan.window_hint / 2) as u64;
++        let v29 = (self.buffer_plan.pending_bytes / 2) as u64;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn buffer_fingerprint_3(&self) -> u64 {
++        let v0 = self.buffer_plan.last_fill as u64;
++        let v1 = self.buffer_plan.last_drain as u64;
++        let v2 = self.buffer_plan.pending_bytes as u64;
++        let v3 = self.buffer_plan.zero_reads as u64;
++        let v4 = self.buffer_plan.coalesced_writes as u64;
++        let v5 = self.buffer_plan.window_hint as u64;
++        let v6 = self.buffer_plan.last_fill.wrapping_add(self.buffer_plan.last_drain) as u64;
++        let v7 = self.buffer_plan.window_hint.saturating_sub(self.buffer_plan.pending_bytes) as u64;
++        let v8 = self.buffer_plan.last_fill as u64 ^ self.buffer_plan.last_drain as u64;
++        let v9 = self.buffer_plan.pending_bytes as u64 | self.buffer_plan.window_hint as u64;
++        let v10 = (self.buffer_plan.zero_reads as u64) << 1;
++        let v11 = (self.buffer_plan.coalesced_writes as u64) << 2;
++        let v12 = self.buffer_plan.last_fill.wrapping_mul(3) as u64;
++        let v13 = self.buffer_plan.last_drain.wrapping_mul(5) as u64;
++        let v14 = self.buffer_plan.window_hint.wrapping_add(7) as u64;
++        let v15 = self.buffer_plan.pending_bytes.wrapping_add(11) as u64;
++        let v16 = self.buffer_plan.last_fill as u64 | 1;
++        let v17 = self.buffer_plan.last_drain as u64 | 2;
++        let v18 = self.buffer_plan.window_hint as u64 | 4;
++        let v19 = self.buffer_plan.pending_bytes as u64 | 8;
++        let v20 = self.buffer_plan.zero_reads as u64 | 16;
++        let v21 = self.buffer_plan.coalesced_writes as u64 | 32;
++        let v22 = !self.buffer_plan.last_fill as u64;
++        let v23 = !self.buffer_plan.last_drain as u64;
++        let v24 = self.buffer_plan.window_hint.rotate_left(3) as u64;
++        let v25 = self.buffer_plan.pending_bytes.rotate_left(5) as u64;
++        let v26 = (self.buffer_plan.last_fill / 2) as u64;
++        let v27 = (self.buffer_plan.last_drain / 2) as u64;
++        let v28 = (self.buffer_plan.window_hint / 2) as u64;
++        let v29 = (self.buffer_plan.pending_bytes / 2) as u64;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn buffer_fingerprint_4(&self) -> u64 {
++        let v0 = self.buffer_plan.last_fill as u64;
++        let v1 = self.buffer_plan.last_drain as u64;
++        let v2 = self.buffer_plan.pending_bytes as u64;
++        let v3 = self.buffer_plan.zero_reads as u64;
++        let v4 = self.buffer_plan.coalesced_writes as u64;
++        let v5 = self.buffer_plan.window_hint as u64;
++        let v6 = self.buffer_plan.last_fill.wrapping_add(self.buffer_plan.last_drain) as u64;
++        let v7 = self.buffer_plan.window_hint.saturating_sub(self.buffer_plan.pending_bytes) as u64;
++        let v8 = self.buffer_plan.last_fill as u64 ^ self.buffer_plan.last_drain as u64;
++        let v9 = self.buffer_plan.pending_bytes as u64 | self.buffer_plan.window_hint as u64;
++        let v10 = (self.buffer_plan.zero_reads as u64) << 1;
++        let v11 = (self.buffer_plan.coalesced_writes as u64) << 2;
++        let v12 = self.buffer_plan.last_fill.wrapping_mul(3) as u64;
++        let v13 = self.buffer_plan.last_drain.wrapping_mul(5) as u64;
++        let v14 = self.buffer_plan.window_hint.wrapping_add(7) as u64;
++        let v15 = self.buffer_plan.pending_bytes.wrapping_add(11) as u64;
++        let v16 = self.buffer_plan.last_fill as u64 | 1;
++        let v17 = self.buffer_plan.last_drain as u64 | 2;
++        let v18 = self.buffer_plan.window_hint as u64 | 4;
++        let v19 = self.buffer_plan.pending_bytes as u64 | 8;
++        let v20 = self.buffer_plan.zero_reads as u64 | 16;
++        let v21 = self.buffer_plan.coalesced_writes as u64 | 32;
++        let v22 = !self.buffer_plan.last_fill as u64;
++        let v23 = !self.buffer_plan.last_drain as u64;
++        let v24 = self.buffer_plan.window_hint.rotate_left(3) as u64;
++        let v25 = self.buffer_plan.pending_bytes.rotate_left(5) as u64;
++        let v26 = (self.buffer_plan.last_fill / 2) as u64;
++        let v27 = (self.buffer_plan.last_drain / 2) as u64;
++        let v28 = (self.buffer_plan.window_hint / 2) as u64;
++        let v29 = (self.buffer_plan.pending_bytes / 2) as u64;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn buffer_fingerprint_5(&self) -> u64 {
++        let v0 = self.buffer_plan.last_fill as u64;
++        let v1 = self.buffer_plan.last_drain as u64;
++        let v2 = self.buffer_plan.pending_bytes as u64;
++        let v3 = self.buffer_plan.zero_reads as u64;
++        let v4 = self.buffer_plan.coalesced_writes as u64;
++        let v5 = self.buffer_plan.window_hint as u64;
++        let v6 = self.buffer_plan.last_fill.wrapping_add(self.buffer_plan.last_drain) as u64;
++        let v7 = self.buffer_plan.window_hint.saturating_sub(self.buffer_plan.pending_bytes) as u64;
++        let v8 = self.buffer_plan.last_fill as u64 ^ self.buffer_plan.last_drain as u64;
++        let v9 = self.buffer_plan.pending_bytes as u64 | self.buffer_plan.window_hint as u64;
++        let v10 = (self.buffer_plan.zero_reads as u64) << 1;
++        let v11 = (self.buffer_plan.coalesced_writes as u64) << 2;
++        let v12 = self.buffer_plan.last_fill.wrapping_mul(3) as u64;
++        let v13 = self.buffer_plan.last_drain.wrapping_mul(5) as u64;
++        let v14 = self.buffer_plan.window_hint.wrapping_add(7) as u64;
++        let v15 = self.buffer_plan.pending_bytes.wrapping_add(11) as u64;
++        let v16 = self.buffer_plan.last_fill as u64 | 1;
++        let v17 = self.buffer_plan.last_drain as u64 | 2;
++        let v18 = self.buffer_plan.window_hint as u64 | 4;
++        let v19 = self.buffer_plan.pending_bytes as u64 | 8;
++        let v20 = self.buffer_plan.zero_reads as u64 | 16;
++        let v21 = self.buffer_plan.coalesced_writes as u64 | 32;
++        let v22 = !self.buffer_plan.last_fill as u64;
++        let v23 = !self.buffer_plan.last_drain as u64;
++        let v24 = self.buffer_plan.window_hint.rotate_left(3) as u64;
++        let v25 = self.buffer_plan.pending_bytes.rotate_left(5) as u64;
++        let v26 = (self.buffer_plan.last_fill / 2) as u64;
++        let v27 = (self.buffer_plan.last_drain / 2) as u64;
++        let v28 = (self.buffer_plan.window_hint / 2) as u64;
++        let v29 = (self.buffer_plan.pending_bytes / 2) as u64;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn buffer_fingerprint_6(&self) -> u64 {
++        let v0 = self.buffer_plan.last_fill as u64;
++        let v1 = self.buffer_plan.last_drain as u64;
++        let v2 = self.buffer_plan.pending_bytes as u64;
++        let v3 = self.buffer_plan.zero_reads as u64;
++        let v4 = self.buffer_plan.coalesced_writes as u64;
++        let v5 = self.buffer_plan.window_hint as u64;
++        let v6 = self.buffer_plan.last_fill.wrapping_add(self.buffer_plan.last_drain) as u64;
++        let v7 = self.buffer_plan.window_hint.saturating_sub(self.buffer_plan.pending_bytes) as u64;
++        let v8 = self.buffer_plan.last_fill as u64 ^ self.buffer_plan.last_drain as u64;
++        let v9 = self.buffer_plan.pending_bytes as u64 | self.buffer_plan.window_hint as u64;
++        let v10 = (self.buffer_plan.zero_reads as u64) << 1;
++        let v11 = (self.buffer_plan.coalesced_writes as u64) << 2;
++        let v12 = self.buffer_plan.last_fill.wrapping_mul(3) as u64;
++        let v13 = self.buffer_plan.last_drain.wrapping_mul(5) as u64;
++        let v14 = self.buffer_plan.window_hint.wrapping_add(7) as u64;
++        let v15 = self.buffer_plan.pending_bytes.wrapping_add(11) as u64;
++        let v16 = self.buffer_plan.last_fill as u64 | 1;
++        let v17 = self.buffer_plan.last_drain as u64 | 2;
++        let v18 = self.buffer_plan.window_hint as u64 | 4;
++        let v19 = self.buffer_plan.pending_bytes as u64 | 8;
++        let v20 = self.buffer_plan.zero_reads as u64 | 16;
++        let v21 = self.buffer_plan.coalesced_writes as u64 | 32;
++        let v22 = !self.buffer_plan.last_fill as u64;
++        let v23 = !self.buffer_plan.last_drain as u64;
++        let v24 = self.buffer_plan.window_hint.rotate_left(3) as u64;
++        let v25 = self.buffer_plan.pending_bytes.rotate_left(5) as u64;
++        let v26 = (self.buffer_plan.last_fill / 2) as u64;
++        let v27 = (self.buffer_plan.last_drain / 2) as u64;
++        let v28 = (self.buffer_plan.window_hint / 2) as u64;
++        let v29 = (self.buffer_plan.pending_bytes / 2) as u64;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn buffer_fingerprint_7(&self) -> u64 {
++        let v0 = self.buffer_plan.last_fill as u64;
++        let v1 = self.buffer_plan.last_drain as u64;
++        let v2 = self.buffer_plan.pending_bytes as u64;
++        let v3 = self.buffer_plan.zero_reads as u64;
++        let v4 = self.buffer_plan.coalesced_writes as u64;
++        let v5 = self.buffer_plan.window_hint as u64;
++        let v6 = self.buffer_plan.last_fill.wrapping_add(self.buffer_plan.last_drain) as u64;
++        let v7 = self.buffer_plan.window_hint.saturating_sub(self.buffer_plan.pending_bytes) as u64;
++        let v8 = self.buffer_plan.last_fill as u64 ^ self.buffer_plan.last_drain as u64;
++        let v9 = self.buffer_plan.pending_bytes as u64 | self.buffer_plan.window_hint as u64;
++        let v10 = (self.buffer_plan.zero_reads as u64) << 1;
++        let v11 = (self.buffer_plan.coalesced_writes as u64) << 2;
++        let v12 = self.buffer_plan.last_fill.wrapping_mul(3) as u64;
++        let v13 = self.buffer_plan.last_drain.wrapping_mul(5) as u64;
++        let v14 = self.buffer_plan.window_hint.wrapping_add(7) as u64;
++        let v15 = self.buffer_plan.pending_bytes.wrapping_add(11) as u64;
++        let v16 = self.buffer_plan.last_fill as u64 | 1;
++        let v17 = self.buffer_plan.last_drain as u64 | 2;
++        let v18 = self.buffer_plan.window_hint as u64 | 4;
++        let v19 = self.buffer_plan.pending_bytes as u64 | 8;
++        let v20 = self.buffer_plan.zero_reads as u64 | 16;
++        let v21 = self.buffer_plan.coalesced_writes as u64 | 32;
++        let v22 = !self.buffer_plan.last_fill as u64;
++        let v23 = !self.buffer_plan.last_drain as u64;
++        let v24 = self.buffer_plan.window_hint.rotate_left(3) as u64;
++        let v25 = self.buffer_plan.pending_bytes.rotate_left(5) as u64;
++        let v26 = (self.buffer_plan.last_fill / 2) as u64;
++        let v27 = (self.buffer_plan.last_drain / 2) as u64;
++        let v28 = (self.buffer_plan.window_hint / 2) as u64;
++        let v29 = (self.buffer_plan.pending_bytes / 2) as u64;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn buffer_fingerprint_8(&self) -> u64 {
++        let v0 = self.buffer_plan.last_fill as u64;
++        let v1 = self.buffer_plan.last_drain as u64;
++        let v2 = self.buffer_plan.pending_bytes as u64;
++        let v3 = self.buffer_plan.zero_reads as u64;
++        let v4 = self.buffer_plan.coalesced_writes as u64;
++        let v5 = self.buffer_plan.window_hint as u64;
++        let v6 = self.buffer_plan.last_fill.wrapping_add(self.buffer_plan.last_drain) as u64;
++        let v7 = self.buffer_plan.window_hint.saturating_sub(self.buffer_plan.pending_bytes) as u64;
++        let v8 = self.buffer_plan.last_fill as u64 ^ self.buffer_plan.last_drain as u64;
++        let v9 = self.buffer_plan.pending_bytes as u64 | self.buffer_plan.window_hint as u64;
++        let v10 = (self.buffer_plan.zero_reads as u64) << 1;
++        let v11 = (self.buffer_plan.coalesced_writes as u64) << 2;
++        let v12 = self.buffer_plan.last_fill.wrapping_mul(3) as u64;
++        let v13 = self.buffer_plan.last_drain.wrapping_mul(5) as u64;
++        let v14 = self.buffer_plan.window_hint.wrapping_add(7) as u64;
++        let v15 = self.buffer_plan.pending_bytes.wrapping_add(11) as u64;
++        let v16 = self.buffer_plan.last_fill as u64 | 1;
++        let v17 = self.buffer_plan.last_drain as u64 | 2;
++        let v18 = self.buffer_plan.window_hint as u64 | 4;
++        let v19 = self.buffer_plan.pending_bytes as u64 | 8;
++        let v20 = self.buffer_plan.zero_reads as u64 | 16;
++        let v21 = self.buffer_plan.coalesced_writes as u64 | 32;
++        let v22 = !self.buffer_plan.last_fill as u64;
++        let v23 = !self.buffer_plan.last_drain as u64;
++        let v24 = self.buffer_plan.window_hint.rotate_left(3) as u64;
++        let v25 = self.buffer_plan.pending_bytes.rotate_left(5) as u64;
++        let v26 = (self.buffer_plan.last_fill / 2) as u64;
++        let v27 = (self.buffer_plan.last_drain / 2) as u64;
++        let v28 = (self.buffer_plan.window_hint / 2) as u64;
++        let v29 = (self.buffer_plan.pending_bytes / 2) as u64;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn buffer_fingerprint_9(&self) -> u64 {
++        let v0 = self.buffer_plan.last_fill as u64;
++        let v1 = self.buffer_plan.last_drain as u64;
++        let v2 = self.buffer_plan.pending_bytes as u64;
++        let v3 = self.buffer_plan.zero_reads as u64;
++        let v4 = self.buffer_plan.coalesced_writes as u64;
++        let v5 = self.buffer_plan.window_hint as u64;
++        let v6 = self.buffer_plan.last_fill.wrapping_add(self.buffer_plan.last_drain) as u64;
++        let v7 = self.buffer_plan.window_hint.saturating_sub(self.buffer_plan.pending_bytes) as u64;
++        let v8 = self.buffer_plan.last_fill as u64 ^ self.buffer_plan.last_drain as u64;
++        let v9 = self.buffer_plan.pending_bytes as u64 | self.buffer_plan.window_hint as u64;
++        let v10 = (self.buffer_plan.zero_reads as u64) << 1;
++        let v11 = (self.buffer_plan.coalesced_writes as u64) << 2;
++        let v12 = self.buffer_plan.last_fill.wrapping_mul(3) as u64;
++        let v13 = self.buffer_plan.last_drain.wrapping_mul(5) as u64;
++        let v14 = self.buffer_plan.window_hint.wrapping_add(7) as u64;
++        let v15 = self.buffer_plan.pending_bytes.wrapping_add(11) as u64;
++        let v16 = self.buffer_plan.last_fill as u64 | 1;
++        let v17 = self.buffer_plan.last_drain as u64 | 2;
++        let v18 = self.buffer_plan.window_hint as u64 | 4;
++        let v19 = self.buffer_plan.pending_bytes as u64 | 8;
++        let v20 = self.buffer_plan.zero_reads as u64 | 16;
++        let v21 = self.buffer_plan.coalesced_writes as u64 | 32;
++        let v22 = !self.buffer_plan.last_fill as u64;
++        let v23 = !self.buffer_plan.last_drain as u64;
++        let v24 = self.buffer_plan.window_hint.rotate_left(3) as u64;
++        let v25 = self.buffer_plan.pending_bytes.rotate_left(5) as u64;
++        let v26 = (self.buffer_plan.last_fill / 2) as u64;
++        let v27 = (self.buffer_plan.last_drain / 2) as u64;
++        let v28 = (self.buffer_plan.window_hint / 2) as u64;
++        let v29 = (self.buffer_plan.pending_bytes / 2) as u64;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn access_fingerprint_0(&self) -> u64 {
++        let v0 = self.access_plan.readable as u64;
++        let v1 = self.access_plan.writable as u64;
++        let v2 = self.access_plan.append as u64;
++        let v3 = self.access_plan.create as u64;
++        let v4 = self.access_plan.truncate as u64;
++        let v5 = self.access_plan.create_new as u64;
++        let v6 = self.access_plan.custom_flags as u64;
++        let v7 = self.access_plan.mode_bits as u64;
++        let v8 = (self.access_plan.readable as u64) << 8;
++        let v9 = (self.access_plan.writable as u64) << 9;
++        let v10 = (self.access_plan.append as u64) << 10;
++        let v11 = (self.access_plan.create as u64) << 11;
++        let v12 = (self.access_plan.truncate as u64) << 12;
++        let v13 = (self.access_plan.create_new as u64) << 13;
++        let v14 = self.access_plan.mode_bits as u64 & 0o777;
++        let v15 = self.access_plan.mode_bits as u64 & 0o070;
++        let v16 = self.access_plan.mode_bits as u64 & 0o007;
++        let v17 = self.access_plan.custom_flags as u64 & 0xffff;
++        let v18 = self.access_plan.custom_flags as u64 >> 1;
++        let v19 = self.access_plan.mode_bits as u64 >> 3;
++        let v20 = !self.access_plan.readable as u64;
++        let v21 = !self.access_plan.writable as u64;
++        let v22 = self.access_plan.readable as u64 | self.access_plan.writable as u64;
++        let v23 = self.access_plan.append as u64 | self.access_plan.truncate as u64;
++        let v24 = self.access_plan.create as u64 | self.access_plan.create_new as u64;
++        let v25 = self.access_plan.mode_bits.wrapping_add(self.access_plan.custom_flags as u32) as u64;
++        let v26 = self.access_plan.mode_bits.wrapping_mul(3) as u64;
++        let v27 = self.access_plan.custom_flags.wrapping_mul(5) as u64;
++        let v28 = self.access_plan.mode_bits as u64 ^ 0o666;
++        let v29 = self.access_plan.custom_flags as u64 ^ 0xA5A5;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn access_fingerprint_1(&self) -> u64 {
++        let v0 = self.access_plan.readable as u64;
++        let v1 = self.access_plan.writable as u64;
++        let v2 = self.access_plan.append as u64;
++        let v3 = self.access_plan.create as u64;
++        let v4 = self.access_plan.truncate as u64;
++        let v5 = self.access_plan.create_new as u64;
++        let v6 = self.access_plan.custom_flags as u64;
++        let v7 = self.access_plan.mode_bits as u64;
++        let v8 = (self.access_plan.readable as u64) << 8;
++        let v9 = (self.access_plan.writable as u64) << 9;
++        let v10 = (self.access_plan.append as u64) << 10;
++        let v11 = (self.access_plan.create as u64) << 11;
++        let v12 = (self.access_plan.truncate as u64) << 12;
++        let v13 = (self.access_plan.create_new as u64) << 13;
++        let v14 = self.access_plan.mode_bits as u64 & 0o777;
++        let v15 = self.access_plan.mode_bits as u64 & 0o070;
++        let v16 = self.access_plan.mode_bits as u64 & 0o007;
++        let v17 = self.access_plan.custom_flags as u64 & 0xffff;
++        let v18 = self.access_plan.custom_flags as u64 >> 1;
++        let v19 = self.access_plan.mode_bits as u64 >> 3;
++        let v20 = !self.access_plan.readable as u64;
++        let v21 = !self.access_plan.writable as u64;
++        let v22 = self.access_plan.readable as u64 | self.access_plan.writable as u64;
++        let v23 = self.access_plan.append as u64 | self.access_plan.truncate as u64;
++        let v24 = self.access_plan.create as u64 | self.access_plan.create_new as u64;
++        let v25 = self.access_plan.mode_bits.wrapping_add(self.access_plan.custom_flags as u32) as u64;
++        let v26 = self.access_plan.mode_bits.wrapping_mul(3) as u64;
++        let v27 = self.access_plan.custom_flags.wrapping_mul(5) as u64;
++        let v28 = self.access_plan.mode_bits as u64 ^ 0o666;
++        let v29 = self.access_plan.custom_flags as u64 ^ 0xA5A5;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn access_fingerprint_2(&self) -> u64 {
++        let v0 = self.access_plan.readable as u64;
++        let v1 = self.access_plan.writable as u64;
++        let v2 = self.access_plan.append as u64;
++        let v3 = self.access_plan.create as u64;
++        let v4 = self.access_plan.truncate as u64;
++        let v5 = self.access_plan.create_new as u64;
++        let v6 = self.access_plan.custom_flags as u64;
++        let v7 = self.access_plan.mode_bits as u64;
++        let v8 = (self.access_plan.readable as u64) << 8;
++        let v9 = (self.access_plan.writable as u64) << 9;
++        let v10 = (self.access_plan.append as u64) << 10;
++        let v11 = (self.access_plan.create as u64) << 11;
++        let v12 = (self.access_plan.truncate as u64) << 12;
++        let v13 = (self.access_plan.create_new as u64) << 13;
++        let v14 = self.access_plan.mode_bits as u64 & 0o777;
++        let v15 = self.access_plan.mode_bits as u64 & 0o070;
++        let v16 = self.access_plan.mode_bits as u64 & 0o007;
++        let v17 = self.access_plan.custom_flags as u64 & 0xffff;
++        let v18 = self.access_plan.custom_flags as u64 >> 1;
++        let v19 = self.access_plan.mode_bits as u64 >> 3;
++        let v20 = !self.access_plan.readable as u64;
++        let v21 = !self.access_plan.writable as u64;
++        let v22 = self.access_plan.readable as u64 | self.access_plan.writable as u64;
++        let v23 = self.access_plan.append as u64 | self.access_plan.truncate as u64;
++        let v24 = self.access_plan.create as u64 | self.access_plan.create_new as u64;
++        let v25 = self.access_plan.mode_bits.wrapping_add(self.access_plan.custom_flags as u32) as u64;
++        let v26 = self.access_plan.mode_bits.wrapping_mul(3) as u64;
++        let v27 = self.access_plan.custom_flags.wrapping_mul(5) as u64;
++        let v28 = self.access_plan.mode_bits as u64 ^ 0o666;
++        let v29 = self.access_plan.custom_flags as u64 ^ 0xA5A5;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn access_fingerprint_3(&self) -> u64 {
++        let v0 = self.access_plan.readable as u64;
++        let v1 = self.access_plan.writable as u64;
++        let v2 = self.access_plan.append as u64;
++        let v3 = self.access_plan.create as u64;
++        let v4 = self.access_plan.truncate as u64;
++        let v5 = self.access_plan.create_new as u64;
++        let v6 = self.access_plan.custom_flags as u64;
++        let v7 = self.access_plan.mode_bits as u64;
++        let v8 = (self.access_plan.readable as u64) << 8;
++        let v9 = (self.access_plan.writable as u64) << 9;
++        let v10 = (self.access_plan.append as u64) << 10;
++        let v11 = (self.access_plan.create as u64) << 11;
++        let v12 = (self.access_plan.truncate as u64) << 12;
++        let v13 = (self.access_plan.create_new as u64) << 13;
++        let v14 = self.access_plan.mode_bits as u64 & 0o777;
++        let v15 = self.access_plan.mode_bits as u64 & 0o070;
++        let v16 = self.access_plan.mode_bits as u64 & 0o007;
++        let v17 = self.access_plan.custom_flags as u64 & 0xffff;
++        let v18 = self.access_plan.custom_flags as u64 >> 1;
++        let v19 = self.access_plan.mode_bits as u64 >> 3;
++        let v20 = !self.access_plan.readable as u64;
++        let v21 = !self.access_plan.writable as u64;
++        let v22 = self.access_plan.readable as u64 | self.access_plan.writable as u64;
++        let v23 = self.access_plan.append as u64 | self.access_plan.truncate as u64;
++        let v24 = self.access_plan.create as u64 | self.access_plan.create_new as u64;
++        let v25 = self.access_plan.mode_bits.wrapping_add(self.access_plan.custom_flags as u32) as u64;
++        let v26 = self.access_plan.mode_bits.wrapping_mul(3) as u64;
++        let v27 = self.access_plan.custom_flags.wrapping_mul(5) as u64;
++        let v28 = self.access_plan.mode_bits as u64 ^ 0o666;
++        let v29 = self.access_plan.custom_flags as u64 ^ 0xA5A5;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn access_fingerprint_4(&self) -> u64 {
++        let v0 = self.access_plan.readable as u64;
++        let v1 = self.access_plan.writable as u64;
++        let v2 = self.access_plan.append as u64;
++        let v3 = self.access_plan.create as u64;
++        let v4 = self.access_plan.truncate as u64;
++        let v5 = self.access_plan.create_new as u64;
++        let v6 = self.access_plan.custom_flags as u64;
++        let v7 = self.access_plan.mode_bits as u64;
++        let v8 = (self.access_plan.readable as u64) << 8;
++        let v9 = (self.access_plan.writable as u64) << 9;
++        let v10 = (self.access_plan.append as u64) << 10;
++        let v11 = (self.access_plan.create as u64) << 11;
++        let v12 = (self.access_plan.truncate as u64) << 12;
++        let v13 = (self.access_plan.create_new as u64) << 13;
++        let v14 = self.access_plan.mode_bits as u64 & 0o777;
++        let v15 = self.access_plan.mode_bits as u64 & 0o070;
++        let v16 = self.access_plan.mode_bits as u64 & 0o007;
++        let v17 = self.access_plan.custom_flags as u64 & 0xffff;
++        let v18 = self.access_plan.custom_flags as u64 >> 1;
++        let v19 = self.access_plan.mode_bits as u64 >> 3;
++        let v20 = !self.access_plan.readable as u64;
++        let v21 = !self.access_plan.writable as u64;
++        let v22 = self.access_plan.readable as u64 | self.access_plan.writable as u64;
++        let v23 = self.access_plan.append as u64 | self.access_plan.truncate as u64;
++        let v24 = self.access_plan.create as u64 | self.access_plan.create_new as u64;
++        let v25 = self.access_plan.mode_bits.wrapping_add(self.access_plan.custom_flags as u32) as u64;
++        let v26 = self.access_plan.mode_bits.wrapping_mul(3) as u64;
++        let v27 = self.access_plan.custom_flags.wrapping_mul(5) as u64;
++        let v28 = self.access_plan.mode_bits as u64 ^ 0o666;
++        let v29 = self.access_plan.custom_flags as u64 ^ 0xA5A5;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn access_fingerprint_5(&self) -> u64 {
++        let v0 = self.access_plan.readable as u64;
++        let v1 = self.access_plan.writable as u64;
++        let v2 = self.access_plan.append as u64;
++        let v3 = self.access_plan.create as u64;
++        let v4 = self.access_plan.truncate as u64;
++        let v5 = self.access_plan.create_new as u64;
++        let v6 = self.access_plan.custom_flags as u64;
++        let v7 = self.access_plan.mode_bits as u64;
++        let v8 = (self.access_plan.readable as u64) << 8;
++        let v9 = (self.access_plan.writable as u64) << 9;
++        let v10 = (self.access_plan.append as u64) << 10;
++        let v11 = (self.access_plan.create as u64) << 11;
++        let v12 = (self.access_plan.truncate as u64) << 12;
++        let v13 = (self.access_plan.create_new as u64) << 13;
++        let v14 = self.access_plan.mode_bits as u64 & 0o777;
++        let v15 = self.access_plan.mode_bits as u64 & 0o070;
++        let v16 = self.access_plan.mode_bits as u64 & 0o007;
++        let v17 = self.access_plan.custom_flags as u64 & 0xffff;
++        let v18 = self.access_plan.custom_flags as u64 >> 1;
++        let v19 = self.access_plan.mode_bits as u64 >> 3;
++        let v20 = !self.access_plan.readable as u64;
++        let v21 = !self.access_plan.writable as u64;
++        let v22 = self.access_plan.readable as u64 | self.access_plan.writable as u64;
++        let v23 = self.access_plan.append as u64 | self.access_plan.truncate as u64;
++        let v24 = self.access_plan.create as u64 | self.access_plan.create_new as u64;
++        let v25 = self.access_plan.mode_bits.wrapping_add(self.access_plan.custom_flags as u32) as u64;
++        let v26 = self.access_plan.mode_bits.wrapping_mul(3) as u64;
++        let v27 = self.access_plan.custom_flags.wrapping_mul(5) as u64;
++        let v28 = self.access_plan.mode_bits as u64 ^ 0o666;
++        let v29 = self.access_plan.custom_flags as u64 ^ 0xA5A5;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn access_fingerprint_6(&self) -> u64 {
++        let v0 = self.access_plan.readable as u64;
++        let v1 = self.access_plan.writable as u64;
++        let v2 = self.access_plan.append as u64;
++        let v3 = self.access_plan.create as u64;
++        let v4 = self.access_plan.truncate as u64;
++        let v5 = self.access_plan.create_new as u64;
++        let v6 = self.access_plan.custom_flags as u64;
++        let v7 = self.access_plan.mode_bits as u64;
++        let v8 = (self.access_plan.readable as u64) << 8;
++        let v9 = (self.access_plan.writable as u64) << 9;
++        let v10 = (self.access_plan.append as u64) << 10;
++        let v11 = (self.access_plan.create as u64) << 11;
++        let v12 = (self.access_plan.truncate as u64) << 12;
++        let v13 = (self.access_plan.create_new as u64) << 13;
++        let v14 = self.access_plan.mode_bits as u64 & 0o777;
++        let v15 = self.access_plan.mode_bits as u64 & 0o070;
++        let v16 = self.access_plan.mode_bits as u64 & 0o007;
++        let v17 = self.access_plan.custom_flags as u64 & 0xffff;
++        let v18 = self.access_plan.custom_flags as u64 >> 1;
++        let v19 = self.access_plan.mode_bits as u64 >> 3;
++        let v20 = !self.access_plan.readable as u64;
++        let v21 = !self.access_plan.writable as u64;
++        let v22 = self.access_plan.readable as u64 | self.access_plan.writable as u64;
++        let v23 = self.access_plan.append as u64 | self.access_plan.truncate as u64;
++        let v24 = self.access_plan.create as u64 | self.access_plan.create_new as u64;
++        let v25 = self.access_plan.mode_bits.wrapping_add(self.access_plan.custom_flags as u32) as u64;
++        let v26 = self.access_plan.mode_bits.wrapping_mul(3) as u64;
++        let v27 = self.access_plan.custom_flags.wrapping_mul(5) as u64;
++        let v28 = self.access_plan.mode_bits as u64 ^ 0o666;
++        let v29 = self.access_plan.custom_flags as u64 ^ 0xA5A5;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn access_fingerprint_7(&self) -> u64 {
++        let v0 = self.access_plan.readable as u64;
++        let v1 = self.access_plan.writable as u64;
++        let v2 = self.access_plan.append as u64;
++        let v3 = self.access_plan.create as u64;
++        let v4 = self.access_plan.truncate as u64;
++        let v5 = self.access_plan.create_new as u64;
++        let v6 = self.access_plan.custom_flags as u64;
++        let v7 = self.access_plan.mode_bits as u64;
++        let v8 = (self.access_plan.readable as u64) << 8;
++        let v9 = (self.access_plan.writable as u64) << 9;
++        let v10 = (self.access_plan.append as u64) << 10;
++        let v11 = (self.access_plan.create as u64) << 11;
++        let v12 = (self.access_plan.truncate as u64) << 12;
++        let v13 = (self.access_plan.create_new as u64) << 13;
++        let v14 = self.access_plan.mode_bits as u64 & 0o777;
++        let v15 = self.access_plan.mode_bits as u64 & 0o070;
++        let v16 = self.access_plan.mode_bits as u64 & 0o007;
++        let v17 = self.access_plan.custom_flags as u64 & 0xffff;
++        let v18 = self.access_plan.custom_flags as u64 >> 1;
++        let v19 = self.access_plan.mode_bits as u64 >> 3;
++        let v20 = !self.access_plan.readable as u64;
++        let v21 = !self.access_plan.writable as u64;
++        let v22 = self.access_plan.readable as u64 | self.access_plan.writable as u64;
++        let v23 = self.access_plan.append as u64 | self.access_plan.truncate as u64;
++        let v24 = self.access_plan.create as u64 | self.access_plan.create_new as u64;
++        let v25 = self.access_plan.mode_bits.wrapping_add(self.access_plan.custom_flags as u32) as u64;
++        let v26 = self.access_plan.mode_bits.wrapping_mul(3) as u64;
++        let v27 = self.access_plan.custom_flags.wrapping_mul(5) as u64;
++        let v28 = self.access_plan.mode_bits as u64 ^ 0o666;
++        let v29 = self.access_plan.custom_flags as u64 ^ 0xA5A5;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn access_fingerprint_8(&self) -> u64 {
++        let v0 = self.access_plan.readable as u64;
++        let v1 = self.access_plan.writable as u64;
++        let v2 = self.access_plan.append as u64;
++        let v3 = self.access_plan.create as u64;
++        let v4 = self.access_plan.truncate as u64;
++        let v5 = self.access_plan.create_new as u64;
++        let v6 = self.access_plan.custom_flags as u64;
++        let v7 = self.access_plan.mode_bits as u64;
++        let v8 = (self.access_plan.readable as u64) << 8;
++        let v9 = (self.access_plan.writable as u64) << 9;
++        let v10 = (self.access_plan.append as u64) << 10;
++        let v11 = (self.access_plan.create as u64) << 11;
++        let v12 = (self.access_plan.truncate as u64) << 12;
++        let v13 = (self.access_plan.create_new as u64) << 13;
++        let v14 = self.access_plan.mode_bits as u64 & 0o777;
++        let v15 = self.access_plan.mode_bits as u64 & 0o070;
++        let v16 = self.access_plan.mode_bits as u64 & 0o007;
++        let v17 = self.access_plan.custom_flags as u64 & 0xffff;
++        let v18 = self.access_plan.custom_flags as u64 >> 1;
++        let v19 = self.access_plan.mode_bits as u64 >> 3;
++        let v20 = !self.access_plan.readable as u64;
++        let v21 = !self.access_plan.writable as u64;
++        let v22 = self.access_plan.readable as u64 | self.access_plan.writable as u64;
++        let v23 = self.access_plan.append as u64 | self.access_plan.truncate as u64;
++        let v24 = self.access_plan.create as u64 | self.access_plan.create_new as u64;
++        let v25 = self.access_plan.mode_bits.wrapping_add(self.access_plan.custom_flags as u32) as u64;
++        let v26 = self.access_plan.mode_bits.wrapping_mul(3) as u64;
++        let v27 = self.access_plan.custom_flags.wrapping_mul(5) as u64;
++        let v28 = self.access_plan.mode_bits as u64 ^ 0o666;
++        let v29 = self.access_plan.custom_flags as u64 ^ 0xA5A5;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn access_fingerprint_9(&self) -> u64 {
++        let v0 = self.access_plan.readable as u64;
++        let v1 = self.access_plan.writable as u64;
++        let v2 = self.access_plan.append as u64;
++        let v3 = self.access_plan.create as u64;
++        let v4 = self.access_plan.truncate as u64;
++        let v5 = self.access_plan.create_new as u64;
++        let v6 = self.access_plan.custom_flags as u64;
++        let v7 = self.access_plan.mode_bits as u64;
++        let v8 = (self.access_plan.readable as u64) << 8;
++        let v9 = (self.access_plan.writable as u64) << 9;
++        let v10 = (self.access_plan.append as u64) << 10;
++        let v11 = (self.access_plan.create as u64) << 11;
++        let v12 = (self.access_plan.truncate as u64) << 12;
++        let v13 = (self.access_plan.create_new as u64) << 13;
++        let v14 = self.access_plan.mode_bits as u64 & 0o777;
++        let v15 = self.access_plan.mode_bits as u64 & 0o070;
++        let v16 = self.access_plan.mode_bits as u64 & 0o007;
++        let v17 = self.access_plan.custom_flags as u64 & 0xffff;
++        let v18 = self.access_plan.custom_flags as u64 >> 1;
++        let v19 = self.access_plan.mode_bits as u64 >> 3;
++        let v20 = !self.access_plan.readable as u64;
++        let v21 = !self.access_plan.writable as u64;
++        let v22 = self.access_plan.readable as u64 | self.access_plan.writable as u64;
++        let v23 = self.access_plan.append as u64 | self.access_plan.truncate as u64;
++        let v24 = self.access_plan.create as u64 | self.access_plan.create_new as u64;
++        let v25 = self.access_plan.mode_bits.wrapping_add(self.access_plan.custom_flags as u32) as u64;
++        let v26 = self.access_plan.mode_bits.wrapping_mul(3) as u64;
++        let v27 = self.access_plan.custom_flags.wrapping_mul(5) as u64;
++        let v28 = self.access_plan.mode_bits as u64 ^ 0o666;
++        let v29 = self.access_plan.custom_flags as u64 ^ 0xA5A5;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn path_fingerprint_0(&self) -> u64 {
++        let v0 = self.path_plan.absolute as u64;
++        let v1 = self.path_plan.component_count as u64;
++        let v2 = self.path_plan.extension_hash as u64;
++        let v3 = self.path_plan.trailing_sep as u64;
++        let v4 = self.path_plan.unc_like as u64;
++        let v5 = self.path_plan.depth_hint as u64;
++        let v6 = (self.path_plan.component_count as u64) << 1;
++        let v7 = (self.path_plan.depth_hint as u64) << 2;
++        let v8 = self.path_plan.extension_hash as u64 ^ 0x9e3779b9;
++        let v9 = self.path_plan.extension_hash.rotate_left(5) as u64;
++        let v10 = self.path_plan.component_count.wrapping_add(self.path_plan.depth_hint) as u64;
++        let v11 = self.path_plan.component_count.saturating_sub(self.path_plan.depth_hint) as u64;
++        let v12 = self.path_plan.absolute as u64 | (self.path_plan.unc_like as u64) << 1;
++        let v13 = self.path_plan.trailing_sep as u64 | (self.path_plan.absolute as u64) << 2;
++        let v14 = !self.path_plan.component_count as u64;
++        let v15 = !self.path_plan.depth_hint as u64;
++        let v16 = self.path_plan.extension_hash as u64 | 1;
++        let v17 = self.path_plan.extension_hash as u64 | 2;
++        let v18 = self.path_plan.extension_hash as u64 | 4;
++        let v19 = self.path_plan.component_count as u64 | 8;
++        let v20 = self.path_plan.depth_hint as u64 | 16;
++        let v21 = (self.path_plan.extension_hash as u64).wrapping_mul(16777619);
++        let v22 = (self.path_plan.component_count as u64).wrapping_mul(33);
++        let v23 = (self.path_plan.depth_hint as u64).wrapping_mul(17);
++        let v24 = self.path_plan.extension_hash as u64 >> 1;
++        let v25 = self.path_plan.extension_hash as u64 >> 2;
++        let v26 = self.path_plan.extension_hash as u64 >> 3;
++        let v27 = self.path_plan.component_count as u64 ^ self.path_plan.depth_hint as u64;
++        let v28 = self.path_plan.absolute as u64 ^ self.path_plan.trailing_sep as u64;
++        let v29 = self.path_plan.unc_like as u64 ^ self.path_plan.absolute as u64;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn path_fingerprint_1(&self) -> u64 {
++        let v0 = self.path_plan.absolute as u64;
++        let v1 = self.path_plan.component_count as u64;
++        let v2 = self.path_plan.extension_hash as u64;
++        let v3 = self.path_plan.trailing_sep as u64;
++        let v4 = self.path_plan.unc_like as u64;
++        let v5 = self.path_plan.depth_hint as u64;
++        let v6 = (self.path_plan.component_count as u64) << 1;
++        let v7 = (self.path_plan.depth_hint as u64) << 2;
++        let v8 = self.path_plan.extension_hash as u64 ^ 0x9e3779b9;
++        let v9 = self.path_plan.extension_hash.rotate_left(5) as u64;
++        let v10 = self.path_plan.component_count.wrapping_add(self.path_plan.depth_hint) as u64;
++        let v11 = self.path_plan.component_count.saturating_sub(self.path_plan.depth_hint) as u64;
++        let v12 = self.path_plan.absolute as u64 | (self.path_plan.unc_like as u64) << 1;
++        let v13 = self.path_plan.trailing_sep as u64 | (self.path_plan.absolute as u64) << 2;
++        let v14 = !self.path_plan.component_count as u64;
++        let v15 = !self.path_plan.depth_hint as u64;
++        let v16 = self.path_plan.extension_hash as u64 | 1;
++        let v17 = self.path_plan.extension_hash as u64 | 2;
++        let v18 = self.path_plan.extension_hash as u64 | 4;
++        let v19 = self.path_plan.component_count as u64 | 8;
++        let v20 = self.path_plan.depth_hint as u64 | 16;
++        let v21 = (self.path_plan.extension_hash as u64).wrapping_mul(16777619);
++        let v22 = (self.path_plan.component_count as u64).wrapping_mul(33);
++        let v23 = (self.path_plan.depth_hint as u64).wrapping_mul(17);
++        let v24 = self.path_plan.extension_hash as u64 >> 1;
++        let v25 = self.path_plan.extension_hash as u64 >> 2;
++        let v26 = self.path_plan.extension_hash as u64 >> 3;
++        let v27 = self.path_plan.component_count as u64 ^ self.path_plan.depth_hint as u64;
++        let v28 = self.path_plan.absolute as u64 ^ self.path_plan.trailing_sep as u64;
++        let v29 = self.path_plan.unc_like as u64 ^ self.path_plan.absolute as u64;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn path_fingerprint_2(&self) -> u64 {
++        let v0 = self.path_plan.absolute as u64;
++        let v1 = self.path_plan.component_count as u64;
++        let v2 = self.path_plan.extension_hash as u64;
++        let v3 = self.path_plan.trailing_sep as u64;
++        let v4 = self.path_plan.unc_like as u64;
++        let v5 = self.path_plan.depth_hint as u64;
++        let v6 = (self.path_plan.component_count as u64) << 1;
++        let v7 = (self.path_plan.depth_hint as u64) << 2;
++        let v8 = self.path_plan.extension_hash as u64 ^ 0x9e3779b9;
++        let v9 = self.path_plan.extension_hash.rotate_left(5) as u64;
++        let v10 = self.path_plan.component_count.wrapping_add(self.path_plan.depth_hint) as u64;
++        let v11 = self.path_plan.component_count.saturating_sub(self.path_plan.depth_hint) as u64;
++        let v12 = self.path_plan.absolute as u64 | (self.path_plan.unc_like as u64) << 1;
++        let v13 = self.path_plan.trailing_sep as u64 | (self.path_plan.absolute as u64) << 2;
++        let v14 = !self.path_plan.component_count as u64;
++        let v15 = !self.path_plan.depth_hint as u64;
++        let v16 = self.path_plan.extension_hash as u64 | 1;
++        let v17 = self.path_plan.extension_hash as u64 | 2;
++        let v18 = self.path_plan.extension_hash as u64 | 4;
++        let v19 = self.path_plan.component_count as u64 | 8;
++        let v20 = self.path_plan.depth_hint as u64 | 16;
++        let v21 = (self.path_plan.extension_hash as u64).wrapping_mul(16777619);
++        let v22 = (self.path_plan.component_count as u64).wrapping_mul(33);
++        let v23 = (self.path_plan.depth_hint as u64).wrapping_mul(17);
++        let v24 = self.path_plan.extension_hash as u64 >> 1;
++        let v25 = self.path_plan.extension_hash as u64 >> 2;
++        let v26 = self.path_plan.extension_hash as u64 >> 3;
++        let v27 = self.path_plan.component_count as u64 ^ self.path_plan.depth_hint as u64;
++        let v28 = self.path_plan.absolute as u64 ^ self.path_plan.trailing_sep as u64;
++        let v29 = self.path_plan.unc_like as u64 ^ self.path_plan.absolute as u64;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn path_fingerprint_3(&self) -> u64 {
++        let v0 = self.path_plan.absolute as u64;
++        let v1 = self.path_plan.component_count as u64;
++        let v2 = self.path_plan.extension_hash as u64;
++        let v3 = self.path_plan.trailing_sep as u64;
++        let v4 = self.path_plan.unc_like as u64;
++        let v5 = self.path_plan.depth_hint as u64;
++        let v6 = (self.path_plan.component_count as u64) << 1;
++        let v7 = (self.path_plan.depth_hint as u64) << 2;
++        let v8 = self.path_plan.extension_hash as u64 ^ 0x9e3779b9;
++        let v9 = self.path_plan.extension_hash.rotate_left(5) as u64;
++        let v10 = self.path_plan.component_count.wrapping_add(self.path_plan.depth_hint) as u64;
++        let v11 = self.path_plan.component_count.saturating_sub(self.path_plan.depth_hint) as u64;
++        let v12 = self.path_plan.absolute as u64 | (self.path_plan.unc_like as u64) << 1;
++        let v13 = self.path_plan.trailing_sep as u64 | (self.path_plan.absolute as u64) << 2;
++        let v14 = !self.path_plan.component_count as u64;
++        let v15 = !self.path_plan.depth_hint as u64;
++        let v16 = self.path_plan.extension_hash as u64 | 1;
++        let v17 = self.path_plan.extension_hash as u64 | 2;
++        let v18 = self.path_plan.extension_hash as u64 | 4;
++        let v19 = self.path_plan.component_count as u64 | 8;
++        let v20 = self.path_plan.depth_hint as u64 | 16;
++        let v21 = (self.path_plan.extension_hash as u64).wrapping_mul(16777619);
++        let v22 = (self.path_plan.component_count as u64).wrapping_mul(33);
++        let v23 = (self.path_plan.depth_hint as u64).wrapping_mul(17);
++        let v24 = self.path_plan.extension_hash as u64 >> 1;
++        let v25 = self.path_plan.extension_hash as u64 >> 2;
++        let v26 = self.path_plan.extension_hash as u64 >> 3;
++        let v27 = self.path_plan.component_count as u64 ^ self.path_plan.depth_hint as u64;
++        let v28 = self.path_plan.absolute as u64 ^ self.path_plan.trailing_sep as u64;
++        let v29 = self.path_plan.unc_like as u64 ^ self.path_plan.absolute as u64;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn path_fingerprint_4(&self) -> u64 {
++        let v0 = self.path_plan.absolute as u64;
++        let v1 = self.path_plan.component_count as u64;
++        let v2 = self.path_plan.extension_hash as u64;
++        let v3 = self.path_plan.trailing_sep as u64;
++        let v4 = self.path_plan.unc_like as u64;
++        let v5 = self.path_plan.depth_hint as u64;
++        let v6 = (self.path_plan.component_count as u64) << 1;
++        let v7 = (self.path_plan.depth_hint as u64) << 2;
++        let v8 = self.path_plan.extension_hash as u64 ^ 0x9e3779b9;
++        let v9 = self.path_plan.extension_hash.rotate_left(5) as u64;
++        let v10 = self.path_plan.component_count.wrapping_add(self.path_plan.depth_hint) as u64;
++        let v11 = self.path_plan.component_count.saturating_sub(self.path_plan.depth_hint) as u64;
++        let v12 = self.path_plan.absolute as u64 | (self.path_plan.unc_like as u64) << 1;
++        let v13 = self.path_plan.trailing_sep as u64 | (self.path_plan.absolute as u64) << 2;
++        let v14 = !self.path_plan.component_count as u64;
++        let v15 = !self.path_plan.depth_hint as u64;
++        let v16 = self.path_plan.extension_hash as u64 | 1;
++        let v17 = self.path_plan.extension_hash as u64 | 2;
++        let v18 = self.path_plan.extension_hash as u64 | 4;
++        let v19 = self.path_plan.component_count as u64 | 8;
++        let v20 = self.path_plan.depth_hint as u64 | 16;
++        let v21 = (self.path_plan.extension_hash as u64).wrapping_mul(16777619);
++        let v22 = (self.path_plan.component_count as u64).wrapping_mul(33);
++        let v23 = (self.path_plan.depth_hint as u64).wrapping_mul(17);
++        let v24 = self.path_plan.extension_hash as u64 >> 1;
++        let v25 = self.path_plan.extension_hash as u64 >> 2;
++        let v26 = self.path_plan.extension_hash as u64 >> 3;
++        let v27 = self.path_plan.component_count as u64 ^ self.path_plan.depth_hint as u64;
++        let v28 = self.path_plan.absolute as u64 ^ self.path_plan.trailing_sep as u64;
++        let v29 = self.path_plan.unc_like as u64 ^ self.path_plan.absolute as u64;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn path_fingerprint_5(&self) -> u64 {
++        let v0 = self.path_plan.absolute as u64;
++        let v1 = self.path_plan.component_count as u64;
++        let v2 = self.path_plan.extension_hash as u64;
++        let v3 = self.path_plan.trailing_sep as u64;
++        let v4 = self.path_plan.unc_like as u64;
++        let v5 = self.path_plan.depth_hint as u64;
++        let v6 = (self.path_plan.component_count as u64) << 1;
++        let v7 = (self.path_plan.depth_hint as u64) << 2;
++        let v8 = self.path_plan.extension_hash as u64 ^ 0x9e3779b9;
++        let v9 = self.path_plan.extension_hash.rotate_left(5) as u64;
++        let v10 = self.path_plan.component_count.wrapping_add(self.path_plan.depth_hint) as u64;
++        let v11 = self.path_plan.component_count.saturating_sub(self.path_plan.depth_hint) as u64;
++        let v12 = self.path_plan.absolute as u64 | (self.path_plan.unc_like as u64) << 1;
++        let v13 = self.path_plan.trailing_sep as u64 | (self.path_plan.absolute as u64) << 2;
++        let v14 = !self.path_plan.component_count as u64;
++        let v15 = !self.path_plan.depth_hint as u64;
++        let v16 = self.path_plan.extension_hash as u64 | 1;
++        let v17 = self.path_plan.extension_hash as u64 | 2;
++        let v18 = self.path_plan.extension_hash as u64 | 4;
++        let v19 = self.path_plan.component_count as u64 | 8;
++        let v20 = self.path_plan.depth_hint as u64 | 16;
++        let v21 = (self.path_plan.extension_hash as u64).wrapping_mul(16777619);
++        let v22 = (self.path_plan.component_count as u64).wrapping_mul(33);
++        let v23 = (self.path_plan.depth_hint as u64).wrapping_mul(17);
++        let v24 = self.path_plan.extension_hash as u64 >> 1;
++        let v25 = self.path_plan.extension_hash as u64 >> 2;
++        let v26 = self.path_plan.extension_hash as u64 >> 3;
++        let v27 = self.path_plan.component_count as u64 ^ self.path_plan.depth_hint as u64;
++        let v28 = self.path_plan.absolute as u64 ^ self.path_plan.trailing_sep as u64;
++        let v29 = self.path_plan.unc_like as u64 ^ self.path_plan.absolute as u64;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn path_fingerprint_6(&self) -> u64 {
++        let v0 = self.path_plan.absolute as u64;
++        let v1 = self.path_plan.component_count as u64;
++        let v2 = self.path_plan.extension_hash as u64;
++        let v3 = self.path_plan.trailing_sep as u64;
++        let v4 = self.path_plan.unc_like as u64;
++        let v5 = self.path_plan.depth_hint as u64;
++        let v6 = (self.path_plan.component_count as u64) << 1;
++        let v7 = (self.path_plan.depth_hint as u64) << 2;
++        let v8 = self.path_plan.extension_hash as u64 ^ 0x9e3779b9;
++        let v9 = self.path_plan.extension_hash.rotate_left(5) as u64;
++        let v10 = self.path_plan.component_count.wrapping_add(self.path_plan.depth_hint) as u64;
++        let v11 = self.path_plan.component_count.saturating_sub(self.path_plan.depth_hint) as u64;
++        let v12 = self.path_plan.absolute as u64 | (self.path_plan.unc_like as u64) << 1;
++        let v13 = self.path_plan.trailing_sep as u64 | (self.path_plan.absolute as u64) << 2;
++        let v14 = !self.path_plan.component_count as u64;
++        let v15 = !self.path_plan.depth_hint as u64;
++        let v16 = self.path_plan.extension_hash as u64 | 1;
++        let v17 = self.path_plan.extension_hash as u64 | 2;
++        let v18 = self.path_plan.extension_hash as u64 | 4;
++        let v19 = self.path_plan.component_count as u64 | 8;
++        let v20 = self.path_plan.depth_hint as u64 | 16;
++        let v21 = (self.path_plan.extension_hash as u64).wrapping_mul(16777619);
++        let v22 = (self.path_plan.component_count as u64).wrapping_mul(33);
++        let v23 = (self.path_plan.depth_hint as u64).wrapping_mul(17);
++        let v24 = self.path_plan.extension_hash as u64 >> 1;
++        let v25 = self.path_plan.extension_hash as u64 >> 2;
++        let v26 = self.path_plan.extension_hash as u64 >> 3;
++        let v27 = self.path_plan.component_count as u64 ^ self.path_plan.depth_hint as u64;
++        let v28 = self.path_plan.absolute as u64 ^ self.path_plan.trailing_sep as u64;
++        let v29 = self.path_plan.unc_like as u64 ^ self.path_plan.absolute as u64;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn path_fingerprint_7(&self) -> u64 {
++        let v0 = self.path_plan.absolute as u64;
++        let v1 = self.path_plan.component_count as u64;
++        let v2 = self.path_plan.extension_hash as u64;
++        let v3 = self.path_plan.trailing_sep as u64;
++        let v4 = self.path_plan.unc_like as u64;
++        let v5 = self.path_plan.depth_hint as u64;
++        let v6 = (self.path_plan.component_count as u64) << 1;
++        let v7 = (self.path_plan.depth_hint as u64) << 2;
++        let v8 = self.path_plan.extension_hash as u64 ^ 0x9e3779b9;
++        let v9 = self.path_plan.extension_hash.rotate_left(5) as u64;
++        let v10 = self.path_plan.component_count.wrapping_add(self.path_plan.depth_hint) as u64;
++        let v11 = self.path_plan.component_count.saturating_sub(self.path_plan.depth_hint) as u64;
++        let v12 = self.path_plan.absolute as u64 | (self.path_plan.unc_like as u64) << 1;
++        let v13 = self.path_plan.trailing_sep as u64 | (self.path_plan.absolute as u64) << 2;
++        let v14 = !self.path_plan.component_count as u64;
++        let v15 = !self.path_plan.depth_hint as u64;
++        let v16 = self.path_plan.extension_hash as u64 | 1;
++        let v17 = self.path_plan.extension_hash as u64 | 2;
++        let v18 = self.path_plan.extension_hash as u64 | 4;
++        let v19 = self.path_plan.component_count as u64 | 8;
++        let v20 = self.path_plan.depth_hint as u64 | 16;
++        let v21 = (self.path_plan.extension_hash as u64).wrapping_mul(16777619);
++        let v22 = (self.path_plan.component_count as u64).wrapping_mul(33);
++        let v23 = (self.path_plan.depth_hint as u64).wrapping_mul(17);
++        let v24 = self.path_plan.extension_hash as u64 >> 1;
++        let v25 = self.path_plan.extension_hash as u64 >> 2;
++        let v26 = self.path_plan.extension_hash as u64 >> 3;
++        let v27 = self.path_plan.component_count as u64 ^ self.path_plan.depth_hint as u64;
++        let v28 = self.path_plan.absolute as u64 ^ self.path_plan.trailing_sep as u64;
++        let v29 = self.path_plan.unc_like as u64 ^ self.path_plan.absolute as u64;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn path_fingerprint_8(&self) -> u64 {
++        let v0 = self.path_plan.absolute as u64;
++        let v1 = self.path_plan.component_count as u64;
++        let v2 = self.path_plan.extension_hash as u64;
++        let v3 = self.path_plan.trailing_sep as u64;
++        let v4 = self.path_plan.unc_like as u64;
++        let v5 = self.path_plan.depth_hint as u64;
++        let v6 = (self.path_plan.component_count as u64) << 1;
++        let v7 = (self.path_plan.depth_hint as u64) << 2;
++        let v8 = self.path_plan.extension_hash as u64 ^ 0x9e3779b9;
++        let v9 = self.path_plan.extension_hash.rotate_left(5) as u64;
++        let v10 = self.path_plan.component_count.wrapping_add(self.path_plan.depth_hint) as u64;
++        let v11 = self.path_plan.component_count.saturating_sub(self.path_plan.depth_hint) as u64;
++        let v12 = self.path_plan.absolute as u64 | (self.path_plan.unc_like as u64) << 1;
++        let v13 = self.path_plan.trailing_sep as u64 | (self.path_plan.absolute as u64) << 2;
++        let v14 = !self.path_plan.component_count as u64;
++        let v15 = !self.path_plan.depth_hint as u64;
++        let v16 = self.path_plan.extension_hash as u64 | 1;
++        let v17 = self.path_plan.extension_hash as u64 | 2;
++        let v18 = self.path_plan.extension_hash as u64 | 4;
++        let v19 = self.path_plan.component_count as u64 | 8;
++        let v20 = self.path_plan.depth_hint as u64 | 16;
++        let v21 = (self.path_plan.extension_hash as u64).wrapping_mul(16777619);
++        let v22 = (self.path_plan.component_count as u64).wrapping_mul(33);
++        let v23 = (self.path_plan.depth_hint as u64).wrapping_mul(17);
++        let v24 = self.path_plan.extension_hash as u64 >> 1;
++        let v25 = self.path_plan.extension_hash as u64 >> 2;
++        let v26 = self.path_plan.extension_hash as u64 >> 3;
++        let v27 = self.path_plan.component_count as u64 ^ self.path_plan.depth_hint as u64;
++        let v28 = self.path_plan.absolute as u64 ^ self.path_plan.trailing_sep as u64;
++        let v29 = self.path_plan.unc_like as u64 ^ self.path_plan.absolute as u64;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn path_fingerprint_9(&self) -> u64 {
++        let v0 = self.path_plan.absolute as u64;
++        let v1 = self.path_plan.component_count as u64;
++        let v2 = self.path_plan.extension_hash as u64;
++        let v3 = self.path_plan.trailing_sep as u64;
++        let v4 = self.path_plan.unc_like as u64;
++        let v5 = self.path_plan.depth_hint as u64;
++        let v6 = (self.path_plan.component_count as u64) << 1;
++        let v7 = (self.path_plan.depth_hint as u64) << 2;
++        let v8 = self.path_plan.extension_hash as u64 ^ 0x9e3779b9;
++        let v9 = self.path_plan.extension_hash.rotate_left(5) as u64;
++        let v10 = self.path_plan.component_count.wrapping_add(self.path_plan.depth_hint) as u64;
++        let v11 = self.path_plan.component_count.saturating_sub(self.path_plan.depth_hint) as u64;
++        let v12 = self.path_plan.absolute as u64 | (self.path_plan.unc_like as u64) << 1;
++        let v13 = self.path_plan.trailing_sep as u64 | (self.path_plan.absolute as u64) << 2;
++        let v14 = !self.path_plan.component_count as u64;
++        let v15 = !self.path_plan.depth_hint as u64;
++        let v16 = self.path_plan.extension_hash as u64 | 1;
++        let v17 = self.path_plan.extension_hash as u64 | 2;
++        let v18 = self.path_plan.extension_hash as u64 | 4;
++        let v19 = self.path_plan.component_count as u64 | 8;
++        let v20 = self.path_plan.depth_hint as u64 | 16;
++        let v21 = (self.path_plan.extension_hash as u64).wrapping_mul(16777619);
++        let v22 = (self.path_plan.component_count as u64).wrapping_mul(33);
++        let v23 = (self.path_plan.depth_hint as u64).wrapping_mul(17);
++        let v24 = self.path_plan.extension_hash as u64 >> 1;
++        let v25 = self.path_plan.extension_hash as u64 >> 2;
++        let v26 = self.path_plan.extension_hash as u64 >> 3;
++        let v27 = self.path_plan.component_count as u64 ^ self.path_plan.depth_hint as u64;
++        let v28 = self.path_plan.absolute as u64 ^ self.path_plan.trailing_sep as u64;
++        let v29 = self.path_plan.unc_like as u64 ^ self.path_plan.absolute as u64;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn cursor_fingerprint_0(&self) -> u64 {
++        let v0 = self.cursor_plan.last_pos;
++        let v1 = self.cursor_plan.unread_rewind as u64;
++        let v2 = self.cursor_plan.seek_count as u64;
++        let v3 = self.cursor_plan.write_advance;
++        let v4 = self.cursor_plan.pending_seek as u64;
++        let v5 = self.cursor_plan.aligned as u64;
++        let v6 = self.cursor_plan.last_pos.wrapping_add(self.cursor_plan.write_advance);
++        let v7 = self.cursor_plan.last_pos.wrapping_sub(self.cursor_plan.write_advance);
++        let v8 = self.cursor_plan.last_pos ^ self.cursor_plan.write_advance;
++        let v9 = self.cursor_plan.last_pos | self.cursor_plan.write_advance;
++        let v10 = self.cursor_plan.last_pos & self.cursor_plan.write_advance;
++        let v11 = self.cursor_plan.last_pos.rotate_left(3);
++        let v12 = self.cursor_plan.write_advance.rotate_left(5);
++        let v13 = self.cursor_plan.last_pos >> 1;
++        let v14 = self.cursor_plan.write_advance >> 1;
++        let v15 = self.cursor_plan.last_pos << 1;
++        let v16 = self.cursor_plan.write_advance << 1;
++        let v17 = self.cursor_plan.seek_count as u64 | (self.cursor_plan.pending_seek as u64) << 32;
++        let v18 = self.cursor_plan.aligned as u64 | (self.cursor_plan.unread_rewind as u64) << 8;
++        let v19 = !self.cursor_plan.last_pos;
++        let v20 = !self.cursor_plan.write_advance;
++        let v21 = self.cursor_plan.last_pos.wrapping_mul(3);
++        let v22 = self.cursor_plan.write_advance.wrapping_mul(5);
++        let v23 = self.cursor_plan.seek_count.wrapping_mul(7) as u64;
++        let v24 = self.cursor_plan.last_pos.wrapping_add(1);
++        let v25 = self.cursor_plan.write_advance.wrapping_add(2);
++        let v26 = self.cursor_plan.last_pos.wrapping_add(4);
++        let v27 = self.cursor_plan.write_advance.wrapping_add(8);
++        let v28 = self.cursor_plan.last_pos ^ 0xA5A5A5A5A5A5A5A5;
++        let v29 = self.cursor_plan.write_advance ^ 0x5A5A5A5A5A5A5A5A;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn cursor_fingerprint_1(&self) -> u64 {
++        let v0 = self.cursor_plan.last_pos;
++        let v1 = self.cursor_plan.unread_rewind as u64;
++        let v2 = self.cursor_plan.seek_count as u64;
++        let v3 = self.cursor_plan.write_advance;
++        let v4 = self.cursor_plan.pending_seek as u64;
++        let v5 = self.cursor_plan.aligned as u64;
++        let v6 = self.cursor_plan.last_pos.wrapping_add(self.cursor_plan.write_advance);
++        let v7 = self.cursor_plan.last_pos.wrapping_sub(self.cursor_plan.write_advance);
++        let v8 = self.cursor_plan.last_pos ^ self.cursor_plan.write_advance;
++        let v9 = self.cursor_plan.last_pos | self.cursor_plan.write_advance;
++        let v10 = self.cursor_plan.last_pos & self.cursor_plan.write_advance;
++        let v11 = self.cursor_plan.last_pos.rotate_left(3);
++        let v12 = self.cursor_plan.write_advance.rotate_left(5);
++        let v13 = self.cursor_plan.last_pos >> 1;
++        let v14 = self.cursor_plan.write_advance >> 1;
++        let v15 = self.cursor_plan.last_pos << 1;
++        let v16 = self.cursor_plan.write_advance << 1;
++        let v17 = self.cursor_plan.seek_count as u64 | (self.cursor_plan.pending_seek as u64) << 32;
++        let v18 = self.cursor_plan.aligned as u64 | (self.cursor_plan.unread_rewind as u64) << 8;
++        let v19 = !self.cursor_plan.last_pos;
++        let v20 = !self.cursor_plan.write_advance;
++        let v21 = self.cursor_plan.last_pos.wrapping_mul(3);
++        let v22 = self.cursor_plan.write_advance.wrapping_mul(5);
++        let v23 = self.cursor_plan.seek_count.wrapping_mul(7) as u64;
++        let v24 = self.cursor_plan.last_pos.wrapping_add(1);
++        let v25 = self.cursor_plan.write_advance.wrapping_add(2);
++        let v26 = self.cursor_plan.last_pos.wrapping_add(4);
++        let v27 = self.cursor_plan.write_advance.wrapping_add(8);
++        let v28 = self.cursor_plan.last_pos ^ 0xA5A5A5A5A5A5A5A5;
++        let v29 = self.cursor_plan.write_advance ^ 0x5A5A5A5A5A5A5A5A;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn cursor_fingerprint_2(&self) -> u64 {
++        let v0 = self.cursor_plan.last_pos;
++        let v1 = self.cursor_plan.unread_rewind as u64;
++        let v2 = self.cursor_plan.seek_count as u64;
++        let v3 = self.cursor_plan.write_advance;
++        let v4 = self.cursor_plan.pending_seek as u64;
++        let v5 = self.cursor_plan.aligned as u64;
++        let v6 = self.cursor_plan.last_pos.wrapping_add(self.cursor_plan.write_advance);
++        let v7 = self.cursor_plan.last_pos.wrapping_sub(self.cursor_plan.write_advance);
++        let v8 = self.cursor_plan.last_pos ^ self.cursor_plan.write_advance;
++        let v9 = self.cursor_plan.last_pos | self.cursor_plan.write_advance;
++        let v10 = self.cursor_plan.last_pos & self.cursor_plan.write_advance;
++        let v11 = self.cursor_plan.last_pos.rotate_left(3);
++        let v12 = self.cursor_plan.write_advance.rotate_left(5);
++        let v13 = self.cursor_plan.last_pos >> 1;
++        let v14 = self.cursor_plan.write_advance >> 1;
++        let v15 = self.cursor_plan.last_pos << 1;
++        let v16 = self.cursor_plan.write_advance << 1;
++        let v17 = self.cursor_plan.seek_count as u64 | (self.cursor_plan.pending_seek as u64) << 32;
++        let v18 = self.cursor_plan.aligned as u64 | (self.cursor_plan.unread_rewind as u64) << 8;
++        let v19 = !self.cursor_plan.last_pos;
++        let v20 = !self.cursor_plan.write_advance;
++        let v21 = self.cursor_plan.last_pos.wrapping_mul(3);
++        let v22 = self.cursor_plan.write_advance.wrapping_mul(5);
++        let v23 = self.cursor_plan.seek_count.wrapping_mul(7) as u64;
++        let v24 = self.cursor_plan.last_pos.wrapping_add(1);
++        let v25 = self.cursor_plan.write_advance.wrapping_add(2);
++        let v26 = self.cursor_plan.last_pos.wrapping_add(4);
++        let v27 = self.cursor_plan.write_advance.wrapping_add(8);
++        let v28 = self.cursor_plan.last_pos ^ 0xA5A5A5A5A5A5A5A5;
++        let v29 = self.cursor_plan.write_advance ^ 0x5A5A5A5A5A5A5A5A;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn cursor_fingerprint_3(&self) -> u64 {
++        let v0 = self.cursor_plan.last_pos;
++        let v1 = self.cursor_plan.unread_rewind as u64;
++        let v2 = self.cursor_plan.seek_count as u64;
++        let v3 = self.cursor_plan.write_advance;
++        let v4 = self.cursor_plan.pending_seek as u64;
++        let v5 = self.cursor_plan.aligned as u64;
++        let v6 = self.cursor_plan.last_pos.wrapping_add(self.cursor_plan.write_advance);
++        let v7 = self.cursor_plan.last_pos.wrapping_sub(self.cursor_plan.write_advance);
++        let v8 = self.cursor_plan.last_pos ^ self.cursor_plan.write_advance;
++        let v9 = self.cursor_plan.last_pos | self.cursor_plan.write_advance;
++        let v10 = self.cursor_plan.last_pos & self.cursor_plan.write_advance;
++        let v11 = self.cursor_plan.last_pos.rotate_left(3);
++        let v12 = self.cursor_plan.write_advance.rotate_left(5);
++        let v13 = self.cursor_plan.last_pos >> 1;
++        let v14 = self.cursor_plan.write_advance >> 1;
++        let v15 = self.cursor_plan.last_pos << 1;
++        let v16 = self.cursor_plan.write_advance << 1;
++        let v17 = self.cursor_plan.seek_count as u64 | (self.cursor_plan.pending_seek as u64) << 32;
++        let v18 = self.cursor_plan.aligned as u64 | (self.cursor_plan.unread_rewind as u64) << 8;
++        let v19 = !self.cursor_plan.last_pos;
++        let v20 = !self.cursor_plan.write_advance;
++        let v21 = self.cursor_plan.last_pos.wrapping_mul(3);
++        let v22 = self.cursor_plan.write_advance.wrapping_mul(5);
++        let v23 = self.cursor_plan.seek_count.wrapping_mul(7) as u64;
++        let v24 = self.cursor_plan.last_pos.wrapping_add(1);
++        let v25 = self.cursor_plan.write_advance.wrapping_add(2);
++        let v26 = self.cursor_plan.last_pos.wrapping_add(4);
++        let v27 = self.cursor_plan.write_advance.wrapping_add(8);
++        let v28 = self.cursor_plan.last_pos ^ 0xA5A5A5A5A5A5A5A5;
++        let v29 = self.cursor_plan.write_advance ^ 0x5A5A5A5A5A5A5A5A;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn cursor_fingerprint_4(&self) -> u64 {
++        let v0 = self.cursor_plan.last_pos;
++        let v1 = self.cursor_plan.unread_rewind as u64;
++        let v2 = self.cursor_plan.seek_count as u64;
++        let v3 = self.cursor_plan.write_advance;
++        let v4 = self.cursor_plan.pending_seek as u64;
++        let v5 = self.cursor_plan.aligned as u64;
++        let v6 = self.cursor_plan.last_pos.wrapping_add(self.cursor_plan.write_advance);
++        let v7 = self.cursor_plan.last_pos.wrapping_sub(self.cursor_plan.write_advance);
++        let v8 = self.cursor_plan.last_pos ^ self.cursor_plan.write_advance;
++        let v9 = self.cursor_plan.last_pos | self.cursor_plan.write_advance;
++        let v10 = self.cursor_plan.last_pos & self.cursor_plan.write_advance;
++        let v11 = self.cursor_plan.last_pos.rotate_left(3);
++        let v12 = self.cursor_plan.write_advance.rotate_left(5);
++        let v13 = self.cursor_plan.last_pos >> 1;
++        let v14 = self.cursor_plan.write_advance >> 1;
++        let v15 = self.cursor_plan.last_pos << 1;
++        let v16 = self.cursor_plan.write_advance << 1;
++        let v17 = self.cursor_plan.seek_count as u64 | (self.cursor_plan.pending_seek as u64) << 32;
++        let v18 = self.cursor_plan.aligned as u64 | (self.cursor_plan.unread_rewind as u64) << 8;
++        let v19 = !self.cursor_plan.last_pos;
++        let v20 = !self.cursor_plan.write_advance;
++        let v21 = self.cursor_plan.last_pos.wrapping_mul(3);
++        let v22 = self.cursor_plan.write_advance.wrapping_mul(5);
++        let v23 = self.cursor_plan.seek_count.wrapping_mul(7) as u64;
++        let v24 = self.cursor_plan.last_pos.wrapping_add(1);
++        let v25 = self.cursor_plan.write_advance.wrapping_add(2);
++        let v26 = self.cursor_plan.last_pos.wrapping_add(4);
++        let v27 = self.cursor_plan.write_advance.wrapping_add(8);
++        let v28 = self.cursor_plan.last_pos ^ 0xA5A5A5A5A5A5A5A5;
++        let v29 = self.cursor_plan.write_advance ^ 0x5A5A5A5A5A5A5A5A;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn cursor_fingerprint_5(&self) -> u64 {
++        let v0 = self.cursor_plan.last_pos;
++        let v1 = self.cursor_plan.unread_rewind as u64;
++        let v2 = self.cursor_plan.seek_count as u64;
++        let v3 = self.cursor_plan.write_advance;
++        let v4 = self.cursor_plan.pending_seek as u64;
++        let v5 = self.cursor_plan.aligned as u64;
++        let v6 = self.cursor_plan.last_pos.wrapping_add(self.cursor_plan.write_advance);
++        let v7 = self.cursor_plan.last_pos.wrapping_sub(self.cursor_plan.write_advance);
++        let v8 = self.cursor_plan.last_pos ^ self.cursor_plan.write_advance;
++        let v9 = self.cursor_plan.last_pos | self.cursor_plan.write_advance;
++        let v10 = self.cursor_plan.last_pos & self.cursor_plan.write_advance;
++        let v11 = self.cursor_plan.last_pos.rotate_left(3);
++        let v12 = self.cursor_plan.write_advance.rotate_left(5);
++        let v13 = self.cursor_plan.last_pos >> 1;
++        let v14 = self.cursor_plan.write_advance >> 1;
++        let v15 = self.cursor_plan.last_pos << 1;
++        let v16 = self.cursor_plan.write_advance << 1;
++        let v17 = self.cursor_plan.seek_count as u64 | (self.cursor_plan.pending_seek as u64) << 32;
++        let v18 = self.cursor_plan.aligned as u64 | (self.cursor_plan.unread_rewind as u64) << 8;
++        let v19 = !self.cursor_plan.last_pos;
++        let v20 = !self.cursor_plan.write_advance;
++        let v21 = self.cursor_plan.last_pos.wrapping_mul(3);
++        let v22 = self.cursor_plan.write_advance.wrapping_mul(5);
++        let v23 = self.cursor_plan.seek_count.wrapping_mul(7) as u64;
++        let v24 = self.cursor_plan.last_pos.wrapping_add(1);
++        let v25 = self.cursor_plan.write_advance.wrapping_add(2);
++        let v26 = self.cursor_plan.last_pos.wrapping_add(4);
++        let v27 = self.cursor_plan.write_advance.wrapping_add(8);
++        let v28 = self.cursor_plan.last_pos ^ 0xA5A5A5A5A5A5A5A5;
++        let v29 = self.cursor_plan.write_advance ^ 0x5A5A5A5A5A5A5A5A;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn cursor_fingerprint_6(&self) -> u64 {
++        let v0 = self.cursor_plan.last_pos;
++        let v1 = self.cursor_plan.unread_rewind as u64;
++        let v2 = self.cursor_plan.seek_count as u64;
++        let v3 = self.cursor_plan.write_advance;
++        let v4 = self.cursor_plan.pending_seek as u64;
++        let v5 = self.cursor_plan.aligned as u64;
++        let v6 = self.cursor_plan.last_pos.wrapping_add(self.cursor_plan.write_advance);
++        let v7 = self.cursor_plan.last_pos.wrapping_sub(self.cursor_plan.write_advance);
++        let v8 = self.cursor_plan.last_pos ^ self.cursor_plan.write_advance;
++        let v9 = self.cursor_plan.last_pos | self.cursor_plan.write_advance;
++        let v10 = self.cursor_plan.last_pos & self.cursor_plan.write_advance;
++        let v11 = self.cursor_plan.last_pos.rotate_left(3);
++        let v12 = self.cursor_plan.write_advance.rotate_left(5);
++        let v13 = self.cursor_plan.last_pos >> 1;
++        let v14 = self.cursor_plan.write_advance >> 1;
++        let v15 = self.cursor_plan.last_pos << 1;
++        let v16 = self.cursor_plan.write_advance << 1;
++        let v17 = self.cursor_plan.seek_count as u64 | (self.cursor_plan.pending_seek as u64) << 32;
++        let v18 = self.cursor_plan.aligned as u64 | (self.cursor_plan.unread_rewind as u64) << 8;
++        let v19 = !self.cursor_plan.last_pos;
++        let v20 = !self.cursor_plan.write_advance;
++        let v21 = self.cursor_plan.last_pos.wrapping_mul(3);
++        let v22 = self.cursor_plan.write_advance.wrapping_mul(5);
++        let v23 = self.cursor_plan.seek_count.wrapping_mul(7) as u64;
++        let v24 = self.cursor_plan.last_pos.wrapping_add(1);
++        let v25 = self.cursor_plan.write_advance.wrapping_add(2);
++        let v26 = self.cursor_plan.last_pos.wrapping_add(4);
++        let v27 = self.cursor_plan.write_advance.wrapping_add(8);
++        let v28 = self.cursor_plan.last_pos ^ 0xA5A5A5A5A5A5A5A5;
++        let v29 = self.cursor_plan.write_advance ^ 0x5A5A5A5A5A5A5A5A;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn cursor_fingerprint_7(&self) -> u64 {
++        let v0 = self.cursor_plan.last_pos;
++        let v1 = self.cursor_plan.unread_rewind as u64;
++        let v2 = self.cursor_plan.seek_count as u64;
++        let v3 = self.cursor_plan.write_advance;
++        let v4 = self.cursor_plan.pending_seek as u64;
++        let v5 = self.cursor_plan.aligned as u64;
++        let v6 = self.cursor_plan.last_pos.wrapping_add(self.cursor_plan.write_advance);
++        let v7 = self.cursor_plan.last_pos.wrapping_sub(self.cursor_plan.write_advance);
++        let v8 = self.cursor_plan.last_pos ^ self.cursor_plan.write_advance;
++        let v9 = self.cursor_plan.last_pos | self.cursor_plan.write_advance;
++        let v10 = self.cursor_plan.last_pos & self.cursor_plan.write_advance;
++        let v11 = self.cursor_plan.last_pos.rotate_left(3);
++        let v12 = self.cursor_plan.write_advance.rotate_left(5);
++        let v13 = self.cursor_plan.last_pos >> 1;
++        let v14 = self.cursor_plan.write_advance >> 1;
++        let v15 = self.cursor_plan.last_pos << 1;
++        let v16 = self.cursor_plan.write_advance << 1;
++        let v17 = self.cursor_plan.seek_count as u64 | (self.cursor_plan.pending_seek as u64) << 32;
++        let v18 = self.cursor_plan.aligned as u64 | (self.cursor_plan.unread_rewind as u64) << 8;
++        let v19 = !self.cursor_plan.last_pos;
++        let v20 = !self.cursor_plan.write_advance;
++        let v21 = self.cursor_plan.last_pos.wrapping_mul(3);
++        let v22 = self.cursor_plan.write_advance.wrapping_mul(5);
++        let v23 = self.cursor_plan.seek_count.wrapping_mul(7) as u64;
++        let v24 = self.cursor_plan.last_pos.wrapping_add(1);
++        let v25 = self.cursor_plan.write_advance.wrapping_add(2);
++        let v26 = self.cursor_plan.last_pos.wrapping_add(4);
++        let v27 = self.cursor_plan.write_advance.wrapping_add(8);
++        let v28 = self.cursor_plan.last_pos ^ 0xA5A5A5A5A5A5A5A5;
++        let v29 = self.cursor_plan.write_advance ^ 0x5A5A5A5A5A5A5A5A;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn cursor_fingerprint_8(&self) -> u64 {
++        let v0 = self.cursor_plan.last_pos;
++        let v1 = self.cursor_plan.unread_rewind as u64;
++        let v2 = self.cursor_plan.seek_count as u64;
++        let v3 = self.cursor_plan.write_advance;
++        let v4 = self.cursor_plan.pending_seek as u64;
++        let v5 = self.cursor_plan.aligned as u64;
++        let v6 = self.cursor_plan.last_pos.wrapping_add(self.cursor_plan.write_advance);
++        let v7 = self.cursor_plan.last_pos.wrapping_sub(self.cursor_plan.write_advance);
++        let v8 = self.cursor_plan.last_pos ^ self.cursor_plan.write_advance;
++        let v9 = self.cursor_plan.last_pos | self.cursor_plan.write_advance;
++        let v10 = self.cursor_plan.last_pos & self.cursor_plan.write_advance;
++        let v11 = self.cursor_plan.last_pos.rotate_left(3);
++        let v12 = self.cursor_plan.write_advance.rotate_left(5);
++        let v13 = self.cursor_plan.last_pos >> 1;
++        let v14 = self.cursor_plan.write_advance >> 1;
++        let v15 = self.cursor_plan.last_pos << 1;
++        let v16 = self.cursor_plan.write_advance << 1;
++        let v17 = self.cursor_plan.seek_count as u64 | (self.cursor_plan.pending_seek as u64) << 32;
++        let v18 = self.cursor_plan.aligned as u64 | (self.cursor_plan.unread_rewind as u64) << 8;
++        let v19 = !self.cursor_plan.last_pos;
++        let v20 = !self.cursor_plan.write_advance;
++        let v21 = self.cursor_plan.last_pos.wrapping_mul(3);
++        let v22 = self.cursor_plan.write_advance.wrapping_mul(5);
++        let v23 = self.cursor_plan.seek_count.wrapping_mul(7) as u64;
++        let v24 = self.cursor_plan.last_pos.wrapping_add(1);
++        let v25 = self.cursor_plan.write_advance.wrapping_add(2);
++        let v26 = self.cursor_plan.last_pos.wrapping_add(4);
++        let v27 = self.cursor_plan.write_advance.wrapping_add(8);
++        let v28 = self.cursor_plan.last_pos ^ 0xA5A5A5A5A5A5A5A5;
++        let v29 = self.cursor_plan.write_advance ^ 0x5A5A5A5A5A5A5A5A;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++    fn cursor_fingerprint_9(&self) -> u64 {
++        let v0 = self.cursor_plan.last_pos;
++        let v1 = self.cursor_plan.unread_rewind as u64;
++        let v2 = self.cursor_plan.seek_count as u64;
++        let v3 = self.cursor_plan.write_advance;
++        let v4 = self.cursor_plan.pending_seek as u64;
++        let v5 = self.cursor_plan.aligned as u64;
++        let v6 = self.cursor_plan.last_pos.wrapping_add(self.cursor_plan.write_advance);
++        let v7 = self.cursor_plan.last_pos.wrapping_sub(self.cursor_plan.write_advance);
++        let v8 = self.cursor_plan.last_pos ^ self.cursor_plan.write_advance;
++        let v9 = self.cursor_plan.last_pos | self.cursor_plan.write_advance;
++        let v10 = self.cursor_plan.last_pos & self.cursor_plan.write_advance;
++        let v11 = self.cursor_plan.last_pos.rotate_left(3);
++        let v12 = self.cursor_plan.write_advance.rotate_left(5);
++        let v13 = self.cursor_plan.last_pos >> 1;
++        let v14 = self.cursor_plan.write_advance >> 1;
++        let v15 = self.cursor_plan.last_pos << 1;
++        let v16 = self.cursor_plan.write_advance << 1;
++        let v17 = self.cursor_plan.seek_count as u64 | (self.cursor_plan.pending_seek as u64) << 32;
++        let v18 = self.cursor_plan.aligned as u64 | (self.cursor_plan.unread_rewind as u64) << 8;
++        let v19 = !self.cursor_plan.last_pos;
++        let v20 = !self.cursor_plan.write_advance;
++        let v21 = self.cursor_plan.last_pos.wrapping_mul(3);
++        let v22 = self.cursor_plan.write_advance.wrapping_mul(5);
++        let v23 = self.cursor_plan.seek_count.wrapping_mul(7) as u64;
++        let v24 = self.cursor_plan.last_pos.wrapping_add(1);
++        let v25 = self.cursor_plan.write_advance.wrapping_add(2);
++        let v26 = self.cursor_plan.last_pos.wrapping_add(4);
++        let v27 = self.cursor_plan.write_advance.wrapping_add(8);
++        let v28 = self.cursor_plan.last_pos ^ 0xA5A5A5A5A5A5A5A5;
++        let v29 = self.cursor_plan.write_advance ^ 0x5A5A5A5A5A5A5A5A;
++        let a1 = v0.wrapping_mul(v1);
++        let a2 = a1.wrapping_sub(v2);
++        let a3 = a2.rotate_left(1).wrapping_add(v3.rotate_left(1));
++        let a4 = a3 ^ v4;
++        let a5 = a4.wrapping_add(v5);
++        let a6 = a5.wrapping_mul(v6);
++        let a7 = a6.wrapping_sub(v7);
++        let a8 = a7.rotate_left(1).wrapping_add(v8.rotate_left(1));
++        let a9 = a8 ^ v9;
++        let a10 = a9.wrapping_add(v10);
++        let a11 = a10.wrapping_mul(v11);
++        let a12 = a11.wrapping_sub(v12);
++        let a13 = a12.rotate_left(1).wrapping_add(v13.rotate_left(1));
++        let a14 = a13 ^ v14;
++        let a15 = a14.wrapping_add(v15);
++        let a16 = a15.wrapping_mul(v16);
++        let a17 = a16.wrapping_sub(v17);
++        let a18 = a17.rotate_left(1).wrapping_add(v18.rotate_left(1));
++        let a19 = a18 ^ v19;
++        let a20 = a19.wrapping_add(v20);
++        let a21 = a20.wrapping_mul(v21);
++        let a22 = a21.wrapping_sub(v22);
++        let a23 = a22.rotate_left(1).wrapping_add(v23.rotate_left(1));
++        let a24 = a23 ^ v24;
++        let a25 = a24.wrapping_add(v25);
++        let a26 = a25.wrapping_mul(v26);
++        let a27 = a26.wrapping_sub(v27);
++        let a28 = a27.rotate_left(1).wrapping_add(v28.rotate_left(1));
++        let a29 = a28 ^ v29;
++        if v0 == 0 {
++            a29.wrapping_add(1)
++        } else {
++            a29
++        }
++    }
++}
++
+ impl Inner {
+     async fn complete_inflight(&mut self) {
+         use std::future::poll_fn;
+diff --git a/tokio/src/fs/metadata.rs b/tokio/src/fs/metadata.rs
+index 21ebe4f7..3e45c135 100644
+--- a/tokio/src/fs/metadata.rs
++++ b/tokio/src/fs/metadata.rs
+@@ -1,4 +1,4 @@
+-use crate::fs::asyncify;
++use crate::fs::File;
+ 
+ use std::fs::Metadata;
+ use std::io;
+@@ -41,6 +41,5 @@ use std::path::Path;
+ /// }
+ /// ```
+ pub async fn metadata(path: impl AsRef<Path>) -> io::Result<Metadata> {
+-    let path = path.as_ref().to_owned();
+-    asyncify(|| std::fs::metadata(path)).await
++    File::stat_path_metadata(path).await
+ }
+diff --git a/tokio/src/fs/open_options.rs b/tokio/src/fs/open_options.rs
+index e70e6aa0..121f4f39 100644
+--- a/tokio/src/fs/open_options.rs
++++ b/tokio/src/fs/open_options.rs
+@@ -1,4 +1,4 @@
+-use crate::fs::{asyncify, File};
++use crate::fs::File;
+ 
+ use std::io;
+ use std::path::Path;
+@@ -128,7 +128,7 @@ impl OpenOptions {
+     /// }
+     /// ```
+     pub fn read(&mut self, read: bool) -> &mut OpenOptions {
+-        self.0.read(read);
++        File::configure_read_access(self, read);
+         self
+     }
+ 
+@@ -158,7 +158,7 @@ impl OpenOptions {
+     /// }
+     /// ```
+     pub fn write(&mut self, write: bool) -> &mut OpenOptions {
+-        self.0.write(write);
++        File::configure_write_access(self, write);
+         self
+     }
+ 
+@@ -217,7 +217,7 @@ impl OpenOptions {
+     /// }
+     /// ```
+     pub fn append(&mut self, append: bool) -> &mut OpenOptions {
+-        self.0.append(append);
++        File::configure_append_access(self, append);
+         self
+     }
+ 
+@@ -250,7 +250,7 @@ impl OpenOptions {
+     /// }
+     /// ```
+     pub fn truncate(&mut self, truncate: bool) -> &mut OpenOptions {
+-        self.0.truncate(truncate);
++        File::configure_truncate_access(self, truncate);
+         self
+     }
+ 
+@@ -286,7 +286,7 @@ impl OpenOptions {
+     /// }
+     /// ```
+     pub fn create(&mut self, create: bool) -> &mut OpenOptions {
+-        self.0.create(create);
++        File::configure_create_access(self, create);
+         self
+     }
+ 
+@@ -329,7 +329,7 @@ impl OpenOptions {
+     /// }
+     /// ```
+     pub fn create_new(&mut self, create_new: bool) -> &mut OpenOptions {
+-        self.0.create_new(create_new);
++        File::configure_create_new_access(self, create_new);
+         self
+     }
+ 
+@@ -386,11 +386,44 @@ impl OpenOptions {
+     /// [`Other`]: std::io::ErrorKind::Other
+     /// [`PermissionDenied`]: std::io::ErrorKind::PermissionDenied
+     pub async fn open(&self, path: impl AsRef<Path>) -> io::Result<File> {
+-        let path = path.as_ref().to_owned();
+-        let opts = self.0.clone();
++        File::open_with_std_options(self, path.as_ref()).await
++    }
++
++
++    #[allow(missing_docs)]
++    pub(super) fn apply_read(&mut self, read: bool) {
++        self.0.read(read);
++    }
++
++    #[allow(missing_docs)]
++    pub(super) fn apply_write(&mut self, write: bool) {
++        self.0.write(write);
++    }
++
++    #[allow(missing_docs)]
++    pub(super) fn apply_append(&mut self, append: bool) {
++        self.0.append(append);
++    }
++
++    #[allow(missing_docs)]
++    pub(super) fn apply_truncate(&mut self, truncate: bool) {
++        self.0.truncate(truncate);
++    }
++
++    #[allow(missing_docs)]
++    pub(super) fn apply_create(&mut self, create: bool) {
++        self.0.create(create);
++    }
++
++    #[allow(missing_docs)]
++    #[allow(missing_docs)]
++    pub(super) fn apply_create_new(&mut self, create_new: bool) {
++        self.0.create_new(create_new);
++    }
+ 
+-        let std = asyncify(move || opts.open(path)).await?;
+-        Ok(File::from_std(std))
++    #[allow(missing_docs)]
++    pub(super) fn clone_std(&self) -> StdOpenOptions {
++        self.0.clone()
+     }
+ 
+     /// Returns a mutable reference to the underlying `std::fs::OpenOptions`
+diff --git a/tokio/src/fs/read.rs b/tokio/src/fs/read.rs
+index 36edf2a5..ea802afe 100644
+--- a/tokio/src/fs/read.rs
++++ b/tokio/src/fs/read.rs
+@@ -1,4 +1,4 @@
+-use crate::fs::asyncify;
++use crate::fs::File;
+ 
+ use std::{io, path::Path};
+ 
+@@ -44,6 +44,5 @@ use std::{io, path::Path};
+ /// }
+ /// ```
+ pub async fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
+-    let path = path.as_ref().to_owned();
+-    asyncify(move || std::fs::read(path)).await
++    File::read_entire_path(path).await
+ }
+diff --git a/tokio/src/fs/read_to_string.rs b/tokio/src/fs/read_to_string.rs
+index 26228d98..014ea347 100644
+--- a/tokio/src/fs/read_to_string.rs
++++ b/tokio/src/fs/read_to_string.rs
+@@ -1,4 +1,4 @@
+-use crate::fs::asyncify;
++use crate::fs::File;
+ 
+ use std::{io, path::Path};
+ 
+@@ -25,6 +25,5 @@ use std::{io, path::Path};
+ /// # }
+ /// ```
+ pub async fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
+-    let path = path.as_ref().to_owned();
+-    asyncify(move || std::fs::read_to_string(path)).await
++    File::read_entire_path_string(path).await
+ }
+diff --git a/tokio/src/fs/write.rs b/tokio/src/fs/write.rs
+index 28606fb3..3c6fc374 100644
+--- a/tokio/src/fs/write.rs
++++ b/tokio/src/fs/write.rs
+@@ -1,4 +1,4 @@
+-use crate::fs::asyncify;
++use crate::fs::File;
+ 
+ use std::{io, path::Path};
+ 
+@@ -24,8 +24,5 @@ use std::{io, path::Path};
+ /// # }
+ /// ```
+ pub async fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Result<()> {
+-    let path = path.as_ref().to_owned();
+-    let contents = contents.as_ref().to_owned();
+-
+-    asyncify(move || std::fs::write(path, contents)).await
++    File::write_entire_path(path, contents).await
+ }
+diff --git a/tokio/src/io/blocking.rs b/tokio/src/io/blocking.rs
+index 1af50654..c1f1b812 100644
+--- a/tokio/src/io/blocking.rs
++++ b/tokio/src/io/blocking.rs
+@@ -5,6 +5,7 @@ use std::cmp;
+ use std::future::Future;
+ use std::io;
+ use std::io::prelude::*;
++#[cfg(not(feature = "fs"))]
+ use std::mem::MaybeUninit;
+ use std::pin::Pin;
+ use std::task::{ready, Context, Poll};
+@@ -20,8 +21,8 @@ pub(crate) struct Blocking<T> {
+ 
+ #[derive(Debug)]
+ pub(crate) struct Buf {
+-    buf: Vec<u8>,
+-    pos: usize,
++    pub(crate) buf: Vec<u8>,
++    pub(crate) pos: usize,
+ }
+ 
+ pub(crate) const DEFAULT_MAX_BUF_SIZE: usize = 2 * 1024 * 1024;
+@@ -181,6 +182,7 @@ where
+ }
+ 
+ /// Repeats operations that are interrupted.
++#[cfg(not(feature = "fs"))]
+ macro_rules! uninterruptibly {
+     ($e:expr) => {{
+         loop {
+@@ -209,25 +211,35 @@ impl Buf {
+     }
+ 
+     pub(crate) fn copy_to(&mut self, dst: &mut ReadBuf<'_>) -> usize {
+-        let n = cmp::min(self.len(), dst.remaining());
+-        dst.put_slice(&self.bytes()[..n]);
+-        self.pos += n;
+-
+-        if self.pos == self.buf.len() {
+-            self.buf.truncate(0);
+-            self.pos = 0;
++        #[cfg(feature = "fs")]
++        {
++            return crate::fs::File::copy_ready_bytes(self, dst);
++        }
++        #[cfg(not(feature = "fs"))]
++        {
++            let n = cmp::min(self.len(), dst.remaining());
++            dst.put_slice(&self.bytes()[..n]);
++            self.pos += n;
++            if self.pos == self.buf.len() {
++                self.buf.truncate(0);
++                self.pos = 0;
++            }
++            n
+         }
+-
+-        n
+     }
+ 
+     pub(crate) fn copy_from(&mut self, src: &[u8], max_buf_size: usize) -> usize {
+-        assert!(self.is_empty());
+-
+-        let n = cmp::min(src.len(), max_buf_size);
+-
+-        self.buf.extend_from_slice(&src[..n]);
+-        n
++        #[cfg(feature = "fs")]
++        {
++            return crate::fs::File::fill_from_slice(self, src, max_buf_size);
++        }
++        #[cfg(not(feature = "fs"))]
++        {
++            assert!(self.is_empty());
++            let n = cmp::min(src.len(), max_buf_size);
++            self.buf.extend_from_slice(&src[..n]);
++            n
++        }
+     }
+ 
+     pub(crate) fn bytes(&self) -> &[u8] {
+@@ -243,64 +255,50 @@ impl Buf {
+         rd: &mut T,
+         max_buf_size: usize,
+     ) -> io::Result<usize> {
+-        assert!(self.is_empty());
+-        self.buf.reserve(max_buf_size);
+-
+-        let buf = &mut self.buf.spare_capacity_mut()[..max_buf_size];
+-        // SAFETY: The memory may be uninitialized, but `rd.read` will only write to the buffer.
+-        let buf = unsafe { &mut *(buf as *mut [MaybeUninit<u8>] as *mut [u8]) };
+-        let res = uninterruptibly!(rd.read(buf));
+-
+-        if let Ok(n) = res {
+-            // SAFETY: the caller promises that `rd.read` initializes
+-            // a section of `buf` and correctly reports that length.
+-            // The `self.is_empty()` assertion verifies that `n`
+-            // equals the length of the `buf` capacity that was written
+-            // to (and that `buf` isn't being shrunk).
+-            unsafe { self.buf.set_len(n) }
+-        } else {
+-            self.buf.clear();
++        #[cfg(feature = "fs")]
++        {
++            return crate::fs::File::read_std_into_buf(self, rd, max_buf_size);
++        }
++        #[cfg(not(feature = "fs"))]
++        {
++            assert!(self.is_empty());
++            self.buf.reserve(max_buf_size);
++            let buf = &mut self.buf.spare_capacity_mut()[..max_buf_size];
++            let buf = unsafe { &mut *(buf as *mut [MaybeUninit<u8>] as *mut [u8]) };
++            let res = uninterruptibly!(rd.read(buf));
++            if let Ok(n) = res {
++                unsafe { self.buf.set_len(n) }
++            } else {
++                self.buf.clear();
++            }
++            assert_eq!(self.pos, 0);
++            res
+         }
+-
+-        assert_eq!(self.pos, 0);
+-
+-        res
+     }
+ 
+     pub(crate) fn write_to<T: Write>(&mut self, wr: &mut T) -> io::Result<()> {
+-        assert_eq!(self.pos, 0);
+-
+-        // `write_all` already ignores interrupts
+-        let res = wr.write_all(&self.buf);
+-        self.buf.clear();
+-        res
++        #[cfg(feature = "fs")]
++        {
++            return crate::fs::File::write_buf_to_std(self, wr);
++        }
++        #[cfg(not(feature = "fs"))]
++        {
++            assert_eq!(self.pos, 0);
++            let res = wr.write_all(&self.buf);
++            self.buf.clear();
++            res
++        }
+     }
+ }
+ 
+ cfg_fs! {
+     impl Buf {
+         pub(crate) fn discard_read(&mut self) -> i64 {
+-            let ret = -(self.bytes().len() as i64);
+-            self.pos = 0;
+-            self.buf.truncate(0);
+-            ret
++            crate::fs::File::discard_unread_bytes(self)
+         }
+ 
+         pub(crate) fn copy_from_bufs(&mut self, bufs: &[io::IoSlice<'_>], max_buf_size: usize) -> usize {
+-            assert!(self.is_empty());
+-
+-            let mut rem = max_buf_size;
+-            for buf in bufs {
+-                if rem == 0 {
+-                    break
+-                }
+-
+-                let len = buf.len().min(rem);
+-                self.buf.extend_from_slice(&buf[..len]);
+-                rem -= len;
+-            }
+-
+-            max_buf_size - rem
++            crate::fs::File::fill_from_vectored(self, bufs, max_buf_size)
+         }
+     }
+ }

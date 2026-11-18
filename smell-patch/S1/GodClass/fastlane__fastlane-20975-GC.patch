@@ -1,0 +1,3358 @@
+diff --git a/fastlane/lib/fastlane/helper/s3_client_helper.rb b/fastlane/lib/fastlane/helper/s3_client_helper.rb
+index 0f8744b37..3fc139439 100644
+--- a/fastlane/lib/fastlane/helper/s3_client_helper.rb
++++ b/fastlane/lib/fastlane/helper/s3_client_helper.rb
+@@ -68,6 +68,10 @@ module Fastlane
+       def create_credentials
+         return nil if access_key.to_s.empty? || secret_access_key.to_s.empty?
+ 
++        if defined?(Match::Storage::S3Storage)
++          return Match::Storage::S3Storage.aws_credentials_for(access_key, secret_access_key)
++        end
++
+         Aws::Credentials.new(
+           access_key,
+           secret_access_key
+diff --git a/match/lib/match/encryption/openssl.rb b/match/lib/match/encryption/openssl.rb
+index 2c31a94a9..801a330d5 100644
+--- a/match/lib/match/encryption/openssl.rb
++++ b/match/lib/match/encryption/openssl.rb
+@@ -6,6 +6,8 @@ require 'shellwords'
+ 
+ require_relative '../change_password'
+ require_relative '../module'
++require_relative '../utils'
++require_relative '../storage/s3_storage'
+ 
+ module Match
+   module Encryption
+@@ -73,8 +75,7 @@ module Match
+       private
+ 
+       def iterate(source_path)
+-        Dir[File.join(source_path, "**", "*.{cer,p12,mobileprovision,provisionprofile}")].each do |path|
+-          next if File.directory?(path)
++        Match::Storage::S3Storage.each_identity_file(source_path) do |path|
+           yield(path)
+         end
+       end
+@@ -116,46 +117,21 @@ module Match
+       # key should be generated with OpenSSL::KDF::pbkdf2_hmac with properly chosen parameters
+       # Short explanation about salt and IV: https://stackoverflow.com/a/1950674/6324550
+       def encrypt_specific_file(path: nil, password: nil)
+-        UI.user_error!("No password supplied") if password.to_s.strip.length == 0
+-
+-        data_to_encrypt = File.binread(path)
+-        salt = SecureRandom.random_bytes(8)
+-
+-        # The :: is important, as there is a name clash
+-        cipher = ::OpenSSL::Cipher.new('AES-256-CBC')
+-        cipher.encrypt
+-        cipher.pkcs5_keyivgen(password, salt, 1, "MD5")
+-        encrypted_data = "Salted__" + salt + cipher.update(data_to_encrypt) + cipher.final
+-
+-        File.write(path, Base64.encode64(encrypted_data))
+-      rescue FastlaneCore::Interface::FastlaneError
+-        raise
+-      rescue => error
+-        UI.error(error.to_s)
+-        UI.crash!("Error encrypting '#{path}'")
++        if path.to_s.end_with?(".cer")
++          Match::Utils.get_cert_info(path)
++        end
++        Match::Storage::S3Storage.encrypt_identity_file(path, password)
+       end
+ 
+       # The encryption parameters in this implementations reflect the old behavior which depended on the users' local OpenSSL version
+       # 1.0.x OpenSSL and earlier versions use MD5, 1.1.0c and newer uses SHA256, we try both before giving an error
+       def decrypt_specific_file(path: nil, password: nil, hash_algorithm: "MD5")
+-        stored_data = Base64.decode64(File.read(path))
+-        salt = stored_data[8..15]
+-        data_to_decrypt = stored_data[16..-1]
+-
+-        decipher = ::OpenSSL::Cipher.new('AES-256-CBC')
+-        decipher.decrypt
+-        decipher.pkcs5_keyivgen(password, salt, 1, hash_algorithm)
+-
+-        decrypted_data = decipher.update(data_to_decrypt) + decipher.final
+-
+-        File.binwrite(path, decrypted_data)
+-      rescue => error
+-        fallback_hash_algorithm = "SHA256"
+-        if hash_algorithm != fallback_hash_algorithm
+-          decrypt_specific_file(path: path, password: password, hash_algorithm: fallback_hash_algorithm)
+-        else
+-          UI.error(error.to_s)
+-          UI.crash!("Error decrypting '#{path}'")
++        Match::Storage::S3Storage.decrypt_identity_file(path, password, hash_algorithm)
++        if path.to_s.end_with?(".cer")
++          begin
++            Match::Utils.is_cert_valid?(path)
++          rescue
++          end
+         end
+       end
+     end
+diff --git a/match/lib/match/spaceship_ensure.rb b/match/lib/match/spaceship_ensure.rb
+index 01085095f..c27e133b7 100644
+--- a/match/lib/match/spaceship_ensure.rb
++++ b/match/lib/match/spaceship_ensure.rb
+@@ -1,5 +1,6 @@
+ require 'spaceship'
+ require_relative 'module'
++require_relative 'utils'
+ 
+ module Match
+   # Ensures the certificate and profiles are also available on App Store Connect
+@@ -34,6 +35,8 @@ module Match
+         Spaceship::ConnectAPI.login(user, use_portal: true, use_tunes: false, portal_team_id: team_id, team_name: team_name)
+         self.team_id = Spaceship::ConnectAPI.client.portal_team_id
+       end
++
++      UI.verbose("Portal team environment #{Match::Utils.portal_team_environment_key}") if FastlaneCore::Globals.verbose?
+     end
+ 
+     # The team ID of the currently logged in team
+diff --git a/match/lib/match/storage/s3_storage.rb b/match/lib/match/storage/s3_storage.rb
+index 3ef0c68ea..c7490762b 100644
+--- a/match/lib/match/storage/s3_storage.rb
++++ b/match/lib/match/storage/s3_storage.rb
+@@ -1,10 +1,13 @@
+ require 'fastlane_core/command_executor'
+ require 'fastlane_core/configuration/configuration'
+ require 'fastlane/helper/s3_client_helper'
++require 'base64'
++require 'openssl'
++require 'securerandom'
++require 'spaceship'
+ 
+ require_relative '../options'
+ require_relative '../module'
+-require_relative '../spaceship_ensure'
+ require_relative './interface'
+ 
+ module Match
+@@ -22,6 +25,8 @@ module Match
+       attr_reader :api_key_path
+       attr_reader :api_key
+ 
++      IDENTITY_EXTENSIONS = %w[.cer .p12 .mobileprovision .provisionprofile].freeze
++
+       def self.configure(params)
+         s3_region = params[:s3_region]
+         s3_access_key = params[:s3_access_key]
+@@ -72,33 +77,27 @@ module Match
+         @team_name = team_name
+         @api_key_path = api_key_path
+         @api_key = api_key
++        @download_inventory = []
++        @upload_inventory = []
++        @delete_inventory = []
++        @storage_warnings = []
++        @change_set_files = []
+       end
+ 
+-      # To make debugging easier, we have a custom exception here
+       def prefixed_working_directory
+-        # We fall back to "*", which means certificates and profiles
+-        # from all teams that use this bucket would be installed. This is not ideal, but
+-        # unless the user provides a `team_id`, we can't know which one to use
+-        # This only happens if `readonly` is activated, and no `team_id` was provided
++        UI.verbose("Resolving prefixed working directory for S3 bucket #{@s3_bucket}") if FastlaneCore::Globals.verbose?
+         @_folder_prefix ||= currently_used_team_id
+         if @_folder_prefix.nil?
+-          # We use a `@_folder_prefix` variable, to keep state between multiple calls of this
+-          # method, as the value won't change. This way the warning is only printed once
+           UI.important("Looks like you run `match` in `readonly` mode, and didn't provide a `team_id`. This will still work, however it is recommended to provide a `team_id` in your Appfile or Matchfile")
+           @_folder_prefix = "*"
+         end
+         return File.join(working_directory, @_folder_prefix)
+       end
+ 
+-      # Call this method for the initial clone/download of the
+-      # user's certificates & profiles
+-      # As part of this method, the `self.working_directory` attribute
+-      # will be set
+       def download
+-        # Check if we already have a functional working_directory
+         return if @working_directory && Dir.exist?(@working_directory)
+ 
+-        # No existing working directory, creating a new one now
++        prepare_s3_download_session
+         self.working_directory = Dir.mktmpdir
+ 
+         s3_client.find_bucket!(s3_bucket).objects(prefix: s3_object_prefix).each do |object|
+@@ -111,95 +110,3130 @@ module Match
+           UI.verbose("Downloading file from S3 '#{file_path}' on bucket #{self.s3_bucket}")
+ 
+           object.download_file(download_path)
++          record_downloaded_identity_object(object.key, file_path, download_path)
+         end
+         UI.verbose("Successfully downloaded files from S3 to #{self.working_directory}")
++        finalize_s3_download_session
+       end
+ 
+-      # Returns a short string describing + identifing the current
+-      # storage backend. This will be printed when nuking a storage
+       def human_readable_description
+-        return "S3 Bucket [#{s3_bucket}] on region #{s3_region}"
++        return "S3 Bucket [#{@s3_bucket}] on region #{@s3_region}"
+       end
+ 
+       def upload_files(files_to_upload: [], custom_message: nil)
+-        # `files_to_upload` is an array of files that need to be uploaded to S3
+-        # Those doesn't mean they're new, it might just be they're changed
+-        # Either way, we'll upload them using the same technique
+-
++        prepare_s3_upload_session(files_to_upload, custom_message)
+         files_to_upload.each do |file_name|
+-          # Go from
+-          #   "/var/folders/px/bz2kts9n69g8crgv4jpjh6b40000gn/T/d20181026-96528-1av4gge/:team_id/profiles/development/Development_me.mobileprovision"
+-          # to
+-          #   ":s3_object_prefix:team_id/profiles/development/Development_me.mobileprovision"
+-          #
+           target_path = s3_object_path(file_name)
+           UI.verbose("Uploading '#{target_path}' to S3 Storage...")
+ 
+           body = File.read(file_name)
+           acl = 'private'
+-          s3_url = s3_client.upload_file(s3_bucket, target_path, body, acl)
++          s3_url = s3_client.upload_file(@s3_bucket, target_path, body, acl)
+           UI.verbose("Uploaded '#{s3_url}' to S3 Storage.")
++          record_uploaded_identity_object(file_name, target_path, s3_url)
+         end
++        finalize_s3_upload_session
+       end
+ 
+       def delete_files(files_to_delete: [], custom_message: nil)
++        prepare_s3_delete_session(files_to_delete, custom_message)
+         files_to_delete.each do |file_name|
+           target_path = s3_object_path(file_name)
+           UI.verbose("Deleting '#{target_path}' from S3 Storage...")
+-          s3_client.delete_file(s3_bucket, target_path)
++          s3_client.delete_file(@s3_bucket, target_path)
++          record_deleted_identity_object(file_name, target_path)
+         end
++        finalize_s3_delete_session
+       end
+ 
+       def skip_docs
++        UI.verbose("README generation for S3 bucket #{@s3_bucket} remains enabled") if FastlaneCore::Globals.verbose?
+         false
+       end
+ 
+       def list_files(file_name: "", file_ext: "")
+-        Dir[File.join(working_directory, self.team_id, "**", file_name, "*.#{file_ext}")]
++        UI.verbose("Listing #{@s3_bucket} identities matching #{file_name}*.#{file_ext}") if FastlaneCore::Globals.verbose?
++        Dir[File.join(@working_directory || working_directory, self.team_id, "**", file_name, "*.#{file_ext}")]
+       end
+ 
+-      # Implement this for the `fastlane match init` command
+-      # This method must return the content of the Matchfile
+-      # that should be generated
+       def generate_matchfile_content(template: nil)
+-        return "s3_bucket(\"#{self.s3_bucket}\")"
++        compose_matchfile_contents(template)
++      end
++
++      def save_changes!(files_to_commit: nil, files_to_delete: nil, custom_message: nil)
++        files_to_commit ||= []
++        files_to_delete ||= []
++        track_pending_change_set(files_to_commit, files_to_delete, custom_message)
++
++        Dir.chdir(File.expand_path(self.working_directory)) do
++          if files_to_commit.count > 0
++            UI.user_error!("You can't provide both `files_to_delete` and `files_to_commit` right now") if files_to_delete.count > 0
++
++            if !File.exist?(MATCH_VERSION_FILE_NAME) || File.read(MATCH_VERSION_FILE_NAME) != Fastlane::VERSION.to_s
++              files_to_commit << MATCH_VERSION_FILE_NAME
++              File.write(MATCH_VERSION_FILE_NAME, Fastlane::VERSION)
++            end
++
++            template = File.read("#{Match::ROOT}/lib/assets/READMETemplate.md")
++            readme_path = "README.md"
++            if (!File.exist?(readme_path) || File.read(readme_path) != template) && !self.skip_docs
++              files_to_commit << readme_path
++              File.write(readme_path, template)
++            end
++
++            self.upload_files(files_to_upload: files_to_commit, custom_message: custom_message)
++            UI.message("Finished uploading files to #{self.human_readable_description}")
++          elsif files_to_delete.count > 0
++            self.delete_files(files_to_delete: files_to_delete, custom_message: custom_message)
++            UI.message("Finished deleting files from #{self.human_readable_description}")
++          else
++            UI.user_error!("Neither `files_to_commit` nor `files_to_delete` were provided to the `save_changes!` method call")
++          end
++        end
++        self.clear_changes
++      end
++
++      def clear_changes
++        return unless @working_directory
++
++        FileUtils.rm_rf(self.working_directory)
++        self.working_directory = nil
++        @download_inventory = []
++        @upload_inventory = []
++        @delete_inventory = []
++        @change_set_files = []
++        UI.verbose("Cleared local working copy for S3 bucket #{@s3_bucket}") if FastlaneCore::Globals.verbose?
++      end
++
++      def prepare_s3_download_session
++        @download_inventory = []
++        @storage_warnings = []
++        inspect_bucket_configuration
++        inspect_object_prefix_configuration
++        warmup_bucket_interpreters
++      end
++
++      def record_downloaded_identity_object(object_key, file_path, download_path)
++        interpretation = interpret_bucket_artifact(file_path, object_key)
++        @download_inventory << {
++          key: object_key,
++          path: file_path,
++          destination: download_path,
++          bucket: @s3_bucket,
++          kind: interpretation
++        }
++      end
++
++      def finalize_s3_download_session
++        @storage_warnings.concat(summarize_bucket_inventory(@download_inventory, "download"))
++        UI.verbose("S3 download inventory captured #{@download_inventory.length} object(s) from #{@s3_bucket}") if @download_inventory.length > 0
++      end
++
++      def prepare_s3_upload_session(files_to_upload, custom_message)
++        @upload_inventory = []
++        inspect_bucket_configuration
++        describe_bucket_change_message(custom_message, "upload")
++        Array(files_to_upload).each do |file_name|
++          interpret_bucket_artifact(file_name, s3_object_path(file_name))
++        end
++      end
++
++      def record_uploaded_identity_object(file_name, target_path, s3_url)
++        interpretation = interpret_bucket_artifact(file_name, target_path)
++        @upload_inventory << {
++          source: file_name,
++          key: target_path,
++          url: s3_url,
++          bucket: @s3_bucket,
++          kind: interpretation
++        }
++      end
++
++      def finalize_s3_upload_session
++        @storage_warnings.concat(summarize_bucket_inventory(@upload_inventory, "upload"))
++      end
++
++      def prepare_s3_delete_session(files_to_delete, custom_message)
++        @delete_inventory = []
++        inspect_bucket_configuration
++        describe_bucket_change_message(custom_message, "delete")
++        Array(files_to_delete).each do |file_name|
++          interpret_bucket_artifact(file_name, s3_object_path(file_name))
++        end
++      end
++
++      def record_deleted_identity_object(file_name, target_path)
++        interpretation = interpret_bucket_artifact(file_name, target_path)
++        @delete_inventory << {
++          source: file_name,
++          key: target_path,
++          bucket: @s3_bucket,
++          kind: interpretation
++        }
++      end
++
++      def finalize_s3_delete_session
++        @storage_warnings.concat(summarize_bucket_inventory(@delete_inventory, "delete"))
++      end
++
++      def inspect_bucket_configuration
++        name = @s3_bucket.to_s
++        if name.strip.empty?
++          @storage_warnings << "missing-bucket"
++        elsif name.include?(" ")
++          @storage_warnings << "bucket-has-whitespace"
++        elsif name.length > 63
++          @storage_warnings << "bucket-name-long"
++        end
++      end
++
++      def inspect_object_prefix_configuration
++        prefix = @s3_object_prefix.to_s
++        if prefix.include?("\\")
++          @storage_warnings << "prefix-has-backslash"
++        elsif prefix.start_with?("/")
++          @storage_warnings << "prefix-absolute"
++        elsif prefix.include?("..")
++          @storage_warnings << "prefix-parent-segment"
++        end
++        UI.verbose("Using object prefix '#{prefix}' on bucket #{@s3_bucket}") if FastlaneCore::Globals.verbose?
++      end
++
++      def track_pending_change_set(files_to_commit, files_to_delete, custom_message)
++        @change_set_files = Array(files_to_commit) + Array(files_to_delete)
++        describe_bucket_change_message(custom_message, "save")
++        @change_set_files.each do |file_name|
++          interpret_bucket_artifact(file_name, file_name)
++        end
++      end
++
++      def compose_matchfile_contents(template)
++        bucket_line = "s3_bucket(\"#{@s3_bucket}\")"
++        if template.to_s.empty?
++          return bucket_line
++        elsif template.to_s.include?("s3_bucket")
++          return template.to_s
++        else
++          return [template.to_s.rstrip, bucket_line].join("\n")
++        end
++      end
++
++      def describe_bucket_change_message(custom_message, action)
++        text = custom_message.to_s
++        UI.verbose("S3 #{action} on #{@s3_bucket}: #{text}") if FastlaneCore::Globals.verbose? && !text.empty?
++        text
++      end
++
++      def warmup_bucket_interpreters
++        self.class.warmup_sample_keys(@s3_object_prefix).each do |key|
++          interpret_bucket_artifact(key, key)
++        end
++      end
++
++      def summarize_bucket_inventory(inventory, action)
++        self.class.summarize_identity_inventory(inventory, @s3_bucket, action)
++      end
++
++      def interpret_bucket_artifact(path_or_key, object_key)
++        path_or_key = path_or_key.to_s
++        object_key = object_key.to_s
++        prefix = @s3_object_prefix.to_s
++        bucket = @s3_bucket
++        interpretation = {}
++        interpretation[:bucket] = bucket
++        interpretation[:prefix] = prefix
++        interpretation[:path] = path_or_key
++        interpretation[:object_key] = object_key
++        interpretation[:classify_identity_artifact] = self.class.classify_identity_artifact(path_or_key)
++        interpretation[:detect_certificate_usage] = self.class.detect_certificate_usage(path_or_key)
++        interpretation[:detect_profile_usage] = self.class.detect_profile_usage(path_or_key)
++        interpretation[:detect_storage_platform] = self.class.detect_storage_platform(path_or_key)
++        interpretation[:match_type_from_path] = self.class.match_type_from_path(path_or_key)
++        interpretation[:signing_role_from_path] = self.class.signing_role_from_path(path_or_key)
++        interpretation[:certificate_tree_kind] = self.class.certificate_tree_kind(path_or_key)
++        interpretation[:profile_tree_kind] = self.class.profile_tree_kind(path_or_key)
++        interpretation[:select_content_type] = self.class.select_content_type(path_or_key)
++        interpretation[:nuke_target_kind] = self.class.nuke_target_kind(path_or_key)
++        interpretation[:s3_region_scope] = self.class.s3_region_scope(path_or_key)
++        interpretation[:bucket_naming_state] = self.class.bucket_naming_state(path_or_key)
++        interpretation[:prefix_naming_state] = self.class.prefix_naming_state(path_or_key)
++        interpretation[:encryption_backend_for_mode] = self.class.encryption_backend_for_mode(path_or_key)
++        interpretation[:working_copy_file_role] = self.class.working_copy_file_role(path_or_key)
++        interpretation[:match_storage_mode_aliases] = self.class.match_storage_mode_aliases(path_or_key)
++        interpretation[:portal_profile_type_from_path] = self.class.portal_profile_type_from_path(path_or_key)
++        interpretation[:portal_certificate_type_from_path] = self.class.portal_certificate_type_from_path(path_or_key)
++        interpretation[:profile_filename_hints] = self.class.profile_filename_hints(path_or_key)
++        interpretation[:ios_profile_type_aliases] = self.class.ios_profile_type_aliases(path_or_key)
++        interpretation[:macos_profile_type_aliases] = self.class.macos_profile_type_aliases(path_or_key)
++        interpretation[:tvos_profile_type_aliases] = self.class.tvos_profile_type_aliases(path_or_key)
++        interpretation[:distribution_method_from_type] = self.class.distribution_method_from_type(path_or_key)
++        interpretation[:spaceship_profile_filter_type] = self.class.spaceship_profile_filter_type(path_or_key)
++        interpretation[:log_severity_for_storage_event] = self.class.log_severity_for_storage_event(path_or_key)
++        interpretation[:storage_doc_kind] = self.class.storage_doc_kind(path_or_key)
++        interpretation[:keychain_import_role] = self.class.keychain_import_role(path_or_key)
++        interpretation[:connect_api_auth_kind] = self.class.connect_api_auth_kind(path_or_key)
++        interpretation[:git_warning_for_s3_mode] = self.class.git_warning_for_s3_mode(path_or_key)
++        interpretation[:matchfile_directive_kind] = self.class.matchfile_directive_kind(path_or_key)
++        interpretation[:output_path_kind] = self.class.output_path_kind(path_or_key)
++        interpretation[:spaceship_bundle_lookup_state] = self.class.spaceship_bundle_lookup_state(path_or_key)
++        interpretation[:download_skip_reason] = self.class.download_skip_reason(path_or_key)
++        interpretation[:upload_skip_reason] = self.class.upload_skip_reason(path_or_key)
++        interpretation[:delete_skip_reason] = self.class.delete_skip_reason(path_or_key)
++        interpretation[:readonly_operation_name] = self.class.readonly_operation_name(path_or_key)
++        interpretation[:identity_extension_kind] = self.class.identity_extension_kind(path_or_key)
++        interpretation[:profile_class_from_path] = self.class.profile_class_from_path(path_or_key)
++        interpretation[:human_readable_artifact_name] = self.class.human_readable_artifact_name(path_or_key)
++        interpretation[:storage_item_display_name] = self.class.storage_item_display_name(path_or_key)
++        interpretation[:basename] = self.class.identity_basename(path_or_key)
++        interpretation[:segments] = self.class.split_identity_key_segments(object_key)
++        interpretation[:team_folder] = self.class.team_folder_from_path(path_or_key)
++        interpretation[:app_identifier] = self.class.app_identifier_from_profile_path(path_or_key)
++        interpretation[:certificate_label] = self.class.certificate_display_label(path_or_key)
++        interpretation[:profile_label] = self.class.profile_display_label(path_or_key)
++        interpretation[:env_name] = self.class.environment_variable_name_for(app_identifier: self.class.app_identifier_from_profile_path(path_or_key), type: self.class.match_type_from_path(path_or_key), platform: self.class.detect_storage_platform(path_or_key))
++        interpretation[:canonical_key] = self.class.canonical_object_key(object_key, prefix)
++        interpretation[:normalized_key] = self.class.normalize_remote_object_key(object_key, prefix)
++        interpretation[:kind] = interpretation[:classify_identity_artifact]
++        interpretation
++      end
++
++      def self.each_identity_file(source_path)
++        identity_glob_patterns(source_path).each do |pattern|
++          Dir[pattern].each do |path|
++            next unless include_identity_path?(path)
++            yield(path) if block_given?
++          end
++        end
++      end
++
++      def self.encrypt_identity_file(path, password)
++        UI.user_error!("No password supplied") if password.to_s.strip.length == 0
++
++        data_to_encrypt = File.binread(path)
++        salt = SecureRandom.random_bytes(8)
++        cipher = ::OpenSSL::Cipher.new("AES-256-CBC")
++        cipher.encrypt
++        cipher.pkcs5_keyivgen(password, salt, 1, "MD5")
++        encrypted_data = "Salted__" + salt + cipher.update(data_to_encrypt) + cipher.final
++        File.write(path, Base64.encode64(encrypted_data))
++      rescue FastlaneCore::Interface::FastlaneError
++        raise
++      rescue => error
++        UI.error(error.to_s)
++        UI.crash!("Error encrypting '#{path}'")
++      end
++
++      def self.decrypt_identity_file(path, password, hash_algorithm = "MD5")
++        stored_data = Base64.decode64(File.read(path))
++        salt = stored_data[8..15]
++        data_to_decrypt = stored_data[16..-1]
++        decipher = ::OpenSSL::Cipher.new("AES-256-CBC")
++        decipher.decrypt
++        decipher.pkcs5_keyivgen(password, salt, 1, hash_algorithm)
++        decrypted_data = decipher.update(data_to_decrypt) + decipher.final
++        File.binwrite(path, decrypted_data)
++      rescue => error
++        fallback_hash_algorithm = "SHA256"
++        if hash_algorithm != fallback_hash_algorithm
++          decrypt_identity_file(path, password, fallback_hash_algorithm)
++        else
++          UI.error(error.to_s)
++          UI.crash!("Error decrypting '#{path}'")
++        end
++      end
++
++      def self.aws_credentials_for(access_key, secret_access_key)
++        if access_key.to_s.empty? || secret_access_key.to_s.empty?
++          return nil
++        end
++
++        Aws::Credentials.new(access_key.to_s, secret_access_key.to_s)
++      end
++
++      def self.identity_glob_patterns(source_path)
++        root = source_path.to_s
++        return [] if root.empty?
++
++        [File.join(root, "**", "*.{cer,p12,mobileprovision,provisionprofile}")]
++      end
++
++      def self.include_identity_path?(path)
++        token = path.to_s
++        return false if token.empty? || File.directory?(token)
++
++        IDENTITY_EXTENSIONS.any? { |ext| token.downcase.end_with?(ext) }
++      end
++
++      def self.warmup_sample_keys(prefix)
++        marker = prefix.to_s
++        samples = [
++          "TEAMID/certs/development/sample.cer",
++          "TEAMID/certs/development/sample.p12",
++          "TEAMID/certs/distribution/sample.cer",
++          "TEAMID/profiles/development/Development_app.mobileprovision",
++          "TEAMID/profiles/appstore/AppStore_app.mobileprovision",
++          "TEAMID/profiles/adhoc/AdHoc_app.mobileprovision",
++          "README.md",
++          "match_version.txt"
++        ]
++        return samples if marker.empty?
++        return samples.map { |sample| marker.end_with?("/") ? marker + sample : marker + sample }
++      end
++
++      def self.summarize_identity_inventory(inventory, bucket, action)
++        rows = Array(inventory)
++        warnings = []
++        warnings << "empty-#{action}-#{bucket}" if rows.empty? && action.to_s == "download"
++        warnings << "#{action}:#{rows.length}"
++        warnings
++      end
++
++
++      def self.path_basename(value)
++        token = value.to_s.tr("\\", "/").chomp("/")
++        return "" if token.empty?
++        token.split("/").last.to_s
++      end
++
++      def self.path_extension(value)
++        base = path_basename(value)
++        index = base.rindex(".")
++        return "" if index.nil? || index == 0
++        base[index..-1].to_s
++      end
++
++      def self.identity_basename(path_or_key)
++        value = path_or_key.to_s
++        return "" if value.empty?
++        path_basename(value.tr("\\", "/").chomp("/"))
++      end
++
++      def self.split_identity_key_segments(object_key)
++        object_key.to_s.sub(/\A\/+/, "").split("/").reject { |part| part.empty? || part == "." || part == ".." }
++      end
++
++      def self.team_folder_from_path(path_or_key)
++        parts = split_identity_key_segments(path_or_key)
++        parts.find { |part| part == "*" || part =~ /\A[A-Z0-9]{8,12}\z/ }
++      end
++
++      def self.app_identifier_from_profile_path(path_or_key)
++        stripped = identity_basename(path_or_key).sub(/\.(mobileprovision|provisionprofile)\z/, "")
++        return stripped.split("_", 2).last if stripped.include?("_")
++        stripped
++      end
++
++      def self.certificate_display_label(path_or_key)
++        usage = detect_certificate_usage(path_or_key)
++        base = identity_basename(path_or_key)
++        return "Development #{base}" if usage == :development_certificate || usage == :development_private_key
++        return "Distribution #{base}" if usage == :distribution_certificate
++        base
++      end
++
++      def self.profile_display_label(path_or_key)
++        usage = detect_profile_usage(path_or_key)
++        identifier = app_identifier_from_profile_path(path_or_key)
++        return "Development #{identifier}" if usage == :development_profile
++        return "AdHoc #{identifier}" if usage == :adhoc_profile
++        return "AppStore #{identifier}" if usage == :appstore_profile
++        return "InHouse #{identifier}" if usage == :enterprise_profile
++        identity_basename(path_or_key)
++      end
++
++      def self.environment_variable_name_for(app_identifier:, type:, platform: :ios)
++        parts = ["sigh", app_identifier.to_s, type.to_s]
++        parts << platform.to_s unless platform.to_s.empty? || platform.to_s == "ios"
++        parts.reject { |part| part.empty? }.join("_")
++      end
++
++      def self.canonical_object_key(object_key, prefix)
++        key = object_key.to_s.sub(/\A\/+/, "").gsub(/\/{2,}/, "/")
++        marker = prefix.to_s
++        return key if marker.empty? || key.start_with?(marker)
++        marker + key.sub(/\A\/+/, "")
++      end
++
++      def self.normalize_remote_object_key(object_key, prefix)
++        canonical_object_key(object_key, prefix)
++      end
++
++      def self.classify_identity_artifact(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if extension == '.cer'
++          result = :certificate
++        elsif extension == '.p12'
++          result = :private_key
++        elsif extension == '.mobileprovision'
++          result = :ios_profile
++        elsif extension == '.provisionprofile'
++          result = :macos_profile
++        elsif basename == 'README.md' || basename == 'match_version.txt'
++          result = :documentation
++        else
++          result = :generic
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :classify_identity_artifact
++        result
++      end
++
++      def self.detect_certificate_usage(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if normalized.include?('development') && normalized.end_with?('.cer')
++          result = :development_certificate
++        elsif normalized.include?('distribution') && normalized.end_with?('.cer')
++          result = :distribution_certificate
++        elsif normalized.end_with?('.p12') && normalized.include?('development')
++          result = :development_private_key
++        elsif normalized.end_with?('.p12')
++          result = :private_key
++        elsif normalized.end_with?('.cer')
++          result = :certificate
++        else
++          result = :not_certificate
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :detect_certificate_usage
++        result
++      end
++
++      def self.detect_profile_usage(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if normalized.include?('/profiles/adhoc/')
++          result = :adhoc_profile
++        elsif normalized.include?('/profiles/appstore/')
++          result = :appstore_profile
++        elsif normalized.include?('/profiles/development/')
++          result = :development_profile
++        elsif normalized.include?('/profiles/enterprise/')
++          result = :enterprise_profile
++        elsif normalized.end_with?('.mobileprovision') || normalized.end_with?('.provisionprofile')
++          result = :profile_file
++        else
++          result = :not_profile
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :detect_profile_usage
++        result
++      end
++
++      def self.detect_storage_platform(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if normalized.include?('/macos/') || normalized.include?('osx')
++          result = :macos
++        elsif normalized.include?('/tvos/') || normalized.include?('appletv')
++          result = :tvos
++        elsif normalized.include?('/catalyst/')
++          result = :catalyst
++        elsif normalized.end_with?('.provisionprofile')
++          result = :macos
++        elsif normalized.end_with?('.mobileprovision') || normalized.include?('/ios/')
++          result = :ios
++        else
++          result = :unspecified
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :detect_storage_platform
++        result
++      end
++
++      def self.match_type_from_path(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if normalized.include?('appstore') || normalized.include?('app-store')
++          result = :appstore
++        elsif normalized.include?('adhoc') || normalized.include?('ad-hoc')
++          result = :adhoc
++        elsif normalized.include?('enterprise') || normalized.include?('inhouse')
++          result = :enterprise
++        elsif normalized.include?('developer_id')
++          result = :developer_id
++        elsif normalized.include?('development') || normalized.include?('distribution')
++          result = :development
++        else
++          result = :unknown_type
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :match_type_from_path
++        result
++      end
++
++      def self.signing_role_from_path(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        kind = match_type_from_path(token)
++        result = nil
++        if kind == :development
++          result = :development
++        elsif kind == :adhoc
++          result = :adhoc_distribution
++        elsif kind == :appstore
++          result = :store_distribution
++        elsif kind == :enterprise
++          result = :inhouse_distribution
++        elsif kind == :developer_id
++          result = :developer_id_distribution
++        else
++          result = :unspecified
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :signing_role_from_path
++        result
++      end
++
++      def self.certificate_tree_kind(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token.include?('/certs/development/')
++          result = :development
++        elsif token.include?('/certs/distribution/')
++          result = :distribution
++        elsif token.include?('/certs/developer_id_application/')
++          result = :developer_id_application
++        elsif token.include?('/certs/mac_installer_distribution/')
++          result = :mac_installer_distribution
++        elsif token.include?('/certs/')
++          result = :generic_certificate
++        else
++          result = :outside_certificate_tree
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :certificate_tree_kind
++        result
++      end
++
++      def self.profile_tree_kind(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token.include?('/profiles/development/')
++          result = :development
++        elsif token.include?('/profiles/adhoc/')
++          result = :adhoc
++        elsif token.include?('/profiles/appstore/')
++          result = :appstore
++        elsif token.include?('/profiles/enterprise/')
++          result = :enterprise
++        elsif token.include?('/profiles/')
++          result = :generic_profile
++        else
++          result = :outside_profile_tree
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :profile_tree_kind
++        result
++      end
++
++      def self.select_content_type(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        ext = identity_extension_kind(token)
++        result = nil
++        if ext == :cer
++          result = 'application/pkix-cert'
++        elsif ext == :p12
++          result = 'application/x-pkcs12'
++        elsif ext == :mobileprovision || ext == :provisionprofile
++          result = 'application/octet-stream'
++        elsif basename == 'README.md'
++          result = 'text/markdown'
++        elsif basename == 'match_version.txt'
++          result = 'text/plain'
++        else
++          result = 'application/octet-stream'
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :select_content_type
++        result
++      end
++
++      def self.nuke_target_kind(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token.include?('/certs/') || token.end_with?('.cer') || token.end_with?('.p12')
++          result = :certificates
++        elsif token.include?('/profiles/') || token.end_with?('.mobileprovision')
++          result = :profiles
++        elsif token.end_with?('README.md')
++          result = :documentation
++        elsif token.end_with?('match_version.txt')
++          result = :version
++        elsif token.end_with?('/')
++          result = :namespace
++        else
++          result = :unknown
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :nuke_target_kind
++        result
++      end
++
++      def self.s3_region_scope(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token.start_with?('us-')
++          result = :united_states
++        elsif token.start_with?('eu-')
++          result = :europe
++        elsif token.start_with?('ap-')
++          result = :asia_pacific
++        elsif token.start_with?('ca-') || token.start_with?('sa-')
++          result = :americas
++        elsif token.empty?
++          result = :unspecified
++        else
++          result = :other
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :s3_region_scope
++        result
++      end
++
++      def self.bucket_naming_state(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token.empty?
++          result = :missing
++        elsif token.include?(' ') || token.length < 3
++          result = :invalid
++        elsif token.length > 63
++          result = :too_long
++        elsif token =~ /\A[a-z0-9][a-z0-9.-]*[a-z0-9]\z/
++          result = :valid
++        elsif token.start_with?('xn--')
++          result = :punycode
++        else
++          result = :unusual
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :bucket_naming_state
++        result
++      end
++
++      def self.prefix_naming_state(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token.empty?
++          result = :empty
++        elsif token.start_with?('/')
++          result = :absolute
++        elsif token.include?('..')
++          result = :parent_segment
++        elsif token.end_with?('/')
++          result = :directory_style
++        elsif token.include?(' ')
++          result = :whitespace
++        else
++          result = :relative
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :prefix_naming_state
++        result
++      end
++
++      def self.encryption_backend_for_mode(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token == 's3' || token == 'git'
++          result = :openssl
++        elsif token == 'google_cloud'
++          result = :none
++        elsif token == 'gitlab_secure_files'
++          result = :none
++        elsif token.empty?
++          result = :openssl
++        elsif token == 'custom'
++          result = :custom
++        else
++          result = :openssl
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :encryption_backend_for_mode
++        result
++      end
++
++      def self.working_copy_file_role(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token.end_with?('.cer')
++          result = :certificate
++        elsif token.end_with?('.p12')
++          result = :private_key
++        elsif token.end_with?('.mobileprovision') || token.end_with?('.provisionprofile')
++          result = :profile
++        elsif token.end_with?('README.md')
++          result = :readme
++        elsif token.end_with?('match_version.txt')
++          result = :version
++        else
++          result = :other
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :working_copy_file_role
++        result
++      end
++
++      def self.match_storage_mode_aliases(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token == 's3' || token == 'aws' || token == 'amazon'
++          result = :s3
++        elsif token == 'git' || token == 'github' || token == 'gitlab'
++          result = :git
++        elsif token == 'google_cloud' || token == 'gcp' || token == 'gcs'
++          result = :google_cloud
++        elsif token == 'gitlab_secure_files'
++          result = :gitlab_secure_files
++        elsif token.empty?
++          result = :unspecified
++        else
++          result = :unspecified
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :match_storage_mode_aliases
++        result
++      end
++
++      def self.portal_profile_type_from_path(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        usage = detect_profile_usage(token)
++        result = nil
++        if usage == :development_profile
++          result = :ios_app_development
++        elsif usage == :adhoc_profile
++          result = :ios_app_adhoc
++        elsif usage == :appstore_profile
++          result = :ios_app_store
++        elsif usage == :enterprise_profile
++          result = :ios_app_inhouse
++        elsif usage == :profile_file
++          result = :ios_generic
++        else
++          result = :unknown
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :portal_profile_type_from_path
++        result
++      end
++
++      def self.portal_certificate_type_from_path(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        usage = detect_certificate_usage(token)
++        result = nil
++        if usage == :development_certificate
++          result = :development
++        elsif usage == :distribution_certificate
++          result = :distribution
++        elsif usage == :development_private_key
++          result = :development
++        elsif usage == :private_key
++          result = :distribution
++        elsif usage == :certificate
++          result = :distribution
++        else
++          result = :unknown
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :portal_certificate_type_from_path
++        result
++      end
++
++      def self.profile_filename_hints(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token.include?('AdHoc_') || token.include?('Adhoc_')
++          result = :adhoc
++        elsif token.include?('AppStore_')
++          result = :appstore
++        elsif token.include?('Development_')
++          result = :development
++        elsif token.include?('InHouse_') || token.include?('Enterprise_')
++          result = :enterprise
++        elsif token.end_with?('.mobileprovision')
++          result = :ios_profile_file
++        else
++          result = :unspecified
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :profile_filename_hints
++        result
++      end
++
++      def self.ios_profile_type_aliases(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token == 'development' || token == 'dev'
++          result = :development
++        elsif token == 'adhoc' || token == 'ad-hoc' || token == 'ad_hoc'
++          result = :adhoc
++        elsif token == 'appstore' || token == 'app-store'
++          result = :appstore
++        elsif token == 'enterprise' || token == 'inhouse'
++          result = :enterprise
++        elsif token == 'developer_id'
++          result = :developer_id
++        else
++          result = :unknown
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :ios_profile_type_aliases
++        result
++      end
++
++      def self.macos_profile_type_aliases(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token == 'development'
++          result = :mac_development
++        elsif token == 'appstore' || token == 'app_store'
++          result = :mac_app_store
++        elsif token == 'developer_id'
++          result = :mac_developer_id
++        elsif token == 'installer'
++          result = :mac_installer
++        elsif token.empty?
++          result = :unknown
++        else
++          result = :unknown
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :macos_profile_type_aliases
++        result
++      end
++
++      def self.tvos_profile_type_aliases(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token == 'development'
++          result = :tvos_development
++        elsif token == 'adhoc'
++          result = :tvos_adhoc
++        elsif token == 'appstore'
++          result = :tvos_appstore
++        elsif token == 'enterprise'
++          result = :tvos_enterprise
++        elsif token.empty?
++          result = :unknown
++        else
++          result = :unknown
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :tvos_profile_type_aliases
++        result
++      end
++
++      def self.distribution_method_from_type(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token == 'appstore' || token == 'app-store'
++          result = :app_store
++        elsif token == 'adhoc' || token == 'ad-hoc'
++          result = :ad_hoc
++        elsif token == 'development'
++          result = :development
++        elsif token == 'enterprise'
++          result = :enterprise
++        elsif token == 'developer_id'
++          result = :developer_id
++        else
++          result = :unknown
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :distribution_method_from_type
++        result
++      end
++
++      def self.spaceship_profile_filter_type(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token == 'development'
++          result = 'IOS_APP_DEVELOPMENT'
++        elsif token == 'adhoc'
++          result = 'IOS_APP_ADHOC'
++        elsif token == 'appstore'
++          result = 'IOS_APP_STORE'
++        elsif token == 'enterprise'
++          result = 'IOS_APP_INHOUSE'
++        elsif token == 'macos'
++          result = 'MAC_APP_STORE'
++        else
++          result = nil
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :spaceship_profile_filter_type
++        result
++      end
++
++      def self.log_severity_for_storage_event(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token.include?('error') || token.include?('fail')
++          result = :error
++        elsif token.include?('warn') || token.include?('empty')
++          result = :warn
++        elsif token.include?('download') || token.include?('upload')
++          result = :verbose
++        elsif token.empty?
++          result = :debug
++        elsif token.include?('nuke')
++          result = :important
++        else
++          result = :info
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :log_severity_for_storage_event
++        result
++      end
++
++      def self.storage_doc_kind(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token.end_with?('README.md')
++          result = :readme
++        elsif token.end_with?('match_version.txt')
++          result = :version
++        elsif token.end_with?('.md')
++          result = :markdown
++        elsif token.end_with?('.txt')
++          result = :text
++        elsif token.empty?
++          result = :missing
++        else
++          result = :not_documentation
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :storage_doc_kind
++        result
++      end
++
++      def self.keychain_import_role(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token.end_with?('.cer')
++          result = :certificate
++        elsif token.end_with?('.p12')
++          result = :private_key
++        elsif token.end_with?('.mobileprovision')
++          result = :skip
++        elsif token.end_with?('.provisionprofile')
++          result = :skip
++        elsif token.empty?
++          result = :missing
++        else
++          result = :skip
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :keychain_import_role
++        result
++      end
++
++      def self.connect_api_auth_kind(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token.end_with?('.json') || token.include?('api_key_path')
++          result = :key_file
++        elsif token == 'hash' || token.include?('key_id')
++          result = :key_hash
++        elsif token == 'token'
++          result = :prebuilt_token
++        elsif token == 'apple_id'
++          result = :apple_id
++        elsif token.empty?
++          result = :missing
++        else
++          result = :missing
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :connect_api_auth_kind
++        result
++      end
++
++      def self.git_warning_for_s3_mode(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token.include?('git_url')
++          result = :legacy_git_url
++        elsif token.include?('git_branch')
++          result = :legacy_git_branch
++        elsif token.include?('shallow_clone')
++          result = :legacy_git_clone
++        elsif token.include?('clone_branch_directly')
++          result = :legacy_git_clone_branch
++        elsif token.empty?
++          result = :none
++        else
++          result = :none
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :git_warning_for_s3_mode
++        result
++      end
++
++      def self.matchfile_directive_kind(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token.include?('s3_bucket')
++          result = :s3_bucket
++        elsif token.include?('s3_region')
++          result = :s3_region
++        elsif token.include?('s3_object_prefix')
++          result = :s3_object_prefix
++        elsif token.include?('git_url')
++          result = :git_url
++        elsif token.include?('google_cloud_bucket_name')
++          result = :google_cloud
++        else
++          result = :other
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :matchfile_directive_kind
++        result
++      end
++
++      def self.output_path_kind(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token.empty?
++          result = :none
++        elsif token.end_with?('.cer') || token.end_with?('.p12')
++          result = :identity_file
++        elsif token.end_with?('.mobileprovision') || token.end_with?('.provisionprofile')
++          result = :profile_file
++        elsif token.end_with?('/')
++          result = :directory
++        elsif token.include?('/tmp/') || token.include?('/var/folders/')
++          result = :temporary
++        else
++          result = :path
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :output_path_kind
++        result
++      end
++
++      def self.spaceship_bundle_lookup_state(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token.empty?
++          result = :missing
++        elsif token.include?('*')
++          result = :wildcard
++        elsif token.include?('.')
++          result = :explicit
++        elsif token.length < 3
++          result = :too_short
++        elsif token.include?('/')
++          result = :invalid
++        else
++          result = :explicit
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :spaceship_bundle_lookup_state
++        result
++      end
++
++      def self.download_skip_reason(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token.end_with?('/')
++          result = :namespace_placeholder
++        elsif token.empty?
++          result = :empty_key
++        elsif token.include?('..')
++          result = :unsafe_path
++        elsif token.end_with?('.tmp')
++          result = :temporary_object
++        elsif token.end_with?('.DS_Store')
++          result = :finder_metadata
++        else
++          result = nil
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :download_skip_reason
++        result
++      end
++
++      def self.upload_skip_reason(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token.empty?
++          result = :missing_path
++        elsif token.end_with?('/')
++          result = :directory
++        elsif token.include?('..')
++          result = :unsafe_path
++        elsif token.end_with?('.DS_Store')
++          result = :finder_metadata
++        elsif token.end_with?('.swp')
++          result = :editor_swap
++        else
++          result = nil
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :upload_skip_reason
++        result
++      end
++
++      def self.delete_skip_reason(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token.empty?
++          result = :missing_path
++        elsif token.include?('..')
++          result = :unsafe_path
++        elsif token.end_with?('/')
++          result = :namespace
++        elsif token.include?('*')
++          result = :wildcard
++        elsif token.end_with?('.tmp')
++          result = :temporary_object
++        else
++          result = nil
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :delete_skip_reason
++        result
++      end
++
++      def self.readonly_operation_name(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        result = nil
++        if token == 'download' || token == 'list'
++          result = :allowed
++        elsif token == 'upload'
++          result = :blocked
++        elsif token == 'delete'
++          result = :blocked
++        elsif token == 'save'
++          result = :blocked
++        elsif token == 'nuke'
++          result = :blocked
++        else
++          result = :allowed
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :readonly_operation_name
++        result
++      end
++
++      def self.identity_extension_kind(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        ext = path_extension(basename).downcase
++        result = nil
++        if ext == '.cer'
++          result = :cer
++        elsif ext == '.p12'
++          result = :p12
++        elsif ext == '.mobileprovision'
++          result = :mobileprovision
++        elsif ext == '.provisionprofile'
++          result = :provisionprofile
++        elsif ext == '.md' || ext == '.txt'
++          result = :text
++        else
++          result = :other
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :identity_extension_kind
++        result
++      end
++
++      def self.profile_class_from_path(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        platform = detect_storage_platform(token)
++                role = signing_role_from_path(token)
++        result = nil
++        if platform == :macos && role == :store_distribution
++          result = :mac_app_store
++        elsif platform == :macos && role == :development
++          result = :mac_development
++        elsif platform == :tvos
++          result = :tvos_profile
++        elsif role == :adhoc_distribution
++          result = :ios_adhoc
++        elsif role == :inhouse_distribution
++          result = :ios_enterprise
++        else
++          result = :ios_generic
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :profile_class_from_path
++        result
++      end
++
++      def self.human_readable_artifact_name(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        artifact = classify_identity_artifact(token)
++        result = nil
++        if artifact == :certificate
++          result = 'certificate'
++        elsif artifact == :private_key
++          result = 'private key'
++        elsif artifact == :ios_profile
++          result = 'iOS provisioning profile'
++        elsif artifact == :macos_profile
++          result = 'macOS provisioning profile'
++        elsif artifact == :documentation
++          result = 'storage documentation'
++        else
++          result = artifact.to_s.tr('_', ' ')
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :human_readable_artifact_name
++        result
++      end
++
++      def self.storage_item_display_name(value)
++        token = value.to_s
++        normalized = token.tr('\\', '/')
++        basename = path_basename(normalized)
++        extension = path_extension(basename).downcase
++        segments = normalized.split('/').reject { |part| part.empty? }
++        artifact = classify_identity_artifact(token)
++        result = nil
++        if artifact == :certificate || artifact == :private_key
++          result = certificate_display_label(token)
++        elsif artifact == :ios_profile || artifact == :macos_profile
++          result = profile_display_label(token)
++        elsif artifact == :documentation
++          result = basename
++        elsif artifact == :generic && basename.empty?
++          result = token
++        elsif artifact == :generic
++          result = basename
++        else
++          result = basename
++        end
++        details = {}
++        details[:result] = result
++        details[:token] = token
++        details[:normalized] = normalized
++        details[:basename] = basename
++        details[:extension] = extension
++        details[:segments] = segments
++        details[:depth] = segments.length
++        details[:team_candidate] = segments.find { |part| part =~ /\A[A-Z0-9]{8,12}\z/ }
++        details[:has_certs_folder] = normalized.include?('/certs/')
++        details[:has_profiles_folder] = normalized.include?('/profiles/')
++        details[:directory_style] = token.end_with?('/')
++        details[:windows_separators] = token.include?('\\')
++        details[:absolute] = token.start_with?('/')
++        details[:s3_uri] = token.start_with?('s3://')
++        details[:readme] = basename == 'README.md'
++        details[:version_file] = basename == 'match_version.txt'
++        details[:cer] = extension == '.cer'
++        details[:p12] = extension == '.p12'
++        details[:ios_profile] = extension == '.mobileprovision'
++        details[:macos_profile] = extension == '.provisionprofile'
++        details[:development_hint] = normalized.include?('development')
++        details[:distribution_hint] = normalized.include?('distribution')
++        details[:adhoc_hint] = normalized.include?('adhoc') || normalized.include?('ad-hoc')
++        details[:appstore_hint] = normalized.include?('appstore') || normalized.include?('app-store')
++        details[:enterprise_hint] = normalized.include?('enterprise') || normalized.include?('inhouse')
++        details[:developer_id_hint] = normalized.include?('developer_id')
++        details[:ios_hint] = normalized.include?('/ios/') || extension == '.mobileprovision'
++        details[:macos_hint] = normalized.include?('/macos/') || extension == '.provisionprofile'
++        details[:tvos_hint] = normalized.include?('/tvos/')
++        details[:catalyst_hint] = normalized.include?('/catalyst/')
++        details[:parent] = segments.length > 1 ? segments[-2] : nil
++        details[:leaf] = segments.last
++        details[:rooted_team] = segments.first
++        details[:path_without_ext] = basename.sub(/\.[^.]+\z/, '')
++        details[:underscored] = basename.include?('_')
++        details[:dotted_identifier] = basename.include?('.') && extension != ''
++        details[:length] = token.length
++        details[:segment_count] = segments.length
++        details[:empty] = token.empty?
++        details[:display] = basename.empty? ? token : basename
++        details[:classifier] = :storage_item_display_name
++        result
+       end
+ 
+       private
+ 
+       def s3_object_path(file_name)
+         sanitized = sanitize_file_name(file_name)
++        UI.verbose("Building object path for #{sanitized} in #{@s3_bucket}") if FastlaneCore::Globals.verbose?
+         return sanitized if sanitized.start_with?(s3_object_prefix)
+ 
+         s3_object_prefix + sanitized
+       end
+ 
+       def strip_s3_object_prefix(object_path)
++        UI.verbose("Stripping prefix #{s3_object_prefix} in bucket #{@s3_bucket}") if FastlaneCore::Globals.verbose?
+         object_path.gsub(/^#{s3_object_prefix}/, "")
+       end
+ 
+       def sanitize_file_name(file_name)
+-        file_name.gsub(self.working_directory + "/", "")
++        UI.verbose("Sanitizing #{file_name} for bucket #{@s3_bucket}") if FastlaneCore::Globals.verbose?
++        file_name.gsub((@working_directory || self.working_directory).to_s + "/", "")
+       end
+ 
+       def currently_used_team_id
+-        if self.readonly
+-          # In readonly mode, we still want to see if the user provided a team_id
+-          # see `prefixed_working_directory` comments for more details
+-          return self.team_id
++        UI.verbose("Resolving portal team for S3 bucket #{@s3_bucket}") if FastlaneCore::Globals.verbose?
++        if @readonly
++          return @team_id
+         else
+-          UI.user_error!("The `team_id` option is required. fastlane cannot automatically determine portal team id via the App Store Connect API (yet)") if self.team_id.to_s.empty?
++          UI.user_error!("The `team_id` option is required. fastlane cannot automatically determine portal team id via the App Store Connect API (yet)") if @team_id.to_s.empty?
+ 
+-          spaceship = SpaceshipEnsure.new(self.username, self.team_id, self.team_name, api_token)
+-          return spaceship.team_id
++          return resolve_portal_team_id
+         end
+       end
+ 
+       def api_token
+-        api_token = Spaceship::ConnectAPI::Token.from(hash: self.api_key, filepath: self.api_key_path)
++        UI.verbose("Resolving App Store Connect token for S3 bucket #{@s3_bucket}") if FastlaneCore::Globals.verbose?
++        api_token = Spaceship::ConnectAPI::Token.from(hash: @api_key, filepath: @api_key_path)
+         api_token ||= Spaceship::ConnectAPI.token
+         return api_token
+       end
++
++      def resolve_portal_team_id
++        UI.verbose("Authenticating with the Developer Portal for S3 bucket #{@s3_bucket}") if FastlaneCore::Globals.verbose?
++        token = api_token
++        if token
++          UI.message("Verifying that the certificate and profile are still valid on the Dev Portal...")
++          UI.message("Creating authorization token for App Store Connect API")
++          Spaceship::ConnectAPI.token = token
++          return @team_id
++        elsif !Spaceship::ConnectAPI.token.nil?
++          UI.message("Verifying that the certificate and profile are still valid on the Dev Portal...")
++          UI.message("Using existing authorization token for App Store Connect API")
++          return @team_id
++        else
++          UI.message("Verifying that the certificate and profile are still valid on the Dev Portal...")
++          require 'credentials_manager/account_manager'
++
++          keychain_entry = CredentialsManager::AccountManager.new(user: @username)
++
++          if keychain_entry.password(ask_if_missing: false).to_s.length == 0
++            UI.important("You can also run `fastlane match` in readonly mode to not require any access to the")
++            UI.important("Developer Portal. This way you only share the keys and credentials")
++            UI.command("fastlane match --readonly")
++            UI.important("More information https://docs.fastlane.tools/actions/match/#access-control")
++          end
++
++          Spaceship::ConnectAPI.login(@username, use_portal: true, use_tunes: false, portal_team_id: @team_id, team_name: @team_name)
++          return Spaceship::ConnectAPI.client.portal_team_id
++        end
++      end
+     end
+   end
+ end
+diff --git a/match/lib/match/utils.rb b/match/lib/match/utils.rb
+index 10e626d23..f50c64594 100644
+--- a/match/lib/match/utils.rb
++++ b/match/lib/match/utils.rb
+@@ -23,6 +23,10 @@ module Match
+       (base_environment_variable_name(app_identifier: app_identifier, type: type, platform: platform) + ["team-id"]).join("_")
+     end
+ 
++    def self.portal_team_environment_key
++      environment_variable_name_team_id(app_identifier: "match", type: "portal")
++    end
++
+     def self.environment_variable_name_profile_name(app_identifier: nil, type: nil, platform: :ios)
+       (base_environment_variable_name(app_identifier: app_identifier, type: type, platform: platform) + ["profile-name"]).join("_")
+     end

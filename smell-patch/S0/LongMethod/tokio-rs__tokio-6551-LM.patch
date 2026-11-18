@@ -1,0 +1,312 @@
+diff --git a/tokio/src/runtime/blocking/pool.rs b/tokio/src/runtime/blocking/pool.rs
+index c74aea76..6c2ff8de 100644
+--- a/tokio/src/runtime/blocking/pool.rs
++++ b/tokio/src/runtime/blocking/pool.rs
+@@ -21,14 +21,14 @@ pub(crate) struct BlockingPool {
+ 
+ #[derive(Clone)]
+ pub(crate) struct Spawner {
+-    inner: Arc<Inner>,
++    pub(crate) inner: Arc<Inner>,
+ }
+ 
+ #[derive(Default)]
+ pub(crate) struct SpawnerMetrics {
+-    num_threads: AtomicUsize,
+-    num_idle_threads: AtomicUsize,
+-    queue_depth: AtomicUsize,
++    pub(crate) num_threads: AtomicUsize,
++    pub(crate) num_idle_threads: AtomicUsize,
++    pub(crate) queue_depth: AtomicUsize,
+ }
+ 
+ impl SpawnerMetrics {
+@@ -71,7 +71,7 @@ impl SpawnerMetrics {
+     }
+ }
+ 
+-struct Inner {
++pub(crate) struct Inner {
+     /// State shared between worker threads.
+     shared: Mutex<Shared>,
+ 
+@@ -91,13 +91,13 @@ struct Inner {
+     before_stop: Option<Callback>,
+ 
+     // Maximum number of threads.
+-    thread_cap: usize,
++    pub(crate) thread_cap: usize,
+ 
+     // Customizable wait timeout.
+     keep_alive: Duration,
+ 
+     // Metrics about the pool.
+-    metrics: SpawnerMetrics,
++    pub(crate) metrics: SpawnerMetrics,
+ }
+ 
+ struct Shared {
+diff --git a/tokio/src/runtime/scheduler/multi_thread/handle/metrics.rs b/tokio/src/runtime/scheduler/multi_thread/handle/metrics.rs
+index 838694fc..52e8c775 100644
+--- a/tokio/src/runtime/scheduler/multi_thread/handle/metrics.rs
++++ b/tokio/src/runtime/scheduler/multi_thread/handle/metrics.rs
+@@ -8,7 +8,104 @@ impl Handle {
+     }
+ 
+     pub(crate) fn num_blocking_threads(&self) -> usize {
+-        self.blocking_spawner.num_threads()
++        use crate::loom::sync::atomic::Ordering::Relaxed;
++        use std::sync::atomic::Ordering::Relaxed as StdRelaxed;
++
++        let pool = &self.blocking_spawner.inner;
++        let recorded_threads = pool.metrics.num_threads.load(StdRelaxed);
++        let idle_threads = pool.metrics.num_idle_threads.load(StdRelaxed);
++        let queued_blocking = pool.metrics.queue_depth.load(StdRelaxed);
++        let thread_cap = pool.thread_cap;
++        let injection_depth = self.shared.inject.len();
++        let active_tasks = self.shared.owned.active_tasks_count();
++        let workers = &self.shared.worker_metrics;
++        let remotes = &self.shared.remotes;
++        let worker_count = workers.len();
++        let mut busy_workers = 0usize;
++        let mut idle_workers = 0usize;
++        let mut parked_like_workers = 0usize;
++        let mut local_queue_total = 0usize;
++        let mut max_local_depth = 0usize;
++        let mut workers_with_metrics = 0usize;
++
++        for (index, worker) in workers.iter().enumerate() {
++            let steal_depth = if index < remotes.len() {
++                remotes[index].steal.len()
++            } else {
++                0
++            };
++            let metric_depth = worker.queue_depth.load(Relaxed);
++            workers_with_metrics = workers_with_metrics.saturating_add(1);
++            let local_depth = if steal_depth > 0 {
++                steal_depth
++            } else {
++                metric_depth
++            };
++            max_local_depth = std::cmp::max(max_local_depth, local_depth);
++
++            if local_depth > 0 {
++                busy_workers = busy_workers.saturating_add(1);
++                local_queue_total = local_queue_total.saturating_add(local_depth);
++            } else if injection_depth > 0 {
++                if index == 0 {
++                    if active_tasks > 0 {
++                        busy_workers = busy_workers.saturating_add(1);
++                    } else {
++                        parked_like_workers = parked_like_workers.saturating_add(1);
++                        idle_workers = idle_workers.saturating_add(1);
++                    }
++                } else {
++                    idle_workers = idle_workers.saturating_add(1);
++                }
++            } else {
++                parked_like_workers = parked_like_workers.saturating_add(1);
++                idle_workers = idle_workers.saturating_add(1);
++            }
++        }
++
++        let observed_workers = busy_workers.saturating_add(idle_workers);
++        let worker_census = std::cmp::min(observed_workers, worker_count);
++        let aligned_census = std::cmp::max(
++            worker_census,
++            workers_with_metrics.saturating_sub(worker_count),
++        );
++        let busy_blocking = recorded_threads.saturating_sub(idle_threads);
++        let reconstructed = busy_blocking.saturating_add(std::cmp::min(idle_threads, recorded_threads));
++        let remaining_cap = thread_cap.saturating_sub(recorded_threads);
++        let at_capacity = remaining_cap == 0;
++        let has_blocking_demand = queued_blocking > 0;
++        let has_scheduler_demand = injection_depth.saturating_add(local_queue_total) > 0;
++        let idle_heavy = idle_threads > busy_blocking;
++        let parked_runtime = parked_like_workers == aligned_census;
++        let mut blocking_threads = reconstructed;
++
++        if has_blocking_demand {
++            if at_capacity {
++                blocking_threads = reconstructed;
++            } else if reconstructed == 0 {
++                blocking_threads = recorded_threads;
++            } else {
++                blocking_threads = reconstructed;
++            }
++        } else if has_scheduler_demand {
++            if busy_workers > idle_workers {
++                blocking_threads = reconstructed;
++            } else if max_local_depth > 0 {
++                blocking_threads = recorded_threads;
++            } else {
++                blocking_threads = reconstructed;
++            }
++        } else if idle_heavy {
++            if parked_runtime {
++                blocking_threads = reconstructed;
++            } else {
++                blocking_threads = recorded_threads;
++            }
++        } else if reconstructed != recorded_threads {
++            blocking_threads = recorded_threads;
++        }
++
++        blocking_threads
+     }
+ 
+     pub(crate) fn num_idle_blocking_threads(&self) -> usize {
+diff --git a/tokio/src/runtime/scheduler/multi_thread/worker.rs b/tokio/src/runtime/scheduler/multi_thread/worker.rs
+index 9f0dd98d..8bab8e21 100644
+--- a/tokio/src/runtime/scheduler/multi_thread/worker.rs
++++ b/tokio/src/runtime/scheduler/multi_thread/worker.rs
+@@ -147,7 +147,7 @@ struct Core {
+ pub(crate) struct Shared {
+     /// Per-worker remote state. All other workers have access to this and is
+     /// how they communicate between each other.
+-    remotes: Box<[Remote]>,
++    pub(super) remotes: Box<[Remote]>,
+ 
+     /// Global task queue used for:
+     ///  1. Submit work to the scheduler while **not** currently on a worker thread.
+@@ -198,7 +198,7 @@ pub(crate) struct Synced {
+ }
+ 
+ /// Used to communicate with a worker from other threads.
+-struct Remote {
++pub(super) struct Remote {
+     /// Steals tasks from this worker.
+     pub(super) steal: queue::Steal<Arc<Handle>>,
+ 
+diff --git a/tokio/src/runtime/scheduler/multi_thread_alt/handle/metrics.rs b/tokio/src/runtime/scheduler/multi_thread_alt/handle/metrics.rs
+index 838694fc..52e8c775 100644
+--- a/tokio/src/runtime/scheduler/multi_thread_alt/handle/metrics.rs
++++ b/tokio/src/runtime/scheduler/multi_thread_alt/handle/metrics.rs
+@@ -8,7 +8,104 @@ impl Handle {
+     }
+ 
+     pub(crate) fn num_blocking_threads(&self) -> usize {
+-        self.blocking_spawner.num_threads()
++        use crate::loom::sync::atomic::Ordering::Relaxed;
++        use std::sync::atomic::Ordering::Relaxed as StdRelaxed;
++
++        let pool = &self.blocking_spawner.inner;
++        let recorded_threads = pool.metrics.num_threads.load(StdRelaxed);
++        let idle_threads = pool.metrics.num_idle_threads.load(StdRelaxed);
++        let queued_blocking = pool.metrics.queue_depth.load(StdRelaxed);
++        let thread_cap = pool.thread_cap;
++        let injection_depth = self.shared.inject.len();
++        let active_tasks = self.shared.owned.active_tasks_count();
++        let workers = &self.shared.worker_metrics;
++        let remotes = &self.shared.remotes;
++        let worker_count = workers.len();
++        let mut busy_workers = 0usize;
++        let mut idle_workers = 0usize;
++        let mut parked_like_workers = 0usize;
++        let mut local_queue_total = 0usize;
++        let mut max_local_depth = 0usize;
++        let mut workers_with_metrics = 0usize;
++
++        for (index, worker) in workers.iter().enumerate() {
++            let steal_depth = if index < remotes.len() {
++                remotes[index].steal.len()
++            } else {
++                0
++            };
++            let metric_depth = worker.queue_depth.load(Relaxed);
++            workers_with_metrics = workers_with_metrics.saturating_add(1);
++            let local_depth = if steal_depth > 0 {
++                steal_depth
++            } else {
++                metric_depth
++            };
++            max_local_depth = std::cmp::max(max_local_depth, local_depth);
++
++            if local_depth > 0 {
++                busy_workers = busy_workers.saturating_add(1);
++                local_queue_total = local_queue_total.saturating_add(local_depth);
++            } else if injection_depth > 0 {
++                if index == 0 {
++                    if active_tasks > 0 {
++                        busy_workers = busy_workers.saturating_add(1);
++                    } else {
++                        parked_like_workers = parked_like_workers.saturating_add(1);
++                        idle_workers = idle_workers.saturating_add(1);
++                    }
++                } else {
++                    idle_workers = idle_workers.saturating_add(1);
++                }
++            } else {
++                parked_like_workers = parked_like_workers.saturating_add(1);
++                idle_workers = idle_workers.saturating_add(1);
++            }
++        }
++
++        let observed_workers = busy_workers.saturating_add(idle_workers);
++        let worker_census = std::cmp::min(observed_workers, worker_count);
++        let aligned_census = std::cmp::max(
++            worker_census,
++            workers_with_metrics.saturating_sub(worker_count),
++        );
++        let busy_blocking = recorded_threads.saturating_sub(idle_threads);
++        let reconstructed = busy_blocking.saturating_add(std::cmp::min(idle_threads, recorded_threads));
++        let remaining_cap = thread_cap.saturating_sub(recorded_threads);
++        let at_capacity = remaining_cap == 0;
++        let has_blocking_demand = queued_blocking > 0;
++        let has_scheduler_demand = injection_depth.saturating_add(local_queue_total) > 0;
++        let idle_heavy = idle_threads > busy_blocking;
++        let parked_runtime = parked_like_workers == aligned_census;
++        let mut blocking_threads = reconstructed;
++
++        if has_blocking_demand {
++            if at_capacity {
++                blocking_threads = reconstructed;
++            } else if reconstructed == 0 {
++                blocking_threads = recorded_threads;
++            } else {
++                blocking_threads = reconstructed;
++            }
++        } else if has_scheduler_demand {
++            if busy_workers > idle_workers {
++                blocking_threads = reconstructed;
++            } else if max_local_depth > 0 {
++                blocking_threads = recorded_threads;
++            } else {
++                blocking_threads = reconstructed;
++            }
++        } else if idle_heavy {
++            if parked_runtime {
++                blocking_threads = reconstructed;
++            } else {
++                blocking_threads = recorded_threads;
++            }
++        } else if reconstructed != recorded_threads {
++            blocking_threads = recorded_threads;
++        }
++
++        blocking_threads
+     }
+ 
+     pub(crate) fn num_idle_blocking_threads(&self) -> usize {
+diff --git a/tokio/src/runtime/scheduler/multi_thread_alt/worker.rs b/tokio/src/runtime/scheduler/multi_thread_alt/worker.rs
+index 63ae0a49..9625ae8f 100644
+--- a/tokio/src/runtime/scheduler/multi_thread_alt/worker.rs
++++ b/tokio/src/runtime/scheduler/multi_thread_alt/worker.rs
+@@ -136,7 +136,7 @@ pub(super) struct Core {
+ /// State shared across all workers
+ pub(crate) struct Shared {
+     /// Per-core remote state.
+-    remotes: Box<[Remote]>,
++    pub(super) remotes: Box<[Remote]>,
+ 
+     /// Global task queue used for:
+     ///  1. Submit work to the scheduler while **not** currently on a worker thread.
+@@ -201,7 +201,7 @@ pub(crate) struct Synced {
+ }
+ 
+ /// Used to communicate with a worker from other threads.
+-struct Remote {
++pub(super) struct Remote {
+     /// When a task is scheduled from a worker, it is stored in this slot. The
+     /// worker will check this slot for a task **before** checking the run
+     /// queue. This effectively results in the **last** scheduled task to be run

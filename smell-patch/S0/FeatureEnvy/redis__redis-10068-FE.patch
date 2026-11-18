@@ -1,0 +1,555 @@
+diff --git a/src/listpack.c b/src/listpack.c
+index 450976e2c..958d11377 100644
+--- a/src/listpack.c
++++ b/src/listpack.c
+@@ -665,6 +665,29 @@ unsigned char *lpGet(unsigned char *p, int64_t *count, unsigned char *intbuf) {
+     return lpGetWithSize(p, count, intbuf, NULL);
+ }
+ 
++/* Wrapper around lpGet() that returns an integer, converting a string-encoded
++ * number when needed. If 'valid' is not NULL it reports whether the record
++ * could be parsed; otherwise a failed conversion asserts. */
++int64_t lpGetIntegerIfValid(unsigned char *ele, int *valid) {
++    int64_t v;
++    unsigned char *e = lpGet(ele,&v,NULL);
++    if (e == NULL) {
++        if (valid)
++            *valid = 1;
++        return v;
++    }
++    /* Listpacks currently store int64 values in integer form, but keep a
++     * conversion path in case the encoding changes. */
++    long long ll;
++    int ret = string2ll((char*)e,v,&ll);
++    if (valid)
++        *valid = ret;
++    else
++        assert(ret != 0);
++    v = ll;
++    return v;
++}
++
+ /* This is just a wrapper to lpGet() that is able to get entry value directly.
+  * When the function returns NULL, it populates the integer value by reference in 'lval'.
+  * Otherwise if the element is encoded as a string a pointer to the string (pointing
+diff --git a/src/listpack.h b/src/listpack.h
+index 6c4d6bdd6..8362c9e67 100644
+--- a/src/listpack.h
++++ b/src/listpack.h
+@@ -71,6 +71,8 @@ unsigned char *lpDeleteRange(unsigned char *lp, long index, unsigned long num);
+ unsigned char *lpMerge(unsigned char **first, unsigned char **second);
+ unsigned long lpLength(unsigned char *lp);
+ unsigned char *lpGet(unsigned char *p, int64_t *count, unsigned char *intbuf);
++int64_t lpGetIntegerIfValid(unsigned char *ele, int *valid);
++#define lpGetInteger(ele) lpGetIntegerIfValid((ele), NULL)
+ unsigned char *lpGetValue(unsigned char *p, unsigned int *slen, long long *lval);
+ unsigned char *lpFind(unsigned char *lp, unsigned char *p, unsigned char *s, uint32_t slen, unsigned int skip);
+ unsigned char *lpFirst(unsigned char *lp);
+diff --git a/src/rax.c b/src/rax.c
+index 3e6829c6e..899491ba0 100644
+--- a/src/rax.c
++++ b/src/rax.c
+@@ -30,6 +30,7 @@
+  * POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
++#include "server.h"
+ #include <stdlib.h>
+ #include <string.h>
+ #include <assert.h>
+@@ -1925,3 +1926,182 @@ unsigned long raxTouch(raxNode *n) {
+     }
+     return sum;
+ }
++
++/* Trim the stream 's' according to args->trim_strategy, and return the
++ * number of elements removed from the stream. The 'approx' option, if non-zero,
++ * specifies that the trimming must be performed in a approximated way in
++ * order to maximize performances. This means that the stream may contain
++ * entries with IDs < 'id' in case of MINID (or more elements than 'maxlen'
++ * in case of MAXLEN), and elements are only removed if we can remove
++ * a *whole* node of the radix tree. The elements are removed from the head
++ * of the stream (older elements).
++ *
++ * The function may return zero if:
++ *
++ * 1) The minimal entry ID of the stream is already < 'id' (MINID); or
++ * 2) The stream is already shorter or equal to the specified max length (MAXLEN); or
++ * 3) The 'approx' option is true and the head node did not have enough elements
++ *    to be deleted.
++ *
++ * args->limit is the maximum number of entries to delete. The purpose is to
++ * prevent this function from taking to long.
++ * If 'limit' is 0 then we do not limit the number of deleted entries.
++ * Much like the 'approx', if 'limit' is smaller than the number of entries
++ * that should be trimmed, there is a chance we will still have entries with
++ * IDs < 'id' (or number of elements >= maxlen in case of MAXLEN).
++ *
++ * Implemented next to the radix-tree iterator so that node walking, key
++ * buffers and associated listpack payloads can be handled together.
++ */
++int64_t streamTrim(stream *s, streamAddTrimArgs *args) {
++    size_t maxlen = args->maxlen;
++    streamID *id = &args->minid;
++    int approx = args->approx_trim;
++    int64_t limit = args->limit;
++    int trim_strategy = args->trim_strategy;
++
++    if (trim_strategy == TRIM_STRATEGY_NONE)
++        return 0;
++
++    raxIterator ri;
++    raxStart(&ri,s->rax);
++    raxSeek(&ri,"^",NULL,0);
++
++    int64_t deleted = 0;
++    while (raxNext(&ri)) {
++        if (trim_strategy == TRIM_STRATEGY_MAXLEN && s->length <= maxlen)
++            break;
++
++        unsigned char *lp = ri.data, *p = lpFirst(lp);
++        int64_t entries = lpGetInteger(p);
++
++        /* Check if we exceeded the amount of work we could do */
++        if (limit && (deleted + entries) > limit)
++            break;
++
++        /* Check if we can remove the whole node. */
++        int remove_node;
++        streamID master_id = {0}; /* For MINID */
++        if (trim_strategy == TRIM_STRATEGY_MAXLEN) {
++            remove_node = s->length - entries >= maxlen;
++        } else {
++            /* Read the master ID from the radix tree key. */
++            streamDecodeID(ri.key, &master_id);
++
++            /* Read last ID. */
++            streamID last_id;
++            lpGetEdgeStreamID(lp, 0, &master_id, &last_id);
++
++            /* We can remove the entire node id its last ID < 'id' */
++            remove_node = streamCompareID(&last_id, id) < 0;
++        }
++
++        if (remove_node) {
++            lpFree(lp);
++            raxRemove(s->rax,ri.key,ri.key_len,NULL);
++            raxSeek(&ri,">=",ri.key,ri.key_len);
++            s->length -= entries;
++            deleted += entries;
++            continue;
++        }
++
++        /* If we cannot remove a whole element, and approx is true,
++         * stop here. */
++        if (approx) break;
++
++        /* Now we have to trim entries from within 'lp' */
++        int64_t deleted_from_lp = 0;
++
++        p = lpNext(lp, p); /* Skip deleted field. */
++        p = lpNext(lp, p); /* Skip num-of-fields in the master entry. */
++
++        /* Skip all the master fields. */
++        int64_t master_fields_count = lpGetInteger(p);
++        p = lpNext(lp,p); /* Skip the first field. */
++        for (int64_t j = 0; j < master_fields_count; j++)
++            p = lpNext(lp,p); /* Skip all master fields. */
++        p = lpNext(lp,p); /* Skip the zero master entry terminator. */
++
++        /* 'p' is now pointing to the first entry inside the listpack.
++         * We have to run entry after entry, marking entries as deleted
++         * if they are already not deleted. */
++        while (p) {
++            /* We keep a copy of p (which point to flags part) in order to
++             * update it after (and if) we actually remove the entry */
++            unsigned char *pcopy = p;
++
++            int flags = lpGetInteger(p);
++            p = lpNext(lp, p); /* Skip flags. */
++            int to_skip;
++
++            int ms_delta = lpGetInteger(p);
++            p = lpNext(lp, p); /* Skip ID ms delta */
++            int seq_delta = lpGetInteger(p);
++            p = lpNext(lp, p); /* Skip ID seq delta */
++
++            streamID currid = {0}; /* For MINID */
++            if (trim_strategy == TRIM_STRATEGY_MINID) {
++                currid.ms = master_id.ms + ms_delta;
++                currid.seq = master_id.seq + seq_delta;
++            }
++
++            int stop;
++            if (trim_strategy == TRIM_STRATEGY_MAXLEN) {
++                stop = s->length <= maxlen;
++            } else {
++                /* Following IDs will definitely be greater because the rax
++                 * tree is sorted, no point of continuing. */
++                stop = streamCompareID(&currid, id) >= 0;
++            }
++            if (stop)
++                break;
++
++            if (flags & STREAM_ITEM_FLAG_SAMEFIELDS) {
++                to_skip = master_fields_count;
++            } else {
++                to_skip = lpGetInteger(p); /* Get num-fields. */
++                p = lpNext(lp,p); /* Skip num-fields. */
++                to_skip *= 2; /* Fields and values. */
++            }
++
++            while(to_skip--) p = lpNext(lp,p); /* Skip the whole entry. */
++            p = lpNext(lp,p); /* Skip the final lp-count field. */
++
++            /* Mark the entry as deleted. */
++            if (!(flags & STREAM_ITEM_FLAG_DELETED)) {
++                intptr_t delta = p - lp;
++                flags |= STREAM_ITEM_FLAG_DELETED;
++                lp = lpReplaceInteger(lp, &pcopy, flags);
++                deleted_from_lp++;
++                s->length--;
++                p = lp + delta;
++            }
++        }
++        deleted += deleted_from_lp;
++
++        /* Now we the entries/deleted counters. */
++        p = lpFirst(lp);
++        lp = lpReplaceInteger(lp,&p,entries-deleted_from_lp);
++        p = lpNext(lp,p); /* Skip deleted field. */
++        int64_t marked_deleted = lpGetInteger(p);
++        lp = lpReplaceInteger(lp,&p,marked_deleted+deleted_from_lp);
++        p = lpNext(lp,p); /* Skip num-of-fields in the master entry. */
++
++        /* Here we should perform garbage collection in case at this point
++         * there are too many entries deleted inside the listpack. */
++        entries -= deleted_from_lp;
++        marked_deleted += deleted_from_lp;
++        if (entries + marked_deleted > 10 && marked_deleted > entries/2) {
++            /* TODO: perform a garbage collection. */
++        }
++
++        /* Update the listpack with the new pointer. */
++        raxInsert(s->rax,ri.key,ri.key_len,lp,NULL);
++
++        break; /* If we are here, there was enough to delete in the current
++                  node, so no need to go to the next node. */
++    }
++
++    raxStop(&ri);
++    return deleted;
++}
+diff --git a/src/stream.h b/src/stream.h
+index 724f2c2ad..7b72f06a6 100644
+--- a/src/stream.h
++++ b/src/stream.h
+@@ -93,6 +93,38 @@ typedef struct streamPropInfo {
+     robj *groupname;
+ } streamPropInfo;
+ 
++/* Every stream item inside the listpack, has a flags field that is used to
++ * mark the entry as deleted, or having the same field as the "master"
++ * entry at the start of the listpack> */
++#define STREAM_ITEM_FLAG_NONE 0             /* No special flags. */
++#define STREAM_ITEM_FLAG_DELETED (1<<0)     /* Entry is deleted. Skip it. */
++#define STREAM_ITEM_FLAG_SAMEFIELDS (1<<1)  /* Same fields as master entry. */
++
++#define TRIM_STRATEGY_NONE 0
++#define TRIM_STRATEGY_MAXLEN 1
++#define TRIM_STRATEGY_MINID 2
++
++/* Parsed XADD/XTRIM options used while appending or trimming a stream. */
++typedef struct {
++    /* XADD options */
++    streamID id; /* User-provided ID, for XADD only. */
++    int id_given; /* Was an ID different than "*" specified? for XADD only. */
++    int seq_given; /* Was an ID different than "ms-*" specified? for XADD only. */
++    int no_mkstream; /* if set to 1 do not create new stream */
++
++    /* XADD + XTRIM common options */
++    int trim_strategy; /* TRIM_STRATEGY_* */
++    int trim_strategy_arg_idx; /* Index of the count in MAXLEN/MINID, for rewriting. */
++    int approx_trim; /* If 1 only delete whole radix tree nodes, so
++                      * the trim argument is not applied verbatim. */
++    long long limit; /* Maximum amount of entries to trim. If 0, no limitation
++                      * on the amount of trimming work is enforced. */
++    /* TRIM_STRATEGY_MAXLEN options */
++    long long maxlen; /* After trimming, leave stream at this length . */
++    /* TRIM_STRATEGY_MINID options */
++    streamID minid; /* Trim by ID (No stream entries with ID < 'minid' will remain) */
++} streamAddTrimArgs;
++
+ /* Prototypes of exported APIs. */
+ struct client;
+ 
+@@ -131,6 +163,8 @@ int streamParseID(const robj *o, streamID *id);
+ robj *createObjectFromStreamID(streamID *id);
+ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_id, streamID *use_id, int seq_given);
+ int streamDeleteItem(stream *s, streamID *id);
++int lpGetEdgeStreamID(unsigned char *lp, int first, streamID *master_id, streamID *edge_id);
++int64_t streamTrim(stream *s, streamAddTrimArgs *args);
+ int64_t streamTrimByLength(stream *s, long long maxlen, int approx);
+ int64_t streamTrimByID(stream *s, streamID minid, int approx);
+ 
+diff --git a/src/t_stream.c b/src/t_stream.c
+index c49889abe..7cb52ab57 100644
+--- a/src/t_stream.c
++++ b/src/t_stream.c
+@@ -31,13 +31,6 @@
+ #include "endianconv.h"
+ #include "stream.h"
+ 
+-/* Every stream item inside the listpack, has a flags field that is used to
+- * mark the entry as deleted, or having the same field as the "master"
+- * entry at the start of the listpack> */
+-#define STREAM_ITEM_FLAG_NONE 0             /* No special flags. */
+-#define STREAM_ITEM_FLAG_DELETED (1<<0)     /* Entry is deleted. Skip it. */
+-#define STREAM_ITEM_FLAG_SAMEFIELDS (1<<1)  /* Same fields as master entry. */
+-
+ /* For stream commands that require multiple IDs
+  * when the number of IDs is less than 'STREAMID_STATIC_VECTOR_LEN',
+  * avoid malloc allocation.*/
+@@ -247,35 +240,6 @@ robj *streamDup(robj *o) {
+     return sobj;
+ }
+ 
+-/* This is a wrapper function for lpGet() to directly get an integer value
+- * from the listpack (that may store numbers as a string), converting
+- * the string if needed.
+- * The 'valid" argument is an optional output parameter to get an indication
+- * if the record was valid, when this parameter is NULL, the function will
+- * fail with an assertion. */
+-static inline int64_t lpGetIntegerIfValid(unsigned char *ele, int *valid) {
+-    int64_t v;
+-    unsigned char *e = lpGet(ele,&v,NULL);
+-    if (e == NULL) {
+-        if (valid)
+-            *valid = 1;
+-        return v;
+-    }
+-    /* The following code path should never be used for how listpacks work:
+-     * they should always be able to store an int64_t value in integer
+-     * encoded form. However the implementation may change. */
+-    long long ll;
+-    int ret = string2ll((char*)e,v,&ll);
+-    if (valid)
+-        *valid = ret;
+-    else
+-        serverAssert(ret != 0);
+-    v = ll;
+-    return v;
+-}
+-
+-#define lpGetInteger(ele) lpGetIntegerIfValid(ele, NULL)
+-
+ /* Get an edge streamID of a given listpack.
+  * 'master_id' is an input param, used to build the 'edge_id' output param */
+ int lpGetEdgeStreamID(unsigned char *lp, int first, streamID *master_id, streamID *edge_id)
+@@ -669,206 +633,6 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_
+     return C_OK;
+ }
+ 
+-typedef struct {
+-    /* XADD options */
+-    streamID id; /* User-provided ID, for XADD only. */
+-    int id_given; /* Was an ID different than "*" specified? for XADD only. */
+-    int seq_given; /* Was an ID different than "ms-*" specified? for XADD only. */
+-    int no_mkstream; /* if set to 1 do not create new stream */
+-
+-    /* XADD + XTRIM common options */
+-    int trim_strategy; /* TRIM_STRATEGY_* */
+-    int trim_strategy_arg_idx; /* Index of the count in MAXLEN/MINID, for rewriting. */
+-    int approx_trim; /* If 1 only delete whole radix tree nodes, so
+-                      * the trim argument is not applied verbatim. */
+-    long long limit; /* Maximum amount of entries to trim. If 0, no limitation
+-                      * on the amount of trimming work is enforced. */
+-    /* TRIM_STRATEGY_MAXLEN options */
+-    long long maxlen; /* After trimming, leave stream at this length . */
+-    /* TRIM_STRATEGY_MINID options */
+-    streamID minid; /* Trim by ID (No stream entries with ID < 'minid' will remain) */
+-} streamAddTrimArgs;
+-
+-#define TRIM_STRATEGY_NONE 0
+-#define TRIM_STRATEGY_MAXLEN 1
+-#define TRIM_STRATEGY_MINID 2
+-
+-/* Trim the stream 's' according to args->trim_strategy, and return the
+- * number of elements removed from the stream. The 'approx' option, if non-zero,
+- * specifies that the trimming must be performed in a approximated way in
+- * order to maximize performances. This means that the stream may contain
+- * entries with IDs < 'id' in case of MINID (or more elements than 'maxlen'
+- * in case of MAXLEN), and elements are only removed if we can remove
+- * a *whole* node of the radix tree. The elements are removed from the head
+- * of the stream (older elements).
+- *
+- * The function may return zero if:
+- *
+- * 1) The minimal entry ID of the stream is already < 'id' (MINID); or
+- * 2) The stream is already shorter or equal to the specified max length (MAXLEN); or
+- * 3) The 'approx' option is true and the head node did not have enough elements
+- *    to be deleted.
+- *
+- * args->limit is the maximum number of entries to delete. The purpose is to
+- * prevent this function from taking to long.
+- * If 'limit' is 0 then we do not limit the number of deleted entries.
+- * Much like the 'approx', if 'limit' is smaller than the number of entries
+- * that should be trimmed, there is a chance we will still have entries with
+- * IDs < 'id' (or number of elements >= maxlen in case of MAXLEN).
+- */
+-int64_t streamTrim(stream *s, streamAddTrimArgs *args) {
+-    size_t maxlen = args->maxlen;
+-    streamID *id = &args->minid;
+-    int approx = args->approx_trim;
+-    int64_t limit = args->limit;
+-    int trim_strategy = args->trim_strategy;
+-
+-    if (trim_strategy == TRIM_STRATEGY_NONE)
+-        return 0;
+-
+-    raxIterator ri;
+-    raxStart(&ri,s->rax);
+-    raxSeek(&ri,"^",NULL,0);
+-
+-    int64_t deleted = 0;
+-    while (raxNext(&ri)) {
+-        if (trim_strategy == TRIM_STRATEGY_MAXLEN && s->length <= maxlen)
+-            break;
+-
+-        unsigned char *lp = ri.data, *p = lpFirst(lp);
+-        int64_t entries = lpGetInteger(p);
+-
+-        /* Check if we exceeded the amount of work we could do */
+-        if (limit && (deleted + entries) > limit)
+-            break;
+-
+-        /* Check if we can remove the whole node. */
+-        int remove_node;
+-        streamID master_id = {0}; /* For MINID */
+-        if (trim_strategy == TRIM_STRATEGY_MAXLEN) {
+-            remove_node = s->length - entries >= maxlen;
+-        } else {
+-            /* Read the master ID from the radix tree key. */
+-            streamDecodeID(ri.key, &master_id);
+-
+-            /* Read last ID. */
+-            streamID last_id;
+-            lpGetEdgeStreamID(lp, 0, &master_id, &last_id);
+-
+-            /* We can remove the entire node id its last ID < 'id' */
+-            remove_node = streamCompareID(&last_id, id) < 0;
+-        }
+-
+-        if (remove_node) {
+-            lpFree(lp);
+-            raxRemove(s->rax,ri.key,ri.key_len,NULL);
+-            raxSeek(&ri,">=",ri.key,ri.key_len);
+-            s->length -= entries;
+-            deleted += entries;
+-            continue;
+-        }
+-
+-        /* If we cannot remove a whole element, and approx is true,
+-         * stop here. */
+-        if (approx) break;
+-
+-        /* Now we have to trim entries from within 'lp' */
+-        int64_t deleted_from_lp = 0;
+-
+-        p = lpNext(lp, p); /* Skip deleted field. */
+-        p = lpNext(lp, p); /* Skip num-of-fields in the master entry. */
+-
+-        /* Skip all the master fields. */
+-        int64_t master_fields_count = lpGetInteger(p);
+-        p = lpNext(lp,p); /* Skip the first field. */
+-        for (int64_t j = 0; j < master_fields_count; j++)
+-            p = lpNext(lp,p); /* Skip all master fields. */
+-        p = lpNext(lp,p); /* Skip the zero master entry terminator. */
+-
+-        /* 'p' is now pointing to the first entry inside the listpack.
+-         * We have to run entry after entry, marking entries as deleted
+-         * if they are already not deleted. */
+-        while (p) {
+-            /* We keep a copy of p (which point to flags part) in order to
+-             * update it after (and if) we actually remove the entry */
+-            unsigned char *pcopy = p;
+-
+-            int flags = lpGetInteger(p);
+-            p = lpNext(lp, p); /* Skip flags. */
+-            int to_skip;
+-
+-            int ms_delta = lpGetInteger(p);
+-            p = lpNext(lp, p); /* Skip ID ms delta */
+-            int seq_delta = lpGetInteger(p);
+-            p = lpNext(lp, p); /* Skip ID seq delta */
+-
+-            streamID currid = {0}; /* For MINID */
+-            if (trim_strategy == TRIM_STRATEGY_MINID) {
+-                currid.ms = master_id.ms + ms_delta;
+-                currid.seq = master_id.seq + seq_delta;
+-            }
+-
+-            int stop;
+-            if (trim_strategy == TRIM_STRATEGY_MAXLEN) {
+-                stop = s->length <= maxlen;
+-            } else {
+-                /* Following IDs will definitely be greater because the rax
+-                 * tree is sorted, no point of continuing. */
+-                stop = streamCompareID(&currid, id) >= 0;
+-            }
+-            if (stop)
+-                break;
+-
+-            if (flags & STREAM_ITEM_FLAG_SAMEFIELDS) {
+-                to_skip = master_fields_count;
+-            } else {
+-                to_skip = lpGetInteger(p); /* Get num-fields. */
+-                p = lpNext(lp,p); /* Skip num-fields. */
+-                to_skip *= 2; /* Fields and values. */
+-            }
+-
+-            while(to_skip--) p = lpNext(lp,p); /* Skip the whole entry. */
+-            p = lpNext(lp,p); /* Skip the final lp-count field. */
+-
+-            /* Mark the entry as deleted. */
+-            if (!(flags & STREAM_ITEM_FLAG_DELETED)) {
+-                intptr_t delta = p - lp;
+-                flags |= STREAM_ITEM_FLAG_DELETED;
+-                lp = lpReplaceInteger(lp, &pcopy, flags);
+-                deleted_from_lp++;
+-                s->length--;
+-                p = lp + delta;
+-            }
+-        }
+-        deleted += deleted_from_lp;
+-
+-        /* Now we the entries/deleted counters. */
+-        p = lpFirst(lp);
+-        lp = lpReplaceInteger(lp,&p,entries-deleted_from_lp);
+-        p = lpNext(lp,p); /* Skip deleted field. */
+-        int64_t marked_deleted = lpGetInteger(p);
+-        lp = lpReplaceInteger(lp,&p,marked_deleted+deleted_from_lp);
+-        p = lpNext(lp,p); /* Skip num-of-fields in the master entry. */
+-
+-        /* Here we should perform garbage collection in case at this point
+-         * there are too many entries deleted inside the listpack. */
+-        entries -= deleted_from_lp;
+-        marked_deleted += deleted_from_lp;
+-        if (entries + marked_deleted > 10 && marked_deleted > entries/2) {
+-            /* TODO: perform a garbage collection. */
+-        }
+-
+-        /* Update the listpack with the new pointer. */
+-        raxInsert(s->rax,ri.key,ri.key_len,lp,NULL);
+-
+-        break; /* If we are here, there was enough to delete in the current
+-                  node, so no need to go to the next node. */
+-    }
+-
+-    raxStop(&ri);
+-    return deleted;
+-}
+-
+ /* Trims a stream by length. Returns the number of deleted items. */
+ int64_t streamTrimByLength(stream *s, long long maxlen, int approx) {
+     streamAddTrimArgs args = {

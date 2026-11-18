@@ -1,0 +1,177 @@
+diff --git a/promql/engine.go b/promql/engine.go
+index dd855c6d2..270e0d894 100644
+--- a/promql/engine.go
++++ b/promql/engine.go
+@@ -730,6 +730,7 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
+ 			samplesStats:             query.sampleStats,
+ 			noStepSubqueryIntervalFn: ng.noStepSubqueryIntervalFn,
+ 			enableDelayedNameRemoval: ng.enableDelayedNameRemoval,
++			ng:                       ng,
+ 		}
+ 		query.sampleStats.InitStepTracking(start, start, 1)
+ 
+@@ -788,6 +789,7 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
+ 		samplesStats:             query.sampleStats,
+ 		noStepSubqueryIntervalFn: ng.noStepSubqueryIntervalFn,
+ 		enableDelayedNameRemoval: ng.enableDelayedNameRemoval,
++		ng:                       ng,
+ 	}
+ 	query.sampleStats.InitStepTracking(evaluator.startTimestamp, evaluator.endTimestamp, evaluator.interval)
+ 	val, warnings, err := evaluator.Eval(ctxInnerEval, s.Expr)
+@@ -1052,6 +1054,9 @@ type evaluator struct {
+ 	samplesStats             *stats.QuerySamples
+ 	noStepSubqueryIntervalFn func(rangeMillis int64) int64
+ 	enableDelayedNameRemoval bool
++	ng                       *Engine
++	matrixSel                *parser.MatrixSelector
++	vectorSel                *parser.VectorSelector
+ }
+ 
+ // errorf causes a panic with the input formatted into an error.
+@@ -1936,7 +1941,9 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value,
+ 		if ev.startTimestamp != ev.endTimestamp {
+ 			panic(errors.New("cannot do range evaluation of matrix selector"))
+ 		}
+-		return ev.matrixSelector(ctx, e)
++		ev.matrixSel = e
++		ev.vectorSel = e.VectorSelector.(*parser.VectorSelector)
++		return ev.ng.matrixSelector(ev, ctx)
+ 
+ 	case *parser.SubqueryExpr:
+ 		offsetMillis := durationMilliseconds(e.Offset)
+@@ -1950,6 +1957,7 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value,
+ 			samplesStats:             ev.samplesStats.NewChild(),
+ 			noStepSubqueryIntervalFn: ev.noStepSubqueryIntervalFn,
+ 			enableDelayedNameRemoval: ev.enableDelayedNameRemoval,
++			ng:                       ev.ng,
+ 		}
+ 
+ 		if e.Step != 0 {
+@@ -1994,6 +2002,7 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value,
+ 			samplesStats:             ev.samplesStats.NewChild(),
+ 			noStepSubqueryIntervalFn: ev.noStepSubqueryIntervalFn,
+ 			enableDelayedNameRemoval: ev.enableDelayedNameRemoval,
++			ng:                       ev.ng,
+ 		}
+ 		res, ws := newEv.eval(ctx, e.Expr)
+ 		ev.currentSamples = newEv.currentSamples
+@@ -2218,49 +2227,6 @@ func putMatrixSelectorHPointSlice(p []HPoint) {
+ 	}
+ }
+ 
+-// matrixSelector evaluates a *parser.MatrixSelector expression.
+-func (ev *evaluator) matrixSelector(ctx context.Context, node *parser.MatrixSelector) (Matrix, annotations.Annotations) {
+-	var (
+-		vs = node.VectorSelector.(*parser.VectorSelector)
+-
+-		offset = durationMilliseconds(vs.Offset)
+-		maxt   = ev.startTimestamp - offset
+-		mint   = maxt - durationMilliseconds(node.Range)
+-		matrix = make(Matrix, 0, len(vs.Series))
+-
+-		it = storage.NewBuffer(durationMilliseconds(node.Range))
+-	)
+-	ws, err := checkAndExpandSeriesSet(ctx, node)
+-	if err != nil {
+-		ev.error(errWithWarnings{fmt.Errorf("expanding series: %w", err), ws})
+-	}
+-
+-	var chkIter chunkenc.Iterator
+-	series := vs.Series
+-	for i, s := range series {
+-		if err := contextDone(ctx, "expression evaluation"); err != nil {
+-			ev.error(err)
+-		}
+-		chkIter = s.Iterator(chkIter)
+-		it.Reset(chkIter)
+-		ss := Series{
+-			Metric: series[i].Labels(),
+-		}
+-
+-		ss.Floats, ss.Histograms = ev.matrixIterSlice(it, mint, maxt, nil, nil)
+-		totalSize := int64(len(ss.Floats)) + int64(totalHPointSize(ss.Histograms))
+-		ev.samplesStats.IncrementSamplesAtTimestamp(ev.startTimestamp, totalSize)
+-
+-		if totalSize > 0 {
+-			matrix = append(matrix, ss)
+-		} else {
+-			putFPointSlice(ss.Floats)
+-			putHPointSlice(ss.Histograms)
+-		}
+-	}
+-	return matrix, ws
+-}
+-
+ // matrixIterSlice populates a matrix vector covering the requested range for a
+ // single time series, with points retrieved from an iterator.
+ //
+diff --git a/promql/query_logger.go b/promql/query_logger.go
+index 7e06ebb97..212c0a9d1 100644
+--- a/promql/query_logger.go
++++ b/promql/query_logger.go
+@@ -28,6 +28,12 @@ import (
+ 	"github.com/edsrzf/mmap-go"
+ 	"github.com/go-kit/log"
+ 	"github.com/go-kit/log/level"
++	"go.opentelemetry.io/otel/attribute"
++	"go.opentelemetry.io/otel/trace"
++
++	"github.com/prometheus/prometheus/storage"
++	"github.com/prometheus/prometheus/tsdb/chunkenc"
++	"github.com/prometheus/prometheus/util/annotations"
+ )
+ 
+ type ActiveQueryTracker struct {
+@@ -235,3 +241,52 @@ func (tracker *ActiveQueryTracker) Close() error {
+ 	}
+ 	return nil
+ }
++
++// matrixSelector evaluates a matrix selector expression.
++func (ng *Engine) matrixSelector(ev *evaluator, ctx context.Context) (Matrix, annotations.Annotations) {
++	vs := ev.vectorSel
++	node := ev.matrixSel
++	qs := ev.samplesStats
++
++	offset := durationMilliseconds(vs.Offset)
++	maxt := ev.startTimestamp - offset
++	mint := maxt - durationMilliseconds(node.Range)
++	matrix := make(Matrix, 0, len(vs.Series))
++	it := storage.NewBuffer(durationMilliseconds(node.Range))
++
++	span := trace.SpanFromContext(ctx)
++	span.SetAttributes(attribute.Bool("engine_per_step_stats", ng.enablePerStepStats && qs.EnablePerStepStats))
++	if start := vs.PosRange.Start; start >= 0 {
++		span.SetAttributes(attribute.Int64("selector_start_pos", int64(start)))
++	}
++
++	ws, err := checkAndExpandSeriesSet(ctx, node)
++	if err != nil {
++		ev.error(errWithWarnings{fmt.Errorf("expanding series: %w", err), ws})
++	}
++
++	var chkIter chunkenc.Iterator
++	series := vs.Series
++	for i, s := range series {
++		if err := contextDone(ctx, "expression evaluation"); err != nil {
++			ev.error(err)
++		}
++		chkIter = s.Iterator(chkIter)
++		it.Reset(chkIter)
++		ss := Series{
++			Metric: series[i].Labels(),
++		}
++
++		ss.Floats, ss.Histograms = ev.matrixIterSlice(it, mint, maxt, nil, nil)
++		totalSize := int64(len(ss.Floats)) + int64(totalHPointSize(ss.Histograms))
++		qs.IncrementSamplesAtTimestamp(ev.startTimestamp, totalSize)
++
++		if totalSize > 0 {
++			matrix = append(matrix, ss)
++		} else {
++			putFPointSlice(ss.Floats)
++			putHPointSlice(ss.Histograms)
++		}
++	}
++	return matrix, ws
++}

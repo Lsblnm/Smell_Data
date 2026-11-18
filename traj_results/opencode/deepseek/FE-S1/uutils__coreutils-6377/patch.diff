@@ -1,0 +1,201 @@
+diff --git a/src/uu/env/src/env.rs b/src/uu/env/src/env.rs
+index 39ce7c7b2..78366083b 100644
+--- a/src/uu/env/src/env.rs
++++ b/src/uu/env/src/env.rs
+@@ -32,6 +32,7 @@ use std::process::{self};
+ use uucore::display::Quotable;
+ use uucore::error::{ExitCode, UError, UResult, USimpleError, UUsageError};
+ use uucore::line_ending::LineEnding;
++use uucore::signals::signal_by_name_or_value;
+ use uucore::{format_usage, help_about, help_section, help_usage, show_warning};
+ 
+ const ABOUT: &str = help_about!("env.md");
+@@ -40,6 +41,10 @@ const AFTER_HELP: &str = help_section!("after help", "env.md");
+ 
+ const ERROR_MSG_S_SHEBANG: &str = "use -[v]S to pass options in shebang lines";
+ 
++// A NUL byte cannot appear in a command-line argument, so it is safe to use as
++// the value for an `--ignore-signal` option given without an argument.
++const IGNORE_ALL_SIGNALS: &str = "\0";
++
+ struct Options<'a> {
+     ignore_env: bool,
+     line_ending: LineEnding,
+@@ -49,6 +54,8 @@ struct Options<'a> {
+     sets: Vec<(Cow<'a, OsStr>, Cow<'a, OsStr>)>,
+     program: Vec<&'a OsStr>,
+     argv0: Option<&'a OsStr>,
++    ignore_all_signals: bool,
++    ignore_signals: Vec<usize>,
+ }
+ 
+ // print name=value env pairs on screen
+@@ -138,6 +145,17 @@ pub fn uu_app() -> Command {
+                 .value_hint(clap::ValueHint::DirPath)
+                 .help("change working directory to DIR"),
+         )
++        .arg(
++            Arg::new("ignore-signal")
++                .long("ignore-signal")
++                .value_name("SIG")
++                .num_args(0..=1)
++                .require_equals(true)
++                .default_missing_value(IGNORE_ALL_SIGNALS)
++                .value_parser(ValueParser::os_string())
++                .action(ArgAction::Append)
++                .help("set handling of SIG signal(s) to do nothing"),
++        )
+         .arg(
+             Arg::new("null")
+                 .short('0')
+@@ -411,6 +429,7 @@ impl EnvAppData {
+             // no program provided, so just dump all env vars to stdout
+             print_env(opts.line_ending);
+         } else {
++            apply_ignore_signals(&opts)?;
+             return self.run_program(&opts, self.do_debug_printing);
+         }
+ 
+@@ -438,6 +457,34 @@ impl EnvAppData {
+         let mut cmd = process::Command::new(&*prog);
+         cmd.args(args);
+ 
++        #[cfg(unix)]
++        {
++            let ignore_all_signals = opts.ignore_all_signals;
++            let ignore_signals = opts.ignore_signals.clone();
++            // SAFETY: this closure only installs signal handlers in the child
++            // after fork and before exec. It does not access any shared state.
++            unsafe {
++                cmd.pre_exec(move || {
++                    let action =
++                        SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
++
++                    if ignore_all_signals {
++                        for signal in Signal::iterator() {
++                            let _ = sigaction(signal, &action);
++                        }
++                    }
++
++                    for &signal_value in &ignore_signals {
++                        if let Ok(signal) = Signal::try_from(signal_value as i32) {
++                            let _ = sigaction(signal, &action);
++                        }
++                    }
++
++                    Ok(())
++                });
++            }
++        }
++
+         if let Some(_argv0) = opts.argv0 {
+             #[cfg(unix)]
+             {
+@@ -532,6 +579,7 @@ fn make_options(matches: &clap::ArgMatches) -> UResult<Options<'_>> {
+         None => Vec::with_capacity(0),
+     };
+     let argv0 = matches.get_one::<OsString>("argv0").map(|s| s.as_os_str());
++    let (ignore_all_signals, ignore_signals) = parse_ignore_signals(matches)?;
+ 
+     let mut opts = Options {
+         ignore_env,
+@@ -542,6 +590,8 @@ fn make_options(matches: &clap::ArgMatches) -> UResult<Options<'_>> {
+         sets: vec![],
+         program: vec![],
+         argv0,
++        ignore_all_signals,
++        ignore_signals,
+     };
+ 
+     let mut begin_prog_opts = false;
+@@ -568,6 +618,90 @@ fn make_options(matches: &clap::ArgMatches) -> UResult<Options<'_>> {
+     Ok(opts)
+ }
+ 
++fn parse_ignore_signals(matches: &clap::ArgMatches) -> UResult<(bool, Vec<usize>)> {
++    let mut ignore_all = false;
++    let mut signals = Vec::new();
++
++    if let Some(values) = matches.get_many::<OsString>("ignore-signal") {
++        for value in values {
++            if value.as_os_str() == OsStr::new(IGNORE_ALL_SIGNALS) {
++                ignore_all = true;
++                continue;
++            }
++
++            let value = value.to_string_lossy();
++            for signal_name in value.split(',') {
++                // An empty SIG argument is a no-op.
++                if signal_name.is_empty() {
++                    continue;
++                }
++
++                let signal_name_upper = signal_name.to_uppercase();
++                match signal_by_name_or_value(&signal_name_upper) {
++                    // Signal 0 (EXIT) cannot be ignored.
++                    Some(0) | None => {
++                        return Err(USimpleError::new(
++                            125,
++                            format!("{}: invalid signal", signal_name.quote()),
++                        ));
++                    }
++                    Some(signal) => signals.push(signal),
++                }
++            }
++        }
++    }
++
++    Ok((ignore_all, signals))
++}
++
++#[cfg(unix)]
++fn apply_ignore_signals(opts: &Options<'_>) -> UResult<()> {
++    let action = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
++
++    if opts.ignore_all_signals {
++        // Without an argument, reset all known signals. Some signals cannot be
++        // ignored, so errors are deliberately ignored in this case.
++        for signal in Signal::iterator() {
++            // The parent must still be able to wait for the command. SIGCHLD is
++            // ignored in the child instead (see run_program).
++            if signal == Signal::SIGCHLD {
++                continue;
++            }
++            let _ = unsafe { sigaction(signal, &action) };
++        }
++    }
++
++    for &signal_value in &opts.ignore_signals {
++        let Ok(signal) = Signal::try_from(signal_value as i32) else {
++            continue;
++        };
++
++        // The parent must still be able to wait for the command. SIGCHLD is
++        // ignored in the child instead (see run_program).
++        if signal == Signal::SIGCHLD {
++            continue;
++        }
++
++        if let Err(error) = unsafe { sigaction(signal, &action) } {
++            return Err(USimpleError::new(
++                125,
++                format!(
++                    "failed to set signal action for signal {}: {}",
++                    signal_value,
++                    error.desc()
++                ),
++            ));
++        }
++    }
++
++    Ok(())
++}
++
++#[cfg(not(unix))]
++fn apply_ignore_signals(_opts: &Options<'_>) -> UResult<()> {
++    Ok(())
++}
++
+ fn apply_unset_env_vars(opts: &Options<'_>) -> Result<(), Box<dyn UError>> {
+     for name in &opts.unsets {
+         let native_name = NativeStr::new(name);

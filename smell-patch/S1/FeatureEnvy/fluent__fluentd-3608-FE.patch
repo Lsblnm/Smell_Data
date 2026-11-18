@@ -1,0 +1,188 @@
+diff --git a/lib/fluent/plugin/buffer.rb b/lib/fluent/plugin/buffer.rb
+index 8315694e..eaf77cd8 100644
+--- a/lib/fluent/plugin/buffer.rb
++++ b/lib/fluent/plugin/buffer.rb
+@@ -631,6 +631,74 @@ module Fluent
+         end
+       end
+ 
++      def update_retry_state(output, chunk_id, using_secondary, error = nil)
++        output.retry_mutex.synchronize do
++          output.num_errors_metrics.inc
++          chunk_id_hex = dump_unique_id_hex(chunk_id)
++          logger = output.log
++          log_level = logger.level
++          logdev = logger.out
++
++          unless output.retry
++            output.retry = output.retry_state
++            if error
++              if log_level <= 3 && logdev
++                logger.warn "failed to flush the buffer.", retry_times: output.retry.steps, next_retry_time: output.retry.next_time.round, chunk: chunk_id_hex, error: error
++                logger.warn_backtrace
++                logdev.flush
++              end
++            end
++            return
++          end
++
++          retry_state = output.retry
++
++          if retry_state.limit?
++            if error
++              records = 0
++              synchronize do
++                @queue.each do |chunk|
++                  records += chunk.size
++                end
++              end
++              msg = "failed to flush the buffer, and hit limit for retries. dropping all chunks in the buffer queue."
++              if log_level <= 4 && logdev
++                logger.error msg, retry_times: retry_state.steps, records: records, error: error
++                logger.error_backtrace
++                logdev.flush
++              end
++            end
++            clear_queue!
++            @queue_size_metrics.set(0)
++            if log_level <= 1 && logdev
++              logger.debug "buffer queue cleared"
++              logdev.flush
++            end
++            output.retry = nil
++          else
++            # Ensure that the current time is greater than or equal to retry_state.next_time to avoid the situation when
++            # retry_state.step is called almost as many times as the number of flush threads in a short time.
++            if Time.now >= retry_state.next_time
++              retry_state.step
++            else
++              retry_state.recalc_next_time # to prevent all flush threads from retrying at the same time
++            end
++            if error
++              if using_secondary
++                msg = "failed to flush the buffer with secondary output."
++              else
++                msg = "failed to flush the buffer."
++              end
++              if log_level <= 3 && logdev
++                logger.warn msg, retry_times: retry_state.steps, next_retry_time: retry_state.next_time.round, chunk: chunk_id_hex, error: error
++                logger.warn_backtrace
++                logdev.flush
++              end
++            end
++          end
++        end
++      end
++
+       def chunk_size_over?(chunk)
+         chunk.bytesize > @chunk_limit_size || (@chunk_limit_records && chunk.size > @chunk_limit_records)
+       end
+diff --git a/lib/fluent/plugin/output.rb b/lib/fluent/plugin/output.rb
+index 34e31ec8..1da4f038 100644
+--- a/lib/fluent/plugin/output.rb
++++ b/lib/fluent/plugin/output.rb
+@@ -167,7 +167,9 @@ module Fluent
+       attr_reader :as_secondary, :delayed_commit, :delayed_commit_timeout, :timekey_zone
+ 
+       # for tests
+-      attr_reader :buffer, :retry, :secondary, :chunk_keys, :chunk_key_accessors, :chunk_key_time, :chunk_key_tag
++      attr_reader :buffer, :secondary, :chunk_keys, :chunk_key_accessors, :chunk_key_time, :chunk_key_tag
++      attr_accessor :retry
++      attr_reader :retry_mutex, :num_errors_metrics
+       attr_accessor :output_enqueue_thread_waiting, :dequeued_chunks, :dequeued_chunks_mutex
+       # output_enqueue_thread_waiting: for test of output.rb itself
+       attr_accessor :retry_for_error_chunk # if true, error flush will be retried even if under_plugin_development is true
+@@ -1090,7 +1092,7 @@ module Fluent
+           @rollback_count_metrics.inc
+           if update_retry
+             primary = @as_secondary ? @primary_instance : self
+-            primary.update_retry_state(chunk_id, @as_secondary)
++            primary.buffer.update_retry_state(primary, chunk_id, @as_secondary)
+           end
+           true
+         else
+@@ -1106,7 +1108,7 @@ module Fluent
+               @rollback_count_metrics.inc
+               log.warn "failed to flush the buffer chunk, timeout to commit.", chunk_id: dump_unique_id_hex(info.chunk_id), flushed_at: info.time
+               primary = @as_secondary ? @primary_instance : self
+-              primary.update_retry_state(info.chunk_id, @as_secondary)
++              primary.buffer.update_retry_state(primary, info.chunk_id, @as_secondary)
+             end
+           end
+         end
+@@ -1121,7 +1123,7 @@ module Fluent
+               @rollback_count_metrics.inc
+               log.info "delayed commit for buffer chunks was cancelled in shutdown", chunk_id: dump_unique_id_hex(info.chunk_id)
+               primary = @as_secondary ? @primary_instance : self
+-              primary.update_retry_state(info.chunk_id, @as_secondary)
++              primary.buffer.update_retry_state(primary, info.chunk_id, @as_secondary)
+             end
+           end
+         end
+@@ -1232,7 +1234,7 @@ module Fluent
+             @rollback_count_metrics.inc
+           end
+ 
+-          update_retry_state(chunk.unique_id, using_secondary, e)
++          @buffer.update_retry_state(self, chunk.unique_id, using_secondary, e)
+ 
+           raise if @under_plugin_development && !@retry_for_error_chunk
+         end
+@@ -1268,56 +1270,7 @@ module Fluent
+         end
+       end
+ 
+-      def update_retry_state(chunk_id, using_secondary, error = nil)
+-        @retry_mutex.synchronize do
+-          @num_errors_metrics.inc
+-          chunk_id_hex = dump_unique_id_hex(chunk_id)
+-
+-          unless @retry
+-            @retry = retry_state(@buffer_config.retry_randomize)
+-            if error
+-              log.warn "failed to flush the buffer.", retry_times: @retry.steps, next_retry_time: @retry.next_time.round, chunk: chunk_id_hex, error: error
+-              log.warn_backtrace error.backtrace
+-            end
+-            return
+-          end
+-
+-          # @retry exists
+-
+-          if @retry.limit?
+-            if error
+-              records = @buffer.queued_records
+-              msg = "failed to flush the buffer, and hit limit for retries. dropping all chunks in the buffer queue."
+-              log.error msg, retry_times: @retry.steps, records: records, error: error
+-              log.error_backtrace error.backtrace
+-            end
+-            @buffer.clear_queue!
+-            log.debug "buffer queue cleared"
+-            @retry = nil
+-          else
+-            # Ensure that the current time is greater than or equal to @retry.next_time to avoid the situation when
+-            # @retry.step is called almost as many times as the number of flush threads in a short time.
+-            if Time.now >= @retry.next_time
+-              @retry.step
+-            else
+-              @retry.recalc_next_time # to prevent all flush threads from retrying at the same time
+-            end
+-            if error
+-              if using_secondary
+-                msg = "failed to flush the buffer with secondary output."
+-                log.warn msg, retry_times: @retry.steps, next_retry_time: @retry.next_time.round, chunk: chunk_id_hex, error: error
+-                log.warn_backtrace error.backtrace
+-              else
+-                msg = "failed to flush the buffer."
+-                log.warn msg, retry_times: @retry.steps, next_retry_time: @retry.next_time.round, chunk: chunk_id_hex, error: error
+-                log.warn_backtrace error.backtrace
+-              end
+-            end
+-          end
+-        end
+-      end
+-
+-      def retry_state(randomize)
++      def retry_state(randomize = @buffer_config.retry_randomize)
+         if @secondary
+           retry_state_create(
+             :output_retries, @buffer_config.retry_type, @buffer_config.retry_wait, @buffer_config.retry_timeout,

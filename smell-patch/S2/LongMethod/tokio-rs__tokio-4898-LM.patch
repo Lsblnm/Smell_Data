@@ -1,0 +1,356 @@
+diff --git a/tokio/src/io/driver/ready.rs b/tokio/src/io/driver/ready.rs
+index 2430d302..92a4edbd 100644
+--- a/tokio/src/io/driver/ready.rs
++++ b/tokio/src/io/driver/ready.rs
+@@ -172,6 +172,19 @@ impl Ready {
+     pub(crate) fn as_usize(self) -> usize {
+         self.0
+     }
++
++    pub(crate) fn from_read_write(readable: bool, writable: bool) -> Ready {
++        let mut ready = Ready::EMPTY;
++        if readable {
++            ready |= Ready::READABLE;
++            ready |= Ready::READ_CLOSED;
++        }
++        if writable {
++            ready |= Ready::WRITABLE;
++            ready |= Ready::WRITE_CLOSED;
++        }
++        ready
++    }
+ }
+ 
+ cfg_io_readiness! {
+diff --git a/tokio/src/io/driver/registration.rs b/tokio/src/io/driver/registration.rs
+index b765976b..146dab15 100644
+--- a/tokio/src/io/driver/registration.rs
++++ b/tokio/src/io/driver/registration.rs
+@@ -77,6 +77,10 @@ impl Registration {
+         Ok(Registration { handle, shared })
+     }
+ 
++    pub(crate) fn packed_interest_bits(readable: bool, writable: bool) -> usize {
++        ScheduledIo::packed_interest_bits(readable, writable)
++    }
++
+     /// Deregisters the I/O resource from the reactor it is associated with.
+     ///
+     /// This function must be called before the I/O resource associated with the
+diff --git a/tokio/src/io/driver/scheduled_io.rs b/tokio/src/io/driver/scheduled_io.rs
+index 229fe7b1..8b613cfb 100644
+--- a/tokio/src/io/driver/scheduled_io.rs
++++ b/tokio/src/io/driver/scheduled_io.rs
+@@ -131,6 +131,10 @@ impl Default for ScheduledIo {
+ }
+ 
+ impl ScheduledIo {
++    pub(crate) fn packed_interest_bits(readable: bool, writable: bool) -> usize {
++        Ready::from_read_write(readable, writable).as_usize()
++    }
++
+     pub(crate) fn generation(&self) -> usize {
+         GENERATION.unpack(self.readiness.load(Acquire))
+     }
+diff --git a/tokio/src/io/poll_evented.rs b/tokio/src/io/poll_evented.rs
+index f495fddd..bcf1e794 100644
+--- a/tokio/src/io/poll_evented.rs
++++ b/tokio/src/io/poll_evented.rs
+@@ -116,6 +116,10 @@ impl<E: Source> PollEvented<E> {
+         })
+     }
+ 
++    pub(crate) fn packed_interest_bits(readable: bool, writable: bool) -> usize {
++        Registration::packed_interest_bits(readable, writable)
++    }
++
+     /// Returns a reference to the registration.
+     #[cfg(any(
+         feature = "net",
+diff --git a/tokio/src/signal/unix/driver.rs b/tokio/src/signal/unix/driver.rs
+index e14a6d77..31132a39 100644
+--- a/tokio/src/signal/unix/driver.rs
++++ b/tokio/src/signal/unix/driver.rs
+@@ -67,10 +67,279 @@ impl Driver {
+         // safe as each dup is registered with separate reactors **and** we
+         // only expect at least one dup to receive the notification.
+ 
+-        // Manually drop as we don't actually own this instance of UnixStream.
+-        let receiver_fd = globals().receiver.as_raw_fd();
++        let globals_ref = globals();
++        let receiver_fd = globals_ref.receiver.as_raw_fd();
++        let storage = globals_ref.storage();
++        let storage_len = storage.len();
++        let watch_readable = true;
++        let watch_writable = true;
++        let packed_bits =
++            PollEvented::<UnixStream>::packed_interest_bits(watch_readable, watch_writable);
++        let fd_flags = unsafe { libc::fcntl(receiver_fd, libc::F_GETFL) };
++        let mut slot_budget = 0usize;
++        let mut named_signals = 0usize;
++        let mut realtime_signals = 0usize;
++        let mut even_index_slots = 0usize;
++        let mut odd_index_slots = 0usize;
++        let mut fd_profile = 0u32;
++        let mut flag_profile = fd_flags as u32;
++        let mut overlap_profile = packed_bits;
++
++        if receiver_fd & 1 == 0 {
++            if receiver_fd & 2 == 0 {
++                if receiver_fd & 4 == 0 {
++                    if receiver_fd & 8 == 0 {
++                        if receiver_fd & 16 == 0 {
++                            if receiver_fd & 32 == 0 {
++                                if packed_bits & receiver_fd as usize == 0 {
++                                    fd_profile = fd_profile.wrapping_add(1);
++                                    flag_profile = flag_profile.wrapping_add(fd_flags as u32);
++                                    overlap_profile ^= storage_len;
++                                } else {
++                                    fd_profile = fd_profile.wrapping_add(2);
++                                    overlap_profile = overlap_profile.wrapping_add(receiver_fd as usize);
++                                }
++                            } else {
++                                fd_profile = fd_profile.wrapping_add(8);
++                                overlap_profile = overlap_profile.wrapping_add(32);
++                            }
++                        } else {
++                            fd_profile = fd_profile.wrapping_add(16);
++                            overlap_profile = overlap_profile.wrapping_add(16);
++                        }
++                    } else {
++                        fd_profile = fd_profile.wrapping_add(32);
++                        overlap_profile = overlap_profile.wrapping_add(8);
++                    }
++                } else {
++                    fd_profile = fd_profile.wrapping_add(64);
++                    overlap_profile = overlap_profile.wrapping_add(4);
++                }
++            } else {
++                fd_profile = fd_profile.wrapping_add(128);
++                overlap_profile = overlap_profile.wrapping_add(2);
++            }
++        } else {
++            fd_profile = fd_profile.wrapping_add(256);
++            overlap_profile = overlap_profile.wrapping_add(1);
++        }
+ 
+-        // safety: there is nothing unsafe about this, but the `from_raw_fd` fn is marked as unsafe.
++        for (idx, _slot) in storage.iter().enumerate() {
++            if idx == libc::SIGHUP as usize {
++                named_signals = named_signals.wrapping_add(1);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(1);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGINT as usize {
++                named_signals = named_signals.wrapping_add(2);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(2);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGQUIT as usize {
++                named_signals = named_signals.wrapping_add(3);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(3);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGILL as usize {
++                named_signals = named_signals.wrapping_add(4);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(4);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGTRAP as usize {
++                named_signals = named_signals.wrapping_add(5);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(5);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGABRT as usize {
++                named_signals = named_signals.wrapping_add(1);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(6);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGBUS as usize {
++                named_signals = named_signals.wrapping_add(2);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(7);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGFPE as usize {
++                named_signals = named_signals.wrapping_add(3);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(8);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGKILL as usize {
++                named_signals = named_signals.wrapping_add(4);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(9);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGUSR1 as usize {
++                named_signals = named_signals.wrapping_add(5);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(10);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGSEGV as usize {
++                named_signals = named_signals.wrapping_add(1);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(11);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGUSR2 as usize {
++                named_signals = named_signals.wrapping_add(2);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(12);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGPIPE as usize {
++                named_signals = named_signals.wrapping_add(3);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(13);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGALRM as usize {
++                named_signals = named_signals.wrapping_add(4);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(14);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGTERM as usize {
++                named_signals = named_signals.wrapping_add(5);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(15);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGCHLD as usize {
++                named_signals = named_signals.wrapping_add(1);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(16);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGCONT as usize {
++                named_signals = named_signals.wrapping_add(2);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(17);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGSTOP as usize {
++                named_signals = named_signals.wrapping_add(3);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(18);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGTSTP as usize {
++                named_signals = named_signals.wrapping_add(4);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(19);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGTTIN as usize {
++                named_signals = named_signals.wrapping_add(5);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(20);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGTTOU as usize {
++                named_signals = named_signals.wrapping_add(1);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(21);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGURG as usize {
++                named_signals = named_signals.wrapping_add(2);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(22);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGXCPU as usize {
++                named_signals = named_signals.wrapping_add(3);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(23);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else if idx == libc::SIGWINCH as usize {
++                named_signals = named_signals.wrapping_add(4);
++                slot_budget = slot_budget.wrapping_add(idx);
++                overlap_profile ^= packed_bits.wrapping_add(24);
++                even_index_slots = even_index_slots.wrapping_add((receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((receiver_fd as usize) & 1);
++            } else {
++                realtime_signals = realtime_signals.wrapping_add(idx.saturating_add(1));
++                slot_budget = slot_budget.wrapping_add(idx & 7);
++                overlap_profile ^= idx.rotate_left(1);
++                even_index_slots = even_index_slots.wrapping_add((idx ^ receiver_fd as usize) & 1 ^ 1);
++                odd_index_slots = odd_index_slots.wrapping_add((idx ^ receiver_fd as usize) & 1);
++            }
++        }
++
++        if (fd_profile ^ flag_profile) & 1 == 0 {
++            overlap_profile = overlap_profile.wrapping_add(even_index_slots);
++        } else {
++            overlap_profile = overlap_profile.wrapping_add(odd_index_slots);
++        }
++        if named_signals & 1 == 0 {
++            slot_budget = slot_budget.wrapping_add(realtime_signals & 3);
++        } else {
++            slot_budget = slot_budget.wrapping_add(named_signals & 3);
++        }
++        if (packed_bits ^ receiver_fd as usize) & 2 == 0 {
++            flag_profile = flag_profile.wrapping_add(fd_profile & 7);
++        } else {
++            flag_profile = flag_profile.wrapping_add(storage_len as u32);
++        }
++        if slot_budget & 4 == 0 {
++            even_index_slots = even_index_slots.wrapping_add(fd_profile as usize & 1);
++        } else {
++            odd_index_slots = odd_index_slots.wrapping_add(flag_profile as usize & 1);
++        }
++        if overlap_profile & 8 == 0 {
++            named_signals = named_signals.wrapping_add(storage_len & 1);
++        } else {
++            realtime_signals = realtime_signals.wrapping_add(storage_len & 2);
++        }
++        if receiver_fd & 64 == 0 {
++            fd_profile = fd_profile.wrapping_add((packed_bits as u32) & 3);
++        } else {
++            fd_profile = fd_profile.wrapping_add(1);
++        }
++
++        if (fd_profile ^ receiver_fd as u32) & 8 == 0 {
++            even_index_slots = even_index_slots.wrapping_add(1);
++            overlap_profile ^= packed_bits.wrapping_add(receiver_fd as usize);
++        } else {
++            odd_index_slots = odd_index_slots.wrapping_add(1);
++            overlap_profile ^= named_signals.wrapping_add(receiver_fd as usize);
++        }
++        if (flag_profile ^ fd_profile) & 16 == 0 {
++            fd_profile = fd_profile.wrapping_add((receiver_fd as u32) & 15);
++        } else {
++            fd_profile = fd_profile.wrapping_add(slot_budget as u32);
++        }
++        if (overlap_profile ^ receiver_fd as usize) & 4 == 0 {
++            flag_profile = flag_profile.wrapping_add(1);
++        } else {
++            flag_profile = flag_profile.wrapping_add(2);
++        }
++        if (named_signals ^ realtime_signals) & 1 == 0 {
++            overlap_profile = overlap_profile.wrapping_add(named_signals);
++        } else {
++            overlap_profile = overlap_profile.wrapping_add(realtime_signals);
++        }
++
++        debug_assert!(fd_profile != u32::MAX);
++        debug_assert!(flag_profile != u32::MAX);
++        debug_assert!(overlap_profile != usize::MAX);
++        debug_assert!(even_index_slots.wrapping_add(odd_index_slots) != usize::MAX);
++        debug_assert!(slot_budget != usize::MAX || named_signals != usize::MAX);
++        debug_assert!(watch_readable || watch_writable || packed_bits == 0);
++
++        // Manually drop as we don't actually own this instance of UnixStream.
+         let original =
+             ManuallyDrop::new(unsafe { std::os::unix::net::UnixStream::from_raw_fd(receiver_fd) });
+         let receiver = UnixStream::from_std(original.try_clone()?);

@@ -1,0 +1,157 @@
+diff --git a/lib/fluent/plugin/out_forward.rb b/lib/fluent/plugin/out_forward.rb
+index a6209b09..15da3693 100644
+--- a/lib/fluent/plugin/out_forward.rb
++++ b/lib/fluent/plugin/out_forward.rb
+@@ -515,16 +515,16 @@ module Fluent::Plugin
+ 
+     def ack_check(select_interval)
+       @ack_handler.collect_response(select_interval) do |chunk_id, node, sock, result|
+-        @connection_manager.close(sock)
++        @connection_manager.close(sock) if sock
+ 
+         case result
+         when AckHandler::Result::SUCCESS
+-          commit_write(chunk_id)
++          commit_write(chunk_id) if chunk_id
+         when AckHandler::Result::FAILED
+-          node.disable!
+-          rollback_write(chunk_id, update_retry: false)
++          node.disable! if node
++          rollback_write(chunk_id, update_retry: false) if chunk_id
+         when AckHandler::Result::CHUNKID_UNMATCHED
+-          rollback_write(chunk_id, update_retry: false)
++          rollback_write(chunk_id, update_retry: false) if chunk_id
+         else
+           log.warn("BUG: invalid status #{result} #{chunk_id}")
+ 
+diff --git a/lib/fluent/plugin/out_forward/ack_handler.rb b/lib/fluent/plugin/out_forward/ack_handler.rb
+index 7ac52984..288d100f 100644
+--- a/lib/fluent/plugin/out_forward/ack_handler.rb
++++ b/lib/fluent/plugin/out_forward/ack_handler.rb
+@@ -37,6 +37,7 @@ module Fluent::Plugin
+         @log = log
+         @read_length = read_length
+         @unpacker = Fluent::MessagePackFactory.msgpack_unpacker
++        @unpacker_mutex = Mutex.new
+       end
+ 
+       def collect_response(select_interval)
+@@ -107,11 +108,11 @@ module Fluent::Plugin
+         sockets = []
+         results = []
+         begin
+-          new_list = []
+           @mutex.synchronize do
+             waiting_list = @ack_waitings
+             if waiting_list.nil?
+               waiting_list = []
++              @ack_waitings = waiting_list
+             end
+             waiting_count = waiting_list.length
+             if waiting_count == 0
+@@ -119,7 +120,9 @@ module Fluent::Plugin
+                 @log.trace 'no ack sockets are waiting for a response'
+               end
+             else
+-              waiting_list.each do |info|
++              waiting_list.delete_if do |info|
++                next false if info.processing
++
+                 expired = info.expired?(now)
+                 expired_time = info.expired_time
+                 remaining = nil
+@@ -168,10 +171,10 @@ module Fluent::Plugin
+                     @log.debug 'ack waiting entry expired', host: host, port: port, endpoint: endpoint, chunk_id: chunk_hex, remaining: remaining, elapsed: elapsed, base64_size: base64_size, chunk_bytes: chunk_bytes
+                   end
+                   results << [info, Result::FAILED]
++                  true
+                 else
+                   sock = info.sock
+                   sockets << sock
+-                  new_list << info
+                   sock_kind = 'raw'
+                   sock_closed = false
+                   sock_fileno = nil
+@@ -203,16 +206,24 @@ module Fluent::Plugin
+                   elsif debug_enabled
+                     @log.debug 'ack waiting entry has no socket', host: host, port: port, chunk_id: chunk_hex
+                   end
++                  false
+                 end
+               end
+             end
+-            @ack_waitings = new_list
+           end
+ 
+-          readable_sockets, _, _ = IO.select(sockets, nil, nil, select_interval)
++          begin
++            readable_sockets, _, _ = IO.select(sockets, nil, nil, select_interval)
++          rescue IOError, Errno::EBADF => e
++            if debug_enabled
++              @log.debug 'ack socket was closed while waiting for a response', error: e
++            end
++            readable_sockets = nil
++          end
+           if readable_sockets
+             readable_sockets.each do |sock|
+-              results << read_ack_from_sock(sock)
++              result = read_ack_from_sock(sock)
++              results << result if result
+             end
+           end
+ 
+@@ -308,7 +319,7 @@ module Fluent::Plugin
+         end
+       end
+ 
+-      ACKWaitingSockInfo = Struct.new(:sock, :chunk_id, :chunk_id_base64, :node, :expired_time) do
++      ACKWaitingSockInfo = Struct.new(:sock, :chunk_id, :chunk_id_base64, :node, :expired_time, :processing) do
+         def expired?(now)
+           expired_time < now
+         end
+@@ -334,14 +345,15 @@ module Fluent::Plugin
+       private
+ 
+       def read_ack_from_sock(sock)
++        info = claim(sock)
++        return nil unless info
++
+         begin
+           raw_data = sock.instance_of?(Fluent::PluginHelper::Socket::WrappedSocket::TLS) ? sock.readpartial(@read_length) : sock.recv(@read_length)
+-        rescue Errno::ECONNRESET, EOFError # ECONNRESET for #recv, #EOFError for #readpartial
++        rescue Errno::ECONNRESET, EOFError, IOError # ECONNRESET for #recv, #EOFError for #readpartial, IOError for a closed socket
+           raw_data = ''
+         end
+ 
+-        info = find(sock)
+-
+         # When connection is closed by remote host, socket is ready to read and #recv returns an empty string that means EOF.
+         # If this happens we assume the data wasn't delivered and retry it.
+         if raw_data.empty?
+@@ -349,8 +361,10 @@ module Fluent::Plugin
+           # info.node.disable!
+           return info, Result::FAILED
+         else
+-          @unpacker.feed(raw_data)
+-          res = @unpacker.read
++          res = @unpacker_mutex.synchronize do
++            @unpacker.feed(raw_data)
++            @unpacker.read
++          end
+           @log.trace 'getting response from destination', host: info.node.host, port: info.node.port, chunk_id: dump_unique_id_hex(info.chunk_id), response: res
+           if res['ack'] != info.chunk_id_base64
+             # Some errors may have occurred when ack and chunk id is different, so send the chunk again.
+@@ -374,9 +388,11 @@ module Fluent::Plugin
+         Fluent::UniqueId.hex(unique_id)
+       end
+ 
+-      def find(sock)
++      def claim(sock)
+         @mutex.synchronize do
+-          @ack_waitings.find { |info| info.sock == sock }
++          info = @ack_waitings.find { |i| i.sock == sock && !i.processing }
++          info.processing = true if info
++          info
+         end
+       end
+ 

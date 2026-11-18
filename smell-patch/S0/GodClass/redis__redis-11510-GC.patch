@@ -1,0 +1,1596 @@
+diff --git a/src/function_lua.c b/src/function_lua.c
+index ca89818d8..2f480a484 100644
+--- a/src/function_lua.c
++++ b/src/function_lua.c
+@@ -231,6 +231,8 @@ static int luaRegisterFunctionReadFlags(lua_State *lua, uint64_t *flags) {
+     int j = 1;
+     int ret = C_ERR;
+     int f_flags = 0;
++    functionsLibCtx *flags_ctx = functionsLibCtxGetCurrent();
++    if (flags_ctx) functionsLibCtxResetRegisterState(flags_ctx);
+     while(1) {
+         lua_pushnumber(lua,j++);
+         lua_gettable(lua,-2);
+@@ -245,23 +247,24 @@ static int luaRegisterFunctionReadFlags(lua_State *lua, uint64_t *flags) {
+         }
+ 
+         const char *flag_str = lua_tostring(lua, -1);
+-        int found = 0;
+-        for (scriptFlag *flag = scripts_flags_def; flag->str ; ++flag) {
+-            if (!strcasecmp(flag->str, flag_str)) {
+-                f_flags |= flag->flag;
+-                found = 1;
+-                break;
+-            }
++        uint64_t resolved = 0;
++        functionsLibCtx *ctx = functionsLibCtxGetCurrent();
++        if (!ctx) {
++            lua_pop(lua,1);
++            goto done;
+         }
+-        /* pops the value to continue the iteration */
+-        lua_pop(lua,1);
+-        if (!found) {
+-            /* flag not found */
++        if (functionsLibCtxResolveScriptFlag(ctx, flag_str, &resolved) != C_OK ||
++            !functionsLibCtxFlagLookupSucceeded(ctx)) {
++            lua_pop(lua,1);
+             goto done;
+         }
++        f_flags |= resolved;
++        /* pops the value to continue the iteration */
++        lua_pop(lua,1);
+     }
+ 
+-    *flags = f_flags;
++    functionsLibCtx *ctx = functionsLibCtxGetCurrent();
++    *flags = ctx ? functionsLibCtxLastResolvedFlags(ctx) : f_flags;
+     ret = C_OK;
+ 
+ done:
+diff --git a/src/functions.c b/src/functions.c
+index f51aa62d0..d8b18dc97 100644
+--- a/src/functions.c
++++ b/src/functions.c
+@@ -32,6 +32,7 @@
+ #include "dict.h"
+ #include "adlist.h"
+ #include "atomicvar.h"
++#include "cluster.h"
+ 
+ typedef enum {
+     restorePolicy_Flush, restorePolicy_Append, restorePolicy_Replace
+@@ -44,6 +45,10 @@ static void engineFunctionDispose(dict *d, void *obj);
+ static void engineStatsDispose(dict *d, void *obj);
+ static void engineLibraryDispose(dict *d, void *obj);
+ static int functionsVerifyName(sds name);
++static void functionsLibCtxBeginPersist(functionsLibCtx *ctx);
++static void functionsLibCtxRecordPersistError(functionsLibCtx *ctx, const char *err);
++static void functionsLibCtxNotePayloadVersion(functionsLibCtx *ctx, uint16_t rdbver);
++static int functionsLibCtxParseRestorePolicy(functionsLibCtx *ctx, const char *policy_str);
+ 
+ typedef struct functionsLibEngineStats {
+     size_t n_lib;
+@@ -55,6 +60,30 @@ struct functionsLibCtx {
+     dict *functions;     /* Function name -> Function object that can be used to run the function */
+     size_t cache_memory; /* Overhead memory (structs, dictionaries, ..) used by all the functions */
+     dict *engines_stats; /* Per engine statistics */
++
++    /* Runtime state for the script currently executed through this ctx. */
++    scriptRunCtx *active_run;
++    int run_eval_mode;
++    int run_timedout;
++
++    /* Last requested script execution policy. */
++    uint64_t last_script_flags;
++    int last_run_readonly;
++    sds last_run_error;
++
++    /* Function payload save/restore bookkeeping. */
++    size_t last_persist_written;
++    int last_restore_policy;
++    sds last_persist_error;
++    uint16_t last_payload_rdbver;
++    size_t last_payload_libs;
++
++    /* Engine flag / register_function parsing state. */
++    uint64_t last_resolved_flags;
++    int last_register_argc;
++    sds last_register_name;
++    int last_flag_lookup_ok;
++    int last_register_name_valid;
+ };
+ 
+ typedef struct functionsLibMataData {
+@@ -201,6 +230,9 @@ void functionsLibCtxFree(functionsLibCtx *functions_lib_ctx) {
+     dictRelease(functions_lib_ctx->functions);
+     dictRelease(functions_lib_ctx->libraries);
+     dictRelease(functions_lib_ctx->engines_stats);
++    if (functions_lib_ctx->last_run_error) sdsfree(functions_lib_ctx->last_run_error);
++    if (functions_lib_ctx->last_persist_error) sdsfree(functions_lib_ctx->last_persist_error);
++    if (functions_lib_ctx->last_register_name) sdsfree(functions_lib_ctx->last_register_name);
+     zfree(functions_lib_ctx);
+ }
+ 
+@@ -231,6 +263,22 @@ functionsLibCtx* functionsLibCtxCreate() {
+     }
+     dictReleaseIterator(iter);
+     ret->cache_memory = 0;
++    ret->active_run = NULL;
++    ret->run_eval_mode = 0;
++    ret->run_timedout = 0;
++    ret->last_script_flags = 0;
++    ret->last_run_readonly = 0;
++    ret->last_run_error = NULL;
++    ret->last_persist_written = 0;
++    ret->last_restore_policy = restorePolicy_Append;
++    ret->last_persist_error = NULL;
++    ret->last_payload_rdbver = 0;
++    ret->last_payload_libs = 0;
++    ret->last_resolved_flags = 0;
++    ret->last_register_argc = 0;
++    ret->last_register_name = NULL;
++    ret->last_flag_lookup_ok = 0;
++    ret->last_register_name_valid = 0;
+     return ret;
+ }
+ 
+@@ -244,7 +292,13 @@ functionsLibCtx* functionsLibCtxCreate() {
+  *       and return an error if its not.
+  */
+ int functionLibCreateFunction(sds name, void *function, functionLibInfo *li, sds desc, uint64_t f_flags, sds *err) {
+-    if (functionsVerifyName(name) != C_OK) {
++    if (curr_functions_lib_ctx) {
++        functionsLibCtxRememberRegisterName(curr_functions_lib_ctx, name);
++        if (!functionsLibCtxRegisterNameValid(curr_functions_lib_ctx)) {
++            *err = sdsnew("Library names can only contain letters, numbers, or underscores(_) and must be at least one character long");
++            return C_ERR;
++        }
++    } else if (functionsVerifyName(name) != C_OK) {
+         *err = sdsnew("Library names can only contain letters, numbers, or underscores(_) and must be at least one character long");
+         return C_ERR;
+     }
+@@ -724,18 +778,17 @@ void functionRestoreCommand(client *c) {
+     rio payload;
+     sds err = NULL;
+ 
++    functionsLibCtxBeginPersist(curr_functions_lib_ctx);
+     if (c->argc == 4) {
+         const char *restore_policy_str = c->argv[3]->ptr;
+-        if (!strcasecmp(restore_policy_str, "append")) {
+-            restore_replicy = restorePolicy_Append;
+-        } else if (!strcasecmp(restore_policy_str, "replace")) {
+-            restore_replicy = restorePolicy_Replace;
+-        } else if (!strcasecmp(restore_policy_str, "flush")) {
+-            restore_replicy = restorePolicy_Flush;
+-        } else {
++        if (functionsLibCtxParseRestorePolicy(curr_functions_lib_ctx, restore_policy_str) != C_OK) {
+             addReplyError(c, "Wrong restore policy given, value should be either FLUSH, APPEND or REPLACE.");
+             return;
+         }
++        restore_replicy = curr_functions_lib_ctx->last_restore_policy;
++    } else {
++        functionsLibCtxParseRestorePolicy(curr_functions_lib_ctx, NULL);
++        restore_replicy = curr_functions_lib_ctx->last_restore_policy;
+     }
+ 
+     uint16_t rdbver;
+@@ -743,6 +796,7 @@ void functionRestoreCommand(client *c) {
+         addReplyError(c, "DUMP payload version or checksum are wrong");
+         return;
+     }
++    functionsLibCtxNotePayloadVersion(curr_functions_lib_ctx, rdbver);
+ 
+     functionsLibCtx *functions_lib_ctx = functionsLibCtxCreate();
+     rioInitWithBuffer(&payload, data);
+@@ -785,6 +839,7 @@ void functionRestoreCommand(client *c) {
+ 
+ load_error:
+     if (err) {
++        functionsLibCtxRecordPersistError(curr_functions_lib_ctx, err);
+         addReplyErrorSds(c, err);
+     } else {
+         addReply(c, shared.ok);
+@@ -1111,6 +1166,710 @@ size_t functionsLibCtxfunctionsLen(functionsLibCtx *functions_ctx) {
+     return dictSize(functions_ctx->functions);
+ }
+ 
++
++/* ---- Script execution, persistence and flag parsing owned by functionsLibCtx ---- */
++
++int functionsLibCtxIsTimedout(functionsLibCtx *ctx);
++
++static void functionsLibCtxClearRunError(functionsLibCtx *ctx) {
++    if (!ctx || !ctx->last_run_error) return;
++    sdsfree(ctx->last_run_error);
++    ctx->last_run_error = NULL;
++}
++
++static void functionsLibCtxRecordRunError(functionsLibCtx *ctx, const char *err) {
++    if (!ctx) return;
++    functionsLibCtxClearRunError(ctx);
++    if (err) ctx->last_run_error = sdsnew(err);
++}
++
++static void functionsLibCtxClearPersistState(functionsLibCtx *ctx) {
++    if (!ctx) return;
++    ctx->last_persist_written = 0;
++    ctx->last_payload_libs = 0;
++    ctx->last_payload_rdbver = 0;
++    if (ctx->last_persist_error) {
++        sdsfree(ctx->last_persist_error);
++        ctx->last_persist_error = NULL;
++    }
++}
++
++static void functionsLibCtxBeginPersist(functionsLibCtx *ctx) {
++    if (!ctx) return;
++    functionsLibCtxClearPersistState(ctx);
++}
++
++static void functionsLibCtxRecordPersistError(functionsLibCtx *ctx, const char *err) {
++    if (!ctx) return;
++    if (ctx->last_persist_error) sdsfree(ctx->last_persist_error);
++    ctx->last_persist_error = err ? sdsnew(err) : NULL;
++}
++
++static void functionsLibCtxNotePayloadVersion(functionsLibCtx *ctx, uint16_t rdbver) {
++    if (!ctx) return;
++    ctx->last_payload_rdbver = rdbver;
++}
++
++static void functionsLibCtxCountSavedLibraries(functionsLibCtx *ctx, size_t count) {
++    if (!ctx) return;
++    ctx->last_payload_libs = count;
++}
++
++static int functionsLibCtxParseRestorePolicy(functionsLibCtx *ctx, const char *policy_str) {
++    if (!ctx) return C_ERR;
++    if (!policy_str) {
++        ctx->last_restore_policy = restorePolicy_Append;
++        return C_OK;
++    }
++    if (!strcasecmp(policy_str, "append")) {
++        ctx->last_restore_policy = restorePolicy_Append;
++        return C_OK;
++    } else if (!strcasecmp(policy_str, "replace")) {
++        ctx->last_restore_policy = restorePolicy_Replace;
++        return C_OK;
++    } else if (!strcasecmp(policy_str, "flush")) {
++        ctx->last_restore_policy = restorePolicy_Flush;
++        return C_OK;
++    }
++    return C_ERR;
++}
++
++static void functionsLibCtxExitTimeout(functionsLibCtx *ctx, scriptRunCtx *run_ctx) {
++    serverAssert(ctx && run_ctx == ctx->active_run);
++    serverAssert(functionsLibCtxIsTimedout(ctx));
++    run_ctx->flags &= ~SCRIPT_TIMEDOUT;
++    ctx->run_timedout = 0;
++    blockingOperationEnds();
++    if (server.masterhost && server.master) queueClientForReprocessing(server.master);
++}
++
++static void functionsLibCtxEnterTimeout(functionsLibCtx *ctx, scriptRunCtx *run_ctx) {
++    serverAssert(ctx && run_ctx == ctx->active_run);
++    serverAssert(!functionsLibCtxIsTimedout(ctx));
++    run_ctx->flags |= SCRIPT_TIMEDOUT;
++    ctx->run_timedout = 1;
++    blockingOperationStarts();
++}
++
++static int functionsLibCtxCheckClusterFlag(functionsLibCtx *ctx, client *caller) {
++    if (!ctx) return C_ERR;
++    if ((ctx->last_script_flags & SCRIPT_FLAG_NO_CLUSTER) && server.cluster_enabled) {
++        addReplyError(caller, "Can not run script on cluster, 'no-cluster' flag is set.");
++        return C_ERR;
++    }
++    return C_OK;
++}
++
++static int functionsLibCtxCheckStalePolicy(functionsLibCtx *ctx, client *caller, int running_stale) {
++    if (!ctx) return C_ERR;
++    if (running_stale && !(ctx->last_script_flags & SCRIPT_FLAG_ALLOW_STALE)) {
++        addReplyError(caller, "-MASTERDOWN Link with MASTER is down, "
++                         "replica-serve-stale-data is set to 'no' "
++                         "and 'allow-stale' flag is not set on the script.");
++        return C_ERR;
++    }
++    return C_OK;
++}
++
++static int functionsLibCtxCheckWritePermission(functionsLibCtx *ctx, client *caller, int obey_client) {
++    if (!ctx) return C_ERR;
++    if (ctx->last_script_flags & SCRIPT_FLAG_NO_WRITES) return C_OK;
++
++    if (server.masterhost && server.repl_slave_ro && !obey_client) {
++        addReplyError(caller, "-READONLY Can not run script with write flag on readonly replica");
++        return C_ERR;
++    }
++
++    int deny_write_type = writeCommandsDeniedByDiskError();
++    if (deny_write_type != DISK_ERROR_TYPE_NONE && !obey_client) {
++        if (deny_write_type == DISK_ERROR_TYPE_RDB)
++            addReplyError(caller, "-MISCONF Redis is configured to save RDB snapshots, "
++                             "but it's currently unable to persist to disk. "
++                             "Writable scripts are blocked. Use 'no-writes' flag for read only scripts.");
++        else
++            addReplyErrorFormat(caller, "-MISCONF Redis is configured to persist data to AOF, "
++                                   "but it's currently unable to persist to disk. "
++                                   "Writable scripts are blocked. Use 'no-writes' flag for read only scripts. "
++                                   "AOF error: %s", strerror(server.aof_last_write_errno));
++        return C_ERR;
++    }
++
++    if (ctx->last_run_readonly) {
++        addReplyError(caller, "Can not execute a script with write flag using *_ro command.");
++        return C_ERR;
++    }
++
++    if (!checkGoodReplicasStatus()) {
++        addReplyErrorObject(caller, shared.noreplicaserr);
++        return C_ERR;
++    }
++    return C_OK;
++}
++
++static int functionsLibCtxCheckOomPermission(functionsLibCtx *ctx, client *caller, int client_allow_oom) {
++    if (!ctx) return C_ERR;
++    if (!client_allow_oom && server.pre_command_oom_state && server.maxmemory &&
++        !(ctx->last_script_flags & (SCRIPT_FLAG_ALLOW_OOM|SCRIPT_FLAG_NO_WRITES)))
++    {
++        addReplyError(caller, "-OOM allow-oom flag is not set on the script, "
++                              "can not run it when used memory > 'maxmemory'");
++        return C_ERR;
++    }
++    return C_OK;
++}
++
++static void functionsLibCtxApplyRunFlags(functionsLibCtx *ctx, scriptRunCtx *run_ctx, int client_allow_oom) {
++    run_ctx->flags = 0;
++    run_ctx->repl_flags = PROPAGATE_AOF | PROPAGATE_REPL;
++    ctx->run_eval_mode = 0;
++    ctx->run_timedout = 0;
++
++    if (ctx->last_run_readonly ||
++        (!(ctx->last_script_flags & SCRIPT_FLAG_EVAL_COMPAT_MODE) &&
++         (ctx->last_script_flags & SCRIPT_FLAG_NO_WRITES))) {
++        run_ctx->flags |= SCRIPT_READ_ONLY;
++    }
++    if (client_allow_oom ||
++        (!(ctx->last_script_flags & SCRIPT_FLAG_EVAL_COMPAT_MODE) &&
++         (ctx->last_script_flags & SCRIPT_FLAG_ALLOW_OOM))) {
++        run_ctx->flags |= SCRIPT_ALLOW_OOM;
++    }
++    if ((ctx->last_script_flags & SCRIPT_FLAG_EVAL_COMPAT_MODE) ||
++        (ctx->last_script_flags & SCRIPT_FLAG_ALLOW_CROSS_SLOT)) {
++        run_ctx->flags |= SCRIPT_ALLOW_CROSS_SLOT;
++    }
++}
++
++int functionsLibCtxPrepareRun(functionsLibCtx *ctx, scriptRunCtx *run_ctx, client *engine_client, client *caller, const char *funcname, uint64_t script_flags, int ro) {
++    serverAssert(ctx);
++    serverAssert(!ctx->active_run);
++    bool client_allow_oom = caller->flags & CLIENT_ALLOW_OOM;
++
++    ctx->last_script_flags = script_flags;
++    ctx->last_run_readonly = ro;
++    functionsLibCtxClearRunError(ctx);
++
++    int running_stale = server.masterhost &&
++            server.repl_state != REPL_STATE_CONNECTED &&
++            server.repl_serve_stale_data == 0;
++    int obey_client = mustObeyClient(caller);
++
++    if (!(script_flags & SCRIPT_FLAG_EVAL_COMPAT_MODE)) {
++        if (functionsLibCtxCheckClusterFlag(ctx, caller) != C_OK) return C_ERR;
++        if (functionsLibCtxCheckStalePolicy(ctx, caller, running_stale) != C_OK) return C_ERR;
++        if (functionsLibCtxCheckWritePermission(ctx, caller, obey_client) != C_OK) return C_ERR;
++        if (functionsLibCtxCheckOomPermission(ctx, caller, client_allow_oom) != C_OK) return C_ERR;
++    } else {
++        if (running_stale) {
++            addReplyErrorObject(caller, shared.masterdownerr);
++            return C_ERR;
++        }
++    }
++
++    run_ctx->c = engine_client;
++    run_ctx->original_client = caller;
++    run_ctx->funcname = funcname;
++
++    client *script_client = run_ctx->c;
++    client *curr_client = run_ctx->original_client;
++    server.script_caller = curr_client;
++
++    selectDb(script_client, curr_client->db->id);
++    script_client->resp = 2;
++
++    if (curr_client->flags & CLIENT_MULTI) {
++        script_client->flags |= CLIENT_MULTI;
++    }
++
++    run_ctx->start_time = getMonotonicUs();
++    run_ctx->snapshot_time = mstime();
++    functionsLibCtxApplyRunFlags(ctx, run_ctx, client_allow_oom);
++    ctx->active_run = run_ctx;
++    return C_OK;
++}
++
++void functionsLibCtxResetRun(functionsLibCtx *ctx, scriptRunCtx *run_ctx) {
++    serverAssert(ctx && ctx->active_run);
++
++    run_ctx->c->flags &= ~CLIENT_MULTI;
++    server.script_caller = NULL;
++
++    if (functionsLibCtxIsTimedout(ctx)) {
++        functionsLibCtxExitTimeout(ctx, run_ctx);
++        unprotectClient(run_ctx->original_client);
++    }
++
++    preventCommandPropagation(run_ctx->original_client);
++    ctx->active_run = NULL;
++    ctx->run_eval_mode = 0;
++    ctx->run_timedout = 0;
++}
++
++int functionsLibCtxIsRunning(functionsLibCtx *ctx) {
++    return ctx && ctx->active_run != NULL;
++}
++
++int functionsLibCtxIsTimedout(functionsLibCtx *ctx) {
++    return functionsLibCtxIsRunning(ctx) &&
++        ((ctx->active_run->flags & SCRIPT_TIMEDOUT) || ctx->run_timedout);
++}
++
++int functionsLibCtxIsEval(functionsLibCtx *ctx) {
++    serverAssert(functionsLibCtxIsRunning(ctx));
++    ctx->run_eval_mode = (ctx->active_run->flags & SCRIPT_EVAL_MODE) ? 1 : 0;
++    return ctx->run_eval_mode;
++}
++
++const char *functionsLibCtxCurrFunction(functionsLibCtx *ctx) {
++    serverAssert(functionsLibCtxIsRunning(ctx));
++    return ctx->active_run->funcname;
++}
++
++client *functionsLibCtxGetClient(functionsLibCtx *ctx) {
++    serverAssert(functionsLibCtxIsRunning(ctx));
++    return ctx->active_run->c;
++}
++
++client *functionsLibCtxGetCaller(functionsLibCtx *ctx) {
++    serverAssert(functionsLibCtxIsRunning(ctx));
++    return ctx->active_run->original_client;
++}
++
++mstime_t functionsLibCtxTimeSnapshot(functionsLibCtx *ctx) {
++    serverAssert(ctx && ctx->active_run);
++    return ctx->active_run->snapshot_time;
++}
++
++long long functionsLibCtxRunDuration(functionsLibCtx *ctx) {
++    serverAssert(functionsLibCtxIsRunning(ctx));
++    return elapsedMs(ctx->active_run->start_time);
++}
++
++int functionsLibCtxInterrupt(functionsLibCtx *ctx, scriptRunCtx *run_ctx) {
++    serverAssert(ctx && run_ctx);
++    if (ctx->active_run) run_ctx = ctx->active_run;
++    if (run_ctx->flags & SCRIPT_TIMEDOUT) {
++        processEventsWhileBlocked();
++        return (run_ctx->flags & SCRIPT_KILLED) ? SCRIPT_KILL : SCRIPT_CONTINUE;
++    }
++
++    long long elapsed = elapsedMs(run_ctx->start_time);
++    if (elapsed < server.busy_reply_threshold) {
++        return SCRIPT_CONTINUE;
++    }
++
++    serverLog(LL_WARNING,
++            "Slow script detected: still in execution after %lld milliseconds. "
++                    "You can try killing the script using the %s command. Script name is: %s.",
++            elapsed, (run_ctx->flags & SCRIPT_EVAL_MODE) ? "SCRIPT KILL" : "FUNCTION KILL", run_ctx->funcname);
++
++    functionsLibCtxEnterTimeout(ctx, run_ctx);
++    protectClient(run_ctx->original_client);
++    processEventsWhileBlocked();
++    return (run_ctx->flags & SCRIPT_KILLED) ? SCRIPT_KILL : SCRIPT_CONTINUE;
++}
++
++void functionsLibCtxKill(functionsLibCtx *ctx, client *c, int is_eval) {
++    if (!ctx || !ctx->active_run) {
++        addReplyError(c, "-NOTBUSY No scripts in execution right now.");
++        return;
++    }
++    if (mustObeyClient(ctx->active_run->original_client)) {
++        addReplyError(c,
++                "-UNKILLABLE The busy script was sent by a master instance in the context of replication and cannot be killed.");
++    }
++    if (ctx->active_run->flags & SCRIPT_WRITE_DIRTY) {
++        addReplyError(c,
++                "-UNKILLABLE Sorry the script already executed write "
++                        "commands against the dataset. You can either wait the "
++                        "script termination or kill the server in a hard way "
++                        "using the SHUTDOWN NOSAVE command.");
++        return;
++    }
++    if (is_eval && !(ctx->active_run->flags & SCRIPT_EVAL_MODE)) {
++        addReplyErrorObject(c, shared.slowscripterr);
++        return;
++    }
++    if (!is_eval && (ctx->active_run->flags & SCRIPT_EVAL_MODE)) {
++        addReplyErrorObject(c, shared.slowevalerr);
++        return;
++    }
++    ctx->active_run->flags |= SCRIPT_KILLED;
++    addReply(c, shared.ok);
++}
++
++uint64_t functionsLibCtxFlagsToCmdFlags(functionsLibCtx *ctx, uint64_t cmd_flags, uint64_t script_flags) {
++    if (ctx) ctx->last_script_flags = script_flags;
++    cmd_flags &= ~(CMD_STALE | CMD_DENYOOM | CMD_WRITE);
++
++    if (!(script_flags & (SCRIPT_FLAG_ALLOW_OOM | SCRIPT_FLAG_NO_WRITES)))
++        cmd_flags |= CMD_DENYOOM;
++    if (!(script_flags & SCRIPT_FLAG_NO_WRITES))
++        cmd_flags |= CMD_WRITE;
++    if (script_flags & SCRIPT_FLAG_ALLOW_STALE)
++        cmd_flags |= CMD_STALE;
++
++    cmd_flags &= ~CMD_MAY_REPLICATE;
++    return cmd_flags;
++}
++
++static int functionsLibCtxVerifyCommandArity(functionsLibCtx *ctx, struct redisCommand *cmd, int argc, sds *err) {
++    if (ctx && ctx->active_run) ctx->last_register_argc = argc;
++    if (!cmd || ((cmd->arity > 0 && cmd->arity != argc) || (argc < -cmd->arity))) {
++        if (cmd)
++            *err = sdsnew("Wrong number of args calling Redis command from script");
++        else
++            *err = sdsnew("Unknown Redis command called from script");
++        return C_ERR;
++    }
++    return C_OK;
++}
++
++static int functionsLibCtxVerifyACL(functionsLibCtx *ctx, client *c, sds *err) {
++    if (ctx && ctx->active_run && ctx->active_run->original_client) {
++        c->user = ctx->active_run->original_client->user;
++    }
++    int acl_errpos;
++    int acl_retval = ACLCheckAllPerm(c, &acl_errpos);
++    if (acl_retval != ACL_OK) {
++        addACLLogEntry(c,acl_retval,ACL_LOG_CTX_LUA,acl_errpos,NULL,NULL);
++        sds msg = getAclErrorMessage(acl_retval, c->user, c->cmd, c->argv[acl_errpos]->ptr, 0);
++        *err = sdscatsds(sdsnew("ACL failure in script: "), msg);
++        sdsfree(msg);
++        return C_ERR;
++    }
++    return C_OK;
++}
++
++static int functionsLibCtxVerifyWrite(functionsLibCtx *ctx, scriptRunCtx *run_ctx, char **err) {
++    if (ctx && ctx->active_run == run_ctx) ctx->last_run_readonly = (run_ctx->flags & SCRIPT_READ_ONLY) ? 1 : 0;
++    if (run_ctx->flags & SCRIPT_READ_ONLY &&
++        (run_ctx->c->cmd->flags & (CMD_WRITE|CMD_MAY_REPLICATE)))
++    {
++        *err = sdsnew("Write commands are not allowed from read-only scripts.");
++        return C_ERR;
++    }
++
++    if (!(run_ctx->c->cmd->flags & CMD_WRITE))
++        return C_OK;
++
++    if ((run_ctx->flags & SCRIPT_WRITE_DIRTY))
++        return C_OK;
++
++    int deny_write_type = writeCommandsDeniedByDiskError();
++
++    if (server.masterhost && server.repl_slave_ro &&
++        !mustObeyClient(run_ctx->original_client))
++    {
++        *err = sdsdup(shared.roslaveerr->ptr);
++        return C_ERR;
++    }
++
++    if (deny_write_type != DISK_ERROR_TYPE_NONE) {
++        *err = writeCommandsGetDiskErrorMessage(deny_write_type);
++        return C_ERR;
++    }
++
++    if (!checkGoodReplicasStatus()) {
++        *err = sdsdup(shared.noreplicaserr->ptr);
++        return C_ERR;
++    }
++
++    return C_OK;
++}
++
++static int functionsLibCtxVerifyOOM(functionsLibCtx *ctx, scriptRunCtx *run_ctx, char **err) {
++    if (ctx && ctx->active_run == run_ctx && (run_ctx->flags & SCRIPT_ALLOW_OOM)) {
++        return C_OK;
++    }
++    if (run_ctx->flags & SCRIPT_ALLOW_OOM) {
++        return C_OK;
++    }
++
++    if (server.maxmemory &&
++        !mustObeyClient(run_ctx->original_client) &&
++        !(run_ctx->flags & SCRIPT_WRITE_DIRTY) &&
++        server.pre_command_oom_state &&
++        (run_ctx->c->cmd->flags & CMD_DENYOOM))
++    {
++        *err = sdsdup(shared.oomerr->ptr);
++        return C_ERR;
++    }
++
++    return C_OK;
++}
++
++static int functionsLibCtxVerifyCluster(functionsLibCtx *ctx, scriptRunCtx *run_ctx, client *c, client *original_c, sds *err) {
++    if (ctx && ctx->active_run) ctx->run_eval_mode = (run_ctx->flags & SCRIPT_EVAL_MODE) ? 1 : 0;
++    if (!server.cluster_enabled || mustObeyClient(original_c)) {
++        return C_OK;
++    }
++    int error_code;
++    c->flags &= ~(CLIENT_READONLY | CLIENT_ASKING);
++    c->flags |= original_c->flags & (CLIENT_READONLY | CLIENT_ASKING);
++    int hashslot = -1;
++    if (getNodeByQuery(c, c->cmd, c->argv, c->argc, &hashslot, &error_code) != server.cluster->myself) {
++        if (error_code == CLUSTER_REDIR_DOWN_RO_STATE) {
++            *err = sdsnew(
++                    "Script attempted to execute a write command while the "
++                            "cluster is down and readonly");
++        } else if (error_code == CLUSTER_REDIR_DOWN_STATE) {
++            *err = sdsnew("Script attempted to execute a command while the "
++                    "cluster is down");
++        } else {
++            *err = sdsnew("Script attempted to access a non local key in a "
++                    "cluster node");
++        }
++        return C_ERR;
++    }
++
++    if (hashslot != -1 && !(run_ctx->flags & SCRIPT_ALLOW_CROSS_SLOT)) {
++        if (original_c->slot == -1) {
++            original_c->slot = hashslot;
++        } else if (original_c->slot != hashslot) {
++            *err = sdsnew("Script attempted to access keys that do not hash to "
++                    "the same slot");
++            return C_ERR;
++        }
++    }
++    return C_OK;
++}
++
++static int functionsLibCtxVerifyAllowStale(functionsLibCtx *ctx, client *c, sds *err) {
++    if (ctx && ctx->active_run) {
++        ctx->run_eval_mode = (ctx->active_run->flags & SCRIPT_EVAL_MODE) ? 1 : ctx->run_eval_mode;
++    }
++    if (!server.masterhost) {
++        return C_OK;
++    }
++
++    if (server.repl_state == REPL_STATE_CONNECTED) {
++        return C_OK;
++    }
++
++    if (server.repl_serve_stale_data == 1) {
++        return C_OK;
++    }
++
++    if (c->cmd->flags & CMD_STALE) {
++        return C_OK;
++    }
++
++    *err = sdsnew("Can not execute the command on a stale replica");
++    return C_ERR;
++}
++
++int functionsLibCtxSetResp(functionsLibCtx *ctx, scriptRunCtx *run_ctx, int resp) {
++    if (ctx && ctx->active_run) {
++        ctx->run_eval_mode = (ctx->active_run->flags & SCRIPT_EVAL_MODE) ? 1 : ctx->run_eval_mode;
++    }
++    if (resp != 2 && resp != 3) {
++        return C_ERR;
++    }
++
++    run_ctx->c->resp = resp;
++    return C_OK;
++}
++
++int functionsLibCtxSetRepl(functionsLibCtx *ctx, scriptRunCtx *run_ctx, int repl) {
++    if (ctx && ctx->active_run) {
++        ctx->run_eval_mode = (ctx->active_run->flags & SCRIPT_EVAL_MODE) ? 1 : ctx->run_eval_mode;
++    }
++    if ((repl & ~(PROPAGATE_AOF | PROPAGATE_REPL)) != 0) {
++        return C_ERR;
++    }
++    run_ctx->repl_flags = repl;
++    return C_OK;
++}
++
++void functionsLibCtxCall(functionsLibCtx *ctx, scriptRunCtx *run_ctx, robj **argv, int argc, sds *err) {
++    scriptRunCtx *active = (ctx && ctx->active_run) ? ctx->active_run : run_ctx;
++    client *c = active->c;
++    run_ctx = active;
++
++    c->argv = argv;
++    c->argc = argc;
++    c->user = run_ctx->original_client->user;
++
++    moduleCallCommandFilters(c);
++    argv = c->argv;
++    argc = c->argc;
++
++    struct redisCommand *cmd = lookupCommand(argv, argc);
++    c->cmd = c->lastcmd = c->realcmd = cmd;
++    if (functionsLibCtxVerifyCommandArity(ctx, cmd, argc, err) != C_OK) {
++        goto error;
++    }
++
++    if (!server.script_disable_deny_script && (cmd->flags & CMD_NOSCRIPT)) {
++        *err = sdsnew("This Redis command is not allowed from script");
++        goto error;
++    }
++
++    if (functionsLibCtxVerifyAllowStale(ctx, c, err) != C_OK) {
++        goto error;
++    }
++
++    if (functionsLibCtxVerifyACL(ctx, c, err) != C_OK) {
++        goto error;
++    }
++
++    if (functionsLibCtxVerifyWrite(ctx, run_ctx, err) != C_OK) {
++        goto error;
++    }
++
++    if (functionsLibCtxVerifyOOM(ctx, run_ctx, err) != C_OK) {
++        goto error;
++    }
++
++    if (cmd->flags & CMD_WRITE) {
++        run_ctx->flags |= SCRIPT_WRITE_DIRTY;
++    }
++
++    if (functionsLibCtxVerifyCluster(ctx, run_ctx, c, run_ctx->original_client, err) != C_OK) {
++        goto error;
++    }
++
++    int call_flags = CMD_CALL_SLOWLOG | CMD_CALL_STATS;
++    if (run_ctx->repl_flags & PROPAGATE_AOF) {
++        call_flags |= CMD_CALL_PROPAGATE_AOF;
++    }
++    if (run_ctx->repl_flags & PROPAGATE_REPL) {
++        call_flags |= CMD_CALL_PROPAGATE_REPL;
++    }
++    call(c, call_flags);
++    serverAssert((c->flags & CLIENT_BLOCKED) == 0);
++    if (ctx && ctx->last_run_error) {
++        sdsfree(ctx->last_run_error);
++        ctx->last_run_error = NULL;
++    }
++    return;
++
++error:
++    functionsLibCtxRecordRunError(ctx, *err);
++    afterErrorReply(c, *err, sdslen(*err), 0);
++    incrCommandStatsOnError(cmd, ERROR_COMMAND_REJECTED);
++}
++
++ssize_t functionsLibCtxSaveLibraries(functionsLibCtx *ctx, rio *rdb) {
++    dict *libraries = ctx ? ctx->libraries : functionsLibGet();
++    dictIterator *iter = dictGetIterator(libraries);
++    dictEntry *entry = NULL;
++    ssize_t written = 0;
++    ssize_t ret;
++    size_t saved = 0;
++
++    if (ctx) functionsLibCtxBeginPersist(ctx);
++
++    while ((entry = dictNext(iter))) {
++        if ((ret = rdbSaveType(rdb, RDB_OPCODE_FUNCTION2)) < 0) goto werr;
++        written += ret;
++        functionLibInfo *li = dictGetVal(entry);
++        if ((ret = rdbSaveRawString(rdb, (unsigned char *) li->code, sdslen(li->code))) < 0) goto werr;
++        written += ret;
++        saved++;
++    }
++    dictReleaseIterator(iter);
++    if (ctx) {
++        ctx->last_persist_written = written;
++        functionsLibCtxCountSavedLibraries(ctx, saved);
++    }
++    return written;
++
++werr:
++    dictReleaseIterator(iter);
++    if (ctx) functionsLibCtxRecordPersistError(ctx, "failed saving function libraries");
++    return -1;
++}
++
++int functionsLibCtxLoadLibraryPayload(functionsLibCtx *ctx, rio *rdb, int ver, int rdbflags, sds *err) {
++    sds error = NULL;
++    sds final_payload = NULL;
++    int res = C_ERR;
++    if (ctx) functionsLibCtxNotePayloadVersion(ctx, (uint16_t)ver);
++
++    if (!(final_payload = rdbGenericLoadStringObject(rdb, RDB_LOAD_SDS, NULL))) {
++        error = sdsnew("Failed loading library payload");
++        goto done;
++    }
++
++    if (ctx) {
++        sds library_name = NULL;
++        if (!(library_name = functionsCreateWithLibraryCtx(final_payload, rdbflags & RDBFLAGS_ALLOW_DUP, &error, ctx))) {
++            if (!error) {
++                error = sdsnew("Failed creating the library");
++            }
++            goto done;
++        }
++        sdsfree(library_name);
++        ctx->last_payload_libs++;
++    }
++
++    res = C_OK;
++
++done:
++    if (final_payload) sdsfree(final_payload);
++    if (error) {
++        if (ctx) functionsLibCtxRecordPersistError(ctx, error);
++        if (err) {
++            *err = error;
++        } else {
++            serverLog(LL_WARNING, "Failed creating function, %s", error);
++            sdsfree(error);
++        }
++    }
++    return res;
++}
++
++void functionsLibCtxResetRegisterState(functionsLibCtx *ctx) {
++    if (!ctx) return;
++    ctx->last_resolved_flags = 0;
++    ctx->last_register_argc = 0;
++    ctx->last_flag_lookup_ok = 0;
++    ctx->last_register_name_valid = 0;
++    if (ctx->last_register_name) {
++        sdsfree(ctx->last_register_name);
++        ctx->last_register_name = NULL;
++    }
++}
++
++int functionsLibCtxResolveScriptFlag(functionsLibCtx *ctx, const char *flag_str, uint64_t *flag_out) {
++    if (!ctx || !flag_str || !flag_out) {
++        if (ctx) ctx->last_flag_lookup_ok = 0;
++        return C_ERR;
++    }
++    ctx->last_flag_lookup_ok = 0;
++    for (scriptFlag *flag = scripts_flags_def; flag->str; ++flag) {
++        if (!strcasecmp(flag->str, flag_str)) {
++            *flag_out = flag->flag;
++            ctx->last_resolved_flags |= flag->flag;
++            ctx->last_flag_lookup_ok = 1;
++            return C_OK;
++        }
++    }
++    return C_ERR;
++}
++
++void functionsLibCtxRememberRegisterName(functionsLibCtx *ctx, sds name) {
++    if (!ctx) return;
++    if (ctx->last_register_name) sdsfree(ctx->last_register_name);
++    ctx->last_register_name = name ? sdsdup(name) : NULL;
++    ctx->last_register_name_valid = (name && functionsVerifyName(name) == C_OK) ? 1 : 0;
++}
++
++int functionsLibCtxRegisterNameValid(functionsLibCtx *ctx) {
++    return ctx && ctx->last_register_name_valid && ctx->last_register_name != NULL;
++}
++
++uint64_t functionsLibCtxLastResolvedFlags(functionsLibCtx *ctx) {
++    return ctx ? ctx->last_resolved_flags : 0;
++}
++
++int functionsLibCtxFlagLookupSucceeded(functionsLibCtx *ctx) {
++    return ctx && ctx->last_flag_lookup_ok;
++}
++
++
+ /* Initialize engine data structures.
+  * Should be called once on server initialization */
+ int functionsInit() {
+diff --git a/src/functions.h b/src/functions.h
+index 40716dbc7..0333eac1b 100644
+--- a/src/functions.h
++++ b/src/functions.h
+@@ -125,6 +125,31 @@ void functionsLibCtxSwapWithCurrent(functionsLibCtx *lib_ctx);
+ 
+ int functionLibCreateFunction(sds name, void *function, functionLibInfo *li, sds desc, uint64_t f_flags, sds *err);
+ 
++int functionsLibCtxPrepareRun(functionsLibCtx *ctx, scriptRunCtx *run_ctx, client *engine_client, client *caller, const char *funcname, uint64_t script_flags, int ro);
++void functionsLibCtxResetRun(functionsLibCtx *ctx, scriptRunCtx *run_ctx);
++int functionsLibCtxInterrupt(functionsLibCtx *ctx, scriptRunCtx *run_ctx);
++void functionsLibCtxKill(functionsLibCtx *ctx, client *c, int is_eval);
++void functionsLibCtxCall(functionsLibCtx *ctx, scriptRunCtx *run_ctx, robj **argv, int argc, sds *err);
++int functionsLibCtxSetResp(functionsLibCtx *ctx, scriptRunCtx *run_ctx, int resp);
++int functionsLibCtxSetRepl(functionsLibCtx *ctx, scriptRunCtx *run_ctx, int repl);
++uint64_t functionsLibCtxFlagsToCmdFlags(functionsLibCtx *ctx, uint64_t cmd_flags, uint64_t script_flags);
++int functionsLibCtxIsRunning(functionsLibCtx *ctx);
++int functionsLibCtxIsTimedout(functionsLibCtx *ctx);
++int functionsLibCtxIsEval(functionsLibCtx *ctx);
++const char *functionsLibCtxCurrFunction(functionsLibCtx *ctx);
++client *functionsLibCtxGetClient(functionsLibCtx *ctx);
++client *functionsLibCtxGetCaller(functionsLibCtx *ctx);
++mstime_t functionsLibCtxTimeSnapshot(functionsLibCtx *ctx);
++long long functionsLibCtxRunDuration(functionsLibCtx *ctx);
++ssize_t functionsLibCtxSaveLibraries(functionsLibCtx *ctx, rio *rdb);
++int functionsLibCtxLoadLibraryPayload(functionsLibCtx *ctx, rio *rdb, int ver, int rdbflags, sds *err);
++int functionsLibCtxResolveScriptFlag(functionsLibCtx *ctx, const char *flag_str, uint64_t *flag_out);
++void functionsLibCtxResetRegisterState(functionsLibCtx *ctx);
++void functionsLibCtxRememberRegisterName(functionsLibCtx *ctx, sds name);
++int functionsLibCtxRegisterNameValid(functionsLibCtx *ctx);
++uint64_t functionsLibCtxLastResolvedFlags(functionsLibCtx *ctx);
++int functionsLibCtxFlagLookupSucceeded(functionsLibCtx *ctx);
++
+ int luaEngineInitEngine();
+ int functionsInit();
+ 
+diff --git a/src/rdb.c b/src/rdb.c
+index bbb61aafb..78ff16b98 100644
+--- a/src/rdb.c
++++ b/src/rdb.c
+@@ -1253,24 +1253,7 @@ error:
+ }
+ 
+ ssize_t rdbSaveFunctions(rio *rdb) {
+-    dict *functions = functionsLibGet();
+-    dictIterator *iter = dictGetIterator(functions);
+-    dictEntry *entry = NULL;
+-    ssize_t written = 0;
+-    ssize_t ret;
+-    while ((entry = dictNext(iter))) {
+-        if ((ret = rdbSaveType(rdb, RDB_OPCODE_FUNCTION2)) < 0) goto werr;
+-        written += ret;
+-        functionLibInfo *li = dictGetVal(entry);
+-        if ((ret = rdbSaveRawString(rdb, (unsigned char *) li->code, sdslen(li->code))) < 0) goto werr;
+-        written += ret;
+-    }
+-    dictReleaseIterator(iter);
+-    return written;
+-
+-werr:
+-    dictReleaseIterator(iter);
+-    return -1;
++    return functionsLibCtxSaveLibraries(functionsLibCtxGetCurrent(), rdb);
+ }
+ 
+ ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, long *key_counter) {
+@@ -2885,39 +2868,7 @@ void rdbLoadProgressCallback(rio *r, const void *buf, size_t len) {
+  * The lib_ctx argument is also optional. If NULL is given, only verify rdb
+  * structure with out performing the actual functions loading. */
+ int rdbFunctionLoad(rio *rdb, int ver, functionsLibCtx* lib_ctx, int rdbflags, sds *err) {
+-    UNUSED(ver);
+-    sds error = NULL;
+-    sds final_payload = NULL;
+-    int res = C_ERR;
+-    if (!(final_payload = rdbGenericLoadStringObject(rdb, RDB_LOAD_SDS, NULL))) {
+-        error = sdsnew("Failed loading library payload");
+-        goto done;
+-    }
+-
+-    if (lib_ctx) {
+-        sds library_name = NULL;
+-        if (!(library_name = functionsCreateWithLibraryCtx(final_payload, rdbflags & RDBFLAGS_ALLOW_DUP, &error, lib_ctx))) {
+-            if (!error) {
+-                error = sdsnew("Failed creating the library");
+-            }
+-            goto done;
+-        }
+-        sdsfree(library_name);
+-    }
+-
+-    res = C_OK;
+-
+-done:
+-    if (final_payload) sdsfree(final_payload);
+-    if (error) {
+-        if (err) {
+-            *err = error;
+-        } else {
+-            serverLog(LL_WARNING, "Failed creating function, %s", error);
+-            sdsfree(error);
+-        }
+-    }
+-    return res;
++    return functionsLibCtxLoadLibraryPayload(lib_ctx, rdb, ver, rdbflags, err);
+ }
+ 
+ /* Load an RDB file from the rio stream 'rdb'. On success C_OK is returned,
+diff --git a/src/script.c b/src/script.c
+index 57fa7eeba..54fb4eca4 100644
+--- a/src/script.c
++++ b/src/script.c
+@@ -29,7 +29,7 @@
+ 
+ #include "server.h"
+ #include "script.h"
+-#include "cluster.h"
++#include "functions.h"
+ 
+ scriptFlag scripts_flags_def[] = {
+     {.flag = SCRIPT_FLAG_NO_WRITES, .str = "no-writes"},
+@@ -40,552 +40,70 @@ scriptFlag scripts_flags_def[] = {
+     {.flag = 0, .str = NULL}, /* flags array end */
+ };
+ 
+-/* On script invocation, holding the current run context */
+-static scriptRunCtx *curr_run_ctx = NULL;
+-
+-static void exitScriptTimedoutMode(scriptRunCtx *run_ctx) {
+-    serverAssert(run_ctx == curr_run_ctx);
+-    serverAssert(scriptIsTimedout());
+-    run_ctx->flags &= ~SCRIPT_TIMEDOUT;
+-    blockingOperationEnds();
+-    /* if we are a replica and we have an active master, set it for continue processing */
+-    if (server.masterhost && server.master) queueClientForReprocessing(server.master);
+-}
+-
+-static void enterScriptTimedoutMode(scriptRunCtx *run_ctx) {
+-    serverAssert(run_ctx == curr_run_ctx);
+-    serverAssert(!scriptIsTimedout());
+-    /* Mark script as timedout */
+-    run_ctx->flags |= SCRIPT_TIMEDOUT;
+-    blockingOperationStarts();
++static functionsLibCtx *scriptFunctionsCtx(void) {
++    return functionsLibCtxGetCurrent();
+ }
+ 
+ int scriptIsTimedout() {
+-    return scriptIsRunning() && (curr_run_ctx->flags & SCRIPT_TIMEDOUT);
++    return functionsLibCtxIsTimedout(scriptFunctionsCtx());
+ }
+ 
+ client* scriptGetClient() {
+-    serverAssert(scriptIsRunning());
+-    return curr_run_ctx->c;
++    return functionsLibCtxGetClient(scriptFunctionsCtx());
+ }
+ 
+ client* scriptGetCaller() {
+-    serverAssert(scriptIsRunning());
+-    return curr_run_ctx->original_client;
++    return functionsLibCtxGetCaller(scriptFunctionsCtx());
+ }
+ 
+-/* interrupt function for scripts, should be call
+- * from time to time to reply some special command (like ping)
+- * and also check if the run should be terminated. */
+ int scriptInterrupt(scriptRunCtx *run_ctx) {
+-    if (run_ctx->flags & SCRIPT_TIMEDOUT) {
+-        /* script already timedout
+-           we just need to precess some events and return */
+-        processEventsWhileBlocked();
+-        return (run_ctx->flags & SCRIPT_KILLED) ? SCRIPT_KILL : SCRIPT_CONTINUE;
+-    }
+-
+-    long long elapsed = elapsedMs(run_ctx->start_time);
+-    if (elapsed < server.busy_reply_threshold) {
+-        return SCRIPT_CONTINUE;
+-    }
+-
+-    serverLog(LL_WARNING,
+-            "Slow script detected: still in execution after %lld milliseconds. "
+-                    "You can try killing the script using the %s command. Script name is: %s.",
+-            elapsed, (run_ctx->flags & SCRIPT_EVAL_MODE) ? "SCRIPT KILL" : "FUNCTION KILL", run_ctx->funcname);
+-
+-    enterScriptTimedoutMode(run_ctx);
+-    /* Once the script timeouts we reenter the event loop to permit others
+-     * some commands execution. For this reason
+-     * we need to mask the client executing the script from the event loop.
+-     * If we don't do that the client may disconnect and could no longer be
+-     * here when the EVAL command will return. */
+-    protectClient(run_ctx->original_client);
+-
+-    processEventsWhileBlocked();
+-
+-    return (run_ctx->flags & SCRIPT_KILLED) ? SCRIPT_KILL : SCRIPT_CONTINUE;
++    return functionsLibCtxInterrupt(scriptFunctionsCtx(), run_ctx);
+ }
+ 
+ uint64_t scriptFlagsToCmdFlags(uint64_t cmd_flags, uint64_t script_flags) {
+-    /* If the script declared flags, clear the ones from the command and use the ones it declared.*/
+-    cmd_flags &= ~(CMD_STALE | CMD_DENYOOM | CMD_WRITE);
+-
+-    /* NO_WRITES implies ALLOW_OOM */
+-    if (!(script_flags & (SCRIPT_FLAG_ALLOW_OOM | SCRIPT_FLAG_NO_WRITES)))
+-        cmd_flags |= CMD_DENYOOM;
+-    if (!(script_flags & SCRIPT_FLAG_NO_WRITES))
+-        cmd_flags |= CMD_WRITE;
+-    if (script_flags & SCRIPT_FLAG_ALLOW_STALE)
+-        cmd_flags |= CMD_STALE;
+-
+-    /* In addition the MAY_REPLICATE flag is set for these commands, but
+-     * if we have flags we know if it's gonna do any writes or not. */
+-    cmd_flags &= ~CMD_MAY_REPLICATE;
+-
+-    return cmd_flags;
++    return functionsLibCtxFlagsToCmdFlags(scriptFunctionsCtx(), cmd_flags, script_flags);
+ }
+ 
+-/* Prepare the given run ctx for execution */
+ int scriptPrepareForRun(scriptRunCtx *run_ctx, client *engine_client, client *caller, const char *funcname, uint64_t script_flags, int ro) {
+-    serverAssert(!curr_run_ctx);
+-    bool client_allow_oom = caller->flags & CLIENT_ALLOW_OOM;
+-
+-    int running_stale = server.masterhost &&
+-            server.repl_state != REPL_STATE_CONNECTED &&
+-            server.repl_serve_stale_data == 0;
+-    int obey_client = mustObeyClient(caller);
+-
+-    if (!(script_flags & SCRIPT_FLAG_EVAL_COMPAT_MODE)) {
+-        if ((script_flags & SCRIPT_FLAG_NO_CLUSTER) && server.cluster_enabled) {
+-            addReplyError(caller, "Can not run script on cluster, 'no-cluster' flag is set.");
+-            return C_ERR;
+-        }
+-
+-        if (running_stale && !(script_flags & SCRIPT_FLAG_ALLOW_STALE)) {
+-            addReplyError(caller, "-MASTERDOWN Link with MASTER is down, "
+-                             "replica-serve-stale-data is set to 'no' "
+-                             "and 'allow-stale' flag is not set on the script.");
+-            return C_ERR;
+-        }
+-
+-        if (!(script_flags & SCRIPT_FLAG_NO_WRITES)) {
+-            /* Script may perform writes we need to verify:
+-             * 1. we are not a readonly replica
+-             * 2. no disk error detected
+-             * 3. command is not `fcall_ro`/`eval[sha]_ro` */
+-            if (server.masterhost && server.repl_slave_ro && !obey_client) {
+-                addReplyError(caller, "-READONLY Can not run script with write flag on readonly replica");
+-                return C_ERR;
+-            }
+-
+-            /* Deny writes if we're unale to persist. */
+-            int deny_write_type = writeCommandsDeniedByDiskError();
+-            if (deny_write_type != DISK_ERROR_TYPE_NONE && !obey_client) {
+-                if (deny_write_type == DISK_ERROR_TYPE_RDB)
+-                    addReplyError(caller, "-MISCONF Redis is configured to save RDB snapshots, "
+-                                     "but it's currently unable to persist to disk. "
+-                                     "Writable scripts are blocked. Use 'no-writes' flag for read only scripts.");
+-                else
+-                    addReplyErrorFormat(caller, "-MISCONF Redis is configured to persist data to AOF, "
+-                                           "but it's currently unable to persist to disk. "
+-                                           "Writable scripts are blocked. Use 'no-writes' flag for read only scripts. "
+-                                           "AOF error: %s", strerror(server.aof_last_write_errno));
+-                return C_ERR;
+-            }
+-
+-            if (ro) {
+-                addReplyError(caller, "Can not execute a script with write flag using *_ro command.");
+-                return C_ERR;
+-            }
+-
+-            /* Don't accept write commands if there are not enough good slaves and
+-             * user configured the min-slaves-to-write option. */
+-            if (!checkGoodReplicasStatus()) {
+-                addReplyErrorObject(caller, shared.noreplicaserr);
+-                return C_ERR;
+-            }
+-        }
+-
+-        /* Check OOM state. the no-writes flag imply allow-oom. we tested it
+-         * after the no-write error, so no need to mention it in the error reply. */
+-        if (!client_allow_oom && server.pre_command_oom_state && server.maxmemory &&
+-            !(script_flags & (SCRIPT_FLAG_ALLOW_OOM|SCRIPT_FLAG_NO_WRITES)))
+-        {
+-            addReplyError(caller, "-OOM allow-oom flag is not set on the script, "
+-                                  "can not run it when used memory > 'maxmemory'");
+-            return C_ERR;
+-        }
+-
+-    } else {
+-        /* Special handling for backwards compatibility (no shebang eval[sha]) mode */
+-        if (running_stale) {
+-            addReplyErrorObject(caller, shared.masterdownerr);
+-            return C_ERR;
+-        }
+-    }
+-
+-    run_ctx->c = engine_client;
+-    run_ctx->original_client = caller;
+-    run_ctx->funcname = funcname;
+-
+-    client *script_client = run_ctx->c;
+-    client *curr_client = run_ctx->original_client;
+-    server.script_caller = curr_client;
+-
+-    /* Select the right DB in the context of the Lua client */
+-    selectDb(script_client, curr_client->db->id);
+-    script_client->resp = 2; /* Default is RESP2, scripts can change it. */
+-
+-    /* If we are in MULTI context, flag Lua client as CLIENT_MULTI. */
+-    if (curr_client->flags & CLIENT_MULTI) {
+-        script_client->flags |= CLIENT_MULTI;
+-    }
+-
+-    run_ctx->start_time = getMonotonicUs();
+-    run_ctx->snapshot_time = mstime();
+-
+-    run_ctx->flags = 0;
+-    run_ctx->repl_flags = PROPAGATE_AOF | PROPAGATE_REPL;
+-
+-    if (ro || (!(script_flags & SCRIPT_FLAG_EVAL_COMPAT_MODE) && (script_flags & SCRIPT_FLAG_NO_WRITES))) {
+-        /* On fcall_ro or on functions that do not have the 'write'
+-         * flag, we will not allow write commands. */
+-        run_ctx->flags |= SCRIPT_READ_ONLY;
+-    }
+-    if (client_allow_oom || (!(script_flags & SCRIPT_FLAG_EVAL_COMPAT_MODE) && (script_flags & SCRIPT_FLAG_ALLOW_OOM))) {
+-        /* Note: we don't need to test the no-writes flag here and set this run_ctx flag,
+-         * since only write commands can are deny-oom. */
+-        run_ctx->flags |= SCRIPT_ALLOW_OOM;
+-    }
+-
+-    if ((script_flags & SCRIPT_FLAG_EVAL_COMPAT_MODE) || (script_flags & SCRIPT_FLAG_ALLOW_CROSS_SLOT)) {
+-        run_ctx->flags |= SCRIPT_ALLOW_CROSS_SLOT;
+-    }
+-
+-    /* set the curr_run_ctx so we can use it to kill the script if needed */
+-    curr_run_ctx = run_ctx;
+-
+-    return C_OK;
++    return functionsLibCtxPrepareRun(scriptFunctionsCtx(), run_ctx, engine_client, caller, funcname, script_flags, ro);
+ }
+ 
+-/* Reset the given run ctx after execution */
+ void scriptResetRun(scriptRunCtx *run_ctx) {
+-    serverAssert(curr_run_ctx);
+-
+-    /* After the script done, remove the MULTI state. */
+-    run_ctx->c->flags &= ~CLIENT_MULTI;
+-
+-    server.script_caller = NULL;
+-
+-    if (scriptIsTimedout()) {
+-        exitScriptTimedoutMode(run_ctx);
+-        /* Restore the client that was protected when the script timeout
+-         * was detected. */
+-        unprotectClient(run_ctx->original_client);
+-    }
+-
+-    preventCommandPropagation(run_ctx->original_client);
+-
+-    /*  unset curr_run_ctx so we will know there is no running script */
+-    curr_run_ctx = NULL;
++    functionsLibCtxResetRun(scriptFunctionsCtx(), run_ctx);
+ }
+ 
+-/* return true if a script is currently running */
+ int scriptIsRunning() {
+-    return curr_run_ctx != NULL;
++    return functionsLibCtxIsRunning(scriptFunctionsCtx());
+ }
+ 
+ const char* scriptCurrFunction() {
+-    serverAssert(scriptIsRunning());
+-    return curr_run_ctx->funcname;
++    return functionsLibCtxCurrFunction(scriptFunctionsCtx());
+ }
+ 
+ int scriptIsEval() {
+-    serverAssert(scriptIsRunning());
+-    return curr_run_ctx->flags & SCRIPT_EVAL_MODE;
++    return functionsLibCtxIsEval(scriptFunctionsCtx());
+ }
+ 
+-/* Kill the current running script */
+ void scriptKill(client *c, int is_eval) {
+-    if (!curr_run_ctx) {
+-        addReplyError(c, "-NOTBUSY No scripts in execution right now.");
+-        return;
+-    }
+-    if (mustObeyClient(curr_run_ctx->original_client)) {
+-        addReplyError(c,
+-                "-UNKILLABLE The busy script was sent by a master instance in the context of replication and cannot be killed.");
+-    }
+-    if (curr_run_ctx->flags & SCRIPT_WRITE_DIRTY) {
+-        addReplyError(c,
+-                "-UNKILLABLE Sorry the script already executed write "
+-                        "commands against the dataset. You can either wait the "
+-                        "script termination or kill the server in a hard way "
+-                        "using the SHUTDOWN NOSAVE command.");
+-        return;
+-    }
+-    if (is_eval && !(curr_run_ctx->flags & SCRIPT_EVAL_MODE)) {
+-        /* Kill a function with 'SCRIPT KILL' is not allow */
+-        addReplyErrorObject(c, shared.slowscripterr);
+-        return;
+-    }
+-    if (!is_eval && (curr_run_ctx->flags & SCRIPT_EVAL_MODE)) {
+-        /* Kill an eval with 'FUNCTION KILL' is not allow */
+-        addReplyErrorObject(c, shared.slowevalerr);
+-        return;
+-    }
+-    curr_run_ctx->flags |= SCRIPT_KILLED;
+-    addReply(c, shared.ok);
+-}
+-
+-static int scriptVerifyCommandArity(struct redisCommand *cmd, int argc, sds *err) {
+-    if (!cmd || ((cmd->arity > 0 && cmd->arity != argc) || (argc < -cmd->arity))) {
+-        if (cmd)
+-            *err = sdsnew("Wrong number of args calling Redis command from script");
+-        else
+-            *err = sdsnew("Unknown Redis command called from script");
+-        return C_ERR;
+-    }
+-    return C_OK;
+-}
+-
+-static int scriptVerifyACL(client *c, sds *err) {
+-    /* Check the ACLs. */
+-    int acl_errpos;
+-    int acl_retval = ACLCheckAllPerm(c, &acl_errpos);
+-    if (acl_retval != ACL_OK) {
+-        addACLLogEntry(c,acl_retval,ACL_LOG_CTX_LUA,acl_errpos,NULL,NULL);
+-        sds msg = getAclErrorMessage(acl_retval, c->user, c->cmd, c->argv[acl_errpos]->ptr, 0);
+-        *err = sdscatsds(sdsnew("ACL failure in script: "), msg);
+-        sdsfree(msg);
+-        return C_ERR;
+-    }
+-    return C_OK;
+-}
+-
+-static int scriptVerifyWriteCommandAllow(scriptRunCtx *run_ctx, char **err) {
+-
+-    /* A write command, on an RO command or an RO script is rejected ASAP.
+-     * Note: For scripts, we consider may-replicate commands as write commands.
+-     * This also makes it possible to allow read-only scripts to be run during
+-     * CLIENT PAUSE WRITE. */
+-    if (run_ctx->flags & SCRIPT_READ_ONLY &&
+-        (run_ctx->c->cmd->flags & (CMD_WRITE|CMD_MAY_REPLICATE)))
+-    {
+-        *err = sdsnew("Write commands are not allowed from read-only scripts.");
+-        return C_ERR;
+-    }
+-
+-    /* The other checks below are on the server state and are only relevant for
+-     *  write commands, return if this is not a write command. */
+-    if (!(run_ctx->c->cmd->flags & CMD_WRITE))
+-        return C_OK;
+-
+-    /* If the script already made a modification to the dataset, we can't
+-     * fail it on unpredictable error state. */
+-    if ((run_ctx->flags & SCRIPT_WRITE_DIRTY))
+-        return C_OK;
+-
+-    /* Write commands are forbidden against read-only slaves, or if a
+-     * command marked as non-deterministic was already called in the context
+-     * of this script. */
+-    int deny_write_type = writeCommandsDeniedByDiskError();
+-
+-    if (server.masterhost && server.repl_slave_ro &&
+-        !mustObeyClient(run_ctx->original_client))
+-    {
+-        *err = sdsdup(shared.roslaveerr->ptr);
+-        return C_ERR;
+-    }
+-
+-    if (deny_write_type != DISK_ERROR_TYPE_NONE) {
+-        *err = writeCommandsGetDiskErrorMessage(deny_write_type);
+-        return C_ERR;
+-    }
+-
+-    /* Don't accept write commands if there are not enough good slaves and
+-     * user configured the min-slaves-to-write option. Note this only reachable
+-     * for Eval scripts that didn't declare flags, see the other check in
+-     * scriptPrepareForRun */
+-    if (!checkGoodReplicasStatus()) {
+-        *err = sdsdup(shared.noreplicaserr->ptr);
+-        return C_ERR;
+-    }
+-
+-    return C_OK;
+-}
+-
+-static int scriptVerifyOOM(scriptRunCtx *run_ctx, char **err) {
+-    if (run_ctx->flags & SCRIPT_ALLOW_OOM) {
+-        /* Allow running any command even if OOM reached */
+-        return C_OK;
+-    }
+-
+-    /* If we reached the memory limit configured via maxmemory, commands that
+-     * could enlarge the memory usage are not allowed, but only if this is the
+-     * first write in the context of this script, otherwise we can't stop
+-     * in the middle. */
+-
+-    if (server.maxmemory &&                            /* Maxmemory is actually enabled. */
+-        !mustObeyClient(run_ctx->original_client) &&   /* Don't care about mem for replicas or AOF. */
+-        !(run_ctx->flags & SCRIPT_WRITE_DIRTY) &&      /* Script had no side effects so far. */
+-        server.pre_command_oom_state &&                /* Detected OOM when script start. */
+-        (run_ctx->c->cmd->flags & CMD_DENYOOM))
+-    {
+-        *err = sdsdup(shared.oomerr->ptr);
+-        return C_ERR;
+-    }
+-
+-    return C_OK;
+-}
+-
+-static int scriptVerifyClusterState(scriptRunCtx *run_ctx, client *c, client *original_c, sds *err) {
+-    if (!server.cluster_enabled || mustObeyClient(original_c)) {
+-        return C_OK;
+-    }
+-    /* If this is a Redis Cluster node, we need to make sure the script is not
+-     * trying to access non-local keys, with the exception of commands
+-     * received from our master or when loading the AOF back in memory. */
+-    int error_code;
+-    /* Duplicate relevant flags in the script client. */
+-    c->flags &= ~(CLIENT_READONLY | CLIENT_ASKING);
+-    c->flags |= original_c->flags & (CLIENT_READONLY | CLIENT_ASKING);
+-    int hashslot = -1;
+-    if (getNodeByQuery(c, c->cmd, c->argv, c->argc, &hashslot, &error_code) != server.cluster->myself) {
+-        if (error_code == CLUSTER_REDIR_DOWN_RO_STATE) {
+-            *err = sdsnew(
+-                    "Script attempted to execute a write command while the "
+-                            "cluster is down and readonly");
+-        } else if (error_code == CLUSTER_REDIR_DOWN_STATE) {
+-            *err = sdsnew("Script attempted to execute a command while the "
+-                    "cluster is down");
+-        } else {
+-            *err = sdsnew("Script attempted to access a non local key in a "
+-                    "cluster node");
+-        }
+-        return C_ERR;
+-    }
+-
+-    /* If the script declared keys in advanced, the cross slot error would have
+-     * already been thrown. This is only checking for cross slot keys being accessed
+-     * that weren't pre-declared. */
+-    if (hashslot != -1 && !(run_ctx->flags & SCRIPT_ALLOW_CROSS_SLOT)) {
+-        if (original_c->slot == -1) {
+-            original_c->slot = hashslot;
+-        } else if (original_c->slot != hashslot) {
+-            *err = sdsnew("Script attempted to access keys that do not hash to "
+-                    "the same slot");
+-            return C_ERR;
+-        }
+-    }
+-    return C_OK;
++    functionsLibCtxKill(scriptFunctionsCtx(), c, is_eval);
+ }
+ 
+-/* set RESP for a given run_ctx */
+ int scriptSetResp(scriptRunCtx *run_ctx, int resp) {
+-    if (resp != 2 && resp != 3) {
+-        return C_ERR;
+-    }
+-
+-    run_ctx->c->resp = resp;
+-    return C_OK;
++    return functionsLibCtxSetResp(scriptFunctionsCtx(), run_ctx, resp);
+ }
+ 
+-/* set Repl for a given run_ctx
+- * either: PROPAGATE_AOF | PROPAGATE_REPL*/
+ int scriptSetRepl(scriptRunCtx *run_ctx, int repl) {
+-    if ((repl & ~(PROPAGATE_AOF | PROPAGATE_REPL)) != 0) {
+-        return C_ERR;
+-    }
+-    run_ctx->repl_flags = repl;
+-    return C_OK;
+-}
+-
+-static int scriptVerifyAllowStale(client *c, sds *err) {
+-    if (!server.masterhost) {
+-        /* Not a replica, stale is irrelevant */
+-        return C_OK;
+-    }
+-
+-    if (server.repl_state == REPL_STATE_CONNECTED) {
+-        /* Connected to replica, stale is irrelevant */
+-        return C_OK;
+-    }
+-
+-    if (server.repl_serve_stale_data == 1) {
+-        /* Disconnected from replica but allow to serve data */
+-        return C_OK;
+-    }
+-
+-    if (c->cmd->flags & CMD_STALE) {
+-        /* Command is allow while stale */
+-        return C_OK;
+-    }
+-
+-    /* On stale replica, can not run the command */
+-    *err = sdsnew("Can not execute the command on a stale replica");
+-    return C_ERR;
++    return functionsLibCtxSetRepl(scriptFunctionsCtx(), run_ctx, repl);
+ }
+ 
+-/* Call a Redis command.
+- * The reply is written to the run_ctx client and it is
+- * up to the engine to take and parse.
+- * The err out variable is set only if error occurs and describe the error.
+- * If err is set on reply is written to the run_ctx client. */
+-void scriptCall(scriptRunCtx *run_ctx, robj* *argv, int argc, sds *err) {
+-    client *c = run_ctx->c;
+-
+-    /* Setup our fake client for command execution */
+-    c->argv = argv;
+-    c->argc = argc;
+-    c->user = run_ctx->original_client->user;
+-
+-    /* Process module hooks */
+-    moduleCallCommandFilters(c);
+-    argv = c->argv;
+-    argc = c->argc;
+-
+-    struct redisCommand *cmd = lookupCommand(argv, argc);
+-    c->cmd = c->lastcmd = c->realcmd = cmd;
+-    if (scriptVerifyCommandArity(cmd, argc, err) != C_OK) {
+-        goto error;
+-    }
+-
+-    /* There are commands that are not allowed inside scripts. */
+-    if (!server.script_disable_deny_script && (cmd->flags & CMD_NOSCRIPT)) {
+-        *err = sdsnew("This Redis command is not allowed from script");
+-        goto error;
+-    }
+-
+-    if (scriptVerifyAllowStale(c, err) != C_OK) {
+-        goto error;
+-    }
+-
+-    if (scriptVerifyACL(c, err) != C_OK) {
+-        goto error;
+-    }
+-
+-    if (scriptVerifyWriteCommandAllow(run_ctx, err) != C_OK) {
+-        goto error;
+-    }
+-
+-    if (scriptVerifyOOM(run_ctx, err) != C_OK) {
+-        goto error;
+-    }
+-
+-    if (cmd->flags & CMD_WRITE) {
+-        /* signify that we already change the data in this execution */
+-        run_ctx->flags |= SCRIPT_WRITE_DIRTY;
+-    }
+-
+-    if (scriptVerifyClusterState(run_ctx, c, run_ctx->original_client, err) != C_OK) {
+-        goto error;
+-    }
+-
+-    int call_flags = CMD_CALL_SLOWLOG | CMD_CALL_STATS;
+-    if (run_ctx->repl_flags & PROPAGATE_AOF) {
+-        call_flags |= CMD_CALL_PROPAGATE_AOF;
+-    }
+-    if (run_ctx->repl_flags & PROPAGATE_REPL) {
+-        call_flags |= CMD_CALL_PROPAGATE_REPL;
+-    }
+-    call(c, call_flags);
+-    serverAssert((c->flags & CLIENT_BLOCKED) == 0);
+-    return;
+-
+-error:
+-    afterErrorReply(c, *err, sdslen(*err), 0);
+-    incrCommandStatsOnError(cmd, ERROR_COMMAND_REJECTED);
++void scriptCall(scriptRunCtx *run_ctx, robj **argv, int argc, sds *err) {
++    functionsLibCtxCall(scriptFunctionsCtx(), run_ctx, argv, argc, err);
+ }
+ 
+-/* Returns the time when the script invocation started */
+ mstime_t scriptTimeSnapshot() {
+-    serverAssert(curr_run_ctx);
+-    return curr_run_ctx->snapshot_time;
++    return functionsLibCtxTimeSnapshot(scriptFunctionsCtx());
+ }
+ 
+ long long scriptRunDuration() {
+-    serverAssert(scriptIsRunning());
+-    return elapsedMs(curr_run_ctx->start_time);
++    return functionsLibCtxRunDuration(scriptFunctionsCtx());
+ }

@@ -1,0 +1,2292 @@
+diff --git a/processing/src/main/java/org/apache/druid/query/groupby/GroupByQueryQueryToolChest.java b/processing/src/main/java/org/apache/druid/query/groupby/GroupByQueryQueryToolChest.java
+index 9c746dd414..48079847bf 100644
+--- a/processing/src/main/java/org/apache/druid/query/groupby/GroupByQueryQueryToolChest.java
++++ b/processing/src/main/java/org/apache/druid/query/groupby/GroupByQueryQueryToolChest.java
+@@ -32,9 +32,16 @@ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.base.Function;
+ import com.google.common.base.Functions;
+ import com.google.common.base.Supplier;
++import com.google.common.collect.Iterables;
+ import com.google.common.collect.Lists;
++import com.google.common.collect.Ordering;
++import com.google.common.primitives.Doubles;
++import com.google.common.primitives.Longs;
+ import com.google.inject.Inject;
++import org.apache.druid.common.config.NullHandling;
++import org.apache.druid.data.input.MapBasedRow;
+ import org.apache.druid.data.input.Row;
++import org.apache.druid.data.input.Rows;
+ import org.apache.druid.frame.Frame;
+ import org.apache.druid.frame.FrameType;
+ import org.apache.druid.frame.allocation.MemoryAllocatorFactory;
+@@ -44,16 +51,20 @@ import org.apache.druid.frame.write.FrameWriterUtils;
+ import org.apache.druid.frame.write.FrameWriters;
+ import org.apache.druid.java.util.common.ISE;
+ import org.apache.druid.java.util.common.Pair;
++import org.apache.druid.java.util.common.collect.Utils;
++import org.apache.druid.java.util.common.granularity.Granularities;
+ import org.apache.druid.java.util.common.granularity.Granularity;
+ import org.apache.druid.java.util.common.guava.MappedSequence;
+ import org.apache.druid.java.util.common.guava.Sequence;
+ import org.apache.druid.java.util.common.guava.Sequences;
++import org.apache.druid.java.util.common.guava.TopNSequence;
+ import org.apache.druid.java.util.common.jackson.JacksonUtils;
+ import org.apache.druid.query.CacheStrategy;
+ import org.apache.druid.query.DataSource;
+ import org.apache.druid.query.FrameSignaturePair;
+ import org.apache.druid.query.IterableRowsCursorHelper;
+ import org.apache.druid.query.Query;
++import org.apache.druid.query.QueryContext;
+ import org.apache.druid.query.QueryDataSource;
+ import org.apache.druid.query.QueryPlus;
+ import org.apache.druid.query.QueryRunner;
+@@ -68,22 +79,42 @@ import org.apache.druid.query.context.ResponseContext;
+ import org.apache.druid.query.dimension.DefaultDimensionSpec;
+ import org.apache.druid.query.dimension.DimensionSpec;
+ import org.apache.druid.query.extraction.ExtractionFn;
++import org.apache.druid.query.groupby.orderby.DefaultLimitSpec;
++import org.apache.druid.query.groupby.orderby.LimitSpec;
++import org.apache.druid.query.groupby.orderby.OrderByColumnSpec;
++import org.apache.druid.query.ordering.StringComparator;
++import org.apache.druid.query.ordering.StringComparators;
+ import org.apache.druid.segment.Cursor;
+ import org.apache.druid.segment.DimensionHandlerUtils;
++import org.apache.druid.segment.column.ColumnType;
+ import org.apache.druid.segment.column.RowSignature;
++import org.apache.druid.segment.column.ValueType;
++import org.apache.druid.segment.data.ComparableList;
++import org.apache.druid.segment.data.ComparableStringArray;
++import org.apache.druid.segment.join.filter.AllNullColumnSelectorFactory;
+ import org.joda.time.DateTime;
+ 
++import javax.annotation.Nullable;
++
+ import java.io.Closeable;
+ import java.io.IOException;
++import java.math.BigDecimal;
+ import java.util.ArrayList;
+ import java.util.BitSet;
++import java.util.Collections;
+ import java.util.Comparator;
++import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Optional;
++import java.util.Set;
+ import java.util.TreeMap;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicReference;
+ import java.util.function.BinaryOperator;
++import java.util.regex.Pattern;
+ 
+ /**
+  *
+@@ -102,6 +133,25 @@ public class GroupByQueryQueryToolChest extends QueryToolChest<ResultRow, GroupB
+   private final GroupingEngine groupingEngine;
+   private final GroupByQueryConfig queryConfig;
+   private final GroupByQueryMetricsFactory queryMetricsFactory;
++  private final boolean includeTimestampInResultMaps;
++  private final boolean finalizeMetricsForResults;
++  private final Pattern havingMetricLongPattern;
++  private final int unlimitedResultLimit;
++  private final boolean useStableResultOrdering;
++  private final int maxMergeBuffersWithoutSubtotal;
++  private final boolean copyLegacyPostAggregators;
++
++  private static final AtomicReference<GroupByQueryQueryToolChest> COORDINATOR = new AtomicReference<>();
++
++  private static final class CoordinatorHolder
++  {
++    private static final GroupByQueryQueryToolChest FALLBACK = new GroupByQueryQueryToolChest(
++        null,
++        GroupByQueryConfig::new,
++        DefaultGroupByQueryMetricsFactory.instance(),
++        false
++    );
++  }
+ 
+   @VisibleForTesting
+   public GroupByQueryQueryToolChest(GroupingEngine groupingEngine)
+@@ -115,15 +165,46 @@ public class GroupByQueryQueryToolChest extends QueryToolChest<ResultRow, GroupB
+       Supplier<GroupByQueryConfig> queryConfigSupplier,
+       GroupByQueryMetricsFactory queryMetricsFactory
+   )
++  {
++    this(groupingEngine, queryConfigSupplier, queryMetricsFactory, true);
++  }
++
++  private GroupByQueryQueryToolChest(
++      GroupingEngine groupingEngine,
++      Supplier<GroupByQueryConfig> queryConfigSupplier,
++      GroupByQueryMetricsFactory queryMetricsFactory,
++      boolean registerCoordinator
++  )
+   {
+     this.groupingEngine = groupingEngine;
+     this.queryConfig = queryConfigSupplier.get();
+     this.queryMetricsFactory = queryMetricsFactory;
++    this.includeTimestampInResultMaps = false;
++    this.finalizeMetricsForResults = true;
++    this.havingMetricLongPattern = Pattern.compile("[-|+]?\\d+");
++    this.unlimitedResultLimit = Integer.MAX_VALUE;
++    this.useStableResultOrdering = true;
++    this.maxMergeBuffersWithoutSubtotal = 2;
++    this.copyLegacyPostAggregators = true;
++    if (registerCoordinator) {
++      COORDINATOR.set(this);
++    }
++  }
++
++  public static GroupByQueryQueryToolChest coordinator()
++  {
++    final GroupByQueryQueryToolChest registered = COORDINATOR.get();
++    return registered != null ? registered : CoordinatorHolder.FALLBACK;
+   }
+ 
+   @Override
+   public QueryRunner<ResultRow> mergeResults(final QueryRunner<ResultRow> runner)
+   {
++    final GroupingEngine engine = groupingEngine;
++    if (engine == null && groupingEngine != null) {
++      return null;
++    }
++
+     return (queryPlus, responseContext) -> {
+       if (queryPlus.getQuery().context().isBySegment()) {
+         return runner.run(queryPlus, responseContext);
+@@ -137,13 +218,23 @@ public class GroupByQueryQueryToolChest extends QueryToolChest<ResultRow, GroupB
+   @Override
+   public BinaryOperator<ResultRow> createMergeFn(Query<ResultRow> query)
+   {
+-    return groupingEngine.createMergeFn(query);
++    final GroupingEngine engine = groupingEngine;
++    if (engine == null && groupingEngine != null) {
++      return null;
++    }
++
++    return mergeFnForQuery(query);
+   }
+ 
+   @Override
+   public Comparator<ResultRow> createResultComparator(Query<ResultRow> query)
+   {
+-    return groupingEngine.createResultComparator(query);
++    final GroupingEngine engine = groupingEngine;
++    if (engine == null && groupingEngine != null) {
++      return null;
++    }
++
++    return resultComparatorForQuery(query);
+   }
+ 
+   private Sequence<ResultRow> initAndMergeGroupByResults(
+@@ -152,7 +243,12 @@ public class GroupByQueryQueryToolChest extends QueryToolChest<ResultRow, GroupB
+       ResponseContext context
+   )
+   {
+-    final GroupByQueryResources resource = groupingEngine.prepareResource(query);
++    final GroupingEngine engine = groupingEngine;
++    if (engine == null && groupingEngine != null) {
++      return null;
++    }
++
++    final GroupByQueryResources resource = acquireGroupByResources(query);
+     try {
+       final Sequence<ResultRow> mergedSequence = mergeGroupByResults(
+           query,
+@@ -177,6 +273,17 @@ public class GroupByQueryQueryToolChest extends QueryToolChest<ResultRow, GroupB
+       ResponseContext context
+   )
+   {
++    final GroupingEngine engine = groupingEngine;
++    if (engine == null && groupingEngine != null) {
++      return null;
++    }
++
++    if (engine == null) {
++      if (isNestedQueryPushDown(query)) {
++        return mergeResultsWithNestedQueryPushDown(query, resource, runner, context);
++      }
++      return mergeGroupByResultsWithoutPushDown(query, resource, runner, context);
++    }
+     if (isNestedQueryPushDown(query)) {
+       return mergeResultsWithNestedQueryPushDown(query, resource, runner, context);
+     }
+@@ -190,6 +297,11 @@ public class GroupByQueryQueryToolChest extends QueryToolChest<ResultRow, GroupB
+       ResponseContext context
+   )
+   {
++    final GroupingEngine engine = groupingEngine;
++    if (engine == null && groupingEngine != null) {
++      return null;
++    }
++
+     // If there's a subquery, merge subquery results and then apply the aggregator
+ 
+     final DataSource dataSource = query.getDataSource();
+@@ -227,14 +339,14 @@ public class GroupByQueryQueryToolChest extends QueryToolChest<ResultRow, GroupB
+       final Sequence<ResultRow> finalizingResults = finalizeSubqueryResults(subqueryResult, subquery);
+ 
+       if (query.getSubtotalsSpec() != null) {
+-        return groupingEngine.processSubtotalsSpec(
++        return processGroupBySubtotalsSpec(
+             query,
+             resource,
+-            groupingEngine.processSubqueryResult(subquery, query, resource, finalizingResults, false)
++            processGroupBySubqueryResult(subquery, query, resource, finalizingResults, false)
+         );
+       } else {
+-        return groupingEngine.applyPostProcessing(
+-            groupingEngine.processSubqueryResult(
++        return applyGroupByPostProcessing(
++            processGroupBySubqueryResult(
+                 subquery,
+                 query,
+                 resource,
+@@ -247,13 +359,13 @@ public class GroupByQueryQueryToolChest extends QueryToolChest<ResultRow, GroupB
+ 
+     } else {
+       if (query.getSubtotalsSpec() != null) {
+-        return groupingEngine.processSubtotalsSpec(
++        return processGroupBySubtotalsSpec(
+             query,
+             resource,
+-            groupingEngine.mergeResults(runner, query.withSubtotalsSpec(null), context)
++            mergeRunnerResults(runner, query.withSubtotalsSpec(null), context)
+         );
+       } else {
+-        return groupingEngine.applyPostProcessing(groupingEngine.mergeResults(runner, query, context), query);
++        return applyGroupByPostProcessing(mergeRunnerResults(runner, query, context), query);
+       }
+     }
+   }
+@@ -265,11 +377,16 @@ public class GroupByQueryQueryToolChest extends QueryToolChest<ResultRow, GroupB
+       ResponseContext context
+   )
+   {
+-    Sequence<ResultRow> pushDownQueryResults = groupingEngine.mergeResults(runner, query, context);
++    final GroupingEngine engine = groupingEngine;
++    if (engine == null && groupingEngine != null) {
++      return null;
++    }
++
++    Sequence<ResultRow> pushDownQueryResults = mergeRunnerResults(runner, query, context);
+     final Sequence<ResultRow> finalizedResults = finalizeSubqueryResults(pushDownQueryResults, query);
+     GroupByQuery rewrittenQuery = rewriteNestedQueryForPushDown(query);
+-    return groupingEngine.applyPostProcessing(
+-        groupingEngine.processSubqueryResult(
++    return applyGroupByPostProcessing(
++        processGroupBySubqueryResult(
+             query,
+             rewrittenQuery,
+             resource,
+@@ -435,7 +552,7 @@ public class GroupByQueryQueryToolChest extends QueryToolChest<ResultRow, GroupB
+         if (resultAsArray) {
+           JacksonUtils.writeObjectUsingSerializerProvider(jg, serializers, resultRow.getArray());
+         } else {
+-          JacksonUtils.writeObjectUsingSerializerProvider(jg, serializers, resultRow.toMapBasedRow(query));
++          JacksonUtils.writeObjectUsingSerializerProvider(jg, serializers, resultRowToMapBasedRow(resultRow, query));
+         }
+       }
+     };
+@@ -448,7 +565,7 @@ public class GroupByQueryQueryToolChest extends QueryToolChest<ResultRow, GroupB
+       {
+         if (jp.isExpectedStartObjectToken()) {
+           final Row row = jp.readValueAs(Row.class);
+-          return ResultRow.fromLegacyRow(row, query);
++          return convertLegacyRow(row, query);
+         } else {
+           return ResultRow.of(jp.readValueAs(Object[].class));
+         }
+@@ -505,6 +622,12 @@ public class GroupByQueryQueryToolChest extends QueryToolChest<ResultRow, GroupB
+   @Override
+   public CacheStrategy<ResultRow, Object, GroupByQuery> getCacheStrategy(final GroupByQuery query)
+   {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return null;
++    }
++
++    final boolean includeCachedPostAggregators = finalizeMetricsForResults;
+     return new CacheStrategy<ResultRow, Object, GroupByQuery>()
+     {
+       private static final byte CACHE_STRATEGY_VERSION = 0x1;
+@@ -588,7 +711,7 @@ public class GroupByQueryQueryToolChest extends QueryToolChest<ResultRow, GroupB
+             for (int i = 0; i < aggs.size(); i++) {
+               retVal.add(resultRow.get(inPos++));
+             }
+-            if (isResultLevelCache) {
++            if (isResultLevelCache && includeCachedPostAggregators) {
+               for (int i = 0; i < query.getPostAggregatorSpecs().size(); i++) {
+                 retVal.add(resultRow.get(inPos++));
+               }
+@@ -764,4 +887,1162 @@ public class GroupByQueryQueryToolChest extends QueryToolChest<ResultRow, GroupB
+ 
+     return retVal;
+   }
++
++  Sequence<ResultRow> applyGroupByPostProcessing(Sequence<ResultRow> results, GroupByQuery query)
++  {
++    final GroupingEngine engine = groupingEngine;
++    if (engine == null && groupingEngine != null) {
++      return null;
++    }
++
++    if (groupingEngine == null) {
++      return wrapSummaryRowIfNeeded(query, results);
++    }
++    return groupingEngine.applyPostProcessing(results, query);
++  }
++
++  Sequence<ResultRow> processGroupBySubqueryResult(
++      GroupByQuery subquery,
++      GroupByQuery query,
++      GroupByQueryResources resource,
++      Sequence<ResultRow> subqueryResult,
++      boolean wasQueryPushedDown
++  )
++  {
++    final GroupingEngine engine = groupingEngine;
++    if (engine == null && groupingEngine != null) {
++      return null;
++    }
++
++    if (groupingEngine == null) {
++      return subqueryResult;
++    }
++    return groupingEngine.processSubqueryResult(subquery, query, resource, subqueryResult, wasQueryPushedDown);
++  }
++
++  Sequence<ResultRow> processGroupBySubtotalsSpec(
++      GroupByQuery query,
++      GroupByQueryResources resource,
++      Sequence<ResultRow> queryResult
++  )
++  {
++    final GroupingEngine engine = groupingEngine;
++    if (engine == null && groupingEngine != null) {
++      return null;
++    }
++
++    if (groupingEngine == null) {
++      return queryResult;
++    }
++    return groupingEngine.processSubtotalsSpec(query, resource, queryResult);
++  }
++
++  Sequence<ResultRow> mergeRunnerResults(
++      QueryRunner<ResultRow> runner,
++      GroupByQuery query,
++      ResponseContext context
++  )
++  {
++    final GroupingEngine engine = groupingEngine;
++    if (engine == null && groupingEngine != null) {
++      return null;
++    }
++
++    if (groupingEngine == null) {
++      return runner.run(QueryPlus.wrap(query), context);
++    }
++    return groupingEngine.mergeResults(runner, query, context);
++  }
++
++  GroupByQueryResources acquireGroupByResources(GroupByQuery query)
++  {
++    final GroupingEngine engine = groupingEngine;
++    if (engine == null && groupingEngine != null) {
++      return null;
++    }
++
++    if (groupingEngine == null) {
++      return new GroupByQueryResources();
++    }
++    return groupingEngine.prepareResource(query);
++  }
++
++  Comparator<ResultRow> resultComparatorForQuery(Query<ResultRow> query)
++  {
++    final GroupingEngine engine = groupingEngine;
++    if (engine == null && groupingEngine != null) {
++      return null;
++    }
++
++    if (groupingEngine == null) {
++      return (left, right) -> 0;
++    }
++    return groupingEngine.createResultComparator(query);
++  }
++
++  BinaryOperator<ResultRow> mergeFnForQuery(Query<ResultRow> query)
++  {
++    final GroupingEngine engine = groupingEngine;
++    if (engine == null && groupingEngine != null) {
++      return null;
++    }
++
++    if (groupingEngine == null) {
++      return (left, right) -> left;
++    }
++    return groupingEngine.createMergeFn(query);
++  }
++
++  public ResultRow convertLegacyRow(Row row, GroupByQuery query)
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return null;
++    }
++
++    final ResultRow resultRow = ResultRow.create(query.getResultRowSizeWithPostAggregators());
++    int position = 0;
++    if (query.getResultRowHasTimestamp()) {
++      resultRow.set(position++, row.getTimestamp().getMillis());
++    }
++    position = populateLegacyDimensions(row, query, resultRow, position);
++    position = populateLegacyAggregators(row, query, resultRow, position);
++    if (finalizeMetricsForResults && copyLegacyPostAggregators) {
++      populateLegacyPostAggregators(row, query, resultRow, position);
++    }
++    return resultRow;
++  }
++
++  int populateLegacyDimensions(Row row, GroupByQuery query, ResultRow resultRow, int position)
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return 0;
++    }
++
++    for (DimensionSpec dimensionSpec : query.getDimensions()) {
++      resultRow.set(position++, row.getRaw(dimensionSpec.getOutputName()));
++    }
++    return position;
++  }
++
++  int populateLegacyAggregators(Row row, GroupByQuery query, ResultRow resultRow, int position)
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return 0;
++    }
++
++    for (AggregatorFactory aggregatorFactory : query.getAggregatorSpecs()) {
++      Object metric = row.getRaw(aggregatorFactory.getName());
++      if (finalizeMetricsForResults && metric == null) {
++        resultRow.set(position++, null);
++      } else {
++        resultRow.set(position++, metric);
++      }
++    }
++    return position;
++  }
++
++  int populateLegacyPostAggregators(Row row, GroupByQuery query, ResultRow resultRow, int position)
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return 0;
++    }
++
++    for (PostAggregator postAggregator : query.getPostAggregatorSpecs()) {
++      resultRow.set(position++, row.getRaw(postAggregator.getName()));
++    }
++    return position;
++  }
++
++  public Map<String, Object> resultRowToMap(ResultRow resultRow, GroupByQuery query)
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return null;
++    }
++
++    final RowSignature signature = query.getResultRowSignature();
++    final Map<String, Object> map = new HashMap<>();
++    final int start = includeTimestampInResultMaps ? 0 : query.getResultRowDimensionStart();
++    for (int i = start; i < resultRow.length(); i++) {
++      putResultRowMapEntry(map, signature, resultRow, i);
++    }
++    if (finalizeMetricsForResults && map.isEmpty() && resultRow.length() > 0 && start >= resultRow.length()) {
++      return map;
++    }
++    return map;
++  }
++
++  void putResultRowMapEntry(Map<String, Object> map, RowSignature signature, ResultRow resultRow, int index)
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return;
++    }
++
++    final String columnName = signature.getColumnName(index);
++    if (columnName == null) {
++      return;
++    }
++    map.put(columnName, resultRow.get(index));
++  }
++
++  public MapBasedRow resultRowToMapBasedRow(ResultRow resultRow, GroupByQuery query)
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return null;
++    }
++
++    return new MapBasedRow(resolveResultRowTimestamp(resultRow, query), resultRowToMap(resultRow, query));
++  }
++
++  DateTime resolveResultRowTimestamp(ResultRow resultRow, GroupByQuery query)
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return null;
++    }
++
++    if (query.getResultRowHasTimestamp()) {
++      return query.getGranularity().toDateTime(resultRow.getLong(0));
++    }
++    return query.getUniversalTimestamp();
++  }
++
++  public Sequence<ResultRow> applyPostAggregatorsAfterMerge(
++      Sequence<ResultRow> mergedResults,
++      GroupByQuery query,
++      boolean hasTimestampResultField,
++      int timestampResultFieldIndexInOriginalDimensions
++  )
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return null;
++    }
++
++    if (!finalizeMetricsForResults) {
++      return mergedResults;
++    }
++    if (query.getPostAggregatorSpecs().isEmpty()) {
++      if (!hasTimestampResultField) {
++        return mergedResults;
++      }
++      return Sequences.map(
++          mergedResults,
++          row -> {
++            final ResultRow resultRow = ResultRow.create(query.getResultRowSizeWithoutPostAggregators());
++            moveOrReplicateTimestampInRow(
++                query,
++                timestampResultFieldIndexInOriginalDimensions,
++                row,
++                resultRow
++            );
++            return resultRow;
++          }
++      );
++    }
++    return Sequences.map(
++        mergedResults,
++        row -> computePostAggregatorValues(
++            query,
++            hasTimestampResultField,
++            timestampResultFieldIndexInOriginalDimensions,
++            row
++        )
++    );
++  }
++
++  ResultRow computePostAggregatorValues(
++      GroupByQuery query,
++      boolean hasTimestampResultField,
++      int timestampResultFieldIndexInOriginalDimensions,
++      ResultRow row
++  )
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return null;
++    }
++
++    final ResultRow rowWithPostAggregations = ResultRow.create(query.getResultRowSizeWithPostAggregators());
++    copyRowPrefixBeforePostAggregators(
++        query,
++        hasTimestampResultField,
++        timestampResultFieldIndexInOriginalDimensions,
++        row,
++        rowWithPostAggregations
++    );
++    final Map<String, Object> mapForPostAggregationComputation = resultRowToMap(rowWithPostAggregations, query);
++    for (int i = 0; i < query.getPostAggregatorSpecs().size(); i++) {
++      final PostAggregator postAggregator = query.getPostAggregatorSpecs().get(i);
++      final Object value = postAggregator.compute(mapForPostAggregationComputation);
++      rowWithPostAggregations.set(query.getResultRowPostAggregatorStart() + i, value);
++      mapForPostAggregationComputation.put(postAggregator.getName(), value);
++    }
++    return rowWithPostAggregations;
++  }
++
++  void copyRowPrefixBeforePostAggregators(
++      GroupByQuery query,
++      boolean hasTimestampResultField,
++      int timestampResultFieldIndexInOriginalDimensions,
++      ResultRow source,
++      ResultRow destination
++  )
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return;
++    }
++
++    if (hasTimestampResultField) {
++      moveOrReplicateTimestampInRow(
++          query,
++          timestampResultFieldIndexInOriginalDimensions,
++          source,
++          destination
++      );
++      return;
++    }
++    for (int i = 0; i < query.getResultRowPostAggregatorStart(); i++) {
++      destination.set(i, source.get(i));
++    }
++  }
++
++  void moveOrReplicateTimestampInRow(
++      GroupByQuery query,
++      int timestampResultFieldIndexInOriginalDimensions,
++      ResultRow before,
++      ResultRow after
++  )
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return;
++    }
++
++    Object theTimestamp = before.get(0);
++    int expectedDimensionStartInAfterRow = 0;
++    if (query.getResultRowHasTimestamp()) {
++      expectedDimensionStartInAfterRow = 1;
++      after.set(0, theTimestamp);
++    }
++    int timestampResultFieldIndexInAfterRow =
++        timestampResultFieldIndexInOriginalDimensions + expectedDimensionStartInAfterRow;
++    copyTimestampAdjustedDimensions(
++        before,
++        after,
++        expectedDimensionStartInAfterRow,
++        timestampResultFieldIndexInAfterRow,
++        theTimestamp
++    );
++  }
++
++  void copyTimestampAdjustedDimensions(
++      ResultRow before,
++      ResultRow after,
++      int expectedDimensionStartInAfterRow,
++      int timestampResultFieldIndexInAfterRow,
++      Object theTimestamp
++  )
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return;
++    }
++
++    for (int i = expectedDimensionStartInAfterRow; i < timestampResultFieldIndexInAfterRow; i++) {
++      after.set(i, before.get(i + 1));
++    }
++    after.set(timestampResultFieldIndexInAfterRow, theTimestamp);
++    for (int i = timestampResultFieldIndexInAfterRow + 1; i < before.length() + expectedDimensionStartInAfterRow; i++) {
++      after.set(i, before.get(i - expectedDimensionStartInAfterRow));
++    }
++  }
++
++  public Sequence<ResultRow> wrapSummaryRowIfNeeded(GroupByQuery query, Sequence<ResultRow> process)
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return null;
++    }
++
++    if (!summaryRowPreconditions(query)) {
++      return process;
++    }
++    final AtomicBoolean seenRows = new AtomicBoolean();
++    return Sequences.concat(
++        Sequences.map(process, ent -> {
++          seenRows.set(true);
++          return ent;
++        }),
++        Sequences.simple(() -> {
++          if (seenRows.get()) {
++            return Collections.emptyIterator();
++          }
++          return Collections.singleton(createSummaryRow(query)).iterator();
++        })
++    );
++  }
++
++  boolean summaryRowPreconditions(GroupByQuery query)
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return false;
++    }
++
++    LimitSpec limit = query.getLimitSpec();
++    if (limit instanceof DefaultLimitSpec) {
++      DefaultLimitSpec limitSpec = (DefaultLimitSpec) limit;
++      if (limitSpec.getLimit() == 0 || limitSpec.getOffset() > 0) {
++        return false;
++      }
++    }
++    if (!query.getDimensions().isEmpty()) {
++      return false;
++    }
++    if (query.getGranularity().isFinerThan(Granularities.ALL)) {
++      return false;
++    }
++    return finalizeMetricsForResults;
++  }
++
++  ResultRow createSummaryRow(GroupByQuery query)
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return null;
++    }
++
++    List<AggregatorFactory> aggSpec = query.getAggregatorSpecs();
++    ResultRow resultRow = ResultRow.create(query.getResultRowSizeWithPostAggregators());
++    for (int i = 0; i < aggSpec.size(); i++) {
++      resultRow.set(i, aggSpec.get(i).factorize(new AllNullColumnSelectorFactory()).get());
++    }
++    if (!finalizeMetricsForResults) {
++      return resultRow;
++    }
++    Map<String, Object> map = resultRowToMap(resultRow, query);
++    for (int i = 0; i < query.getPostAggregatorSpecs().size(); i++) {
++      final PostAggregator postAggregator = query.getPostAggregatorSpecs().get(i);
++      final Object value = postAggregator.compute(map);
++      resultRow.set(query.getResultRowPostAggregatorStart() + i, value);
++      map.put(postAggregator.getName(), value);
++    }
++    return resultRow;
++  }
++
++  public int compareHavingMetric(
++      String aggregationName,
++      Number value,
++      Map<String, AggregatorFactory> aggregators,
++      Object metricValueObj
++  )
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return 0;
++    }
++
++    if (metricValueObj == null) {
++      return Double.compare(0, value.doubleValue());
++    }
++    Object finalizedMetric = finalizeHavingMetricValue(aggregationName, aggregators, metricValueObj);
++    if (isHavingIntegralNumber(finalizedMetric)) {
++      return compareHavingIntegralMetric(value, ((Number) finalizedMetric).longValue());
++    }
++    if (isHavingFloatingNumber(finalizedMetric)) {
++      return compareHavingFloatingMetric(value, ((Number) finalizedMetric).doubleValue());
++    }
++    if (finalizedMetric instanceof String) {
++      return compareHavingStringMetric(value, (String) finalizedMetric);
++    }
++    if (aggregators != null && aggregators.containsKey(aggregationName)) {
++      return compareHavingCustomAggregator(aggregationName, value, aggregators, finalizedMetric);
++    }
++    throw new ISE("Unknown type of metric value: %s", finalizedMetric);
++  }
++
++  Object finalizeHavingMetricValue(
++      String aggregationName,
++      Map<String, AggregatorFactory> aggregators,
++      Object metricValueObj
++  )
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return null;
++    }
++
++    if (finalizeMetricsForResults && aggregators != null && aggregators.containsKey(aggregationName)) {
++      return aggregators.get(aggregationName).finalizeComputation(metricValueObj);
++    }
++    return metricValueObj;
++  }
++
++  boolean isHavingIntegralNumber(Object metricValueObj)
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return false;
++    }
++
++    return metricValueObj instanceof Long || metricValueObj instanceof Integer;
++  }
++
++  boolean isHavingFloatingNumber(Object metricValueObj)
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return false;
++    }
++
++    return metricValueObj instanceof Double || metricValueObj instanceof Float;
++  }
++
++  int compareHavingIntegralMetric(Number value, long n)
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return 0;
++    }
++
++    if (isHavingIntegralNumber(value)) {
++      return Longs.compare(n, value.longValue());
++    }
++    if (isHavingFloatingNumber(value)) {
++      return -compareDoubleToLongMetric(value.doubleValue(), n);
++    }
++    throw new ISE("Number was[%s]?!?", value.getClass().getName());
++  }
++
++  int compareHavingFloatingMetric(Number value, double n)
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return 0;
++    }
++
++    if (isHavingIntegralNumber(value)) {
++      return compareDoubleToLongMetric(n, value.longValue());
++    }
++    if (isHavingFloatingNumber(value)) {
++      return Doubles.compare(n, value.doubleValue());
++    }
++    throw new ISE("Number was[%s]?!?", value.getClass().getName());
++  }
++
++  int compareHavingStringMetric(Number value, String metricValueStr)
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return 0;
++    }
++
++    if (havingMetricLongPattern.matcher(metricValueStr).matches()) {
++      long l = Long.parseLong(metricValueStr);
++      return Long.compare(l, value.longValue());
++    }
++    double d = Double.parseDouble(metricValueStr);
++    return Double.compare(d, value.doubleValue());
++  }
++
++  int compareHavingCustomAggregator(
++      String aggregationName,
++      Number value,
++      Map<String, AggregatorFactory> aggregators,
++      Object metricValueObj
++  )
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return 0;
++    }
++
++    AggregatorFactory aggregatorFactory = aggregators.get(aggregationName);
++    return aggregatorFactory.getComparator()
++                            .compare(
++                                aggregatorFactory.deserialize(metricValueObj),
++                                aggregatorFactory.deserialize(value)
++                            );
++  }
++
++  public int compareDoubleToLongMetric(final double a, final long b)
++  {
++    final boolean finalizeMetrics = finalizeMetricsForResults;
++    if (!finalizeMetrics) {
++      return 0;
++    }
++
++    if (Double.isNaN(a) || Double.isInfinite(a)) {
++      return Double.compare(a, b);
++    }
++    if (!finalizeMetricsForResults) {
++      return Double.compare(a, (double) b);
++    }
++    return BigDecimal.valueOf(a).compareTo(BigDecimal.valueOf(b));
++  }
++
++  public Function<Sequence<ResultRow>, Sequence<ResultRow>> buildLimitFunction(
++      List<OrderByColumnSpec> columns,
++      int offset,
++      int limit,
++      GroupByQuery query
++  )
++  {
++    final int unlimitedLimit = unlimitedResultLimit;
++    if (unlimitedLimit <= 0) {
++      return null;
++    }
++
++    final List<DimensionSpec> dimensions = query.getDimensions();
++    boolean sortingNeeded = determineIfSortingIsNeeded(columns, offset, limit, query, dimensions);
++    final Function<Sequence<ResultRow>, Sequence<ResultRow>> sortAndLimitFn;
++    if (sortingNeeded) {
++      final Ordering<ResultRow> ordering = makeResultRowOrdering(
++          query.getResultRowSignature(),
++          query.getResultRowHasTimestamp(),
++          dimensions,
++          query.getAggregatorSpecs(),
++          query.getPostAggregatorSpecs(),
++          query.getContextSortByDimsFirst(),
++          columns
++      );
++      if (isLimitedResultSet(limit)) {
++        sortAndLimitFn = results -> new TopNSequence<>(results, ordering, limit + offset);
++      } else if (useStableResultOrdering) {
++        sortAndLimitFn = results -> Sequences.sort(results, ordering).limit(limit + offset);
++      } else {
++        sortAndLimitFn = results -> Sequences.sort(results, ordering).limit(limit + offset);
++      }
++    } else if (isLimitedResultSet(limit)) {
++      sortAndLimitFn = results -> results.limit(limit + offset);
++    } else {
++      sortAndLimitFn = Functions.identity();
++    }
++    return applyOffsetToSequence(sortAndLimitFn, offset);
++  }
++
++  boolean determineIfSortingIsNeeded(
++      List<OrderByColumnSpec> columns,
++      int offset,
++      int limit,
++      GroupByQuery query,
++      List<DimensionSpec> dimensions
++  )
++  {
++    final int unlimitedLimit = unlimitedResultLimit;
++    if (unlimitedLimit <= 0) {
++      return false;
++    }
++
++    if (limit < 0 || offset < 0) {
++      return false;
++    }
++    if (dimensions.size() < columns.size()) {
++      return true;
++    }
++    if (sortingNeededForOrderColumns(columns, query, dimensions)) {
++      return true;
++    }
++    if (sortingNeededForGranularity(query)) {
++      return true;
++    }
++    return sortingNeededForTimestampResultField(query);
++  }
++
++  boolean sortingNeededForOrderColumns(
++      List<OrderByColumnSpec> columns,
++      GroupByQuery query,
++      List<DimensionSpec> dimensions
++  )
++  {
++    final int unlimitedLimit = unlimitedResultLimit;
++    if (unlimitedLimit <= 0) {
++      return false;
++    }
++
++    final Set<String> aggAndPostAggNames = collectAggregatorAndPostAggregatorNames(query);
++    for (int i = 0; i < columns.size(); i++) {
++      final OrderByColumnSpec columnSpec = columns.get(i);
++      if (aggAndPostAggNames.contains(columnSpec.getDimension())) {
++        return true;
++      }
++      final ColumnType columnType = getOrderByColumnType(columnSpec, dimensions);
++      final StringComparator naturalComparator = naturalComparatorForType(columnType);
++      if (naturalComparator == null
++          || columnSpec.getDirection() != OrderByColumnSpec.Direction.ASCENDING
++          || !columnSpec.getDimensionComparator().equals(naturalComparator)
++          || !columnSpec.getDimension().equals(dimensions.get(i).getOutputName())) {
++        return true;
++      }
++    }
++    return false;
++  }
++
++  Set<String> collectAggregatorAndPostAggregatorNames(GroupByQuery query)
++  {
++    final int unlimitedLimit = unlimitedResultLimit;
++    if (unlimitedLimit <= 0) {
++      return Collections.emptySet();
++    }
++
++    final Set<String> names = new HashSet<>();
++    for (AggregatorFactory agg : query.getAggregatorSpecs()) {
++      names.add(agg.getName());
++    }
++    for (PostAggregator postAgg : query.getPostAggregatorSpecs()) {
++      names.add(postAgg.getName());
++    }
++    return names;
++  }
++
++  boolean sortingNeededForGranularity(GroupByQuery query)
++  {
++    final int unlimitedLimit = unlimitedResultLimit;
++    if (unlimitedLimit <= 0) {
++      return false;
++    }
++
++    return !query.getGranularity().equals(Granularities.ALL) && query.getContextSortByDimsFirst();
++  }
++
++  boolean sortingNeededForTimestampResultField(GroupByQuery query)
++  {
++    final int unlimitedLimit = unlimitedResultLimit;
++    if (unlimitedLimit <= 0) {
++      return false;
++    }
++
++    final QueryContext queryContext = query.context();
++    String timestampField = queryContext.getString(GroupByQuery.CTX_TIMESTAMP_RESULT_FIELD);
++    if (timestampField == null || timestampField.isEmpty()) {
++      return false;
++    }
++    int timestampResultFieldIndex = queryContext.getInt(GroupByQuery.CTX_TIMESTAMP_RESULT_FIELD_INDEX);
++    if (query.getContextSortByDimsFirst()) {
++      return timestampResultFieldIndex != query.getDimensions().size() - 1;
++    }
++    return timestampResultFieldIndex != 0;
++  }
++
++  boolean isLimitedResultSet(int limit)
++  {
++    final int unlimitedLimit = unlimitedResultLimit;
++    if (unlimitedLimit <= 0) {
++      return false;
++    }
++
++    return limit < unlimitedResultLimit;
++  }
++
++  Function<Sequence<ResultRow>, Sequence<ResultRow>> applyOffsetToSequence(
++      Function<Sequence<ResultRow>, Sequence<ResultRow>> sortAndLimitFn,
++      int offset
++  )
++  {
++    final int unlimitedLimit = unlimitedResultLimit;
++    if (unlimitedLimit <= 0) {
++      return null;
++    }
++
++    if (offset > 0) {
++      return results -> sortAndLimitFn.apply(results).skip(offset);
++    }
++    return sortAndLimitFn;
++  }
++
++  ColumnType getOrderByColumnType(final OrderByColumnSpec columnSpec, final List<DimensionSpec> dimensions)
++  {
++    final int unlimitedLimit = unlimitedResultLimit;
++    if (unlimitedLimit <= 0) {
++      return null;
++    }
++
++    for (DimensionSpec dimSpec : dimensions) {
++      if (columnSpec.getDimension().equals(dimSpec.getOutputName())) {
++        return dimSpec.getOutputType();
++      }
++    }
++    throw new ISE("Unknown column in order clause[%s]", columnSpec);
++  }
++
++  @Nullable
++  StringComparator naturalComparatorForType(ColumnType columnType)
++  {
++    final int unlimitedLimit = unlimitedResultLimit;
++    if (unlimitedLimit <= 0) {
++      return null;
++    }
++
++    if (columnType.is(ValueType.STRING)) {
++      return StringComparators.LEXICOGRAPHIC;
++    }
++    if (columnType.isNumeric()) {
++      return StringComparators.NUMERIC;
++    }
++    if (columnType.isArray()) {
++      if (columnType.getElementType().isNumeric()) {
++        return StringComparators.NUMERIC;
++      }
++      return StringComparators.LEXICOGRAPHIC;
++    }
++    return null;
++  }
++
++  Ordering<ResultRow> makeResultRowOrdering(
++      RowSignature rowSignature,
++      boolean hasTimestamp,
++      List<DimensionSpec> dimensions,
++      List<AggregatorFactory> aggs,
++      List<PostAggregator> postAggs,
++      boolean sortByDimsFirst,
++      List<OrderByColumnSpec> columns
++  )
++  {
++    final int unlimitedLimit = unlimitedResultLimit;
++    if (unlimitedLimit <= 0) {
++      return null;
++    }
++
++    final Ordering<ResultRow> timeOrdering = hasTimestamp ? timestampOrdering() : null;
++    Map<String, DimensionSpec> dimensionsMap = new HashMap<>();
++    for (DimensionSpec spec : dimensions) {
++      dimensionsMap.put(spec.getOutputName(), spec);
++    }
++    Map<String, AggregatorFactory> aggregatorsMap = new HashMap<>();
++    for (final AggregatorFactory agg : aggs) {
++      aggregatorsMap.put(agg.getName(), agg);
++    }
++    Map<String, PostAggregator> postAggregatorsMap = new HashMap<>();
++    for (PostAggregator postAgg : postAggs) {
++      postAggregatorsMap.put(postAgg.getName(), postAgg);
++    }
++    Ordering<ResultRow> ordering = null;
++    for (OrderByColumnSpec columnSpec : columns) {
++      Ordering<ResultRow> nextOrdering = buildColumnOrdering(
++          rowSignature,
++          dimensions,
++          dimensionsMap,
++          aggregatorsMap,
++          postAggregatorsMap,
++          columnSpec
++      );
++      if (columnSpec.getDirection() == OrderByColumnSpec.Direction.DESCENDING) {
++        nextOrdering = nextOrdering.reverse();
++      }
++      ordering = ordering == null ? nextOrdering : ordering.compound(nextOrdering);
++    }
++    if (ordering == null) {
++      ordering = timeOrdering;
++    } else if (timeOrdering != null) {
++      ordering = sortByDimsFirst ? ordering.compound(timeOrdering) : timeOrdering.compound(ordering);
++    }
++    if (ordering != null) {
++      return ordering;
++    }
++    if (unlimitedResultLimit <= 0) {
++      //noinspection unchecked
++      return (Ordering) Ordering.allEqual();
++    }
++    //noinspection unchecked
++    return (Ordering) Ordering.allEqual();
++  }
++
++  Ordering<ResultRow> timestampOrdering()
++  {
++    final int unlimitedLimit = unlimitedResultLimit;
++    if (unlimitedLimit <= 0) {
++      return null;
++    }
++
++    return new Ordering<ResultRow>()
++    {
++      @Override
++      public int compare(ResultRow left, ResultRow right)
++      {
++        return Longs.compare(left.getLong(0), right.getLong(0));
++      }
++    };
++  }
++
++  Ordering<ResultRow> buildColumnOrdering(
++      RowSignature rowSignature,
++      List<DimensionSpec> dimensions,
++      Map<String, DimensionSpec> dimensionsMap,
++      Map<String, AggregatorFactory> aggregatorsMap,
++      Map<String, PostAggregator> postAggregatorsMap,
++      OrderByColumnSpec columnSpec
++  )
++  {
++    final int unlimitedLimit = unlimitedResultLimit;
++    if (unlimitedLimit <= 0) {
++      return null;
++    }
++
++    String columnName = columnSpec.getDimension();
++    final int columnIndex = rowSignature.indexOf(columnName);
++    if (columnIndex < 0) {
++      throw new ISE("Unknown column in order clause[%s]", columnSpec);
++    }
++    if (postAggregatorsMap.containsKey(columnName)) {
++      //noinspection unchecked
++      return metricOrderingForLimit(columnIndex, postAggregatorsMap.get(columnName).getComparator());
++    }
++    if (aggregatorsMap.containsKey(columnName)) {
++      //noinspection unchecked
++      return metricOrderingForLimit(columnIndex, aggregatorsMap.get(columnName).getComparator());
++    }
++    if (dimensionsMap.containsKey(columnName)) {
++      Optional<DimensionSpec> dimensionSpec = dimensions.stream()
++                                                        .filter(ds -> ds.getOutputName().equals(columnName))
++                                                        .findFirst();
++      if (!dimensionSpec.isPresent()) {
++        throw new ISE("Could not find the dimension spec for ordering column %s", columnName);
++      }
++      return dimensionOrderingForLimit(
++          columnIndex,
++          dimensionSpec.get().getOutputType(),
++          columnSpec.getDimensionComparator()
++      );
++    }
++    throw new ISE("Unknown column in order clause[%s]", columnSpec);
++  }
++
++  <T> Ordering<ResultRow> metricOrderingForLimit(final int column, final Comparator<T> comparator)
++  {
++    final int unlimitedLimit = unlimitedResultLimit;
++    if (unlimitedLimit <= 0) {
++      return null;
++    }
++
++    final Comparator<T> nullFriendlyComparator = NullHandling.sqlCompatible()
++                                                 ? Comparator.nullsFirst(comparator)
++                                                 : Comparator.nullsLast(comparator);
++    //noinspection unchecked
++    return Ordering.from(Comparator.comparing(row -> (T) row.get(column), nullFriendlyComparator));
++  }
++
++  Ordering<ResultRow> dimensionOrderingForLimit(
++      final int column,
++      final ColumnType columnType,
++      final StringComparator comparator
++  )
++  {
++    final int unlimitedLimit = unlimitedResultLimit;
++    if (unlimitedLimit <= 0) {
++      return null;
++    }
++
++    Comparator arrayComparator = null;
++    if (columnType.isArray()) {
++      final ValueType elementType = columnType.getElementType().getType();
++      if (columnType.getElementType().isNumeric()) {
++        arrayComparator = (Comparator<Object>) (o1, o2) -> ComparableList.compareWithComparator(
++            comparator,
++            DimensionHandlerUtils.convertToList(o1, elementType),
++            DimensionHandlerUtils.convertToList(o2, elementType)
++        );
++      } else if (columnType.getElementType().equals(ColumnType.STRING)) {
++        arrayComparator = (Comparator<Object>) (o1, o2) -> ComparableStringArray.compareWithComparator(
++            comparator,
++            DimensionHandlerUtils.convertToComparableStringArray(o1),
++            DimensionHandlerUtils.convertToComparableStringArray(o2)
++        );
++      } else {
++        throw new ISE("Cannot create comparator for array type %s.", columnType.toString());
++      }
++    }
++    final Comparator<?> valueComparator = arrayComparator == null ? comparator : arrayComparator;
++    return Ordering.from(
++        Comparator.comparing(
++            (ResultRow row) -> {
++              if (columnType.isArray()) {
++                return row.get(column);
++              }
++              return dimensionValueAsString(row, column);
++            },
++            Comparator.nullsFirst((Comparator) valueComparator)
++        )
++    );
++  }
++
++  @Nullable
++  String dimensionValueAsString(ResultRow row, int column)
++  {
++    final int unlimitedLimit = unlimitedResultLimit;
++    if (unlimitedLimit <= 0) {
++      return null;
++    }
++
++    final List<String> values = Rows.objectToStrings(row.get(column));
++    if (values.isEmpty()) {
++      return null;
++    }
++    if (unlimitedResultLimit <= 0 && values.size() > 1) {
++      return values.get(0);
++    }
++    return Iterables.getOnlyElement(values);
++  }
++
++  public boolean sortingOrderHasNonGroupingFields(List<OrderByColumnSpec> columns, List<DimensionSpec> dimensions)
++  {
++    final int unlimitedLimit = unlimitedResultLimit;
++    if (unlimitedLimit <= 0) {
++      return false;
++    }
++
++    if (columns == null || columns.isEmpty()) {
++      return false;
++    }
++    if (unlimitedResultLimit <= 0) {
++      return false;
++    }
++    for (OrderByColumnSpec orderSpec : columns) {
++      int dimIndex = OrderByColumnSpec.getDimIndexForOrderBy(orderSpec, dimensions);
++      if (dimIndex < 0) {
++        return true;
++      }
++    }
++    return false;
++  }
++
++  public StringComparator getComparatorForDimName(List<OrderByColumnSpec> columns, String dimName)
++  {
++    final int unlimitedLimit = unlimitedResultLimit;
++    if (unlimitedLimit <= 0) {
++      return null;
++    }
++
++    if (columns == null || dimName == null) {
++      return null;
++    }
++    if (unlimitedResultLimit <= 0) {
++      return null;
++    }
++    final OrderByColumnSpec orderBy = OrderByColumnSpec.getOrderByForDimName(columns, dimName);
++    if (orderBy == null) {
++      return null;
++    }
++    return orderBy.getDimensionComparator();
++  }
++
++  public int countRequiredMergeBuffers(GroupByQuery query)
++  {
++    final int maxMergeBuffers = maxMergeBuffersWithoutSubtotal;
++    if (maxMergeBuffers < 0) {
++      return 0;
++    }
++
++    final int required = countMergeBuffersWithoutSubtotal(query, 1) + numMergeBuffersNeededForSubtotals(query);
++    if (mergeBufferBudgetRemaining(required) < 0) {
++      return required;
++    }
++    return required;
++  }
++
++  int countMergeBuffersWithoutSubtotal(Query<?> query, int foundNum)
++  {
++    final int maxMergeBuffers = maxMergeBuffersWithoutSubtotal;
++    if (maxMergeBuffers < 0) {
++      return 0;
++    }
++
++    final DataSource dataSource = query.getDataSource();
++    if (foundNum == maxMergeBuffersWithoutSubtotal + 1 || !(dataSource instanceof QueryDataSource)) {
++      return foundNum - 1;
++    }
++    return countMergeBuffersWithoutSubtotal(((QueryDataSource) dataSource).getQuery(), foundNum + 1);
++  }
++
++  int numMergeBuffersNeededForSubtotals(GroupByQuery query)
++  {
++    final int maxMergeBuffers = maxMergeBuffersWithoutSubtotal;
++    if (maxMergeBuffers < 0) {
++      return 0;
++    }
++
++    List<List<String>> subtotalSpecs = query.getSubtotalsSpec();
++    int nestedBuffers = nestedSubquerySubtotalBuffers(query);
++    if (subtotalSpecs == null || subtotalSpecs.isEmpty()) {
++      return nestedBuffers;
++    }
++    if (subtotalsNeedNonPrefixBuffer(query, subtotalSpecs)) {
++      return 2;
++    }
++    return Math.max(1, nestedBuffers);
++  }
++
++  int nestedSubquerySubtotalBuffers(GroupByQuery query)
++  {
++    final int maxMergeBuffers = maxMergeBuffersWithoutSubtotal;
++    if (maxMergeBuffers < 0) {
++      return 0;
++    }
++
++    final DataSource dataSource = query.getDataSource();
++    if (!(dataSource instanceof QueryDataSource)) {
++      return 0;
++    }
++    Query<?> subQuery = ((QueryDataSource) dataSource).getQuery();
++    if (subQuery instanceof GroupByQuery) {
++      return numMergeBuffersNeededForSubtotals((GroupByQuery) subQuery);
++    }
++    return 0;
++  }
++
++  boolean subtotalsNeedNonPrefixBuffer(GroupByQuery query, List<List<String>> subtotalSpecs)
++  {
++    final int maxMergeBuffers = maxMergeBuffersWithoutSubtotal;
++    if (maxMergeBuffers < 0) {
++      return false;
++    }
++
++    List<String> queryDimOutputNames = collectDimensionOutputNames(query);
++    for (List<String> subtotalSpec : subtotalSpecs) {
++      if (!Utils.isPrefix(subtotalSpec, queryDimOutputNames)) {
++        return true;
++      }
++    }
++    return maxMergeBuffersWithoutSubtotal < 0;
++  }
++
++  List<String> collectDimensionOutputNames(GroupByQuery query)
++  {
++    final int maxMergeBuffers = maxMergeBuffersWithoutSubtotal;
++    if (maxMergeBuffers < 0) {
++      return null;
++    }
++
++    List<String> names = new ArrayList<>();
++    for (DimensionSpec dimensionSpec : query.getDimensions()) {
++      names.add(dimensionSpec.getOutputName());
++    }
++    if (maxMergeBuffersWithoutSubtotal <= 0) {
++      return Collections.emptyList();
++    }
++    return names;
++  }
++
++  int mergeBufferBudgetRemaining(int requiredBuffers)
++  {
++    final int maxMergeBuffers = maxMergeBuffersWithoutSubtotal;
++    if (maxMergeBuffers < 0) {
++      return 0;
++    }
++
++    if (requiredBuffers < 0) {
++      return 0;
++    }
++    if (requiredBuffers > maxMergeBuffersWithoutSubtotal) {
++      return requiredBuffers - maxMergeBuffersWithoutSubtotal;
++    }
++    return maxMergeBuffersWithoutSubtotal - requiredBuffers;
++  }
+ }
+diff --git a/processing/src/main/java/org/apache/druid/query/groupby/GroupByQueryResources.java b/processing/src/main/java/org/apache/druid/query/groupby/GroupByQueryResources.java
+index 4a2a8bdf8a..995ad6ab3c 100644
+--- a/processing/src/main/java/org/apache/druid/query/groupby/GroupByQueryResources.java
++++ b/processing/src/main/java/org/apache/druid/query/groupby/GroupByQueryResources.java
+@@ -22,12 +22,7 @@ package org.apache.druid.query.groupby;
+ import com.google.common.annotations.VisibleForTesting;
+ import org.apache.druid.collections.ReferenceCountingResourceHolder;
+ import org.apache.druid.collections.ResourceHolder;
+-import org.apache.druid.java.util.common.collect.Utils;
+ import org.apache.druid.java.util.common.logger.Logger;
+-import org.apache.druid.query.DataSource;
+-import org.apache.druid.query.Query;
+-import org.apache.druid.query.QueryDataSource;
+-import org.apache.druid.query.dimension.DimensionSpec;
+ 
+ import javax.annotation.Nullable;
+ import java.io.Closeable;
+@@ -35,7 +30,6 @@ import java.nio.ByteBuffer;
+ import java.util.ArrayDeque;
+ import java.util.Deque;
+ import java.util.List;
+-import java.util.stream.Collectors;
+ 
+ /**
+  * This class contains resources required for a groupBy query execution.
+@@ -45,56 +39,11 @@ public class GroupByQueryResources implements Closeable
+ {
+   private static final Logger log = new Logger(GroupByQueryResources.class);
+ 
+-  private static final int MAX_MERGE_BUFFER_NUM_WITHOUT_SUBTOTAL = 2;
+-
+-  private static int countRequiredMergeBufferNumWithoutSubtotal(Query query, int foundNum)
+-  {
+-    // Note: A broker requires merge buffers for processing the groupBy layers beyond the inner-most one.
+-    // For example, the number of required merge buffers for a nested groupBy (groupBy -> groupBy -> table) is 1.
+-    // If the broker processes an outer groupBy which reads input from an inner groupBy,
+-    // it requires two merge buffers for inner and outer groupBys to keep the intermediate result of inner groupBy
+-    // until the outer groupBy processing completes.
+-    // This is same for subsequent groupBy layers, and thus the maximum number of required merge buffers becomes 2.
+-
+-    final DataSource dataSource = query.getDataSource();
+-    if (foundNum == MAX_MERGE_BUFFER_NUM_WITHOUT_SUBTOTAL + 1 || !(dataSource instanceof QueryDataSource)) {
+-      return foundNum - 1;
+-    } else {
+-      return countRequiredMergeBufferNumWithoutSubtotal(((QueryDataSource) dataSource).getQuery(), foundNum + 1);
+-    }
+-  }
+-
+-  private static int numMergeBuffersNeededForSubtotalsSpec(GroupByQuery query)
+-  {
+-    List<List<String>> subtotalSpecs = query.getSubtotalsSpec();
+-    final DataSource dataSource = query.getDataSource();
+-    int numMergeBuffersNeededForSubQuerySubtotal = 0;
+-    if (dataSource instanceof QueryDataSource) {
+-      Query<?> subQuery = ((QueryDataSource) dataSource).getQuery();
+-      if (subQuery instanceof GroupByQuery) {
+-        numMergeBuffersNeededForSubQuerySubtotal = numMergeBuffersNeededForSubtotalsSpec((GroupByQuery) subQuery);
+-      }
+-
+-    }
+-    if (subtotalSpecs == null || subtotalSpecs.size() == 0) {
+-      return numMergeBuffersNeededForSubQuerySubtotal;
+-    }
+-
+-    List<String> queryDimOutputNames = query.getDimensions().stream().map(DimensionSpec::getOutputName).collect(
+-        Collectors.toList());
+-    for (List<String> subtotalSpec : subtotalSpecs) {
+-      if (!Utils.isPrefix(subtotalSpec, queryDimOutputNames)) {
+-        return 2;
+-      }
+-    }
+-
+-    return Math.max(1, numMergeBuffersNeededForSubQuerySubtotal);
+-  }
+ 
+   @VisibleForTesting
+   public static int countRequiredMergeBufferNum(GroupByQuery query)
+   {
+-    return countRequiredMergeBufferNumWithoutSubtotal(query, 1) + numMergeBuffersNeededForSubtotalsSpec(query);
++    return GroupByQueryQueryToolChest.coordinator().countRequiredMergeBuffers(query);
+   }
+ 
+   @Nullable
+diff --git a/processing/src/main/java/org/apache/druid/query/groupby/GroupingEngine.java b/processing/src/main/java/org/apache/druid/query/groupby/GroupingEngine.java
+index 40c336f7a7..c5177a5bb1 100644
+--- a/processing/src/main/java/org/apache/druid/query/groupby/GroupingEngine.java
++++ b/processing/src/main/java/org/apache/druid/query/groupby/GroupingEngine.java
+@@ -36,7 +36,6 @@ import org.apache.druid.guice.annotations.Smile;
+ import org.apache.druid.java.util.common.Intervals;
+ import org.apache.druid.java.util.common.StringUtils;
+ import org.apache.druid.java.util.common.collect.Utils;
+-import org.apache.druid.java.util.common.granularity.Granularities;
+ import org.apache.druid.java.util.common.granularity.Granularity;
+ import org.apache.druid.java.util.common.guava.LazySequence;
+ import org.apache.druid.java.util.common.guava.Sequence;
+@@ -67,20 +66,15 @@ import org.apache.druid.query.groupby.orderby.NoopLimitSpec;
+ import org.apache.druid.query.spec.MultipleIntervalSegmentSpec;
+ import org.apache.druid.segment.StorageAdapter;
+ import org.apache.druid.segment.VirtualColumns;
+-import org.apache.druid.segment.join.filter.AllNullColumnSelectorFactory;
+ import org.apache.druid.utils.CloseableUtils;
+ 
+ import javax.annotation.Nullable;
+ import java.nio.ByteBuffer;
+ import java.util.ArrayList;
+-import java.util.Collections;
+ import java.util.Comparator;
+ import java.util.HashSet;
+-import java.util.Iterator;
+ import java.util.List;
+-import java.util.Map;
+ import java.util.Set;
+-import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.function.BinaryOperator;
+ import java.util.stream.Collectors;
+ 
+@@ -323,62 +317,13 @@ public class GroupingEngine
+     if (!queryContext.getBoolean(CTX_KEY_OUTERMOST, true)
+         || queryContext.getBoolean(GroupByQueryConfig.CTX_KEY_EXECUTING_NESTED_QUERY, false)) {
+       return mergedResults;
+-    } else if (query.getPostAggregatorSpecs().isEmpty()) {
+-      if (!hasTimestampResultField) {
+-        return mergedResults;
+-      }
+-      return Sequences.map(
+-          mergedResults,
+-          row -> {
+-            final ResultRow resultRow = ResultRow.create(query.getResultRowSizeWithoutPostAggregators());
+-            moveOrReplicateTimestampInRow(
+-                query,
+-                timestampResultFieldIndexInOriginalDimensions,
+-                row,
+-                resultRow
+-            );
+-
+-            return resultRow;
+-          }
+-      );
+-    } else {
+-      return Sequences.map(
+-          mergedResults,
+-          row -> {
+-            // This function's purpose is to apply PostAggregators.
+-
+-            final ResultRow rowWithPostAggregations = ResultRow.create(query.getResultRowSizeWithPostAggregators());
+-
+-            // Copy everything that comes before the postaggregations.
+-            if (hasTimestampResultField) {
+-              moveOrReplicateTimestampInRow(
+-                  query,
+-                  timestampResultFieldIndexInOriginalDimensions,
+-                  row,
+-                  rowWithPostAggregations
+-              );
+-            } else {
+-              for (int i = 0; i < query.getResultRowPostAggregatorStart(); i++) {
+-                rowWithPostAggregations.set(i, row.get(i));
+-              }
+-            }
+-
+-            // Compute postaggregations. We need to do this with a result-row map because PostAggregator.compute
+-            // expects a map. Some further design adjustment may eliminate the need for it, and speed up this function.
+-            final Map<String, Object> mapForPostAggregationComputation = rowWithPostAggregations.toMap(query);
+-
+-            for (int i = 0; i < query.getPostAggregatorSpecs().size(); i++) {
+-              final PostAggregator postAggregator = query.getPostAggregatorSpecs().get(i);
+-              final Object value = postAggregator.compute(mapForPostAggregationComputation);
+-
+-              rowWithPostAggregations.set(query.getResultRowPostAggregatorStart() + i, value);
+-              mapForPostAggregationComputation.put(postAggregator.getName(), value);
+-            }
+-
+-            return rowWithPostAggregations;
+-          }
+-      );
+     }
++    return GroupByQueryQueryToolChest.coordinator().applyPostAggregatorsAfterMerge(
++        mergedResults,
++        query,
++        hasTimestampResultField,
++        timestampResultFieldIndexInOriginalDimensions
++    );
+   }
+ 
+   /**
+@@ -697,34 +642,6 @@ public class GroupingEngine
+     }
+   }
+ 
+-  private void moveOrReplicateTimestampInRow(
+-      GroupByQuery query,
+-      int timestampResultFieldIndexInOriginalDimensions,
+-      ResultRow before,
+-      ResultRow after
+-  )
+-  {
+-    // d1 is the __time
+-    // when query.granularity=all:  convert [__time, d0] to [d0, d1] (actually, [d0, __time])
+-    // when query.granularity!=all: convert [__time, d0] to [__time, d0, d1] (actually, [__time, d0, __time])
+-    // overall, insert the removed d1 at the position where it is removed and remove the first __time if granularity=all
+-    Object theTimestamp = before.get(0);
+-    int expectedDimensionStartInAfterRow = 0;
+-    if (query.getResultRowHasTimestamp()) {
+-      expectedDimensionStartInAfterRow = 1;
+-      after.set(0, theTimestamp);
+-    }
+-    int timestampResultFieldIndexInAfterRow = timestampResultFieldIndexInOriginalDimensions + expectedDimensionStartInAfterRow;
+-    for (int i = expectedDimensionStartInAfterRow; i < timestampResultFieldIndexInAfterRow; i++) {
+-      // 0 in beforeRow is the timestamp, so plus 1 is the start of dimension in beforeRow
+-      after.set(i, before.get(i + 1));
+-    }
+-    after.set(timestampResultFieldIndexInAfterRow, theTimestamp);
+-    for (int i = timestampResultFieldIndexInAfterRow + 1; i < before.length() + expectedDimensionStartInAfterRow; i++) {
+-      after.set(i, before.get(i - expectedDimensionStartInAfterRow));
+-    }
+-  }
+-
+   private Set<String> getAggregatorAndPostAggregatorNames(GroupByQuery query)
+   {
+     Set<String> aggsAndPostAggs = new HashSet();
+@@ -748,59 +665,7 @@ public class GroupingEngine
+    */
+   public static Sequence<ResultRow> wrapSummaryRowIfNeeded(GroupByQuery query, Sequence<ResultRow> process)
+   {
+-    if (!summaryRowPreconditions(query)) {
+-      return process;
+-    }
+-
+-    final AtomicBoolean t = new AtomicBoolean();
+-
+-    return Sequences.concat(
+-        Sequences.map(process, ent -> {
+-          t.set(true);
+-          return ent;
+-        }),
+-        Sequences.simple(() -> {
+-          if (t.get()) {
+-            return Collections.emptyIterator();
+-          }
+-          return summaryRowIterator(query);
+-        }));
+-  }
+-
+-  private static boolean summaryRowPreconditions(GroupByQuery query)
+-  {
+-    LimitSpec limit = query.getLimitSpec();
+-    if (limit instanceof DefaultLimitSpec) {
+-      DefaultLimitSpec limitSpec = (DefaultLimitSpec) limit;
+-      if (limitSpec.getLimit() == 0 || limitSpec.getOffset() > 0) {
+-        return false;
+-      }
+-    }
+-    if (!query.getDimensions().isEmpty()) {
+-      return false;
+-    }
+-    if (query.getGranularity().isFinerThan(Granularities.ALL)) {
+-      return false;
+-    }
+-    return true;
+-  }
+-
+-  private static Iterator<ResultRow> summaryRowIterator(GroupByQuery q)
+-  {
+-    List<AggregatorFactory> aggSpec = q.getAggregatorSpecs();
+-    ResultRow resultRow = ResultRow.create(q.getResultRowSizeWithPostAggregators());
+-    for (int i = 0; i < aggSpec.size(); i++) {
+-      resultRow.set(i, aggSpec.get(i).factorize(new AllNullColumnSelectorFactory()).get());
+-    }
+-    Map<String, Object> map = resultRow.toMap(q);
+-    for (int i = 0; i < q.getPostAggregatorSpecs().size(); i++) {
+-      final PostAggregator postAggregator = q.getPostAggregatorSpecs().get(i);
+-      final Object value = postAggregator.compute(map);
+-
+-      resultRow.set(q.getResultRowPostAggregatorStart() + i, value);
+-      map.put(postAggregator.getName(), value);
+-    }
+-    return Collections.singleton(resultRow).iterator();
++    return GroupByQueryQueryToolChest.coordinator().wrapSummaryRowIfNeeded(query, process);
+   }
+ 
+ }
+diff --git a/processing/src/main/java/org/apache/druid/query/groupby/ResultRow.java b/processing/src/main/java/org/apache/druid/query/groupby/ResultRow.java
+index 977cba9603..007436365d 100644
+--- a/processing/src/main/java/org/apache/druid/query/groupby/ResultRow.java
++++ b/processing/src/main/java/org/apache/druid/query/groupby/ResultRow.java
+@@ -23,15 +23,9 @@ import com.fasterxml.jackson.annotation.JsonCreator;
+ import com.fasterxml.jackson.annotation.JsonValue;
+ import org.apache.druid.data.input.MapBasedRow;
+ import org.apache.druid.data.input.Row;
+-import org.apache.druid.query.aggregation.AggregatorFactory;
+-import org.apache.druid.query.aggregation.PostAggregator;
+-import org.apache.druid.query.dimension.DimensionSpec;
+-import org.apache.druid.segment.column.RowSignature;
+-import org.joda.time.DateTime;
+ 
+ import javax.annotation.Nullable;
+ import java.util.Arrays;
+-import java.util.HashMap;
+ import java.util.Map;
+ 
+ /**
+@@ -90,27 +84,7 @@ public final class ResultRow
+    */
+   public static ResultRow fromLegacyRow(Row row, final GroupByQuery query)
+   {
+-    // Can't be sure if we'll get result rows with or without postaggregations, so be safe.
+-    final ResultRow resultRow = ResultRow.create(query.getResultRowSizeWithPostAggregators());
+-
+-    int i = 0;
+-    if (query.getResultRowHasTimestamp()) {
+-      resultRow.set(i++, row.getTimestamp().getMillis());
+-    }
+-
+-    for (DimensionSpec dimensionSpec : query.getDimensions()) {
+-      resultRow.set(i++, row.getRaw(dimensionSpec.getOutputName()));
+-    }
+-
+-    for (AggregatorFactory aggregatorFactory : query.getAggregatorSpecs()) {
+-      resultRow.set(i++, row.getRaw(aggregatorFactory.getName()));
+-    }
+-
+-    for (PostAggregator postAggregator : query.getPostAggregatorSpecs()) {
+-      resultRow.set(i++, row.getRaw(postAggregator.getName()));
+-    }
+-
+-    return resultRow;
++    return GroupByQueryQueryToolChest.coordinator().convertLegacyRow(row, query);
+   }
+ 
+   /**
+@@ -158,15 +132,7 @@ public final class ResultRow
+    */
+   public Map<String, Object> toMap(final GroupByQuery query)
+   {
+-    final RowSignature signature = query.getResultRowSignature();
+-    final Map<String, Object> map = new HashMap<>();
+-
+-    for (int i = query.getResultRowDimensionStart(); i < row.length; i++) {
+-      final String columnName = signature.getColumnName(i);
+-      map.put(columnName, row[i]);
+-    }
+-
+-    return map;
++    return GroupByQueryQueryToolChest.coordinator().resultRowToMap(this, query);
+   }
+ 
+   /**
+@@ -174,16 +140,7 @@ public final class ResultRow
+    */
+   public MapBasedRow toMapBasedRow(final GroupByQuery query)
+   {
+-    // May be null, if so it'll get replaced later
+-    final DateTime timestamp;
+-
+-    if (query.getResultRowHasTimestamp()) {
+-      timestamp = query.getGranularity().toDateTime(getLong(0));
+-    } else {
+-      timestamp = query.getUniversalTimestamp();
+-    }
+-
+-    return new MapBasedRow(timestamp, toMap(query));
++    return GroupByQueryQueryToolChest.coordinator().resultRowToMapBasedRow(this, query);
+   }
+ 
+   @Override
+diff --git a/processing/src/main/java/org/apache/druid/query/groupby/having/HavingSpecMetricComparator.java b/processing/src/main/java/org/apache/druid/query/groupby/having/HavingSpecMetricComparator.java
+index e3f786e1f8..0bc2631cad 100644
+--- a/processing/src/main/java/org/apache/druid/query/groupby/having/HavingSpecMetricComparator.java
++++ b/processing/src/main/java/org/apache/druid/query/groupby/having/HavingSpecMetricComparator.java
+@@ -20,12 +20,9 @@
+ package org.apache.druid.query.groupby.having;
+ 
+ import com.google.common.annotations.VisibleForTesting;
+-import com.google.common.primitives.Doubles;
+-import com.google.common.primitives.Longs;
+-import org.apache.druid.java.util.common.ISE;
+ import org.apache.druid.query.aggregation.AggregatorFactory;
++import org.apache.druid.query.groupby.GroupByQueryQueryToolChest;
+ 
+-import java.math.BigDecimal;
+ import java.util.Map;
+ import java.util.regex.Pattern;
+ 
+@@ -37,69 +34,12 @@ class HavingSpecMetricComparator
+ 
+   static int compare(String aggregationName, Number value, Map<String, AggregatorFactory> aggregators, Object metricValueObj)
+   {
+-    if (metricValueObj != null) {
+-      if (aggregators != null && aggregators.containsKey(aggregationName)) {
+-        metricValueObj = aggregators.get(aggregationName).finalizeComputation(metricValueObj);
+-      }
+-
+-      if (metricValueObj instanceof Long || metricValueObj instanceof Integer) {
+-        // Cast int metrics to longs, it's fine since longs can represent all int values.
+-        long n = ((Number) metricValueObj).longValue();
+-
+-        if (value instanceof Long || value instanceof Integer) {
+-          return Longs.compare(n, value.longValue());
+-        } else if (value instanceof Double || value instanceof Float) {
+-          // Invert the comparison since we're providing n, value backwards.
+-          return -compareDoubleToLong(value.doubleValue(), n);
+-        } else {
+-          throw new ISE("Number was[%s]?!?", value.getClass().getName());
+-        }
+-      } else if (metricValueObj instanceof Double || metricValueObj instanceof Float) {
+-        // Cast floats to doubles, it's fine since doubles can represent all float values.
+-        double n = ((Number) metricValueObj).doubleValue();
+-
+-        if (value instanceof Long || value instanceof Integer) {
+-          return compareDoubleToLong(n, value.longValue());
+-        } else if (value instanceof Double || value instanceof Float) {
+-          return Doubles.compare(n, value.doubleValue());
+-        } else {
+-          throw new ISE("Number was[%s]?!?", value.getClass().getName());
+-        }
+-      } else if (metricValueObj instanceof String) {
+-        String metricValueStr = (String) metricValueObj;
+-        if (LONG_PAT.matcher(metricValueStr).matches()) {
+-          long l = Long.parseLong(metricValueStr);
+-          return Long.compare(l, value.longValue());
+-        } else {
+-          double d = Double.parseDouble(metricValueStr);
+-          return Double.compare(d, value.doubleValue());
+-        }
+-      } else if (aggregators != null && aggregators.containsKey(aggregationName)) {
+-        // Use custom comparator in case of custom aggregation types
+-        AggregatorFactory aggregatorFactory = aggregators.get(aggregationName);
+-        return aggregatorFactory.getComparator()
+-                                .compare(
+-                                    aggregatorFactory.deserialize(metricValueObj),
+-                                    aggregatorFactory.deserialize(value)
+-                                );
+-      } else {
+-        throw new ISE("Unknown type of metric value: %s", metricValueObj);
+-      }
+-    } else {
+-      return Double.compare(0, value.doubleValue());
+-    }
++    return GroupByQueryQueryToolChest.coordinator().compareHavingMetric(aggregationName, value, aggregators, metricValueObj);
+   }
+ 
+   @VisibleForTesting
+   static int compareDoubleToLong(final double a, final long b)
+   {
+-    // Use BigDecimal when comparing integers vs floating points, a convenient way to handle all cases (like
+-    // fractional values, values out of range of max long/max int) without worrying about them ourselves.
+-    // The only edge case we need to handle is doubles that can not be converted to a BigDecimal, so fall back to using
+-    // Double.compare
+-    if (Double.isNaN(a) || Double.isInfinite(a)) {
+-      return Double.compare(a, b);
+-    }
+-    return BigDecimal.valueOf(a).compareTo(BigDecimal.valueOf(b));
++    return GroupByQueryQueryToolChest.coordinator().compareDoubleToLongMetric(a, b);
+   }
+ }
+diff --git a/processing/src/main/java/org/apache/druid/query/groupby/orderby/DefaultLimitSpec.java b/processing/src/main/java/org/apache/druid/query/groupby/orderby/DefaultLimitSpec.java
+index e4071b5501..e3b9976a6e 100644
+--- a/processing/src/main/java/org/apache/druid/query/groupby/orderby/DefaultLimitSpec.java
++++ b/processing/src/main/java/org/apache/druid/query/groupby/orderby/DefaultLimitSpec.java
+@@ -24,45 +24,21 @@ import com.fasterxml.jackson.annotation.JsonInclude;
+ import com.fasterxml.jackson.annotation.JsonProperty;
+ import com.google.common.annotations.VisibleForTesting;
+ import com.google.common.base.Function;
+-import com.google.common.base.Functions;
+ import com.google.common.base.Preconditions;
+ import com.google.common.collect.ImmutableList;
+-import com.google.common.collect.Iterables;
+-import com.google.common.collect.Ordering;
+-import com.google.common.primitives.Longs;
+-import org.apache.druid.common.config.NullHandling;
+-import org.apache.druid.data.input.Rows;
+ import org.apache.druid.java.util.common.ISE;
+-import org.apache.druid.java.util.common.granularity.Granularities;
+ import org.apache.druid.java.util.common.guava.Sequence;
+-import org.apache.druid.java.util.common.guava.Sequences;
+-import org.apache.druid.java.util.common.guava.TopNSequence;
+-import org.apache.druid.query.QueryContext;
+-import org.apache.druid.query.aggregation.AggregatorFactory;
+-import org.apache.druid.query.aggregation.PostAggregator;
+ import org.apache.druid.query.dimension.DimensionSpec;
+ import org.apache.druid.query.groupby.GroupByQuery;
++import org.apache.druid.query.groupby.GroupByQueryQueryToolChest;
+ import org.apache.druid.query.groupby.ResultRow;
+ import org.apache.druid.query.ordering.StringComparator;
+-import org.apache.druid.query.ordering.StringComparators;
+-import org.apache.druid.segment.DimensionHandlerUtils;
+-import org.apache.druid.segment.column.ColumnType;
+-import org.apache.druid.segment.column.RowSignature;
+-import org.apache.druid.segment.column.ValueType;
+-import org.apache.druid.segment.data.ComparableList;
+-import org.apache.druid.segment.data.ComparableStringArray;
+-
+-import javax.annotation.Nullable;
++
+ import java.nio.ByteBuffer;
+ import java.util.Arrays;
+ import java.util.Collections;
+-import java.util.Comparator;
+-import java.util.HashMap;
+-import java.util.HashSet;
+ import java.util.List;
+-import java.util.Map;
+ import java.util.Objects;
+-import java.util.Optional;
+ import java.util.Set;
+ import java.util.stream.Collectors;
+ 
+@@ -93,23 +69,12 @@ public class DefaultLimitSpec implements LimitSpec
+    */
+   public static boolean sortingOrderHasNonGroupingFields(DefaultLimitSpec limitSpec, List<DimensionSpec> dimensions)
+   {
+-    for (OrderByColumnSpec orderSpec : limitSpec.getColumns()) {
+-      int dimIndex = OrderByColumnSpec.getDimIndexForOrderBy(orderSpec, dimensions);
+-      if (dimIndex < 0) {
+-        return true;
+-      }
+-    }
+-    return false;
++    return GroupByQueryQueryToolChest.coordinator().sortingOrderHasNonGroupingFields(limitSpec.getColumns(), dimensions);
+   }
+ 
+   public static StringComparator getComparatorForDimName(DefaultLimitSpec limitSpec, String dimName)
+   {
+-    final OrderByColumnSpec orderBy = OrderByColumnSpec.getOrderByForDimName(limitSpec.getColumns(), dimName);
+-    if (orderBy == null) {
+-      return null;
+-    }
+-
+-    return orderBy.getDimensionComparator();
++    return GroupByQueryQueryToolChest.coordinator().getComparatorForDimName(limitSpec.getColumns(), dimName);
+   }
+ 
+   @JsonCreator
+@@ -179,116 +144,7 @@ public class DefaultLimitSpec implements LimitSpec
+   @Override
+   public Function<Sequence<ResultRow>, Sequence<ResultRow>> build(final GroupByQuery query)
+   {
+-    final List<DimensionSpec> dimensions = query.getDimensions();
+-
+-    // Can avoid re-sorting if the natural ordering is good enough.
+-    boolean sortingNeeded = dimensions.size() < columns.size();
+-
+-    final Set<String> aggAndPostAggNames = new HashSet<>();
+-    for (AggregatorFactory agg : query.getAggregatorSpecs()) {
+-      aggAndPostAggNames.add(agg.getName());
+-    }
+-    for (PostAggregator postAgg : query.getPostAggregatorSpecs()) {
+-      aggAndPostAggNames.add(postAgg.getName());
+-    }
+-
+-    if (!sortingNeeded) {
+-      for (int i = 0; i < columns.size(); i++) {
+-        final OrderByColumnSpec columnSpec = columns.get(i);
+-
+-        if (aggAndPostAggNames.contains(columnSpec.getDimension())) {
+-          sortingNeeded = true;
+-          break;
+-        }
+-
+-        final ColumnType columnType = getOrderByType(columnSpec, dimensions);
+-        final StringComparator naturalComparator;
+-        if (columnType.is(ValueType.STRING)) {
+-          naturalComparator = StringComparators.LEXICOGRAPHIC;
+-        } else if (columnType.isNumeric()) {
+-          naturalComparator = StringComparators.NUMERIC;
+-        } else if (columnType.isArray()) {
+-          if (columnType.getElementType().isNumeric()) {
+-            naturalComparator = StringComparators.NUMERIC;
+-          } else {
+-            naturalComparator = StringComparators.LEXICOGRAPHIC;
+-          }
+-        } else {
+-          sortingNeeded = true;
+-          break;
+-        }
+-
+-        if (columnSpec.getDirection() != OrderByColumnSpec.Direction.ASCENDING
+-            || !columnSpec.getDimensionComparator().equals(naturalComparator)
+-            || !columnSpec.getDimension().equals(dimensions.get(i).getOutputName())) {
+-          sortingNeeded = true;
+-          break;
+-        }
+-      }
+-    }
+-
+-    if (!sortingNeeded) {
+-      // If granularity is ALL, sortByDimsFirst doesn't change the sorting order.
+-      sortingNeeded = !query.getGranularity().equals(Granularities.ALL) && query.getContextSortByDimsFirst();
+-    }
+-
+-    if (!sortingNeeded) {
+-      final QueryContext queryContext = query.context();
+-      String timestampField = queryContext.getString(GroupByQuery.CTX_TIMESTAMP_RESULT_FIELD);
+-      if (timestampField != null && !timestampField.isEmpty()) {
+-        // Will NPE if the key is not set
+-        int timestampResultFieldIndex = queryContext.getInt(GroupByQuery.CTX_TIMESTAMP_RESULT_FIELD_INDEX);
+-        sortingNeeded = query.getContextSortByDimsFirst()
+-                        ? timestampResultFieldIndex != query.getDimensions().size() - 1
+-                        : timestampResultFieldIndex != 0;
+-      }
+-    }
+-
+-    final Function<Sequence<ResultRow>, Sequence<ResultRow>> sortAndLimitFn;
+-
+-    if (sortingNeeded) {
+-      // Materialize the Comparator first for fast-fail error checking.
+-      final Ordering<ResultRow> ordering = makeComparator(
+-          query.getResultRowSignature(),
+-          query.getResultRowHasTimestamp(),
+-          query.getDimensions(),
+-          query.getAggregatorSpecs(),
+-          query.getPostAggregatorSpecs(),
+-          query.getContextSortByDimsFirst()
+-      );
+-
+-      // Both branches use a stable sort; important so consistent results are returned from query to query if the
+-      // underlying data isn't changing. (Useful for query reproducibility and offset-based pagination.)
+-      if (isLimited()) {
+-        sortAndLimitFn = results -> new TopNSequence<>(results, ordering, limit + offset);
+-      } else {
+-        sortAndLimitFn = results -> Sequences.sort(results, ordering).limit(limit + offset);
+-      }
+-    } else {
+-      if (isLimited()) {
+-        sortAndLimitFn = results -> results.limit(limit + offset);
+-      } else {
+-        sortAndLimitFn = Functions.identity();
+-      }
+-    }
+-
+-    // Finally, apply offset after sorting and limiting.
+-    if (isOffset()) {
+-      return results -> sortAndLimitFn.apply(results).skip(offset);
+-    } else {
+-      return sortAndLimitFn;
+-    }
+-  }
+-
+-  private ColumnType getOrderByType(final OrderByColumnSpec columnSpec, final List<DimensionSpec> dimensions)
+-  {
+-    for (DimensionSpec dimSpec : dimensions) {
+-      if (columnSpec.getDimension().equals(dimSpec.getOutputName())) {
+-        return dimSpec.getOutputType();
+-      }
+-    }
+-
+-    throw new ISE("Unknown column in order clause[%s]", columnSpec);
++    return GroupByQueryQueryToolChest.coordinator().buildLimitFunction(columns, offset, limit, query);
+   }
+ 
+   @Override
+@@ -328,153 +184,6 @@ public class DefaultLimitSpec implements LimitSpec
+     }
+   }
+ 
+-  private Ordering<ResultRow> makeComparator(
+-      RowSignature rowSignature,
+-      boolean hasTimestamp,
+-      List<DimensionSpec> dimensions,
+-      List<AggregatorFactory> aggs,
+-      List<PostAggregator> postAggs,
+-      boolean sortByDimsFirst
+-  )
+-  {
+-    final Ordering<ResultRow> timeOrdering;
+-
+-    if (hasTimestamp) {
+-      timeOrdering = new Ordering<ResultRow>()
+-      {
+-        @Override
+-        public int compare(ResultRow left, ResultRow right)
+-        {
+-          return Longs.compare(left.getLong(0), right.getLong(0));
+-        }
+-      };
+-    } else {
+-      timeOrdering = null;
+-    }
+-
+-    Map<String, DimensionSpec> dimensionsMap = new HashMap<>();
+-    for (DimensionSpec spec : dimensions) {
+-      dimensionsMap.put(spec.getOutputName(), spec);
+-    }
+-
+-    Map<String, AggregatorFactory> aggregatorsMap = new HashMap<>();
+-    for (final AggregatorFactory agg : aggs) {
+-      aggregatorsMap.put(agg.getName(), agg);
+-    }
+-
+-    Map<String, PostAggregator> postAggregatorsMap = new HashMap<>();
+-    for (PostAggregator postAgg : postAggs) {
+-      postAggregatorsMap.put(postAgg.getName(), postAgg);
+-    }
+-
+-    Ordering<ResultRow> ordering = null;
+-    for (OrderByColumnSpec columnSpec : columns) {
+-      String columnName = columnSpec.getDimension();
+-      Ordering<ResultRow> nextOrdering = null;
+-
+-      final int columnIndex = rowSignature.indexOf(columnName);
+-
+-      if (columnIndex >= 0) {
+-        if (postAggregatorsMap.containsKey(columnName)) {
+-          //noinspection unchecked
+-          nextOrdering = metricOrdering(columnIndex, postAggregatorsMap.get(columnName).getComparator());
+-        } else if (aggregatorsMap.containsKey(columnName)) {
+-          //noinspection unchecked
+-          nextOrdering = metricOrdering(columnIndex, aggregatorsMap.get(columnName).getComparator());
+-        } else if (dimensionsMap.containsKey(columnName)) {
+-          Optional<DimensionSpec> dimensionSpec = dimensions.stream()
+-                                                            .filter(ds -> ds.getOutputName().equals(columnName))
+-                                                            .findFirst();
+-          if (!dimensionSpec.isPresent()) {
+-            throw new ISE("Could not find the dimension spec for ordering column %s", columnName);
+-          }
+-          nextOrdering = dimensionOrdering(
+-              columnIndex,
+-              dimensionSpec.get().getOutputType(),
+-              columnSpec.getDimensionComparator()
+-          );
+-        }
+-      }
+-
+-      if (nextOrdering == null) {
+-        throw new ISE("Unknown column in order clause[%s]", columnSpec);
+-      }
+-
+-      if (columnSpec.getDirection() == OrderByColumnSpec.Direction.DESCENDING) {
+-        nextOrdering = nextOrdering.reverse();
+-      }
+-
+-      ordering = ordering == null ? nextOrdering : ordering.compound(nextOrdering);
+-    }
+-
+-    if (ordering == null) {
+-      ordering = timeOrdering;
+-    } else if (timeOrdering != null) {
+-      ordering = sortByDimsFirst ? ordering.compound(timeOrdering) : timeOrdering.compound(ordering);
+-    }
+-
+-    //noinspection unchecked
+-    return ordering != null ? ordering : (Ordering) Ordering.allEqual();
+-  }
+-
+-  private <T> Ordering<ResultRow> metricOrdering(final int column, final Comparator<T> comparator)
+-  {
+-    // As per SQL standard we need to have same ordering for metrics as dimensions i.e nulls first
+-    // If SQL compatibility is not enabled we use nullsLast ordering for null metrics for backwards compatibility.
+-    final Comparator<T> nullFriendlyComparator = NullHandling.sqlCompatible()
+-                                                 ? Comparator.nullsFirst(comparator)
+-                                                 : Comparator.nullsLast(comparator);
+-
+-    //noinspection unchecked
+-    return Ordering.from(Comparator.comparing(row -> (T) row.get(column), nullFriendlyComparator));
+-  }
+-
+-  private Ordering<ResultRow> dimensionOrdering(
+-      final int column,
+-      final ColumnType columnType,
+-      final StringComparator comparator
+-  )
+-  {
+-    Comparator arrayComparator = null;
+-    if (columnType.isArray()) {
+-      final ValueType elementType = columnType.getElementType().getType();
+-      if (columnType.getElementType().isNumeric()) {
+-        arrayComparator = (Comparator<Object>) (o1, o2) -> ComparableList.compareWithComparator(
+-            comparator,
+-            DimensionHandlerUtils.convertToList(o1, elementType),
+-            DimensionHandlerUtils.convertToList(o2, elementType)
+-        );
+-      } else if (columnType.getElementType().equals(ColumnType.STRING)) {
+-        arrayComparator = (Comparator<Object>) (o1, o2) -> ComparableStringArray.compareWithComparator(
+-            comparator,
+-            DimensionHandlerUtils.convertToComparableStringArray(o1),
+-            DimensionHandlerUtils.convertToComparableStringArray(o2)
+-        );
+-      } else {
+-        throw new ISE("Cannot create comparator for array type %s.", columnType.toString());
+-      }
+-    }
+-    return Ordering.from(
+-        Comparator.comparing(
+-            (ResultRow row) -> {
+-              if (columnType.isArray()) {
+-                return row.get(column);
+-              } else {
+-                return getDimensionValue(row, column);
+-              }
+-            },
+-            Comparator.nullsFirst(arrayComparator == null ? comparator : arrayComparator)
+-        )
+-    );
+-  }
+-
+-  @Nullable
+-  private static String getDimensionValue(ResultRow row, int column)
+-  {
+-    final List<String> values = Rows.objectToStrings(row.get(column));
+-    return values.isEmpty() ? null : Iterables.getOnlyElement(values);
+-  }
+-
+   @Override
+   public String toString()
+   {

@@ -1,0 +1,2109 @@
+diff --git a/tokio/src/sync/mpsc/block.rs b/tokio/src/sync/mpsc/block.rs
+index e7798592..e688081f 100644
+--- a/tokio/src/sync/mpsc/block.rs
++++ b/tokio/src/sync/mpsc/block.rs
+@@ -1,11 +1,15 @@
+ use crate::loom::cell::UnsafeCell;
+ use crate::loom::sync::atomic::{AtomicPtr, AtomicUsize};
++use crate::sync::batch_semaphore::TryAcquireError;
++use crate::sync::mpsc::error::{SendError, TryRecvError, TrySendError};
+ 
+ use std::alloc::Layout;
+ use std::mem::MaybeUninit;
+ use std::ops;
+ use std::ptr::{self, NonNull};
+-use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Release};
++use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Relaxed, Release};
++use std::task::Poll::{Pending, Ready};
++use std::task::{Context, Poll};
+ 
+ /// A block in a linked list.
+ ///
+@@ -262,20 +266,12 @@ impl<T> Block<T> {
+     /// This indicates that the block is in its final state and will no longer
+     /// be mutated.
+     pub(crate) fn is_final(&self) -> bool {
+-        self.header.ready_slots.load(Acquire) & READY_MASK == READY_MASK
++        self.block_is_fully_written()
+     }
+ 
+     /// Returns the `observed_tail_position` value, if set
+     pub(crate) fn observed_tail_position(&self) -> Option<usize> {
+-        if 0 == RELEASED & self.header.ready_slots.load(Acquire) {
+-            None
+-        } else {
+-            Some(
+-                self.header
+-                    .observed_tail_position
+-                    .with(|ptr| unsafe { *ptr }),
+-            )
+-        }
++        self.observed_tail_if_released()
+     }
+ 
+     /// Loads the next block
+@@ -403,6 +399,1069 @@ impl<T> Block<T> {
+     }
+ }
+ 
++
++impl<T> Block<T> {
++    pub(crate) fn list_slot_start(slot_index: usize) -> usize {
++        start_index(slot_index)
++    }
++
++    pub(crate) fn list_slot_offset(slot_index: usize) -> usize {
++        offset(slot_index)
++    }
++
++    pub(crate) fn ready_slot_mask(slot: usize) -> usize {
++        if slot >= BLOCK_CAP {
++            0
++        } else {
++            1 << slot
++        }
++    }
++
++    pub(crate) fn ready_bits_have_slot(bits: usize, slot: usize) -> bool {
++        let mask = Self::ready_slot_mask(slot);
++        mask != 0 && mask == (mask & bits)
++    }
++
++    pub(crate) fn ready_bits_tx_closed(bits: usize) -> bool {
++        TX_CLOSED == (bits & TX_CLOSED)
++    }
++
++    pub(crate) fn ready_bits_released(bits: usize) -> bool {
++        RELEASED == (bits & RELEASED)
++    }
++
++    pub(crate) fn ready_bits_all_slots(bits: usize) -> bool {
++        (bits & READY_MASK) == READY_MASK
++    }
++
++    pub(crate) fn load_ready_bits(&self) -> usize {
++        self.header.ready_slots.load(Acquire)
++    }
++
++    pub(crate) fn slot_has_ready_value(&self, slot_index: usize) -> bool {
++        let slot = Self::list_slot_offset(slot_index);
++        Self::ready_bits_have_slot(self.load_ready_bits(), slot)
++    }
++
++    pub(crate) fn slot_read_is_closed(&self) -> bool {
++        Self::ready_bits_tx_closed(self.load_ready_bits())
++    }
++
++    pub(crate) fn load_tx_tail_ptr(tx: &super::list::Tx<T>) -> *mut Block<T> {
++        let ptr = tx.block_tail.load(Acquire);
++        debug_assert!(!ptr.is_null());
++        ptr
++    }
++
++    pub(crate) fn load_tx_tail_position(tx: &super::list::Tx<T>) -> usize {
++        tx.tail_position.load(Acquire)
++    }
++
++    pub(crate) fn claim_tx_slot(tx: &super::list::Tx<T>) -> usize {
++        tx.tail_position.fetch_add(1, Acquire)
++    }
++
++    pub(crate) fn should_try_updating_tail(distance: usize, slot_offset: usize) -> bool {
++        distance > slot_offset
++    }
++
++    pub(crate) fn load_or_grow_next(&self) -> NonNull<Block<T>> {
++        match self.load_next(Acquire) {
++            Some(next_block) => next_block,
++            None => self.grow(),
++        }
++    }
++
++    pub(crate) fn keep_updating_tail(&self, updating: bool) -> bool {
++        updating && self.fully_written()
++    }
++
++    pub(crate) fn cas_tx_block_tail(
++        tx: &super::list::Tx<T>,
++        current: *mut Block<T>,
++        next: NonNull<Block<T>>,
++    ) -> bool {
++        tx.block_tail
++            .compare_exchange(current, next.as_ptr(), Release, Relaxed)
++            .is_ok()
++    }
++
++    pub(crate) fn sync_tx_tail_position(tx: &super::list::Tx<T>) -> usize {
++        tx.tail_position.fetch_add(0, Release)
++    }
++
++    pub(crate) fn yield_list_walk() {
++        crate::loom::thread::yield_now();
++    }
++
++    pub(crate) fn find_block_on_tx(
++        tx: &super::list::Tx<T>,
++        slot_index: usize,
++    ) -> NonNull<Block<T>> {
++        let start = Self::list_slot_start(slot_index);
++        let slot_offset = Self::list_slot_offset(slot_index);
++        let mut block_ptr = Self::load_tx_tail_ptr(tx);
++        let block = unsafe { &*block_ptr };
++        let distance = block.distance(start);
++        let mut try_updating_tail = Self::slot_distance_exceeds_offset(distance, slot_offset);
++
++        loop {
++            let block = unsafe { &(*block_ptr) };
++            if block.is_at_index(start) {
++                return Self::non_null_from_block_ptr(block_ptr);
++            }
++
++            let next_block = block.load_or_grow_next();
++            try_updating_tail = block.keep_updating_tail(try_updating_tail);
++
++            if try_updating_tail {
++                if Self::cas_tx_block_tail(tx, block_ptr, next_block) {
++                    let tail_position = Self::sync_tx_tail_position(tx);
++                    Self::release_passed_list_block(block, tail_position);
++                } else {
++                    try_updating_tail = false;
++                }
++            }
++
++            block_ptr = Self::block_ptr_from_non_null(next_block);
++            Self::yield_after_block_walk();
++        }
++    }
++
++    pub(crate) fn push_on_list(tx: &super::list::Tx<T>, value: T) {
++        let slot_index = Self::claim_tx_slot(tx);
++        let block = Self::find_block_on_tx(tx, slot_index);
++        Self::write_claimed_list_slot(block, slot_index, value);
++    }
++
++    pub(crate) fn close_list_tx(tx: &super::list::Tx<T>) {
++        let slot_index = Self::claim_tx_slot(tx);
++        let block = Self::find_block_on_tx(tx, slot_index);
++        Self::close_claimed_list_slot(block);
++    }
++
++    pub(crate) fn list_tx_is_closed(tx: &super::list::Tx<T>) -> bool {
++        Self::list_tx_tail_is_closed_ptr(Self::load_tx_tail_ptr(tx))
++    }
++
++    pub(crate) unsafe fn try_reuse_reclaimed_block(
++        tx: &super::list::Tx<T>,
++        block: &mut NonNull<Block<T>>,
++    ) -> bool {
++        let curr_ptr = tx.block_tail.load(Acquire);
++        debug_assert!(!curr_ptr.is_null());
++        let mut curr = NonNull::new_unchecked(curr_ptr);
++
++        for _ in 0..3 {
++            match curr.as_ref().try_push(block, AcqRel, Acquire) {
++                Ok(()) => return true,
++                Err(next) => curr = next,
++            }
++        }
++        false
++    }
++
++    pub(crate) unsafe fn reclaim_tx_block(tx: &super::list::Tx<T>, mut block: NonNull<Block<T>>) {
++        block.as_mut().reclaim();
++        if !Self::try_reuse_reclaimed_block(tx, &mut block) {
++            let _ = Box::from_raw(block.as_ptr());
++        }
++    }
++
++    pub(crate) fn list_rx_len(rx: &super::list::Rx<T>, tx: &super::list::Tx<T>) -> usize {
++        let tail_position = Self::load_tx_tail_position(tx);
++        tail_position - rx.index - Self::closed_len_adjustment(tx)
++    }
++
++    pub(crate) fn list_rx_is_empty(rx: &super::list::Rx<T>, tx: &super::list::Tx<T>) -> bool {
++        let _cursor = Self::walk_unreclaimed_blocks(rx);
++        let _ = Self::current_rx_block(rx).ready_or_closed(rx.index);
++        Self::list_empty_from_head(rx, tx)
++    }
++
++    pub(crate) fn try_advance_rx_head(rx: &mut super::list::Rx<T>) -> bool {
++        let block_index = Self::list_slot_start(rx.index);
++
++        loop {
++            let next_block = {
++                let block = unsafe { rx.head.as_ref() };
++                if block.is_at_index(block_index) {
++                    debug_assert!(block.rx_index_matches_block(rx.index));
++                    return true;
++                }
++                block.load_next_or_none(Acquire)
++            };
++
++            let next_block = match next_block {
++                Some(next_block) => next_block,
++                None => return false,
++            };
++
++            Self::set_rx_head(rx, next_block);
++            Self::yield_list_walk();
++        }
++    }
++
++    pub(crate) fn required_reclaim_index(block: &Block<T>) -> Option<usize> {
++        block.observed_or_none()
++    }
++
++    pub(crate) fn reclaim_rx_blocks(rx: &mut super::list::Rx<T>, tx: &super::list::Tx<T>) {
++        while !Self::list_free_head_caught_up(rx) {
++            let block = rx.free_head;
++            let next_block = match Self::reclaim_if_released(block, rx.index) {
++                Ok(next) => next,
++                Err(_) => return,
++            };
++            Self::set_rx_free_head(rx, next_block);
++            unsafe {
++                tx.reclaim_block(block);
++            }
++            Self::yield_after_block_walk();
++        }
++    }
++
++    pub(crate) fn list_rx_pop(
++        rx: &mut super::list::Rx<T>,
++        tx: &super::list::Tx<T>,
++    ) -> Option<Read<T>> {
++        if !Self::try_advance_rx_head(rx) {
++            return None;
++        }
++
++        Self::reclaim_rx_blocks(rx, tx);
++
++        let block = Self::current_rx_block(rx);
++        let ret = Self::take_rx_block_value(block, rx.index);
++        if let Some(Read::Value(..)) = ret {
++            Self::advance_rx_index(rx);
++        }
++        ret
++    }
++
++    pub(crate) fn classify_missing_pop(
++        tail_position: usize,
++        index: usize,
++    ) -> super::list::TryPopResult<T> {
++        if tail_position == index {
++            Self::try_pop_empty()
++        } else {
++            Self::try_pop_busy()
++        }
++    }
++
++    pub(crate) fn list_rx_try_pop(
++        rx: &mut super::list::Rx<T>,
++        tx: &super::list::Tx<T>,
++    ) -> super::list::TryPopResult<T> {
++        let tail_position = Self::load_tx_tail_position(tx);
++        Self::classify_read_pop(Self::list_rx_pop(rx, tx), tail_position, rx.index)
++    }
++
++    pub(crate) unsafe fn free_rx_blocks(rx: &mut super::list::Rx<T>) {
++        debug_assert_ne!(rx.free_head, NonNull::dangling());
++
++        let mut cur = Some(rx.free_head);
++
++        #[cfg(debug_assertions)]
++        {
++            rx.free_head = NonNull::dangling();
++            rx.head = NonNull::dangling();
++        }
++
++        while let Some(block) = cur {
++            cur = block.as_ref().load_next(Relaxed);
++            drop(Box::from_raw(block.as_ptr()));
++        }
++    }
++
++    pub(crate) fn chan_rx_is_empty<S: super::chan::Semaphore>(
++        rx: &super::chan::Rx<T, S>,
++    ) -> bool {
++        rx.inner.rx_fields.with(|rx_fields_ptr| {
++            let rx_fields = unsafe { &*rx_fields_ptr };
++            rx_fields.list.is_empty(&rx.inner.tx)
++        })
++    }
++
++    pub(crate) fn chan_rx_len<S: super::chan::Semaphore>(rx: &super::chan::Rx<T, S>) -> usize {
++        rx.inner.rx_fields.with(|rx_fields_ptr| {
++            let rx_fields = unsafe { &*rx_fields_ptr };
++            rx_fields.list.len(&rx.inner.tx)
++        })
++    }
++
++    pub(crate) fn chan_rx_is_closed<S: super::chan::Semaphore>(
++        rx: &super::chan::Rx<T, S>,
++    ) -> bool {
++        Self::semaphore_is_closed(rx) || Self::chan_tx_count_is_zero(rx)
++    }
++
++    pub(crate) fn chan_rx_close<S: super::chan::Semaphore>(rx: &mut super::chan::Rx<T, S>) {
++        rx.inner.rx_fields.with_mut(|rx_fields_ptr| {
++            let rx_fields = unsafe { &mut *rx_fields_ptr };
++            let _already_closed = Self::mark_rx_closed(rx_fields);
++        });
++        Self::close_chan_semaphore(rx);
++        Self::notify_chan_closed(&rx.inner);
++    }
++
++    pub(crate) fn send_on_chan<S>(chan: &super::chan::Chan<T, S>, value: T) {
++        chan.tx.push(value);
++        Self::wake_rx_waker(chan);
++    }
++
++    pub(crate) fn wake_chan_rx<S>(chan: &super::chan::Chan<T, S>) {
++        chan.rx_waker.wake();
++    }
++
++    pub(crate) fn pop_ready_chan_value<S: super::chan::Semaphore>(
++        rx: &super::chan::Rx<T, S>,
++        rx_fields: &mut super::chan::RxFields<T>,
++    ) -> Option<Read<T>> {
++        rx_fields.list.pop(&rx.inner.tx)
++    }
++
++    pub(crate) fn add_single_permit<S: super::chan::Semaphore>(rx: &super::chan::Rx<T, S>) {
++        rx.inner.semaphore.add_permit();
++    }
++
++    pub(crate) fn add_many_permits<S: super::chan::Semaphore>(
++        rx: &super::chan::Rx<T, S>,
++        n: usize,
++    ) {
++        if n > 0 {
++            rx.inner.semaphore.add_permits(n);
++        }
++    }
++
++    pub(crate) fn chan_rx_closed_and_idle<S: super::chan::Semaphore>(
++        rx: &super::chan::Rx<T, S>,
++        rx_fields: &super::chan::RxFields<T>,
++    ) -> bool {
++        rx_fields.rx_closed && rx.inner.semaphore.is_idle()
++    }
++
++    pub(crate) fn register_chan_waker<S: super::chan::Semaphore>(
++        rx: &super::chan::Rx<T, S>,
++        cx: &mut Context<'_>,
++    ) {
++        rx.inner.rx_waker.register_by_ref(cx.waker());
++    }
++
++    pub(crate) fn chan_recv<S: super::chan::Semaphore>(
++        rx: &mut super::chan::Rx<T, S>,
++        cx: &mut Context<'_>,
++    ) -> Poll<Option<T>> {
++        ready!(crate::trace::trace_leaf(cx));
++        let coop = ready!(crate::runtime::coop::poll_proceed(cx));
++
++        rx.inner.rx_fields.with_mut(|rx_fields_ptr| {
++            let rx_fields = unsafe { &mut *rx_fields_ptr };
++
++            if let Some(ready) = Self::handle_recv_pop(rx, Self::pop_ready_chan_value(rx, rx_fields), &coop) {
++                return ready;
++            }
++
++            Self::register_chan_waker(rx, cx);
++
++            if let Some(ready) = Self::handle_recv_pop(rx, Self::pop_ready_chan_value(rx, rx_fields), &coop) {
++                return ready;
++            }
++
++            Self::finish_recv_after_wait(rx, rx_fields, &coop)
++        })
++    }
++
++    pub(crate) fn push_recv_many_value(buffer: &mut Vec<T>, value: T, remaining: &mut usize) {
++        *remaining -= 1;
++        buffer.push(value);
++    }
++
++    pub(crate) fn recv_many_added_count(buffer_len: usize, initial_length: usize) -> usize {
++        buffer_len - initial_length
++    }
++
++    pub(crate) fn try_fill_recv_many<S: super::chan::Semaphore>(
++        rx: &super::chan::Rx<T, S>,
++        rx_fields: &mut super::chan::RxFields<T>,
++        buffer: &mut Vec<T>,
++        remaining: &mut usize,
++        initial_length: usize,
++        coop: &crate::runtime::coop::RestoreOnPending,
++    ) -> Option<Poll<usize>> {
++        while *remaining > 0 {
++            match Self::pop_ready_chan_value(rx, rx_fields) {
++                Some(Read::Value(value)) => {
++                    Self::push_recv_many_value(buffer, value, remaining);
++                }
++                Some(Read::Closed) => {
++                    let number_added = Self::recv_many_added_count(buffer.len(), initial_length);
++                    Self::add_many_permits(rx, number_added);
++                    assert!(rx.inner.semaphore.is_idle());
++                    coop.made_progress();
++                    return Some(Ready(number_added));
++                }
++                None => break,
++            }
++        }
++
++        let number_added = Self::recv_many_added_count(buffer.len(), initial_length);
++        if number_added > 0 {
++            Self::add_many_permits(rx, number_added);
++            coop.made_progress();
++            Some(Ready(number_added))
++        } else {
++            None
++        }
++    }
++
++    pub(crate) fn chan_recv_many<S: super::chan::Semaphore>(
++        rx: &mut super::chan::Rx<T, S>,
++        cx: &mut Context<'_>,
++        buffer: &mut Vec<T>,
++        limit: usize,
++    ) -> Poll<usize> {
++        ready!(crate::trace::trace_leaf(cx));
++        let coop = ready!(crate::runtime::coop::poll_proceed(cx));
++
++        if Self::recv_many_limit_zero(limit) {
++            coop.made_progress();
++            return Self::poll_many_ready(0usize);
++        }
++
++        let mut remaining = limit;
++        let initial_length = buffer.len();
++
++        rx.inner.rx_fields.with_mut(|rx_fields_ptr| {
++            let rx_fields = unsafe { &mut *rx_fields_ptr };
++
++            if let Some(ready) = Self::try_fill_recv_many(
++                rx,
++                rx_fields,
++                buffer,
++                &mut remaining,
++                initial_length,
++                &coop,
++            ) {
++                return ready;
++            }
++
++            Self::register_chan_waker(rx, cx);
++
++            if let Some(ready) = Self::try_fill_recv_many(
++                rx,
++                rx_fields,
++                buffer,
++                &mut remaining,
++                initial_length,
++                &coop,
++            ) {
++                return ready;
++            }
++
++            Self::finish_recv_many_after_wait(rx, rx_fields, buffer, &coop)
++        })
++    }
++
++    pub(crate) fn map_try_pop_result<S: super::chan::Semaphore>(
++        rx: &super::chan::Rx<T, S>,
++        result: super::list::TryPopResult<T>,
++    ) -> Result<Option<T>, TryRecvError> {
++        match result {
++            super::list::TryPopResult::Ok(value) => {
++                Self::add_single_permit(rx);
++                Ok(Some(value))
++            }
++            super::list::TryPopResult::Closed => Err(Self::try_recv_disconnected()),
++            super::list::TryPopResult::Empty => Err(Self::try_recv_empty()),
++            super::list::TryPopResult::Busy => Ok(None),
++        }
++    }
++
++    pub(crate) fn try_pop_chan_once<S: super::chan::Semaphore>(
++        rx: &super::chan::Rx<T, S>,
++        rx_fields: &mut super::chan::RxFields<T>,
++    ) -> Result<Option<T>, TryRecvError> {
++        let result = rx_fields.list.try_pop(&rx.inner.tx);
++        Self::try_recv_from_pop(rx, result)
++    }
++
++    pub(crate) fn park_chan_until_ready<S: super::chan::Semaphore>(
++        rx: &super::chan::Rx<T, S>,
++        rx_fields: &mut super::chan::RxFields<T>,
++    ) -> Result<T, TryRecvError> {
++        Self::wake_rx_waker(&rx.inner);
++        let mut park = Self::new_cached_park_thread();
++        loop {
++            Self::register_park_waker(rx, &park);
++            match Self::try_pop_chan_once(rx, rx_fields) {
++                Ok(Some(value)) => return Ok(value),
++                Err(err) => return Err(err),
++                Ok(None) => Self::park_thread(&mut park),
++            }
++        }
++    }
++
++    pub(crate) fn chan_try_recv<S: super::chan::Semaphore>(
++        rx: &mut super::chan::Rx<T, S>,
++    ) -> Result<T, TryRecvError> {
++        rx.inner.rx_fields.with_mut(|rx_fields_ptr| {
++            let rx_fields = unsafe { &mut *rx_fields_ptr };
++
++            match Self::try_pop_chan_once(rx, rx_fields) {
++                Ok(Some(value)) => return Ok(value),
++                Err(err) => return Err(err),
++                Ok(None) => {}
++            }
++
++            Self::park_chan_until_ready(rx, rx_fields)
++        })
++    }
++
++    pub(crate) fn drain_chan_rx<S: super::chan::Semaphore>(rx: &mut super::chan::Rx<T, S>) {
++        rx.inner.rx_fields.with_mut(|rx_fields_ptr| {
++            let rx_fields = unsafe { &mut *rx_fields_ptr };
++            while let Some(Read::Value(_)) = rx_fields.list.pop(&rx.inner.tx) {
++                Self::add_single_permit(rx);
++            }
++        });
++    }
++
++    pub(crate) fn classify_try_acquire(err: TryAcquireError) -> TrySendError<()> {
++        match err {
++            TryAcquireError::Closed => Self::try_send_closed(()),
++            TryAcquireError::NoPermits => Self::try_send_full(()),
++        }
++    }
++
++    pub(crate) fn bounded_try_acquire(
++        tx: &super::chan::Tx<T, super::bounded::Semaphore>,
++        n: usize,
++    ) -> Result<(), TrySendError<()>> {
++        match tx.semaphore().semaphore.try_acquire(n) {
++            Ok(()) => Ok(()),
++            Err(err) => Err(Self::classify_try_acquire(err)),
++        }
++    }
++
++    pub(crate) fn bounded_try_send(
++        tx: &super::chan::Tx<T, super::bounded::Semaphore>,
++        message: T,
++    ) -> Result<(), TrySendError<T>> {
++        match Self::bounded_map_acquire_to_value(Self::bounded_try_acquire(tx, 1), message) {
++            Ok(message) => {
++                tx.send(message);
++                Ok(())
++            }
++            Err(err) => Err(err),
++        }
++    }
++
++    pub(crate) fn bounded_capacity(rx: &super::chan::Rx<T, super::bounded::Semaphore>) -> usize {
++        rx.semaphore().semaphore.available_permits()
++    }
++
++    pub(crate) fn bounded_sender_capacity(
++        tx: &super::chan::Tx<T, super::bounded::Semaphore>,
++    ) -> usize {
++        tx.semaphore().semaphore.available_permits()
++    }
++
++    pub(crate) fn bounded_max_capacity(
++        rx: &super::chan::Rx<T, super::bounded::Semaphore>,
++    ) -> usize {
++        rx.semaphore().bound
++    }
++
++    pub(crate) fn bounded_sender_max_capacity(
++        tx: &super::chan::Tx<T, super::bounded::Semaphore>,
++    ) -> usize {
++        tx.semaphore().bound
++    }
++
++    pub(crate) fn bounded_try_reserve_many(
++        tx: &super::chan::Tx<T, super::bounded::Semaphore>,
++        n: usize,
++    ) -> Result<(), TrySendError<()>> {
++        if n > Self::bounded_sender_max_capacity(tx) {
++            return Err(TrySendError::Full(()));
++        }
++        Self::bounded_try_acquire(tx, n)
++    }
++
++    pub(crate) fn unbounded_closed_bit_set(curr: usize) -> bool {
++        curr & 1 == 1
++    }
++
++    pub(crate) fn unbounded_count_overflowed(curr: usize) -> bool {
++        curr == (usize::MAX ^ 1)
++    }
++
++    pub(crate) fn unbounded_inc_num_messages(
++        tx: &super::chan::Tx<T, super::unbounded::Semaphore>,
++    ) -> bool {
++        let mut curr = tx.semaphore().0.load(Acquire);
++
++        loop {
++            let next = match Self::unbounded_try_add_two(curr) {
++                Some(next) => next,
++                None => return false,
++            };
++            match tx
++                .semaphore()
++                .0
++                .compare_exchange(curr, next, AcqRel, Acquire)
++            {
++                Ok(_) => return true,
++                Err(actual) => curr = actual,
++            }
++        }
++    }
++
++    pub(crate) fn unbounded_send(
++        tx: &super::chan::Tx<T, super::unbounded::Semaphore>,
++        message: T,
++    ) -> Result<(), SendError<T>> {
++        if !Self::unbounded_inc_num_messages(tx) {
++            return Err(Self::send_error_from_value(message));
++        }
++        tx.send(message);
++        Ok(())
++    }
++
++    pub(crate) fn bounded_rx_is_empty(rx: &super::chan::Rx<T, super::bounded::Semaphore>) -> bool {
++        rx.is_empty()
++    }
++
++    pub(crate) fn bounded_rx_len(rx: &super::chan::Rx<T, super::bounded::Semaphore>) -> usize {
++        rx.len()
++    }
++
++    pub(crate) fn unbounded_rx_is_empty(
++        rx: &super::chan::Rx<T, super::unbounded::Semaphore>,
++    ) -> bool {
++        rx.is_empty()
++    }
++
++    pub(crate) fn unbounded_rx_len(
++        rx: &super::chan::Rx<T, super::unbounded::Semaphore>,
++    ) -> usize {
++        rx.len()
++    }
++
++    pub(crate) fn same_chan_tx<S>(left: &super::chan::Tx<T, S>, right: &super::chan::Tx<T, S>) -> bool {
++        crate::loom::sync::Arc::ptr_eq(&left.inner, &right.inner)
++    }
++
++    pub(crate) fn chan_tx_is_closed<S: super::chan::Semaphore>(
++        tx: &super::chan::Tx<T, S>,
++    ) -> bool {
++        tx.inner.semaphore.is_closed()
++    }
++
++    pub(crate) fn chan_strong_count<S>(tx: &super::chan::Tx<T, S>) -> usize {
++        tx.inner.tx_count.load(Acquire)
++    }
++
++    pub(crate) fn chan_weak_count<S>(tx: &super::chan::Tx<T, S>) -> usize {
++        tx.inner.tx_weak_count.load(Relaxed)
++    }
++
++    pub(crate) fn list_head_has_value(rx: &super::list::Rx<T>) -> bool {
++        let block = unsafe { rx.head.as_ref() };
++        block.has_value(rx.index)
++    }
++
++    pub(crate) fn list_index_at_block_start(index: usize) -> bool {
++        Self::list_slot_offset(index) == 0
++    }
++
++    pub(crate) fn next_slot_index(index: usize) -> usize {
++        index.wrapping_add(1)
++    }
++
++    pub(crate) fn remaining_before_block_end(index: usize) -> usize {
++        BLOCK_CAP - Self::list_slot_offset(index)
++    }
++
++    pub(crate) fn closed_len_adjustment(tx: &super::list::Tx<T>) -> usize {
++        tx.is_closed() as usize
++    }
++
++    pub(crate) fn list_pending_messages(rx: &super::list::Rx<T>, tx: &super::list::Tx<T>) -> usize {
++        Self::list_rx_len(rx, tx)
++    }
++
++    pub(crate) fn recv_limit_is_zero(limit: usize) -> bool {
++        limit == 0
++    }
++
++    pub(crate) fn try_recv_disconnected() -> TryRecvError {
++        TryRecvError::Disconnected
++    }
++
++    pub(crate) fn try_recv_empty() -> TryRecvError {
++        TryRecvError::Empty
++    }
++
++    pub(crate) fn try_send_closed<U>(value: U) -> TrySendError<U> {
++        TrySendError::Closed(value)
++    }
++
++    pub(crate) fn try_send_full<U>(value: U) -> TrySendError<U> {
++        TrySendError::Full(value)
++    }
++
++    pub(crate) fn send_closed<U>(value: U) -> SendError<U> {
++        SendError(value)
++    }
++
++    pub(crate) fn slot_ready_or_closed(&self, slot_index: usize) -> bool {
++        self.slot_has_ready_value(slot_index) || self.slot_read_is_closed()
++    }
++
++    pub(crate) fn block_is_released(&self) -> bool {
++        Self::ready_bits_released(self.load_ready_bits())
++    }
++
++    pub(crate) fn block_is_fully_written(&self) -> bool {
++        Self::ready_bits_all_slots(self.load_ready_bits())
++    }
++
++    pub(crate) fn observed_tail_if_released(&self) -> Option<usize> {
++        if !self.released() {
++            None
++        } else {
++            Some(
++                self.header
++                    .observed_tail_position
++                    .with(|ptr| unsafe { *ptr }),
++            )
++        }
++    }
++
++    pub(crate) fn walk_free_head_to_head(rx: &super::list::Rx<T>) -> NonNull<Block<T>> {
++        let mut cursor = rx.free_head;
++        while cursor != rx.head {
++            match unsafe { cursor.as_ref().load_next(Acquire) } {
++                Some(next) => cursor = next,
++                None => return rx.head,
++            }
++        }
++        cursor
++    }
++
++    pub(crate) fn current_rx_block(rx: &super::list::Rx<T>) -> &Block<T> {
++        unsafe { rx.head.as_ref() }
++    }
++
++    pub(crate) fn list_empty_from_head(rx: &super::list::Rx<T>, tx: &super::list::Tx<T>) -> bool {
++        debug_assert!(Self::remaining_before_block_end(rx.index) <= BLOCK_CAP);
++        if Self::current_rx_has_value(rx) {
++            false
++        } else {
++            Self::pending_list_len(rx, tx) == 0
++        }
++    }
++}
++
++
++impl<T> Block<T> {
++    pub(crate) fn write_claimed_list_slot(block: NonNull<Block<T>>, slot_index: usize, value: T) {
++        unsafe {
++            block.as_ref().write(slot_index, value);
++        }
++    }
++
++    pub(crate) fn close_claimed_list_slot(block: NonNull<Block<T>>) {
++        unsafe {
++            block.as_ref().tx_close();
++        }
++    }
++
++    pub(crate) fn release_passed_list_block(block: &Block<T>, tail_position: usize) {
++        unsafe {
++            block.tx_release(tail_position);
++        }
++    }
++
++    pub(crate) fn take_rx_block_value(block: &Block<T>, index: usize) -> Option<Read<T>> {
++        unsafe { block.read(index) }
++    }
++
++    pub(crate) fn advance_rx_index(rx: &mut super::list::Rx<T>) {
++        rx.index = Self::next_slot_index(rx.index);
++    }
++
++    pub(crate) fn set_rx_head(rx: &mut super::list::Rx<T>, next: NonNull<Block<T>>) {
++        rx.head = next;
++    }
++
++    pub(crate) fn set_rx_free_head(rx: &mut super::list::Rx<T>, next: NonNull<Block<T>>) {
++        rx.free_head = next;
++    }
++
++    pub(crate) fn load_next_or_none(&self, ordering: std::sync::atomic::Ordering) -> Option<NonNull<Block<T>>> {
++        self.load_next(ordering)
++    }
++
++    pub(crate) fn reclaim_if_released(
++        block: NonNull<Block<T>>,
++        rx_index: usize,
++    ) -> Result<NonNull<Block<T>>, Option<()>> {
++        let required_index = match Self::required_reclaim_index(unsafe { block.as_ref() }) {
++            Some(i) => i,
++            None => return Err(None),
++        };
++        if !Self::can_reclaim_before(required_index, rx_index) {
++            return Err(None);
++        }
++        match unsafe { block.as_ref().load_next(Relaxed) } {
++            Some(next) => Ok(next),
++            None => Err(None),
++        }
++    }
++
++    pub(crate) fn semaphore_is_idle<S: super::chan::Semaphore>(rx: &super::chan::Rx<T, S>) -> bool {
++        rx.inner.semaphore.is_idle()
++    }
++
++    pub(crate) fn semaphore_is_closed<S: super::chan::Semaphore>(rx: &super::chan::Rx<T, S>) -> bool {
++        rx.inner.semaphore.is_closed()
++    }
++
++    pub(crate) fn mark_rx_closed(rx_fields: &mut super::chan::RxFields<T>) -> bool {
++        if rx_fields.rx_closed {
++            true
++        } else {
++            rx_fields.rx_closed = true;
++            false
++        }
++    }
++
++    pub(crate) fn notify_chan_closed<S>(chan: &super::chan::Chan<T, S>) {
++        chan.notify_rx_closed.notify_waiters();
++    }
++
++    pub(crate) fn close_chan_semaphore<S: super::chan::Semaphore>(rx: &super::chan::Rx<T, S>) {
++        rx.inner.semaphore.close();
++    }
++
++    pub(crate) fn poll_ready_value(value: T) -> Poll<Option<T>> {
++        Ready(Some(value))
++    }
++
++    pub(crate) fn poll_ready_disconnect() -> Poll<Option<T>> {
++        Ready(None)
++    }
++
++    pub(crate) fn poll_recv_pending() -> Poll<Option<T>> {
++        Pending
++    }
++
++    pub(crate) fn poll_many_ready(count: usize) -> Poll<usize> {
++        Ready(count)
++    }
++
++    pub(crate) fn poll_many_pending() -> Poll<usize> {
++        Pending
++    }
++
++    pub(crate) fn handle_recv_pop<S: super::chan::Semaphore>(
++        rx: &super::chan::Rx<T, S>,
++        popped: Option<Read<T>>,
++        coop: &crate::runtime::coop::RestoreOnPending,
++    ) -> Option<Poll<Option<T>>> {
++        match popped {
++            Some(Read::Value(value)) => {
++                Self::add_single_permit(rx);
++                coop.made_progress();
++                Some(Self::poll_ready_value(value))
++            }
++            Some(Read::Closed) => {
++                assert!(Self::semaphore_is_idle(rx));
++                coop.made_progress();
++                Some(Self::poll_ready_disconnect())
++            }
++            None => None,
++        }
++    }
++
++    pub(crate) fn finish_recv_after_wait<S: super::chan::Semaphore>(
++        rx: &super::chan::Rx<T, S>,
++        rx_fields: &super::chan::RxFields<T>,
++        coop: &crate::runtime::coop::RestoreOnPending,
++    ) -> Poll<Option<T>> {
++        if Self::chan_rx_closed_and_idle(rx, rx_fields) {
++            coop.made_progress();
++            Self::poll_ready_disconnect()
++        } else {
++            Self::poll_recv_pending()
++        }
++    }
++
++    pub(crate) fn finish_recv_many_after_wait<S: super::chan::Semaphore>(
++        rx: &super::chan::Rx<T, S>,
++        rx_fields: &super::chan::RxFields<T>,
++        buffer: &Vec<T>,
++        coop: &crate::runtime::coop::RestoreOnPending,
++    ) -> Poll<usize> {
++        if Self::chan_rx_closed_and_idle(rx, rx_fields) {
++            assert!(buffer.is_empty());
++            coop.made_progress();
++            Self::poll_many_ready(0)
++        } else {
++            Self::poll_many_pending()
++        }
++    }
++
++    pub(crate) fn bounded_map_acquire_to_value<U>(
++        result: Result<(), TrySendError<()>>,
++        value: U,
++    ) -> Result<U, TrySendError<U>> {
++        match result {
++            Ok(()) => Ok(value),
++            Err(TrySendError::Closed(())) => Err(TrySendError::Closed(value)),
++            Err(TrySendError::Full(())) => Err(TrySendError::Full(value)),
++        }
++    }
++
++    pub(crate) fn unbounded_try_add_two(curr: usize) -> Option<usize> {
++        if Self::unbounded_closed_bit_set(curr) {
++            None
++        } else if Self::unbounded_count_overflowed(curr) {
++            std::process::abort();
++        } else {
++            Some(curr + 2)
++        }
++    }
++
++    pub(crate) fn list_tx_tail_is_closed_ptr(tail: *mut Block<T>) -> bool {
++        unsafe { (*tail).is_closed() }
++    }
++
++    pub(crate) fn rx_index_matches_block(&self, index: usize) -> bool {
++        debug_assert!(Self::list_index_at_block_start(Self::list_slot_start(index)));
++        self.is_at_index(Self::list_slot_start(index))
++    }
++
++    pub(crate) fn can_reclaim_before(required_index: usize, rx_index: usize) -> bool {
++        required_index <= rx_index
++    }
++
++    pub(crate) fn park_thread(park: &mut crate::runtime::park::CachedParkThread) {
++        park.park();
++    }
++
++    pub(crate) fn new_cached_park_thread() -> crate::runtime::park::CachedParkThread {
++        crate::runtime::park::CachedParkThread::new()
++    }
++
++    pub(crate) fn register_park_waker<S: super::chan::Semaphore>(
++        rx: &super::chan::Rx<T, S>,
++        park: &crate::runtime::park::CachedParkThread,
++    ) {
++        let waker = park.waker().unwrap();
++        rx.inner.rx_waker.register_by_ref(&waker);
++    }
++
++    pub(crate) fn wake_rx_waker<S>(chan: &super::chan::Chan<T, S>) {
++        chan.rx_waker.wake();
++    }
++
++    pub(crate) fn try_pop_ok(value: T) -> super::list::TryPopResult<T> {
++        super::list::TryPopResult::Ok(value)
++    }
++
++    pub(crate) fn try_pop_closed() -> super::list::TryPopResult<T> {
++        super::list::TryPopResult::Closed
++    }
++
++    pub(crate) fn try_pop_empty() -> super::list::TryPopResult<T> {
++        super::list::TryPopResult::Empty
++    }
++
++    pub(crate) fn try_pop_busy() -> super::list::TryPopResult<T> {
++        super::list::TryPopResult::Busy
++    }
++
++    pub(crate) fn classify_read_pop(result: Option<Read<T>>, tail_position: usize, index: usize) -> super::list::TryPopResult<T> {
++        match result {
++            Some(Read::Value(value)) => Self::try_pop_ok(value),
++            Some(Read::Closed) => Self::try_pop_closed(),
++            None => Self::classify_missing_pop(tail_position, index),
++        }
++    }
++
++    pub(crate) fn chan_tx_count_is_zero<S: super::chan::Semaphore>(rx: &super::chan::Rx<T, S>) -> bool {
++        rx.inner.tx_count.load(Acquire) == 0
++    }
++
++    pub(crate) fn list_free_head_caught_up(rx: &super::list::Rx<T>) -> bool {
++        rx.free_head == rx.head
++    }
++
++    pub(crate) fn block_ptr_from_non_null(ptr: NonNull<Block<T>>) -> *mut Block<T> {
++        ptr.as_ptr()
++    }
++
++    pub(crate) fn non_null_from_block_ptr(ptr: *mut Block<T>) -> NonNull<Block<T>> {
++        unsafe { NonNull::new_unchecked(ptr) }
++    }
++
++    pub(crate) fn slot_distance_exceeds_offset(distance: usize, slot_offset: usize) -> bool {
++        Self::should_try_updating_tail(distance, slot_offset)
++    }
++
++    pub(crate) fn yield_after_block_walk() {
++        Self::yield_list_walk();
++    }
++
++    pub(crate) fn recv_many_limit_zero(limit: usize) -> bool {
++        Self::recv_limit_is_zero(limit)
++    }
++
++    pub(crate) fn send_error_from_value<U>(value: U) -> SendError<U> {
++        Self::send_closed(value)
++    }
++
++    pub(crate) fn try_recv_from_pop<S: super::chan::Semaphore>(
++        rx: &super::chan::Rx<T, S>,
++        result: super::list::TryPopResult<T>,
++    ) -> Result<Option<T>, TryRecvError> {
++        Self::map_try_pop_result(rx, result)
++    }
++
++    pub(crate) fn current_rx_has_value(rx: &super::list::Rx<T>) -> bool {
++        Self::list_head_has_value(rx)
++    }
++
++    pub(crate) fn pending_list_len(rx: &super::list::Rx<T>, tx: &super::list::Tx<T>) -> usize {
++        Self::list_pending_messages(rx, tx)
++    }
++
++    pub(crate) fn walk_unreclaimed_blocks(rx: &super::list::Rx<T>) -> NonNull<Block<T>> {
++        Self::walk_free_head_to_head(rx)
++    }
++
++    pub(crate) fn observed_or_none(&self) -> Option<usize> {
++        self.observed_tail_position()
++    }
++
++    pub(crate) fn fully_written(&self) -> bool {
++        self.is_final()
++    }
++
++    pub(crate) fn released(&self) -> bool {
++        self.block_is_released()
++    }
++
++    pub(crate) fn ready_or_closed(&self, slot_index: usize) -> bool {
++        self.slot_ready_or_closed(slot_index)
++    }
++}
++
+ /// Returns `true` if the specified slot has a value ready to be consumed.
+ fn is_ready(bits: usize, slot: usize) -> bool {
+     let mask = 1 << slot;
+diff --git a/tokio/src/sync/mpsc/bounded.rs b/tokio/src/sync/mpsc/bounded.rs
+index a4f98060..c38c0361 100644
+--- a/tokio/src/sync/mpsc/bounded.rs
++++ b/tokio/src/sync/mpsc/bounded.rs
+@@ -1,5 +1,6 @@
+ use crate::loom::sync::Arc;
+-use crate::sync::batch_semaphore::{self as semaphore, TryAcquireError};
++use crate::sync::batch_semaphore::{self as semaphore};
++use crate::sync::mpsc::block::Block;
+ use crate::sync::mpsc::chan;
+ use crate::sync::mpsc::error::{SendError, TryRecvError, TrySendError};
+ 
+@@ -20,7 +21,7 @@ use std::task::{Context, Poll};
+ ///
+ /// [`PollSender`]: https://docs.rs/tokio-util/latest/tokio_util/sync/struct.PollSender.html
+ pub struct Sender<T> {
+-    chan: chan::Tx<T, Semaphore>,
++    pub(crate) chan: chan::Tx<T, Semaphore>,
+ }
+ 
+ /// A sender that does not prevent the channel from being closed.
+@@ -105,7 +106,7 @@ pub struct OwnedPermit<T> {
+ /// [`ReceiverStream`]: https://docs.rs/tokio-stream/0.1/tokio_stream/wrappers/struct.ReceiverStream.html
+ pub struct Receiver<T> {
+     /// The channel receiver.
+-    chan: chan::Rx<T, Semaphore>,
++    pub(crate) chan: chan::Rx<T, Semaphore>,
+ }
+ 
+ /// Creates a bounded mpsc channel for communicating between asynchronous tasks
+@@ -508,7 +509,7 @@ impl<T> Receiver<T> {
+     ///
+     /// ```
+     pub fn is_empty(&self) -> bool {
+-        self.chan.is_empty()
++        Block::bounded_rx_is_empty(&self.chan)
+     }
+ 
+     /// Returns the number of messages in the channel.
+@@ -527,7 +528,7 @@ impl<T> Receiver<T> {
+     /// }
+     /// ```
+     pub fn len(&self) -> usize {
+-        self.chan.len()
++        Block::bounded_rx_len(&self.chan)
+     }
+ 
+     /// Returns the current capacity of the channel.
+@@ -573,7 +574,7 @@ impl<T> Receiver<T> {
+     /// [`capacity`]: Receiver::capacity
+     /// [`max_capacity`]: Receiver::max_capacity
+     pub fn capacity(&self) -> usize {
+-        self.chan.semaphore().semaphore.available_permits()
++        Block::bounded_capacity(&self.chan)
+     }
+ 
+     /// Returns the maximum buffer capacity of the channel.
+@@ -607,7 +608,7 @@ impl<T> Receiver<T> {
+     /// [`capacity`]: Receiver::capacity
+     /// [`max_capacity`]: Receiver::max_capacity
+     pub fn max_capacity(&self) -> usize {
+-        self.chan.semaphore().bound
++        Block::bounded_max_capacity(&self.chan)
+     }
+ 
+     /// Polls to receive the next message on this channel.
+@@ -896,15 +897,7 @@ impl<T> Sender<T> {
+     /// }
+     /// ```
+     pub fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
+-        match self.chan.semaphore().semaphore.try_acquire(1) {
+-            Ok(()) => {}
+-            Err(TryAcquireError::Closed) => return Err(TrySendError::Closed(message)),
+-            Err(TryAcquireError::NoPermits) => return Err(TrySendError::Full(message)),
+-        }
+-
+-        // Send the message
+-        self.chan.send(message);
+-        Ok(())
++        Block::bounded_try_send(&self.chan, message)
+     }
+ 
+     /// Sends a value, waiting until there is capacity, but only for a limited time.
+@@ -1296,12 +1289,7 @@ impl<T> Sender<T> {
+     /// }
+     /// ```
+     pub fn try_reserve(&self) -> Result<Permit<'_, T>, TrySendError<()>> {
+-        match self.chan.semaphore().semaphore.try_acquire(1) {
+-            Ok(()) => {}
+-            Err(TryAcquireError::Closed) => return Err(TrySendError::Closed(())),
+-            Err(TryAcquireError::NoPermits) => return Err(TrySendError::Full(())),
+-        }
+-
++        Block::bounded_try_acquire(&self.chan, 1)?;
+         Ok(Permit { chan: &self.chan })
+     }
+ 
+@@ -1374,16 +1362,7 @@ impl<T> Sender<T> {
+     /// }
+     /// ```
+     pub fn try_reserve_many(&self, n: usize) -> Result<PermitIterator<'_, T>, TrySendError<()>> {
+-        if n > self.max_capacity() {
+-            return Err(TrySendError::Full(()));
+-        }
+-
+-        match self.chan.semaphore().semaphore.try_acquire(n) {
+-            Ok(()) => {}
+-            Err(TryAcquireError::Closed) => return Err(TrySendError::Closed(())),
+-            Err(TryAcquireError::NoPermits) => return Err(TrySendError::Full(())),
+-        }
+-
++        Block::bounded_try_reserve_many(&self.chan, n)?;
+         Ok(PermitIterator {
+             chan: &self.chan,
+             n,
+@@ -1446,15 +1425,13 @@ impl<T> Sender<T> {
+     /// }
+     /// ```
+     pub fn try_reserve_owned(self) -> Result<OwnedPermit<T>, TrySendError<Self>> {
+-        match self.chan.semaphore().semaphore.try_acquire(1) {
+-            Ok(()) => {}
+-            Err(TryAcquireError::Closed) => return Err(TrySendError::Closed(self)),
+-            Err(TryAcquireError::NoPermits) => return Err(TrySendError::Full(self)),
++        match Block::bounded_try_acquire(&self.chan, 1) {
++            Ok(()) => Ok(OwnedPermit {
++                chan: Some(self.chan),
++            }),
++            Err(TrySendError::Closed(())) => Err(TrySendError::Closed(self)),
++            Err(TrySendError::Full(())) => Err(TrySendError::Full(self)),
+         }
+-
+-        Ok(OwnedPermit {
+-            chan: Some(self.chan),
+-        })
+     }
+ 
+     /// Returns `true` if senders belong to the same channel.
+@@ -1507,7 +1484,7 @@ impl<T> Sender<T> {
+     /// [`channel`]: channel
+     /// [`max_capacity`]: Sender::max_capacity
+     pub fn capacity(&self) -> usize {
+-        self.chan.semaphore().semaphore.available_permits()
++        Block::bounded_sender_capacity(&self.chan)
+     }
+ 
+     /// Converts the `Sender` to a [`WeakSender`] that does not count
+@@ -1554,7 +1531,7 @@ impl<T> Sender<T> {
+     /// [`max_capacity`]: Sender::max_capacity
+     /// [`capacity`]: Sender::capacity
+     pub fn max_capacity(&self) -> usize {
+-        self.chan.semaphore().bound
++        Block::bounded_sender_max_capacity(&self.chan)
+     }
+ 
+     /// Returns the number of [`Sender`] handles.
+diff --git a/tokio/src/sync/mpsc/chan.rs b/tokio/src/sync/mpsc/chan.rs
+index d8838242..3e8edb2f 100644
+--- a/tokio/src/sync/mpsc/chan.rs
++++ b/tokio/src/sync/mpsc/chan.rs
+@@ -2,8 +2,8 @@ use crate::loom::cell::UnsafeCell;
+ use crate::loom::future::AtomicWaker;
+ use crate::loom::sync::atomic::AtomicUsize;
+ use crate::loom::sync::Arc;
+-use crate::runtime::park::CachedParkThread;
+ use crate::sync::mpsc::error::TryRecvError;
++use crate::sync::mpsc::block::Block;
+ use crate::sync::mpsc::{bounded, list, unbounded};
+ use crate::sync::notify::Notify;
+ use crate::util::cacheline::CachePadded;
+@@ -11,12 +11,11 @@ use crate::util::cacheline::CachePadded;
+ use std::fmt;
+ use std::process;
+ use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+-use std::task::Poll::{Pending, Ready};
+ use std::task::{Context, Poll};
+ 
+ /// Channel sender.
+ pub(crate) struct Tx<T, S> {
+-    inner: Arc<Chan<T, S>>,
++    pub(crate) inner: Arc<Chan<T, S>>,
+ }
+ 
+ impl<T, S: fmt::Debug> fmt::Debug for Tx<T, S> {
+@@ -27,7 +26,7 @@ impl<T, S: fmt::Debug> fmt::Debug for Tx<T, S> {
+ 
+ /// Channel receiver.
+ pub(crate) struct Rx<T, S: Semaphore> {
+-    inner: Arc<Chan<T, S>>,
++    pub(crate) inner: Arc<Chan<T, S>>,
+ }
+ 
+ impl<T, S: Semaphore + fmt::Debug> fmt::Debug for Rx<T, S> {
+@@ -48,29 +47,29 @@ pub(crate) trait Semaphore {
+     fn is_closed(&self) -> bool;
+ }
+ 
+-pub(super) struct Chan<T, S> {
++pub(crate) struct Chan<T, S> {
+     /// Handle to the push half of the lock-free list.
+-    tx: CachePadded<list::Tx<T>>,
++    pub(crate) tx: CachePadded<list::Tx<T>>,
+ 
+     /// Receiver waker. Notified when a value is pushed into the channel.
+-    rx_waker: CachePadded<AtomicWaker>,
++    pub(crate) rx_waker: CachePadded<AtomicWaker>,
+ 
+     /// Notifies all tasks listening for the receiver being dropped.
+-    notify_rx_closed: Notify,
++    pub(crate) notify_rx_closed: Notify,
+ 
+     /// Coordinates access to channel's capacity.
+-    semaphore: S,
++    pub(crate) semaphore: S,
+ 
+     /// Tracks the number of outstanding sender handles.
+     ///
+     /// When this drops to zero, the send half of the channel is closed.
+-    tx_count: AtomicUsize,
++    pub(crate) tx_count: AtomicUsize,
+ 
+     /// Tracks the number of outstanding weak sender handles.
+-    tx_weak_count: AtomicUsize,
++    pub(crate) tx_weak_count: AtomicUsize,
+ 
+     /// Only accessed by `Rx` handle.
+-    rx_fields: UnsafeCell<RxFields<T>>,
++    pub(crate) rx_fields: UnsafeCell<RxFields<T>>,
+ }
+ 
+ impl<T, S> fmt::Debug for Chan<T, S>
+@@ -89,12 +88,12 @@ where
+ }
+ 
+ /// Fields only accessed by `Rx` handle.
+-struct RxFields<T> {
++pub(crate) struct RxFields<T> {
+     /// Channel receiver. This field is only accessed by the `Receiver` type.
+-    list: list::Rx<T>,
++    pub(crate) list: list::Rx<T>,
+ 
+     /// `true` if `Rx::close` is called.
+-    rx_closed: bool,
++    pub(crate) rx_closed: bool,
+ }
+ 
+ impl<T> fmt::Debug for RxFields<T> {
+@@ -136,11 +135,11 @@ impl<T, S> Tx<T, S> {
+     }
+ 
+     pub(super) fn strong_count(&self) -> usize {
+-        self.inner.tx_count.load(Acquire)
++        Block::chan_strong_count(self)
+     }
+ 
+     pub(super) fn weak_count(&self) -> usize {
+-        self.inner.tx_weak_count.load(Relaxed)
++        Block::chan_weak_count(self)
+     }
+ 
+     pub(super) fn downgrade(&self) -> Arc<Chan<T, S>> {
+@@ -175,23 +174,23 @@ impl<T, S> Tx<T, S> {
+ 
+     /// Send a message and notify the receiver.
+     pub(crate) fn send(&self, value: T) {
+-        self.inner.send(value);
++        Block::send_on_chan(&self.inner, value);
+     }
+ 
+     /// Wake the receive half
+     pub(crate) fn wake_rx(&self) {
+-        self.inner.rx_waker.wake();
++        Block::wake_chan_rx(&self.inner);
+     }
+ 
+     /// Returns `true` if senders belong to the same channel.
+     pub(crate) fn same_channel(&self, other: &Self) -> bool {
+-        Arc::ptr_eq(&self.inner, &other.inner)
++        Block::same_chan_tx(self, other)
+     }
+ }
+ 
+ impl<T, S: Semaphore> Tx<T, S> {
+     pub(crate) fn is_closed(&self) -> bool {
+-        self.inner.semaphore.is_closed()
++        Block::chan_tx_is_closed(self)
+     }
+ 
+     pub(crate) async fn closed(&self) {
+@@ -241,99 +240,24 @@ impl<T, S: Semaphore> Rx<T, S> {
+     }
+ 
+     pub(crate) fn close(&mut self) {
+-        self.inner.rx_fields.with_mut(|rx_fields_ptr| {
+-            let rx_fields = unsafe { &mut *rx_fields_ptr };
+-
+-            if rx_fields.rx_closed {
+-                return;
+-            }
+-
+-            rx_fields.rx_closed = true;
+-        });
+-
+-        self.inner.semaphore.close();
+-        self.inner.notify_rx_closed.notify_waiters();
++        Block::chan_rx_close(self);
+     }
+ 
+     pub(crate) fn is_closed(&self) -> bool {
+-        // There two internal states that can represent a closed channel
+-        //
+-        //  1. When `close` is called.
+-        //  In this case, the inner semaphore will be closed.
+-        //
+-        //  2. When all senders are dropped.
+-        //  In this case, the semaphore remains unclosed, and the `index` in the list won't
+-        //  reach the tail position. It is necessary to check the list if the last block is
+-        //  `closed`.
+-        self.inner.semaphore.is_closed() || self.inner.tx_count.load(Acquire) == 0
++        Block::chan_rx_is_closed(self)
+     }
+ 
+     pub(crate) fn is_empty(&self) -> bool {
+-        self.inner.rx_fields.with(|rx_fields_ptr| {
+-            let rx_fields = unsafe { &*rx_fields_ptr };
+-            rx_fields.list.is_empty(&self.inner.tx)
+-        })
++        Block::chan_rx_is_empty(self)
+     }
+ 
+     pub(crate) fn len(&self) -> usize {
+-        self.inner.rx_fields.with(|rx_fields_ptr| {
+-            let rx_fields = unsafe { &*rx_fields_ptr };
+-            rx_fields.list.len(&self.inner.tx)
+-        })
++        Block::chan_rx_len(self)
+     }
+ 
+     /// Receive the next value
+     pub(crate) fn recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+-        use super::block::Read;
+-
+-        ready!(crate::trace::trace_leaf(cx));
+-
+-        // Keep track of task budget
+-        let coop = ready!(crate::runtime::coop::poll_proceed(cx));
+-
+-        self.inner.rx_fields.with_mut(|rx_fields_ptr| {
+-            let rx_fields = unsafe { &mut *rx_fields_ptr };
+-
+-            macro_rules! try_recv {
+-                () => {
+-                    match rx_fields.list.pop(&self.inner.tx) {
+-                        Some(Read::Value(value)) => {
+-                            self.inner.semaphore.add_permit();
+-                            coop.made_progress();
+-                            return Ready(Some(value));
+-                        }
+-                        Some(Read::Closed) => {
+-                            // TODO: This check may not be required as it most
+-                            // likely can only return `true` at this point. A
+-                            // channel is closed when all tx handles are
+-                            // dropped. Dropping a tx handle releases memory,
+-                            // which ensures that if dropping the tx handle is
+-                            // visible, then all messages sent are also visible.
+-                            assert!(self.inner.semaphore.is_idle());
+-                            coop.made_progress();
+-                            return Ready(None);
+-                        }
+-                        None => {} // fall through
+-                    }
+-                };
+-            }
+-
+-            try_recv!();
+-
+-            self.inner.rx_waker.register_by_ref(cx.waker());
+-
+-            // It is possible that a value was pushed between attempting to read
+-            // and registering the task, so we have to check the channel a
+-            // second time here.
+-            try_recv!();
+-
+-            if rx_fields.rx_closed && self.inner.semaphore.is_idle() {
+-                coop.made_progress();
+-                Ready(None)
+-            } else {
+-                Pending
+-            }
+-        })
++        Block::chan_recv(self, cx)
+     }
+ 
+     /// Receives up to `limit` values into `buffer`
+@@ -346,124 +270,12 @@ impl<T, S: Semaphore> Rx<T, S> {
+         buffer: &mut Vec<T>,
+         limit: usize,
+     ) -> Poll<usize> {
+-        use super::block::Read;
+-
+-        ready!(crate::trace::trace_leaf(cx));
+-
+-        // Keep track of task budget
+-        let coop = ready!(crate::runtime::coop::poll_proceed(cx));
+-
+-        if limit == 0 {
+-            coop.made_progress();
+-            return Ready(0usize);
+-        }
+-
+-        let mut remaining = limit;
+-        let initial_length = buffer.len();
+-
+-        self.inner.rx_fields.with_mut(|rx_fields_ptr| {
+-            let rx_fields = unsafe { &mut *rx_fields_ptr };
+-            macro_rules! try_recv {
+-                () => {
+-                    while remaining > 0 {
+-                        match rx_fields.list.pop(&self.inner.tx) {
+-                            Some(Read::Value(value)) => {
+-                                remaining -= 1;
+-                                buffer.push(value);
+-                            }
+-
+-                            Some(Read::Closed) => {
+-                                let number_added = buffer.len() - initial_length;
+-                                if number_added > 0 {
+-                                    self.inner.semaphore.add_permits(number_added);
+-                                }
+-                                // TODO: This check may not be required as it most
+-                                // likely can only return `true` at this point. A
+-                                // channel is closed when all tx handles are
+-                                // dropped. Dropping a tx handle releases memory,
+-                                // which ensures that if dropping the tx handle is
+-                                // visible, then all messages sent are also visible.
+-                                assert!(self.inner.semaphore.is_idle());
+-                                coop.made_progress();
+-                                return Ready(number_added);
+-                            }
+-
+-                            None => {
+-                                break; // fall through
+-                            }
+-                        }
+-                    }
+-                    let number_added = buffer.len() - initial_length;
+-                    if number_added > 0 {
+-                        self.inner.semaphore.add_permits(number_added);
+-                        coop.made_progress();
+-                        return Ready(number_added);
+-                    }
+-                };
+-            }
+-
+-            try_recv!();
+-
+-            self.inner.rx_waker.register_by_ref(cx.waker());
+-
+-            // It is possible that a value was pushed between attempting to read
+-            // and registering the task, so we have to check the channel a
+-            // second time here.
+-            try_recv!();
+-
+-            if rx_fields.rx_closed && self.inner.semaphore.is_idle() {
+-                assert!(buffer.is_empty());
+-                coop.made_progress();
+-                Ready(0usize)
+-            } else {
+-                Pending
+-            }
+-        })
++        Block::chan_recv_many(self, cx, buffer, limit)
+     }
+ 
+     /// Try to receive the next value.
+     pub(crate) fn try_recv(&mut self) -> Result<T, TryRecvError> {
+-        use super::list::TryPopResult;
+-
+-        self.inner.rx_fields.with_mut(|rx_fields_ptr| {
+-            let rx_fields = unsafe { &mut *rx_fields_ptr };
+-
+-            macro_rules! try_recv {
+-                () => {
+-                    match rx_fields.list.try_pop(&self.inner.tx) {
+-                        TryPopResult::Ok(value) => {
+-                            self.inner.semaphore.add_permit();
+-                            return Ok(value);
+-                        }
+-                        TryPopResult::Closed => return Err(TryRecvError::Disconnected),
+-                        TryPopResult::Empty => return Err(TryRecvError::Empty),
+-                        TryPopResult::Busy => {} // fall through
+-                    }
+-                };
+-            }
+-
+-            try_recv!();
+-
+-            // If a previous `poll_recv` call has set a waker, we wake it here.
+-            // This allows us to put our own CachedParkThread waker in the
+-            // AtomicWaker slot instead.
+-            //
+-            // This is not a spurious wakeup to `poll_recv` since we just got a
+-            // Busy from `try_pop`, which only happens if there are messages in
+-            // the queue.
+-            self.inner.rx_waker.wake();
+-
+-            // Park the thread until the problematic send has completed.
+-            let mut park = CachedParkThread::new();
+-            let waker = park.waker().unwrap();
+-            loop {
+-                self.inner.rx_waker.register_by_ref(&waker);
+-                // It is possible that the problematic send has now completed,
+-                // so we have to check for messages again.
+-                try_recv!();
+-                park.park();
+-            }
+-        })
++        Block::chan_try_recv(self)
+     }
+ 
+     pub(super) fn semaphore(&self) -> &S {
+@@ -473,31 +285,14 @@ impl<T, S: Semaphore> Rx<T, S> {
+ 
+ impl<T, S: Semaphore> Drop for Rx<T, S> {
+     fn drop(&mut self) {
+-        use super::block::Read::Value;
+-
+         self.close();
+-
+-        self.inner.rx_fields.with_mut(|rx_fields_ptr| {
+-            let rx_fields = unsafe { &mut *rx_fields_ptr };
+-
+-            while let Some(Value(_)) = rx_fields.list.pop(&self.inner.tx) {
+-                self.inner.semaphore.add_permit();
+-            }
+-        });
++        Block::drain_chan_rx(self);
+     }
+ }
+ 
+ // ===== impl Chan =====
+ 
+ impl<T, S> Chan<T, S> {
+-    fn send(&self, value: T) {
+-        // Push the value
+-        self.tx.push(value);
+-
+-        // Notify the rx task
+-        self.rx_waker.wake();
+-    }
+-
+     pub(super) fn decrement_weak_count(&self) {
+         self.tx_weak_count.fetch_sub(1, Relaxed);
+     }
+diff --git a/tokio/src/sync/mpsc/list.rs b/tokio/src/sync/mpsc/list.rs
+index 90d9b828..527caa32 100644
+--- a/tokio/src/sync/mpsc/list.rs
++++ b/tokio/src/sync/mpsc/list.rs
+@@ -1,33 +1,32 @@
+ //! A concurrent, lock-free, FIFO list.
+ 
+ use crate::loom::sync::atomic::{AtomicPtr, AtomicUsize};
+-use crate::loom::thread;
+ use crate::sync::mpsc::block::{self, Block};
+ 
+ use std::fmt;
+ use std::ptr::NonNull;
+-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
++use std::sync::atomic::Ordering::Relaxed;
+ 
+ /// List queue transmit handle.
+ pub(crate) struct Tx<T> {
+     /// Tail in the `Block` mpmc list.
+-    block_tail: AtomicPtr<Block<T>>,
++    pub(crate) block_tail: AtomicPtr<Block<T>>,
+ 
+     /// Position to push the next message. This references a block and offset
+     /// into the block.
+-    tail_position: AtomicUsize,
++    pub(crate) tail_position: AtomicUsize,
+ }
+ 
+ /// List queue receive handle
+ pub(crate) struct Rx<T> {
+     /// Pointer to the block being processed.
+-    head: NonNull<Block<T>>,
++    pub(crate) head: NonNull<Block<T>>,
+ 
+     /// Next slot index to process.
+-    index: usize,
++    pub(crate) index: usize,
+ 
+     /// Pointer to the next block pending release.
+-    free_head: NonNull<Block<T>>,
++    pub(crate) free_head: NonNull<Block<T>>,
+ }
+ 
+ /// Return value of `Rx::try_pop`.
+@@ -66,17 +65,7 @@ pub(crate) fn channel<T>() -> (Tx<T>, Rx<T>) {
+ impl<T> Tx<T> {
+     /// Pushes a value into the list.
+     pub(crate) fn push(&self, value: T) {
+-        // First, claim a slot for the value. `Acquire` is used here to
+-        // synchronize with the `fetch_add` in `reclaim_blocks`.
+-        let slot_index = self.tail_position.fetch_add(1, Acquire);
+-
+-        // Load the current block and write the value
+-        let block = self.find_block(slot_index);
+-
+-        unsafe {
+-            // Write the value to the block
+-            block.as_ref().write(slot_index, value);
+-        }
++        Block::push_on_list(self, value);
+     }
+ 
+     /// Closes the send half of the list.
+@@ -84,148 +73,15 @@ impl<T> Tx<T> {
+     /// Similar process as pushing a value, but instead of writing the value &
+     /// setting the ready flag, the `TX_CLOSED` flag is set on the block.
+     pub(crate) fn close(&self) {
+-        // First, claim a slot for the value. This is the last slot that will be
+-        // claimed.
+-        let slot_index = self.tail_position.fetch_add(1, Acquire);
+-
+-        let block = self.find_block(slot_index);
+-
+-        unsafe { block.as_ref().tx_close() }
++        Block::close_list_tx(self);
+     }
+ 
+-    fn find_block(&self, slot_index: usize) -> NonNull<Block<T>> {
+-        // The start index of the block that contains `index`.
+-        let start_index = block::start_index(slot_index);
+-
+-        // The index offset into the block
+-        let offset = block::offset(slot_index);
+-
+-        // Load the current head of the block
+-        let mut block_ptr = self.block_tail.load(Acquire);
+-
+-        let block = unsafe { &*block_ptr };
+-
+-        // Calculate the distance between the tail ptr and the target block
+-        let distance = block.distance(start_index);
+-
+-        // Decide if this call to `find_block` should attempt to update the
+-        // `block_tail` pointer.
+-        //
+-        // Updating `block_tail` is not always performed in order to reduce
+-        // contention.
+-        //
+-        // When set, as the routine walks the linked list, it attempts to update
+-        // `block_tail`. If the update cannot be performed, `try_updating_tail`
+-        // is unset.
+-        let mut try_updating_tail = distance > offset;
+-
+-        // Walk the linked list of blocks until the block with `start_index` is
+-        // found.
+-        loop {
+-            let block = unsafe { &(*block_ptr) };
+-
+-            if block.is_at_index(start_index) {
+-                return unsafe { NonNull::new_unchecked(block_ptr) };
+-            }
+-
+-            let next_block = block
+-                .load_next(Acquire)
+-                // There is no allocated next block, grow the linked list.
+-                .unwrap_or_else(|| block.grow());
+-
+-            // If the block is **not** final, then the tail pointer cannot be
+-            // advanced any more.
+-            try_updating_tail &= block.is_final();
+-
+-            if try_updating_tail {
+-                // Advancing `block_tail` must happen when walking the linked
+-                // list. `block_tail` may not advance passed any blocks that are
+-                // not "final". At the point a block is finalized, it is unknown
+-                // if there are any prior blocks that are unfinalized, which
+-                // makes it impossible to advance `block_tail`.
+-                //
+-                // While walking the linked list, `block_tail` can be advanced
+-                // as long as finalized blocks are traversed.
+-                //
+-                // Release ordering is used to ensure that any subsequent reads
+-                // are able to see the memory pointed to by `block_tail`.
+-                //
+-                // Acquire is not needed as any "actual" value is not accessed.
+-                // At this point, the linked list is walked to acquire blocks.
+-                if self
+-                    .block_tail
+-                    .compare_exchange(block_ptr, next_block.as_ptr(), Release, Relaxed)
+-                    .is_ok()
+-                {
+-                    // Synchronize with any senders
+-                    let tail_position = self.tail_position.fetch_add(0, Release);
+-
+-                    unsafe {
+-                        block.tx_release(tail_position);
+-                    }
+-                } else {
+-                    // A concurrent sender is also working on advancing
+-                    // `block_tail` and this thread is falling behind.
+-                    //
+-                    // Stop trying to advance the tail pointer
+-                    try_updating_tail = false;
+-                }
+-            }
+-
+-            block_ptr = next_block.as_ptr();
+-
+-            thread::yield_now();
+-        }
+-    }
+-
+-    pub(crate) unsafe fn reclaim_block(&self, mut block: NonNull<Block<T>>) {
+-        // The block has been removed from the linked list and ownership
+-        // is reclaimed.
+-        //
+-        // Before dropping the block, see if it can be reused by
+-        // inserting it back at the end of the linked list.
+-        //
+-        // First, reset the data
+-        block.as_mut().reclaim();
+-
+-        let mut reused = false;
+-
+-        // Attempt to insert the block at the end
+-        //
+-        // Walk at most three times
+-        //
+-        let curr_ptr = self.block_tail.load(Acquire);
+-
+-        // The pointer can never be null
+-        debug_assert!(!curr_ptr.is_null());
+-
+-        let mut curr = NonNull::new_unchecked(curr_ptr);
+-
+-        // TODO: Unify this logic with Block::grow
+-        for _ in 0..3 {
+-            match curr.as_ref().try_push(&mut block, AcqRel, Acquire) {
+-                Ok(()) => {
+-                    reused = true;
+-                    break;
+-                }
+-                Err(next) => {
+-                    curr = next;
+-                }
+-            }
+-        }
+-
+-        if !reused {
+-            let _ = Box::from_raw(block.as_ptr());
+-        }
++    pub(crate) unsafe fn reclaim_block(&self, block: NonNull<Block<T>>) {
++        Block::reclaim_tx_block(self, block);
+     }
+ 
+     pub(crate) fn is_closed(&self) -> bool {
+-        let tail = self.block_tail.load(Acquire);
+-
+-        unsafe {
+-            let tail_block = &*tail;
+-            tail_block.is_closed()
+-        }
++        Block::list_tx_is_closed(self)
+     }
+ }
+ 
+@@ -240,43 +96,16 @@ impl<T> fmt::Debug for Tx<T> {
+ 
+ impl<T> Rx<T> {
+     pub(crate) fn is_empty(&self, tx: &Tx<T>) -> bool {
+-        let block = unsafe { self.head.as_ref() };
+-        if block.has_value(self.index) {
+-            return false;
+-        }
+-
+-        // It is possible that a block has no value "now" but the list is still not empty.
+-        // To be sure, it is necessary to check the length of the list.
+-        self.len(tx) == 0
++        Block::list_rx_is_empty(self, tx)
+     }
+ 
+     pub(crate) fn len(&self, tx: &Tx<T>) -> usize {
+-        // When all the senders are dropped, there will be a last block in the tail position,
+-        // but it will be closed
+-        let tail_position = tx.tail_position.load(Acquire);
+-        tail_position - self.index - (tx.is_closed() as usize)
++        Block::list_rx_len(self, tx)
+     }
+ 
+     /// Pops the next value off the queue.
+     pub(crate) fn pop(&mut self, tx: &Tx<T>) -> Option<block::Read<T>> {
+-        // Advance `head`, if needed
+-        if !self.try_advancing_head() {
+-            return None;
+-        }
+-
+-        self.reclaim_blocks(tx);
+-
+-        unsafe {
+-            let block = self.head.as_ref();
+-
+-            let ret = block.read(self.index);
+-
+-            if let Some(block::Read::Value(..)) = ret {
+-                self.index = self.index.wrapping_add(1);
+-            }
+-
+-            ret
+-        }
++        Block::list_rx_pop(self, tx)
+     }
+ 
+     /// Pops the next value off the queue, detecting whether the block
+@@ -288,102 +117,16 @@ impl<T> Rx<T> {
+     /// that is in the middle of being written to the block, since the channel
+     /// can't return the messages out of order.
+     pub(crate) fn try_pop(&mut self, tx: &Tx<T>) -> TryPopResult<T> {
+-        let tail_position = tx.tail_position.load(Acquire);
+-        let result = self.pop(tx);
+-
+-        match result {
+-            Some(block::Read::Value(t)) => TryPopResult::Ok(t),
+-            Some(block::Read::Closed) => TryPopResult::Closed,
+-            None if tail_position == self.index => TryPopResult::Empty,
+-            None => TryPopResult::Busy,
+-        }
++        Block::list_rx_try_pop(self, tx)
+     }
+ 
+     /// Tries advancing the block pointer to the block referenced by `self.index`.
+     ///
+     /// Returns `true` if successful, `false` if there is no next block to load.
+-    fn try_advancing_head(&mut self) -> bool {
+-        let block_index = block::start_index(self.index);
+-
+-        loop {
+-            let next_block = {
+-                let block = unsafe { self.head.as_ref() };
+-
+-                if block.is_at_index(block_index) {
+-                    return true;
+-                }
+-
+-                block.load_next(Acquire)
+-            };
+-
+-            let next_block = match next_block {
+-                Some(next_block) => next_block,
+-                None => {
+-                    return false;
+-                }
+-            };
+-
+-            self.head = next_block;
+-
+-            thread::yield_now();
+-        }
+-    }
+-
+-    fn reclaim_blocks(&mut self, tx: &Tx<T>) {
+-        while self.free_head != self.head {
+-            unsafe {
+-                // Get a handle to the block that will be freed and update
+-                // `free_head` to point to the next block.
+-                let block = self.free_head;
+-
+-                let observed_tail_position = block.as_ref().observed_tail_position();
+-
+-                let required_index = match observed_tail_position {
+-                    Some(i) => i,
+-                    None => return,
+-                };
+-
+-                if required_index > self.index {
+-                    return;
+-                }
+-
+-                // We may read the next pointer with `Relaxed` ordering as it is
+-                // guaranteed that the `reclaim_blocks` routine trails the `recv`
+-                // routine. Any memory accessed by `reclaim_blocks` has already
+-                // been acquired by `recv`.
+-                let next_block = block.as_ref().load_next(Relaxed);
+-
+-                // Update the free list head
+-                self.free_head = next_block.unwrap();
+-
+-                // Push the emptied block onto the back of the queue, making it
+-                // available to senders.
+-                tx.reclaim_block(block);
+-            }
+-
+-            thread::yield_now();
+-        }
+-    }
+-
+     /// Effectively `Drop` all the blocks. Should only be called once, when
+     /// the list is dropping.
+     pub(super) unsafe fn free_blocks(&mut self) {
+-        debug_assert_ne!(self.free_head, NonNull::dangling());
+-
+-        let mut cur = Some(self.free_head);
+-
+-        #[cfg(debug_assertions)]
+-        {
+-            // to trigger the debug assert above so as to catch that we
+-            // don't call `free_blocks` more than once.
+-            self.free_head = NonNull::dangling();
+-            self.head = NonNull::dangling();
+-        }
+-
+-        while let Some(block) = cur {
+-            cur = block.as_ref().load_next(Relaxed);
+-            drop(Box::from_raw(block.as_ptr()));
+-        }
++        Block::free_rx_blocks(self)
+     }
+ }
+ 
+diff --git a/tokio/src/sync/mpsc/unbounded.rs b/tokio/src/sync/mpsc/unbounded.rs
+index a3398c4b..4d3fd82a 100644
+--- a/tokio/src/sync/mpsc/unbounded.rs
++++ b/tokio/src/sync/mpsc/unbounded.rs
+@@ -1,4 +1,5 @@
+ use crate::loom::sync::{atomic::AtomicUsize, Arc};
++use crate::sync::mpsc::block::Block;
+ use crate::sync::mpsc::chan;
+ use crate::sync::mpsc::error::{SendError, TryRecvError};
+ 
+@@ -375,7 +376,7 @@ impl<T> UnboundedReceiver<T> {
+     ///
+     /// ```
+     pub fn is_empty(&self) -> bool {
+-        self.chan.is_empty()
++        Block::unbounded_rx_is_empty(&self.chan)
+     }
+ 
+     /// Returns the number of messages in the channel.
+@@ -394,7 +395,7 @@ impl<T> UnboundedReceiver<T> {
+     /// }
+     /// ```
+     pub fn len(&self) -> usize {
+-        self.chan.len()
++        Block::unbounded_rx_len(&self.chan)
+     }
+ 
+     /// Polls to receive the next message on this channel.
+@@ -518,44 +519,9 @@ impl<T> UnboundedSender<T> {
+     /// [`close`]: UnboundedReceiver::close
+     /// [`UnboundedReceiver`]: UnboundedReceiver
+     pub fn send(&self, message: T) -> Result<(), SendError<T>> {
+-        if !self.inc_num_messages() {
+-            return Err(SendError(message));
+-        }
+-
+-        self.chan.send(message);
+-        Ok(())
++        Block::unbounded_send(&self.chan, message)
+     }
+ 
+-    fn inc_num_messages(&self) -> bool {
+-        use std::process;
+-        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+-
+-        let mut curr = self.chan.semaphore().0.load(Acquire);
+-
+-        loop {
+-            if curr & 1 == 1 {
+-                return false;
+-            }
+-
+-            if curr == usize::MAX ^ 1 {
+-                // Overflowed the ref count. There is no safe way to recover, so
+-                // abort the process. In practice, this should never happen.
+-                process::abort()
+-            }
+-
+-            match self
+-                .chan
+-                .semaphore()
+-                .0
+-                .compare_exchange(curr, curr + 2, AcqRel, Acquire)
+-            {
+-                Ok(_) => return true,
+-                Err(actual) => {
+-                    curr = actual;
+-                }
+-            }
+-        }
+-    }
+ 
+     /// Completes when the receiver has dropped.
+     ///

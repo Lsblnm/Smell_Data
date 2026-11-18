@@ -1,0 +1,378 @@
+diff --git a/tokio/src/fs/file.rs b/tokio/src/fs/file.rs
+index 78470664..cba9d1cb 100644
+--- a/tokio/src/fs/file.rs
++++ b/tokio/src/fs/file.rs
+@@ -7,11 +7,11 @@ use crate::io::blocking::{Buf, DEFAULT_MAX_BUF_SIZE};
+ use crate::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
+ use crate::sync::Mutex;
+ 
+-use std::cmp;
+ use std::fmt;
+ use std::fs::{Metadata, Permissions};
+ use std::future::Future;
+ use std::io::{self, Seek, SeekFrom};
++use std::mem::MaybeUninit;
+ use std::path::Path;
+ use std::pin::Pin;
+ use std::sync::Arc;
+@@ -602,54 +602,309 @@ impl AsyncRead for File {
+                     }
+ 
+                     let std = me.std.clone();
++                    let dst_capacity = dst.buf.len();
++                    let dst_filled = dst.filled;
++                    let dst_remaining = if dst_capacity > dst_filled {
++                        dst_capacity - dst_filled
++                    } else {
++                        0
++                    };
++
++                    let configured_max = me.max_buf_size;
++                    let max_buf_size = if dst_remaining > configured_max {
++                        configured_max
++                    } else {
++                        dst_remaining
++                    };
+ 
+-                    let max_buf_size = cmp::min(dst.remaining(), me.max_buf_size);
+                     inner.state = State::Busy(spawn_blocking(move || {
+-                        // SAFETY: the `Read` implementation of `std` does not
+-                        // read from the buffer it is borrowing and correctly
+-                        // reports the length of the data written into the buffer.
+-                        let res = unsafe { buf.read_from(&mut &*std, max_buf_size) };
++                        let current_len = buf.buf.len();
++                        let current_pos = buf.pos;
++                        let logical_len = if current_len > current_pos {
++                            current_len - current_pos
++                        } else {
++                            0
++                        };
++                        assert_eq!(logical_len, 0);
++
++                        buf.buf.reserve(max_buf_size);
++                        let spare = buf.buf.spare_capacity_mut();
++                        let uninit = &mut spare[..max_buf_size];
++                        let slice = unsafe {
++                            &mut *(uninit as *mut [MaybeUninit<u8>] as *mut [u8])
++                        };
++
++                        let read_res = loop {
++                            match std::io::Read::read(&mut &*std, slice) {
++                                Err(ref err) if err.kind() == io::ErrorKind::Interrupted => {
++                                    continue;
++                                }
++                                Err(err) => break Err(err),
++                                Ok(read_n) => break Ok(read_n),
++                            }
++                        };
++
++                        let res = match read_res {
++                            Ok(n) => {
++                                unsafe {
++                                    buf.buf.set_len(n);
++                                }
++                                assert_eq!(buf.pos, 0);
++                                Ok(n)
++                            }
++                            Err(err) => {
++                                buf.buf.clear();
++                                assert_eq!(buf.pos, 0);
++                                Err(err)
++                            }
++                        };
+                         (Operation::Read(res), buf)
+                     }));
+                 }
+                 State::Busy(ref mut rx) => {
+-                    let (op, mut buf) = ready!(Pin::new(rx).poll(cx))?;
++                    let (op, mut buf) = match Pin::new(rx).poll(cx) {
++                        Poll::Pending => return Poll::Pending,
++                        Poll::Ready(Err(join_err)) => {
++                            let io_err: io::Error = join_err.into();
++                            match io_err.kind() {
++                                io::ErrorKind::Other => return Poll::Ready(Err(io_err)),
++                                io::ErrorKind::Interrupted => {
++                                    return Poll::Ready(Err(io_err))
++                                }
++                                io::ErrorKind::UnexpectedEof => {
++                                    return Poll::Ready(Err(io_err))
++                                }
++                                _ => return Poll::Ready(Err(io_err)),
++                            }
++                        }
++                        Poll::Ready(Ok(pair)) => pair,
++                    };
+ 
+                     match op {
+-                        Operation::Read(Ok(_)) => {
+-                            buf.copy_to(dst);
++                        Operation::Read(Ok(_read_n)) => {
++                            let buf_len = buf.buf.len();
++                            let buf_pos = buf.pos;
++                            let available = if buf_len > buf_pos {
++                                buf_len - buf_pos
++                            } else {
++                                0
++                            };
++                            let dst_capacity = dst.buf.len();
++                            let dst_filled = dst.filled;
++                            let dst_initialized = dst.initialized;
++                            let space = if dst_capacity > dst_filled {
++                                dst_capacity - dst_filled
++                            } else {
++                                0
++                            };
++                            let n_copy = if available > space {
++                                space
++                            } else {
++                                available
++                            };
++                            let init_space = if dst_initialized > dst_filled {
++                                dst_initialized - dst_filled
++                            } else {
++                                0
++                            };
++
++                            if n_copy == 0 {
++                                if buf_pos == buf_len {
++                                    if buf.buf.is_empty() {
++                                        buf.pos = 0;
++                                    } else {
++                                        buf.buf.truncate(0);
++                                        buf.pos = 0;
++                                    }
++                                }
++                                inner.state = State::Idle(Some(buf));
++                                return Poll::Ready(Ok(()));
++                            }
++
++                            if n_copy <= init_space {
++                                if n_copy <= 64 {
++                                    let src = &buf.buf[buf_pos..buf_pos + n_copy];
++                                    let end = dst_filled + n_copy;
++                                    unsafe {
++                                        dst.buf[dst_filled..end]
++                                            .as_mut_ptr()
++                                            .cast::<u8>()
++                                            .copy_from_nonoverlapping(src.as_ptr(), n_copy);
++                                    }
++                                    dst.filled = end;
++                                } else {
++                                    let chunk_size = if n_copy <= 4096 { 512 } else { 8192 };
++                                    let mut offset = 0;
++                                    while offset < n_copy {
++                                        let remaining_copy = n_copy - offset;
++                                        let chunk = if remaining_copy > chunk_size {
++                                            chunk_size
++                                        } else {
++                                            remaining_copy
++                                        };
++                                        let src_start = buf_pos + offset;
++                                        let src = &buf.buf[src_start..src_start + chunk];
++                                        let start = dst_filled + offset;
++                                        let end = start + chunk;
++                                        unsafe {
++                                            dst.buf[start..end]
++                                                .as_mut_ptr()
++                                                .cast::<u8>()
++                                                .copy_from_nonoverlapping(
++                                                    src.as_ptr(),
++                                                    chunk,
++                                                );
++                                        }
++                                        offset += chunk;
++                                    }
++                                    dst.filled = dst_filled + n_copy;
++                                }
++                            } else if init_space > 0 {
++                                let src = &buf.buf[buf_pos..buf_pos + init_space];
++                                let end = dst_filled + init_space;
++                                unsafe {
++                                    dst.buf[dst_filled..end]
++                                        .as_mut_ptr()
++                                        .cast::<u8>()
++                                        .copy_from_nonoverlapping(src.as_ptr(), init_space);
++                                }
++
++                                let rest = n_copy - init_space;
++                                if rest <= 64 {
++                                    let src_start = buf_pos + init_space;
++                                    let src = &buf.buf[src_start..src_start + rest];
++                                    let start = dst_filled + init_space;
++                                    let copy_end = start + rest;
++                                    unsafe {
++                                        dst.buf[start..copy_end]
++                                            .as_mut_ptr()
++                                            .cast::<u8>()
++                                            .copy_from_nonoverlapping(src.as_ptr(), rest);
++                                    }
++                                    dst.initialized = dst.initialized.max(copy_end);
++                                } else {
++                                    let chunk_size = if rest <= 4096 { 512 } else { 8192 };
++                                    let mut offset = 0;
++                                    while offset < rest {
++                                        let remaining_copy = rest - offset;
++                                        let chunk = if remaining_copy > chunk_size {
++                                            chunk_size
++                                        } else {
++                                            remaining_copy
++                                        };
++                                        let src_start = buf_pos + init_space + offset;
++                                        let src = &buf.buf[src_start..src_start + chunk];
++                                        let start = dst_filled + init_space + offset;
++                                        let copy_end = start + chunk;
++                                        unsafe {
++                                            dst.buf[start..copy_end]
++                                                .as_mut_ptr()
++                                                .cast::<u8>()
++                                                .copy_from_nonoverlapping(
++                                                    src.as_ptr(),
++                                                    chunk,
++                                                );
++                                        }
++                                        dst.initialized = dst.initialized.max(copy_end);
++                                        offset += chunk;
++                                    }
++                                }
++                                dst.filled = dst_filled + n_copy;
++                            } else {
++                                let chunk_size = if n_copy <= 4096 { 512 } else { 8192 };
++                                let mut offset = 0;
++                                while offset < n_copy {
++                                    let remaining_copy = n_copy - offset;
++                                    let chunk = if remaining_copy > chunk_size {
++                                        chunk_size
++                                    } else {
++                                        remaining_copy
++                                    };
++                                    let src_start = buf_pos + offset;
++                                    let src = &buf.buf[src_start..src_start + chunk];
++                                    let start = dst_filled + offset;
++                                    let copy_end = start + chunk;
++                                    unsafe {
++                                        dst.buf[start..copy_end]
++                                            .as_mut_ptr()
++                                            .cast::<u8>()
++                                            .copy_from_nonoverlapping(
++                                                src.as_ptr(),
++                                                chunk,
++                                            );
++                                    }
++                                    dst.initialized = dst.initialized.max(copy_end);
++                                    offset += chunk;
++                                }
++                                dst.filled = dst_filled + n_copy;
++                            }
++
++                            buf.pos = buf_pos + n_copy;
++                            if buf.pos == buf.buf.len() {
++                                buf.buf.truncate(0);
++                                buf.pos = 0;
++                            }
+                             inner.state = State::Idle(Some(buf));
+                             return Poll::Ready(Ok(()));
+                         }
+-                        Operation::Read(Err(e)) => {
+-                            assert!(buf.is_empty());
+-
++                        Operation::Read(Err(err)) => {
++                            let empty = buf.buf.len() == buf.pos;
++                            assert!(empty);
+                             inner.state = State::Idle(Some(buf));
+-                            return Poll::Ready(Err(e));
++                            match err.kind() {
++                                io::ErrorKind::Interrupted => {
++                                    return Poll::Ready(Err(err));
++                                }
++                                io::ErrorKind::UnexpectedEof => {
++                                    return Poll::Ready(Err(err));
++                                }
++                                io::ErrorKind::WouldBlock => {
++                                    return Poll::Ready(Err(err));
++                                }
++                                io::ErrorKind::TimedOut => {
++                                    return Poll::Ready(Err(err));
++                                }
++                                io::ErrorKind::PermissionDenied => {
++                                    return Poll::Ready(Err(err));
++                                }
++                                _ => {
++                                    return Poll::Ready(Err(err));
++                                }
++                            }
+                         }
+                         Operation::Write(Ok(())) => {
+-                            assert!(buf.is_empty());
++                            let empty = buf.buf.len() == buf.pos;
++                            assert!(empty);
+                             inner.state = State::Idle(Some(buf));
+                             continue;
+                         }
+-                        Operation::Write(Err(e)) => {
++                        Operation::Write(Err(err)) => {
+                             assert!(inner.last_write_err.is_none());
+-                            inner.last_write_err = Some(e.kind());
++                            inner.last_write_err = Some(err.kind());
+                             inner.state = State::Idle(Some(buf));
+                         }
+                         Operation::Seek(result) => {
+-                            assert!(buf.is_empty());
++                            let empty = buf.buf.len() == buf.pos;
++                            assert!(empty);
+                             inner.state = State::Idle(Some(buf));
+-                            if let Ok(pos) = result {
+-                                inner.pos = pos;
++                            match result {
++                                Ok(pos) => {
++                                    if pos != inner.pos {
++                                        inner.pos = pos;
++                                    } else {
++                                        inner.pos = pos;
++                                    }
++                                    continue;
++                                }
++                                Err(_) => continue,
+                             }
+-                            continue;
+                         }
+                     }
+                 }
+             }
+         }
+     }
++
+ }
+ 
+ impl AsyncSeek for File {
+diff --git a/tokio/src/io/blocking.rs b/tokio/src/io/blocking.rs
+index 1af50654..a361265a 100644
+--- a/tokio/src/io/blocking.rs
++++ b/tokio/src/io/blocking.rs
+@@ -20,8 +20,8 @@ pub(crate) struct Blocking<T> {
+ 
+ #[derive(Debug)]
+ pub(crate) struct Buf {
+-    buf: Vec<u8>,
+-    pos: usize,
++    pub(crate) buf: Vec<u8>,
++    pub(crate) pos: usize,
+ }
+ 
+ pub(crate) const DEFAULT_MAX_BUF_SIZE: usize = 2 * 1024 * 1024;
+diff --git a/tokio/src/io/read_buf.rs b/tokio/src/io/read_buf.rs
+index edef8485..9c5bb558 100644
+--- a/tokio/src/io/read_buf.rs
++++ b/tokio/src/io/read_buf.rs
+@@ -21,9 +21,9 @@ use std::mem::MaybeUninit;
+ /// region, since it is merely unknown whether this region is uninitialized or
+ /// not, and if part of it turns out to be initialized, it must stay initialized.
+ pub struct ReadBuf<'a> {
+-    buf: &'a mut [MaybeUninit<u8>],
+-    filled: usize,
+-    initialized: usize,
++    pub(crate) buf: &'a mut [MaybeUninit<u8>],
++    pub(crate) filled: usize,
++    pub(crate) initialized: usize,
+ }
+ 
+ impl<'a> ReadBuf<'a> {

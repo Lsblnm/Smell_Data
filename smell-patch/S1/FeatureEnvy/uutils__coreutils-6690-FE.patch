@@ -1,0 +1,396 @@
+diff --git a/src/uu/cp/src/copydir.rs b/src/uu/cp/src/copydir.rs
+index 627f5a4de..a693235cd 100644
+--- a/src/uu/cp/src/copydir.rs
++++ b/src/uu/cp/src/copydir.rs
+@@ -26,7 +26,7 @@ use uucore::uio_error;
+ use walkdir::{DirEntry, WalkDir};
+ 
+ use crate::{
+-    aligned_ancestors, context_for, copy_attributes, copy_file, copy_link, CopyResult, Error,
++    aligned_ancestors, context_for, copy_file, copy_link, CopyPaths, CopyResult, Error,
+     Options,
+ };
+ 
+@@ -429,14 +429,26 @@ pub(crate) fn copy_directory(
+     // Copy the attributes from the root directory to the target directory.
+     if options.parents {
+         let dest = target.join(root.file_name().unwrap());
+-        copy_attributes(root, dest.as_path(), &options.attributes)?;
++        CopyPaths {
++            source: root,
++            dest: dest.as_path(),
++        }
++        .copy_attributes(&options.attributes, false)?;
+         for (x, y) in aligned_ancestors(root, dest.as_path()) {
+             if let Ok(src) = canonicalize(x, MissingHandling::Normal, ResolveMode::Physical) {
+-                copy_attributes(&src, y, &options.attributes)?;
++                CopyPaths {
++                    source: &src,
++                    dest: y,
++                }
++                .copy_attributes(&options.attributes, false)?;
+             }
+         }
+     } else {
+-        copy_attributes(root, target, &options.attributes)?;
++        CopyPaths {
++            source: root,
++            dest: target,
++        }
++        .copy_attributes(&options.attributes, false)?;
+     }
+ 
+     Ok(())
+diff --git a/src/uu/cp/src/cp.rs b/src/uu/cp/src/cp.rs
+index cce042bfa..77ba6cd87 100644
+--- a/src/uu/cp/src/cp.rs
++++ b/src/uu/cp/src/cp.rs
+@@ -411,6 +411,165 @@ const PRESERVE_DEFAULT_VALUES: &str = if cfg!(unix) {
+ } else {
+     "mode,timestamp"
+ };
++
++/// Source and destination paths for a single copy operation.
++pub(crate) struct CopyPaths<'a> {
++    source: &'a Path,
++    dest: &'a Path,
++}
++
++impl CopyPaths<'_> {
++    fn operand_arg() -> Arg {
++        Arg::new(options::PATHS)
++            .action(ArgAction::Append)
++            .value_hint(clap::ValueHint::AnyPath)
++            .value_parser(ValueParser::os_string())
++    }
++
++    /// Copy the specified attributes from the source path to the destination path.
++    pub(crate) fn copy_attributes(
++        &self,
++        attributes: &Attributes,
++        dereference: bool,
++    ) -> CopyResult<()> {
++        fn handle_preserve<F: Fn() -> CopyResult<()>>(p: &Preserve, f: F) -> CopyResult<()> {
++            match p {
++                Preserve::No { .. } => {}
++                Preserve::Yes { required } => {
++                    let result = f();
++                    if *required {
++                        result?;
++                    } else if let Err(error) = result {
++                        show_error_if_needed(&error);
++                    }
++                }
++            };
++            Ok(())
++        }
++
++        let canonical_source;
++        let source = if dereference {
++            match canonicalize(self.source, MissingHandling::Normal, ResolveMode::Physical) {
++                Ok(path) => {
++                    canonical_source = path;
++                    canonical_source.as_path()
++                }
++                Err(_) => return Ok(()),
++            }
++        } else {
++            self.source
++        };
++        let context = &*format!("{} -> {}", source.quote(), self.dest.quote());
++        let source_metadata = fs::symlink_metadata(source).context(context)?;
++
++        // Ownership must be changed first to avoid interfering with mode change.
++        #[cfg(unix)]
++        handle_preserve(&attributes.ownership, || -> CopyResult<()> {
++            use std::os::unix::prelude::MetadataExt;
++            use uucore::perms::wrap_chown;
++            use uucore::perms::Verbosity;
++            use uucore::perms::VerbosityLevel;
++
++            let dest_uid = source_metadata.uid();
++            let dest_gid = source_metadata.gid();
++            // gnu compatibility: cp doesn't report an error if it fails to set the ownership.
++            let _ = wrap_chown(
++                self.dest,
++                &self.dest.symlink_metadata().context(context)?,
++                Some(dest_uid),
++                Some(dest_gid),
++                false,
++                Verbosity {
++                    groups_only: false,
++                    level: VerbosityLevel::Silent,
++                },
++            );
++            Ok(())
++        })?;
++
++        handle_preserve(&attributes.mode, || -> CopyResult<()> {
++            // The `chmod()` system call that underlies the
++            // `fs::set_permissions()` call is unable to change the
++            // permissions of a symbolic link. In that case, we just
++            // do nothing, since every symbolic link has the same
++            // permissions.
++            if !self.dest.is_symlink() {
++                fs::set_permissions(self.dest, source_metadata.permissions()).context(context)?;
++                // FIXME: Implement this for windows as well
++                #[cfg(feature = "feat_acl")]
++                exacl::getfacl(source, None)
++                    .and_then(|acl| exacl::setfacl(&[self.dest], &acl, None))
++                    .map_err(|err| Error::Error(err.to_string()))?;
++            }
++
++            Ok(())
++        })?;
++
++        handle_preserve(&attributes.timestamps, || -> CopyResult<()> {
++            let atime = FileTime::from_last_access_time(&source_metadata);
++            let mtime = FileTime::from_last_modification_time(&source_metadata);
++            if self.dest.is_symlink() {
++                filetime::set_symlink_file_times(self.dest, atime, mtime)?;
++            } else {
++                filetime::set_file_times(self.dest, atime, mtime)?;
++            }
++
++            Ok(())
++        })?;
++
++        #[cfg(feature = "feat_selinux")]
++        handle_preserve(&attributes.context, || -> CopyResult<()> {
++            let context = selinux::SecurityContext::of_path(source, false, false).map_err(|e| {
++                format!(
++                    "failed to get security context of {}: {}",
++                    source.display(),
++                    e
++                )
++            })?;
++            if let Some(context) = context {
++                context.set_for_path(self.dest, false, false).map_err(|e| {
++                    format!(
++                        "failed to set security context for {}: {}",
++                        self.dest.display(),
++                        e
++                    )
++                })?;
++            }
++
++            Ok(())
++        })?;
++
++        handle_preserve(&attributes.xattr, || -> CopyResult<()> {
++            #[cfg(all(unix, not(target_os = "android")))]
++            {
++                let xattrs = xattr::list(source)?;
++                for attr in xattrs {
++                    if let Some(attr_value) = xattr::get(source, attr.clone())? {
++                        xattr::set(self.dest, attr, &attr_value[..])?;
++                    }
++                }
++            }
++            #[cfg(not(all(unix, not(target_os = "android"))))]
++            {
++                // The documentation for GNU cp states:
++                //
++                // > Try to preserve SELinux security context and
++                // > extended attributes (xattr), but ignore any failure
++                // > to do that and print no corresponding diagnostic.
++                //
++                // so we simply do nothing here.
++                //
++                // TODO Silently ignore failures in the `#[cfg(unix)]`
++                // block instead of terminating immediately on errors.
++            }
++
++            Ok(())
++        })?;
++
++        Ok(())
++    }
++}
++
+ pub fn uu_app() -> Command {
+     const MODE_ARGS: &[&str] = &[
+         options::LINK,
+@@ -674,12 +833,7 @@ pub fn uu_app() -> Command {
+                 Note: this feature is not supported by GNU coreutils.",
+                 ),
+         )
+-        .arg(
+-            Arg::new(options::PATHS)
+-                .action(ArgAction::Append)
+-                .value_hint(clap::ValueHint::AnyPath)
+-                .value_parser(ValueParser::os_string()),
+-        )
++        .arg(CopyPaths::operand_arg())
+ }
+ 
+ #[uucore::main]
+@@ -1386,7 +1540,11 @@ fn copy_source(
+         if options.parents {
+             for (x, y) in aligned_ancestors(source, dest.as_path()) {
+                 if let Ok(src) = canonicalize(x, MissingHandling::Normal, ResolveMode::Physical) {
+-                    copy_attributes(&src, y, &options.attributes)?;
++                    CopyPaths {
++                        source: &src,
++                        dest: y,
++                    }
++                    .copy_attributes(&options.attributes, false)?;
+                 }
+             }
+         }
+@@ -1416,137 +1574,6 @@ impl OverwriteMode {
+ /// Handles errors for attributes preservation. If the attribute is not required, and
+ /// errored, tries to show error (see `show_error_if_needed` for additional behavior details).
+ /// If it's required, then the error is thrown.
+-fn handle_preserve<F: Fn() -> CopyResult<()>>(p: &Preserve, f: F) -> CopyResult<()> {
+-    match p {
+-        Preserve::No { .. } => {}
+-        Preserve::Yes { required } => {
+-            let result = f();
+-            if *required {
+-                result?;
+-            } else if let Err(error) = result {
+-                show_error_if_needed(&error);
+-            }
+-        }
+-    };
+-    Ok(())
+-}
+-
+-/// Copy the specified attributes from one path to another.
+-pub(crate) fn copy_attributes(
+-    source: &Path,
+-    dest: &Path,
+-    attributes: &Attributes,
+-) -> CopyResult<()> {
+-    let context = &*format!("{} -> {}", source.quote(), dest.quote());
+-    let source_metadata = fs::symlink_metadata(source).context(context)?;
+-
+-    // Ownership must be changed first to avoid interfering with mode change.
+-    #[cfg(unix)]
+-    handle_preserve(&attributes.ownership, || -> CopyResult<()> {
+-        use std::os::unix::prelude::MetadataExt;
+-        use uucore::perms::wrap_chown;
+-        use uucore::perms::Verbosity;
+-        use uucore::perms::VerbosityLevel;
+-
+-        let dest_uid = source_metadata.uid();
+-        let dest_gid = source_metadata.gid();
+-        // gnu compatibility: cp doesn't report an error if it fails to set the ownership.
+-        let _ = wrap_chown(
+-            dest,
+-            &dest.symlink_metadata().context(context)?,
+-            Some(dest_uid),
+-            Some(dest_gid),
+-            false,
+-            Verbosity {
+-                groups_only: false,
+-                level: VerbosityLevel::Silent,
+-            },
+-        );
+-        Ok(())
+-    })?;
+-
+-    handle_preserve(&attributes.mode, || -> CopyResult<()> {
+-        // The `chmod()` system call that underlies the
+-        // `fs::set_permissions()` call is unable to change the
+-        // permissions of a symbolic link. In that case, we just
+-        // do nothing, since every symbolic link has the same
+-        // permissions.
+-        if !dest.is_symlink() {
+-            fs::set_permissions(dest, source_metadata.permissions()).context(context)?;
+-            // FIXME: Implement this for windows as well
+-            #[cfg(feature = "feat_acl")]
+-            exacl::getfacl(source, None)
+-                .and_then(|acl| exacl::setfacl(&[dest], &acl, None))
+-                .map_err(|err| Error::Error(err.to_string()))?;
+-        }
+-
+-        Ok(())
+-    })?;
+-
+-    handle_preserve(&attributes.timestamps, || -> CopyResult<()> {
+-        let atime = FileTime::from_last_access_time(&source_metadata);
+-        let mtime = FileTime::from_last_modification_time(&source_metadata);
+-        if dest.is_symlink() {
+-            filetime::set_symlink_file_times(dest, atime, mtime)?;
+-        } else {
+-            filetime::set_file_times(dest, atime, mtime)?;
+-        }
+-
+-        Ok(())
+-    })?;
+-
+-    #[cfg(feature = "feat_selinux")]
+-    handle_preserve(&attributes.context, || -> CopyResult<()> {
+-        let context = selinux::SecurityContext::of_path(source, false, false).map_err(|e| {
+-            format!(
+-                "failed to get security context of {}: {}",
+-                source.display(),
+-                e
+-            )
+-        })?;
+-        if let Some(context) = context {
+-            context.set_for_path(dest, false, false).map_err(|e| {
+-                format!(
+-                    "failed to set security context for {}: {}",
+-                    dest.display(),
+-                    e
+-                )
+-            })?;
+-        }
+-
+-        Ok(())
+-    })?;
+-
+-    handle_preserve(&attributes.xattr, || -> CopyResult<()> {
+-        #[cfg(all(unix, not(target_os = "android")))]
+-        {
+-            let xattrs = xattr::list(source)?;
+-            for attr in xattrs {
+-                if let Some(attr_value) = xattr::get(source, attr.clone())? {
+-                    xattr::set(dest, attr, &attr_value[..])?;
+-                }
+-            }
+-        }
+-        #[cfg(not(all(unix, not(target_os = "android"))))]
+-        {
+-            // The documentation for GNU cp states:
+-            //
+-            // > Try to preserve SELinux security context and
+-            // > extended attributes (xattr), but ignore any failure
+-            // > to do that and print no corresponding diagnostic.
+-            //
+-            // so we simply do nothing here.
+-            //
+-            // TODO Silently ignore failures in the `#[cfg(unix)]`
+-            // block instead of terminating immediately on errors.
+-        }
+-
+-        Ok(())
+-    })?;
+-
+-    Ok(())
+-}
+-
+ fn symlink_file(
+     source: &Path,
+     dest: &Path,
+@@ -2168,13 +2195,10 @@ fn copy_file(
+         fs::set_permissions(dest, dest_permissions).ok();
+     }
+ 
+-    if options.dereference(source_in_command_line) {
+-        if let Ok(src) = canonicalize(source, MissingHandling::Normal, ResolveMode::Physical) {
+-            copy_attributes(&src, dest, &options.attributes)?;
+-        }
+-    } else {
+-        copy_attributes(source, dest, &options.attributes)?;
+-    }
++    CopyPaths { source, dest }.copy_attributes(
++        &options.attributes,
++        options.dereference(source_in_command_line),
++    )?;
+ 
+     copied_files.insert(
+         FileInformation::from_path(source, options.dereference(source_in_command_line))?,

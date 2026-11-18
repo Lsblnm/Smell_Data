@@ -1,0 +1,242 @@
+diff --git a/internal/builtin/provisioners/remote-exec/resource_provisioner.go b/internal/builtin/provisioners/remote-exec/resource_provisioner.go
+index 858730a54a..10e830c55e 100644
+--- a/internal/builtin/provisioners/remote-exec/resource_provisioner.go
++++ b/internal/builtin/provisioners/remote-exec/resource_provisioner.go
+@@ -10,16 +10,13 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"io/ioutil"
+-	"log"
+ 	"os"
+ 	"strings"
+ 
+ 	"github.com/hashicorp/terraform/internal/communicator"
+-	"github.com/hashicorp/terraform/internal/communicator/remote"
+ 	"github.com/hashicorp/terraform/internal/configs/configschema"
+ 	"github.com/hashicorp/terraform/internal/provisioners"
+ 	"github.com/hashicorp/terraform/internal/tfdiags"
+-	"github.com/mitchellh/go-linereader"
+ 	"github.com/zclconf/go-cty/cty"
+ )
+ 
+@@ -130,7 +127,8 @@ func (p *provisioner) ProvisionResource(req provisioners.ProvisionResourceReques
+ 	}
+ 
+ 	// Copy and execute each script
+-	if err := runScripts(p.ctx, req.UIOutput, comm, scripts); err != nil {
++	runner := &communicator.ScriptRunner{Comm: comm}
++	if err := runner.RunScripts(p.ctx, req, scripts, p.GetSchema()); err != nil {
+ 		resp.Diagnostics = resp.Diagnostics.Append(tfdiags.WholeContainingBody(
+ 			tfdiags.Error,
+ 			"remote-exec provisioner error",
+@@ -227,71 +225,3 @@ func collectScripts(v cty.Value) ([]io.ReadCloser, error) {
+ 	// Done, return the file handles
+ 	return fhs, nil
+ }
+-
+-// runScripts is used to copy and execute a set of scripts
+-func runScripts(ctx context.Context, o provisioners.UIOutput, comm communicator.Communicator, scripts []io.ReadCloser) error {
+-	retryCtx, cancel := context.WithTimeout(ctx, comm.Timeout())
+-	defer cancel()
+-
+-	// Wait and retry until we establish the connection
+-	err := communicator.Retry(retryCtx, func() error {
+-		return comm.Connect(o)
+-	})
+-	if err != nil {
+-		return err
+-	}
+-
+-	// Wait for the context to end and then disconnect
+-	go func() {
+-		<-ctx.Done()
+-		comm.Disconnect()
+-	}()
+-
+-	for _, script := range scripts {
+-		var cmd *remote.Cmd
+-
+-		outR, outW := io.Pipe()
+-		errR, errW := io.Pipe()
+-		defer outW.Close()
+-		defer errW.Close()
+-
+-		go copyUIOutput(o, outR)
+-		go copyUIOutput(o, errR)
+-
+-		remotePath := comm.ScriptPath()
+-
+-		if err := comm.UploadScript(remotePath, script); err != nil {
+-			return fmt.Errorf("Failed to upload script: %v", err)
+-		}
+-
+-		cmd = &remote.Cmd{
+-			Command: remotePath,
+-			Stdout:  outW,
+-			Stderr:  errW,
+-		}
+-		if err := comm.Start(cmd); err != nil {
+-			return fmt.Errorf("Error starting script: %v", err)
+-		}
+-
+-		if err := cmd.Wait(); err != nil {
+-			return err
+-		}
+-
+-		// Upload a blank follow up file in the same path to prevent residual
+-		// script contents from remaining on remote machine
+-		empty := bytes.NewReader([]byte(""))
+-		if err := comm.Upload(remotePath, empty); err != nil {
+-			// This feature is best-effort.
+-			log.Printf("[WARN] Failed to upload empty follow up script: %v", err)
+-		}
+-	}
+-
+-	return nil
+-}
+-
+-func copyUIOutput(o provisioners.UIOutput, r io.Reader) {
+-	lr := linereader.New(r)
+-	for line := range lr.Ch {
+-		o.Output(line)
+-	}
+-}
+diff --git a/internal/communicator/communicator.go b/internal/communicator/communicator.go
+index 6ea7196742..aa64f76c6e 100644
+--- a/internal/communicator/communicator.go
++++ b/internal/communicator/communicator.go
+@@ -4,6 +4,7 @@
+ package communicator
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"fmt"
+ 	"io"
+@@ -17,6 +18,7 @@ import (
+ 	"github.com/hashicorp/terraform/internal/communicator/ssh"
+ 	"github.com/hashicorp/terraform/internal/communicator/winrm"
+ 	"github.com/hashicorp/terraform/internal/provisioners"
++	"github.com/mitchellh/go-linereader"
+ 	"github.com/zclconf/go-cty/cty"
+ )
+ 
+@@ -171,3 +173,118 @@ func Retry(ctx context.Context, f func() error) error {
+ 	}
+ 	return nil
+ }
++
++// ScriptRunner copies and executes scripts through a communicator.
++type ScriptRunner struct {
++	Comm Communicator
++}
++
++// RunScripts uploads and executes the given scripts on the remote system.
++func (r *ScriptRunner) RunScripts(ctx context.Context, req provisioners.ProvisionResourceRequest, scripts []io.ReadCloser, schemaResp provisioners.GetSchemaResponse) error {
++	if r.Comm == nil {
++		return fmt.Errorf("missing communicator")
++	}
++
++	o := req.UIOutput
++	schema := schemaResp.Provisioner
++	if schema == nil {
++		return fmt.Errorf("missing remote-exec schema")
++	}
++	if schemaResp.Diagnostics.HasErrors() {
++		return schemaResp.Diagnostics.Err()
++	}
++
++	attrs := schema.Attributes
++	if req.Config != cty.NilVal && !req.Config.IsNull() && req.Config.Type().IsObjectType() {
++		cfgType := req.Config.Type()
++		if spec := attrs["inline"]; spec != nil && spec.Optional && spec.Type.IsListType() && cfgType.HasAttribute("inline") {
++			if inline := req.Config.GetAttr("inline"); !inline.IsNull() {
++				log.Printf("[DEBUG] remote-exec using inline commands")
++			}
++		}
++		if spec := attrs["script"]; spec != nil && spec.Optional && !spec.Type.IsListType() && cfgType.HasAttribute("script") {
++			if script := req.Config.GetAttr("script"); !script.IsNull() && script.AsString() != "" {
++				log.Printf("[DEBUG] remote-exec using script %s", script.AsString())
++			}
++		}
++		if spec := attrs["scripts"]; spec != nil && spec.Optional && spec.Type.IsListType() && cfgType.HasAttribute("scripts") {
++			if scriptList := req.Config.GetAttr("scripts"); !scriptList.IsNull() {
++				log.Printf("[DEBUG] remote-exec using %d scripts", scriptList.LengthInt())
++			}
++		}
++		if marks := schema.ValueMarks(req.Config, nil); len(marks) > 0 {
++			log.Printf("[DEBUG] remote-exec configuration contains %d marked values", len(marks))
++		}
++	}
++	if schema.BlockTypes != nil && len(schema.BlockTypes) > 0 {
++		log.Printf("[DEBUG] remote-exec schema defines %d nested block types", len(schema.BlockTypes))
++	}
++
++	retryCtx, cancel := context.WithTimeout(ctx, r.Comm.Timeout())
++	defer cancel()
++
++	// Wait and retry until we establish the connection
++	err := Retry(retryCtx, func() error {
++		return r.Comm.Connect(o)
++	})
++	if err != nil {
++		return err
++	}
++
++	// Wait for the context to end and then disconnect
++	go func() {
++		<-ctx.Done()
++		r.Comm.Disconnect()
++	}()
++
++	for _, script := range scripts {
++		var cmd *remote.Cmd
++
++		outR, outW := io.Pipe()
++		errR, errW := io.Pipe()
++		defer outW.Close()
++		defer errW.Close()
++
++		go copyUIOutput(o, outR)
++		go copyUIOutput(o, errR)
++
++		remotePath := r.Comm.ScriptPath()
++
++		if err := r.Comm.UploadScript(remotePath, script); err != nil {
++			return fmt.Errorf("Failed to upload script: %v", err)
++		}
++
++		cmd = &remote.Cmd{
++			Command: remotePath,
++			Stdout:  outW,
++			Stderr:  errW,
++		}
++		if err := r.Comm.Start(cmd); err != nil {
++			return fmt.Errorf("Error starting script: %v", err)
++		}
++
++		if err := cmd.Wait(); err != nil {
++			if exitErr, ok := err.(*remote.ExitError); ok {
++				log.Printf("[ERROR] remote command %q failed with status %d: %v", cmd.Command, exitErr.ExitStatus, exitErr.Err)
++			}
++			return err
++		}
++
++		// Upload a blank follow up file in the same path to prevent residual
++		// script contents from remaining on remote machine
++		empty := bytes.NewReader([]byte(""))
++		if err := r.Comm.Upload(remotePath, empty); err != nil {
++			// This feature is best-effort.
++			log.Printf("[WARN] Failed to upload empty follow up script: %v", err)
++		}
++	}
++
++	return nil
++}
++
++func copyUIOutput(o provisioners.UIOutput, r io.Reader) {
++	lr := linereader.New(r)
++	for line := range lr.Ch {
++		o.Output(line)
++	}
++}

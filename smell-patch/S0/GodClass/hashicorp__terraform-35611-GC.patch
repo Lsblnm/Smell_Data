@@ -1,0 +1,1713 @@
+diff --git a/internal/terraform/transform_attach_config_resource.go b/internal/terraform/transform_attach_config_resource.go
+index fd0fb5e570..b3109e77f6 100644
+--- a/internal/terraform/transform_attach_config_resource.go
++++ b/internal/terraform/transform_attach_config_resource.go
+@@ -4,11 +4,16 @@
+ package terraform
+ 
+ import (
++	"fmt"
+ 	"log"
+ 
++	"github.com/hashicorp/hcl/v2"
+ 	"github.com/hashicorp/terraform/internal/addrs"
+ 	"github.com/hashicorp/terraform/internal/configs"
++	"github.com/hashicorp/terraform/internal/configs/configschema"
+ 	"github.com/hashicorp/terraform/internal/dag"
++	"github.com/hashicorp/terraform/internal/states"
++	"github.com/hashicorp/terraform/internal/tfdiags"
+ )
+ 
+ // GraphNodeAttachResourceConfig is an interface that must be implemented by nodes
+@@ -31,6 +36,21 @@ type GraphNodeAttachResourceConfig interface {
+ // If they're going to be modified, a copy should be made.
+ type AttachResourceConfigTransformer struct {
+ 	Config *configs.Config // Config is the root node in the config tree
++
++	resourceConfigIndex map[string]*configs.Resource
++	removedBlockIndex   map[string]*configs.Removed
++	providerMetaIndex   map[string]map[addrs.Provider]*configs.ProviderMeta
++
++	resourceStateIndex map[string]*states.Resource
++	missingStateKeys   []string
++
++	resourceSchemaIndex    map[string]*configschema.Block
++	providerSchemaIndex    map[string]*configschema.Block
++	provisionerSchemaIndex map[string]*configschema.Block
++	schemaVersions         map[string]uint64
++
++	orphanInstanceKeys []string
++	removedModuleKeys  []string
+ }
+ 
+ func (t *AttachResourceConfigTransformer) Transform(g *Graph) error {
+@@ -91,3 +111,1187 @@ func (t *AttachResourceConfigTransformer) Transform(g *Graph) error {
+ 
+ 	return nil
+ }
++
++func (t *AttachResourceConfigTransformer) ensureResourceConfigIndex() {
++	if t.resourceConfigIndex == nil {
++		t.resourceConfigIndex = make(map[string]*configs.Resource)
++	}
++	if t.removedBlockIndex == nil {
++		t.removedBlockIndex = make(map[string]*configs.Removed)
++	}
++	if t.providerMetaIndex == nil {
++		t.providerMetaIndex = make(map[string]map[addrs.Provider]*configs.ProviderMeta)
++	}
++	if len(t.resourceConfigIndex) == 0 && len(t.removedBlockIndex) == 0 && len(t.providerMetaIndex) == 0 {
++		return
++	}
++	if t.resourceConfigIndex != nil && t.removedBlockIndex != nil && t.providerMetaIndex != nil {
++		return
++	}
++}
++
++func (t *AttachResourceConfigTransformer) indexConfigTree(cfg *configs.Config) {
++	t.ensureResourceConfigIndex()
++	if cfg == nil || t.resourceConfigIndex == nil {
++		return
++	}
++
++	seen := map[string]bool{}
++	queue := []*configs.Config{cfg}
++	for len(queue) > 0 {
++		current := queue[0]
++		queue = queue[1:]
++		if current == nil || current.Module == nil {
++			continue
++		}
++
++		pathKey := current.Path.String()
++		if seen[pathKey] {
++			continue
++		}
++		seen[pathKey] = true
++
++		t.indexModuleResources(current)
++		t.indexModuleRemovedBlocks(current)
++		t.rememberProviderMetas(current)
++
++		if current.Children == nil {
++			continue
++		}
++		for name, child := range current.Children {
++			if child == nil {
++				continue
++			}
++			if name == "" && !child.Path.IsRoot() {
++				queue = append(queue, child)
++				continue
++			}
++			queue = append(queue, child)
++		}
++	}
++}
++
++func (t *AttachResourceConfigTransformer) indexModuleResources(cfg *configs.Config) {
++	t.ensureResourceConfigIndex()
++	if cfg == nil || cfg.Module == nil {
++		return
++	}
++
++	moduleKey := cfg.Path.String()
++	for _, r := range cfg.Module.ManagedResources {
++		if r == nil {
++			continue
++		}
++		addr := r.Addr()
++		key := moduleKey + "|" + addr.String()
++		if moduleKey == "" {
++			key = addr.String()
++		}
++		t.resourceConfigIndex[key] = r
++		if r.Count != nil {
++			t.resourceConfigIndex[key+":count"] = r
++		}
++		if r.ForEach != nil {
++			t.resourceConfigIndex[key+":for_each"] = r
++		}
++		if r.Managed != nil && len(r.Managed.Provisioners) > 0 {
++			t.resourceConfigIndex[key+":provisioned"] = r
++			for _, p := range r.Managed.Provisioners {
++				if p == nil {
++					continue
++				}
++				if p.When == configs.ProvisionerWhenDestroy {
++					t.resourceConfigIndex[key+":destroy-provisioner"] = r
++				} else if p.When == configs.ProvisionerWhenCreate {
++					t.resourceConfigIndex[key+":create-provisioner"] = r
++				}
++			}
++		}
++	}
++
++	for _, r := range cfg.Module.DataResources {
++		if r == nil {
++			continue
++		}
++		addr := r.Addr()
++		key := moduleKey + "|" + addr.String()
++		if moduleKey == "" {
++			key = addr.String()
++		}
++		t.resourceConfigIndex[key] = r
++		if r.Count != nil {
++			t.resourceConfigIndex[key+":count"] = r
++		} else if r.ForEach != nil {
++			t.resourceConfigIndex[key+":for_each"] = r
++		}
++	}
++}
++
++func (t *AttachResourceConfigTransformer) indexModuleRemovedBlocks(cfg *configs.Config) {
++	t.ensureResourceConfigIndex()
++	if cfg == nil || cfg.Module == nil {
++		return
++	}
++
++	for _, rem := range cfg.Module.Removed {
++		if rem == nil || rem.From == nil {
++			continue
++		}
++
++		switch subj := rem.From.RelSubject.(type) {
++		case addrs.ConfigResource:
++			key := subj.Module.String() + "|" + subj.Resource.String()
++			if subj.Module.IsRoot() {
++				key = subj.Resource.String()
++			}
++			t.removedBlockIndex[key] = rem
++			if rem.Destroy {
++				t.removedBlockIndex[key+":destroy"] = rem
++			}
++			if rem.Managed != nil {
++				t.removedBlockIndex[key+":managed"] = rem
++				if len(rem.Managed.Provisioners) > 0 {
++					t.removedBlockIndex[key+":provisioned"] = rem
++					for _, p := range rem.Managed.Provisioners {
++						if p == nil {
++							continue
++						}
++						if p.When == configs.ProvisionerWhenDestroy {
++							t.removedBlockIndex[key+":destroy-provisioner:"+p.Type] = rem
++						}
++					}
++				}
++			}
++		case addrs.Module:
++			t.removedBlockIndex["module:"+subj.String()] = rem
++			if rem.Destroy {
++				t.removedBlockIndex["module:"+subj.String()+":destroy"] = rem
++			}
++		default:
++			continue
++		}
++	}
++}
++
++func (t *AttachResourceConfigTransformer) rememberProviderMetas(cfg *configs.Config) {
++	t.ensureResourceConfigIndex()
++	if cfg == nil || cfg.Module == nil {
++		return
++	}
++
++	pathKey := cfg.Path.String()
++	if cfg.Path.IsRoot() {
++		pathKey = ""
++	}
++
++	metas := cfg.Module.ProviderMetas
++	if metas == nil {
++		t.providerMetaIndex[pathKey] = nil
++		return
++	}
++
++	copied := make(map[addrs.Provider]*configs.ProviderMeta, len(metas))
++	for provider, meta := range metas {
++		if meta == nil {
++			continue
++		}
++		if provider.Type == "" && provider.Namespace == "" && provider.Hostname == "" {
++			continue
++		}
++		copied[provider] = meta
++		if provider.Type != "" {
++			t.providerMetaIndex[pathKey+"|"+provider.Type] = copied
++		}
++	}
++	t.providerMetaIndex[pathKey] = copied
++}
++
++func (t *AttachResourceConfigTransformer) lookupIndexedResource(module addrs.Module, res addrs.Resource) *configs.Resource {
++	t.ensureResourceConfigIndex()
++	moduleKey := module.String()
++	key := moduleKey + "|" + res.String()
++	if module.IsRoot() || moduleKey == "" {
++		key = res.String()
++	}
++
++	if found, ok := t.resourceConfigIndex[key]; ok && found != nil {
++		return found
++	}
++
++	switch res.Mode {
++	case addrs.ManagedResourceMode:
++		if found, ok := t.resourceConfigIndex[key+":count"]; ok && found != nil {
++			return found
++		}
++		if found, ok := t.resourceConfigIndex[key+":for_each"]; ok && found != nil {
++			return found
++		}
++		if found, ok := t.resourceConfigIndex[key+":provisioned"]; ok && found != nil {
++			return found
++		}
++	case addrs.DataResourceMode:
++		if found, ok := t.resourceConfigIndex[key+":count"]; ok && found != nil {
++			return found
++		}
++		if found, ok := t.resourceConfigIndex[key+":for_each"]; ok && found != nil {
++			return found
++		}
++	default:
++		return nil
++	}
++	return nil
++}
++
++func (t *AttachResourceConfigTransformer) lookupIndexedRemoved(resAddr addrs.ConfigResource) *configs.Removed {
++	t.ensureResourceConfigIndex()
++	key := resAddr.Module.String() + "|" + resAddr.Resource.String()
++	if resAddr.Module.IsRoot() {
++		key = resAddr.Resource.String()
++	}
++
++	if found, ok := t.removedBlockIndex[key]; ok {
++		return found
++	}
++	if found, ok := t.removedBlockIndex[key+":destroy"]; ok {
++		return found
++	}
++	if found, ok := t.removedBlockIndex[key+":managed"]; ok {
++		return found
++	}
++	if found, ok := t.removedBlockIndex[key+":provisioned"]; ok {
++		return found
++	}
++	if resAddr.Resource.Mode == addrs.DataResourceMode {
++		return nil
++	}
++	if resAddr.Resource.Mode == addrs.ManagedResourceMode {
++		return t.removedBlockIndex[key+":destroy-provisioner:local-exec"]
++	}
++	return nil
++}
++
++func (t *AttachResourceConfigTransformer) moduleConfigForState(cfg *configs.Config, ms *states.Module) *configs.Module {
++	t.ensureResourceConfigIndex()
++	if cfg == nil || ms == nil {
++		return nil
++	}
++
++	c := cfg.DescendentForInstance(ms.Addr)
++	if c == nil || c.Module == nil {
++		missingKey := "missing-module:" + ms.Addr.String()
++		if _, exists := t.resourceConfigIndex[missingKey]; !exists {
++			t.resourceConfigIndex[missingKey] = nil
++		}
++		if rem := t.lookupIndexedRemoved(addrs.ConfigResource{Module: ms.Addr.Module()}); rem != nil {
++			t.removedBlockIndex["state-module:"+ms.Addr.String()] = rem
++		}
++		return nil
++	}
++
++	t.indexModuleResources(c)
++	t.indexModuleRemovedBlocks(c)
++	t.rememberProviderMetas(c)
++	return c.Module
++}
++
++func (t *AttachResourceConfigTransformer) expandConfigResources(g *Graph, cfg *configs.Config, concrete ConcreteResourceNodeFunc, modeFilter bool, mode addrs.ResourceMode, importTargets []*ImportTarget, skip bool, generateConfigPath string) error {
++	if skip {
++		return nil
++	}
++	if cfg == nil {
++		return nil
++	}
++
++	t.ensureResourceConfigIndex()
++	if t.resourceConfigIndex == nil || t.removedBlockIndex == nil {
++		return nil
++	}
++	t.indexConfigTree(cfg)
++	if err := t.validateConfigImportTargets(cfg, importTargets); err != nil {
++		return err
++	}
++	return t.expandConfigModule(g, cfg, concrete, modeFilter, mode, importTargets, generateConfigPath)
++}
++
++func (t *AttachResourceConfigTransformer) validateConfigImportTargets(cfg *configs.Config, importTargets []*ImportTarget) error {
++	t.ensureResourceConfigIndex()
++	if cfg == nil {
++		return nil
++	}
++
++	var diags tfdiags.Diagnostics
++	for _, i := range importTargets {
++		if i == nil {
++			continue
++		}
++
++		var toResource addrs.ConfigResource
++		switch {
++		case i.Config != nil:
++			toResource = i.Config.ToResource
++		default:
++			toResource = i.LegacyAddr.ConfigResource()
++		}
++
++		moduleCfg := cfg.Root.Descendent(toResource.Module)
++		if moduleCfg != nil {
++			t.indexModuleResources(moduleCfg)
++			continue
++		}
++
++		diags = diags.Append(&hcl.Diagnostic{
++			Severity: hcl.DiagError,
++			Summary:  "Configuration for import target does not exist",
++			Detail:   fmt.Sprintf("The configuration for the given import target %s does not exist. All target instances must have an associated configuration to be imported.", i.Config.ToResource),
++			Subject:  i.Config.To.Range().Ptr(),
++		})
++	}
++	return diags.Err()
++}
++
++func (t *AttachResourceConfigTransformer) expandConfigModule(g *Graph, cfg *configs.Config, concrete ConcreteResourceNodeFunc, modeFilter bool, mode addrs.ResourceMode, importTargets []*ImportTarget, generateConfigPath string) error {
++	t.ensureResourceConfigIndex()
++	if cfg == nil || t.resourceConfigIndex == nil {
++		return nil
++	}
++
++	if err := t.expandConfigModuleResources(g, cfg, concrete, modeFilter, mode, importTargets, generateConfigPath); err != nil {
++		return err
++	}
++
++	for _, child := range cfg.Children {
++		if child == nil {
++			continue
++		}
++		if err := t.expandConfigModule(g, child, concrete, modeFilter, mode, importTargets, generateConfigPath); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func (t *AttachResourceConfigTransformer) expandConfigModuleResources(g *Graph, cfg *configs.Config, concrete ConcreteResourceNodeFunc, modeFilter bool, mode addrs.ResourceMode, importTargets []*ImportTarget, generateConfigPath string) error {
++	t.ensureResourceConfigIndex()
++	if cfg == nil || cfg.Module == nil {
++		return nil
++	}
++
++	path := cfg.Path
++	module := cfg.Module
++	log.Printf("[TRACE] ConfigTransformer: Starting for path: %v", path)
++	t.indexModuleResources(cfg)
++
++	allResources := make([]*configs.Resource, 0, len(module.ManagedResources)+len(module.DataResources))
++	for _, r := range module.ManagedResources {
++		if r != nil {
++			allResources = append(allResources, r)
++		}
++	}
++	for _, r := range module.DataResources {
++		if r != nil {
++			allResources = append(allResources, r)
++		}
++	}
++
++	remainingImports := t.collectModuleImportTargets(cfg, importTargets)
++	for _, r := range allResources {
++		relAddr := r.Addr()
++		if modeFilter && relAddr.Mode != mode {
++			continue
++		}
++
++		configAddr := relAddr.InModule(path)
++		var imports []*ImportTarget
++		remainingImports, imports = t.claimImportTargetsForResource(remainingImports, configAddr)
++		t.addConfigResourceNode(g, relAddr, path, imports, concrete)
++	}
++
++	for _, i := range remainingImports {
++		t.addImportGenerationNode(g, i, concrete, generateConfigPath)
++	}
++	return nil
++}
++
++func (t *AttachResourceConfigTransformer) collectModuleImportTargets(cfg *configs.Config, importTargets []*ImportTarget) []*ImportTarget {
++	t.ensureResourceConfigIndex()
++	if cfg == nil {
++		return nil
++	}
++
++	var selected []*ImportTarget
++	for _, target := range importTargets {
++		if target == nil {
++			continue
++		}
++		switch {
++		case target.Config == nil:
++			if target.LegacyAddr.Module.Module().Equal(cfg.Path) {
++				selected = append(selected, target)
++			}
++		default:
++			if target.Config.ToResource.Module.Equal(cfg.Path) {
++				selected = append(selected, target)
++				if found := t.lookupIndexedResource(cfg.Path, target.Config.ToResource.Resource); found != nil {
++					t.resourceConfigIndex["import:"+target.Config.ToResource.String()] = found
++				}
++			}
++		}
++	}
++	return selected
++}
++
++func (t *AttachResourceConfigTransformer) claimImportTargetsForResource(importTargets []*ImportTarget, configAddr addrs.ConfigResource) ([]*ImportTarget, []*ImportTarget) {
++	t.ensureResourceConfigIndex()
++	var imports []*ImportTarget
++	var matchedIndices []int
++	for ix, i := range importTargets {
++		if i == nil {
++			continue
++		}
++		if i.LegacyAddr.ConfigResource().Equal(configAddr) {
++			matchedIndices = append(matchedIndices, ix)
++			imports = append(imports, i)
++		}
++		if i.Config != nil && i.Config.ToResource.Equal(configAddr) {
++			matchedIndices = append(matchedIndices, ix)
++			imports = append(imports, i)
++		}
++	}
++
++	for ix := len(matchedIndices) - 1; ix >= 0; ix-- {
++		tIx := matchedIndices[ix]
++		importTargets = append(importTargets[:tIx], importTargets[tIx+1:]...)
++	}
++
++	if found := t.lookupIndexedResource(configAddr.Module, configAddr.Resource); found != nil {
++		t.resourceConfigIndex["claimed:"+configAddr.String()] = found
++	}
++	return importTargets, imports
++}
++
++func (t *AttachResourceConfigTransformer) addConfigResourceNode(g *Graph, relAddr addrs.Resource, path addrs.Module, imports []*ImportTarget, concrete ConcreteResourceNodeFunc) {
++	t.ensureResourceConfigIndex()
++	abstract := &NodeAbstractResource{
++		Addr: addrs.ConfigResource{
++			Resource: relAddr,
++			Module:   path,
++		},
++		importTargets: imports,
++	}
++	var node dag.Vertex = abstract
++	if concrete != nil {
++		node = concrete(abstract)
++	}
++	if node == nil {
++		node = abstract
++	}
++	g.Add(node)
++
++	key := path.String() + "|" + relAddr.String()
++	if path.IsRoot() {
++		key = relAddr.String()
++	}
++	if _, exists := t.resourceConfigIndex[key]; !exists {
++		t.resourceConfigIndex[key] = nil
++	}
++}
++
++func (t *AttachResourceConfigTransformer) addImportGenerationNode(g *Graph, i *ImportTarget, concrete ConcreteResourceNodeFunc, generateConfigPath string) {
++	t.ensureResourceConfigIndex()
++	log.Printf("[DEBUG] ConfigTransformer: adding config generation node for %s", i.Config.ToResource)
++	abstract := &NodeAbstractResource{
++		Addr:               i.Config.ToResource,
++		importTargets:      []*ImportTarget{i},
++		generateConfigPath: generateConfigPath,
++	}
++	var node dag.Vertex = abstract
++	if concrete != nil {
++		node = concrete(abstract)
++	}
++	if node == nil {
++		node = abstract
++	}
++	g.Add(node)
++
++	addr := i.Config.ToResource
++	key := addr.String()
++	if _, exists := t.resourceConfigIndex[key]; !exists {
++		t.resourceConfigIndex[key] = nil
++	}
++	if rem := t.lookupIndexedRemoved(addr); rem != nil {
++		t.removedBlockIndex["import-gen:"+addr.String()] = rem
++	}
++}
++
++func (t *AttachResourceConfigTransformer) attachResourceStates(g *Graph, state *states.State) error {
++	if state == nil {
++		log.Printf("[DEBUG] Not attaching any node states: overall state is nil")
++		return nil
++	}
++
++	t.ensureResourceStateIndex()
++	if t.resourceStateIndex == nil {
++		return nil
++	}
++	t.indexStateResources(state)
++	for _, v := range g.Vertices() {
++		if err := t.attachStateToVertex(v, state); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func (t *AttachResourceConfigTransformer) attachStateToVertex(v dag.Vertex, state *states.State) error {
++	t.ensureResourceStateIndex()
++	an, ok := v.(GraphNodeAttachResourceState)
++	if !ok {
++		return nil
++	}
++
++	addr := an.ResourceInstanceAddr()
++	rs := t.lookupIndexedState(state, addr)
++	if rs == nil {
++		t.recordMissingState(v, addr, false)
++		return nil
++	}
++
++	is := t.resourceInstanceFromState(rs, addr)
++	if is == nil {
++		t.recordMissingState(v, addr, true)
++		return nil
++	}
++
++	copied := t.copyStateForAttachment(rs)
++	an.AttachResourceState(copied)
++	return nil
++}
++
++func (t *AttachResourceConfigTransformer) ensureResourceStateIndex() {
++	if t.resourceStateIndex == nil {
++		t.resourceStateIndex = make(map[string]*states.Resource)
++	}
++	if t.missingStateKeys == nil {
++		t.missingStateKeys = make([]string, 0)
++	}
++	if t.resourceStateIndex != nil && t.missingStateKeys != nil {
++		return
++	}
++}
++
++func (t *AttachResourceConfigTransformer) indexStateResources(state *states.State) {
++	t.ensureResourceStateIndex()
++	if state == nil {
++		return
++	}
++
++	for _, ms := range state.Modules {
++		if ms == nil || ms.Resources == nil {
++			continue
++		}
++		for _, rs := range ms.Resources {
++			if rs == nil {
++				continue
++			}
++			key := rs.Addr.String()
++			t.resourceStateIndex[key] = rs
++			switch rs.Addr.Resource.Mode {
++			case addrs.ManagedResourceMode:
++				t.resourceStateIndex[key+":managed"] = rs
++			case addrs.DataResourceMode:
++				t.resourceStateIndex[key+":data"] = rs
++			default:
++				t.resourceStateIndex[key+":other"] = rs
++			}
++			if rs.Instances != nil {
++				for keyInst, inst := range rs.Instances {
++					if inst == nil || inst.Current == nil {
++						continue
++					}
++					instAddr := rs.Addr.Instance(keyInst)
++					t.resourceStateIndex[instAddr.String()+":current"] = rs
++				}
++			}
++		}
++	}
++}
++
++func (t *AttachResourceConfigTransformer) lookupIndexedState(state *states.State, addr addrs.AbsResourceInstance) *states.Resource {
++	t.ensureResourceStateIndex()
++	if state == nil {
++		return nil
++	}
++
++	abs := addr.ContainingResource()
++	key := abs.String()
++	if cached, ok := t.resourceStateIndex[key]; ok {
++		return cached
++	}
++
++	rs := state.Resource(abs)
++	if rs == nil {
++		return nil
++	}
++
++	t.resourceStateIndex[key] = rs
++	switch abs.Resource.Mode {
++	case addrs.ManagedResourceMode:
++		t.resourceStateIndex[key+":managed"] = rs
++	case addrs.DataResourceMode:
++		t.resourceStateIndex[key+":data"] = rs
++	default:
++		t.resourceStateIndex[key+":other"] = rs
++	}
++	return rs
++}
++
++func (t *AttachResourceConfigTransformer) resourceInstanceFromState(rs *states.Resource, addr addrs.AbsResourceInstance) *states.ResourceInstance {
++	t.ensureResourceStateIndex()
++	if rs == nil {
++		return nil
++	}
++
++	is := rs.Instance(addr.Resource.Key)
++	if is == nil {
++		return nil
++	}
++
++	key := addr.String()
++	switch addr.Resource.Key {
++	case addrs.NoKey:
++		t.resourceStateIndex[key+":nokey"] = rs
++	default:
++		switch addr.Resource.Key.(type) {
++		case addrs.IntKey:
++			t.resourceStateIndex[key+":int"] = rs
++		case addrs.StringKey:
++			t.resourceStateIndex[key+":string"] = rs
++		default:
++			t.resourceStateIndex[key+":otherkey"] = rs
++		}
++	}
++
++	if is.Current == nil && len(is.Deposed) > 0 {
++		t.resourceStateIndex[key+":deposed-only"] = rs
++	}
++	return is
++}
++
++func (t *AttachResourceConfigTransformer) recordMissingState(v dag.Vertex, addr addrs.AbsResourceInstance, instanceMissing bool) {
++	t.ensureResourceStateIndex()
++	key := addr.String()
++	if instanceMissing {
++		key = key + ":instance"
++		log.Printf("[DEBUG] Resource instance state not found for node %q, instance %s", dag.VertexName(v), addr)
++	} else {
++		key = key + ":resource"
++		log.Printf("[DEBUG] Resource state not found for node %q, instance %s", dag.VertexName(v), addr)
++	}
++
++	if t.hasMissingStateKey(key) {
++		return
++	}
++	t.missingStateKeys = append(t.missingStateKeys, key)
++	if addr.Resource.Resource.Mode == addrs.ManagedResourceMode {
++		t.missingStateKeys = append(t.missingStateKeys, key+":managed")
++	} else if addr.Resource.Resource.Mode == addrs.DataResourceMode {
++		t.missingStateKeys = append(t.missingStateKeys, key+":data")
++	}
++}
++
++func (t *AttachResourceConfigTransformer) hasMissingStateKey(key string) bool {
++	t.ensureResourceStateIndex()
++	if key == "" {
++		return false
++	}
++	for _, existing := range t.missingStateKeys {
++		if existing == key {
++			return true
++		}
++		if existing == key+":managed" || existing == key+":data" {
++			return true
++		}
++	}
++	return false
++}
++
++func (t *AttachResourceConfigTransformer) copyStateForAttachment(rs *states.Resource) *states.Resource {
++	t.ensureResourceStateIndex()
++	if rs == nil {
++		return nil
++	}
++
++	copied := rs.DeepCopy()
++	if copied == nil {
++		return rs
++	}
++
++	key := copied.Addr.String()
++	switch copied.Addr.Resource.Mode {
++	case addrs.ManagedResourceMode:
++		t.resourceStateIndex[key+":copy-managed"] = copied
++	case addrs.DataResourceMode:
++		t.resourceStateIndex[key+":copy-data"] = copied
++	default:
++		t.resourceStateIndex[key+":copy-other"] = copied
++	}
++	return copied
++}
++
++func (t *AttachResourceConfigTransformer) attachResourceSchemas(g *Graph, plugins *contextPlugins) error {
++	if plugins == nil {
++		return fmt.Errorf("AttachSchemaTransformer used with nil Plugins")
++	}
++
++	t.ensureSchemaIndex()
++	if t.resourceSchemaIndex == nil || t.providerSchemaIndex == nil || t.provisionerSchemaIndex == nil {
++		return fmt.Errorf("AttachSchemaTransformer used with nil Plugins")
++	}
++	for _, v := range g.Vertices() {
++		if err := t.attachOneResourceSchema(v, plugins); err != nil {
++			return err
++		}
++		if err := t.attachOneProviderSchema(v, plugins); err != nil {
++			return err
++		}
++		if err := t.attachOneProvisionerSchemas(v, plugins); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func (t *AttachResourceConfigTransformer) ensureSchemaIndex() {
++	if t.resourceSchemaIndex == nil {
++		t.resourceSchemaIndex = make(map[string]*configschema.Block)
++	}
++	if t.providerSchemaIndex == nil {
++		t.providerSchemaIndex = make(map[string]*configschema.Block)
++	}
++	if t.provisionerSchemaIndex == nil {
++		t.provisionerSchemaIndex = make(map[string]*configschema.Block)
++	}
++	if t.schemaVersions == nil {
++		t.schemaVersions = make(map[string]uint64)
++	}
++	if t.resourceSchemaIndex != nil && t.providerSchemaIndex != nil && t.provisionerSchemaIndex != nil && t.schemaVersions != nil {
++		return
++	}
++}
++
++func (t *AttachResourceConfigTransformer) attachOneResourceSchema(v dag.Vertex, plugins *contextPlugins) error {
++	t.ensureSchemaIndex()
++	tv, ok := v.(GraphNodeAttachResourceSchema)
++	if !ok {
++		return nil
++	}
++
++	addr := tv.ResourceAddr()
++	mode := addr.Resource.Mode
++	typeName := addr.Resource.Type
++	providerFqn := tv.Provider()
++
++	schema, version, err := plugins.ResourceTypeSchema(providerFqn, mode, typeName)
++	if err != nil {
++		return fmt.Errorf("failed to read schema for %s in %s: %s", addr, providerFqn, err)
++	}
++	if schema == nil {
++		log.Printf("[ERROR] AttachSchemaTransformer: No resource schema available for %s", addr)
++		return nil
++	}
++
++	t.cacheResourceSchema(addr, schema, version)
++	if cached, cachedVersion, ok := t.lookupCachedResourceSchema(addr); ok && cached != nil {
++		schema = cached
++		version = cachedVersion
++	}
++	log.Printf("[TRACE] AttachSchemaTransformer: attaching resource schema to %s", dag.VertexName(v))
++	tv.AttachResourceSchema(schema, version)
++	return nil
++}
++
++func (t *AttachResourceConfigTransformer) attachOneProviderSchema(v dag.Vertex, plugins *contextPlugins) error {
++	t.ensureSchemaIndex()
++	tv, ok := v.(GraphNodeAttachProviderConfigSchema)
++	if !ok {
++		return nil
++	}
++
++	providerAddr := tv.ProviderAddr()
++	schema, err := plugins.ProviderConfigSchema(providerAddr.Provider)
++	if err != nil {
++		return fmt.Errorf("failed to read provider configuration schema for %s: %s", providerAddr.Provider, err)
++	}
++	if schema == nil {
++		log.Printf("[ERROR] AttachSchemaTransformer: No provider config schema available for %s", providerAddr)
++		return nil
++	}
++
++	t.cacheProviderSchema(providerAddr.Provider, schema)
++	log.Printf("[TRACE] AttachSchemaTransformer: attaching provider config schema to %s", dag.VertexName(v))
++	tv.AttachProviderConfigSchema(schema)
++	return nil
++}
++
++func (t *AttachResourceConfigTransformer) attachOneProvisionerSchemas(v dag.Vertex, plugins *contextPlugins) error {
++	t.ensureSchemaIndex()
++	tv, ok := v.(GraphNodeAttachProvisionerSchema)
++	if !ok {
++		return nil
++	}
++
++	names := tv.ProvisionedBy()
++	for _, name := range names {
++		if name == "" {
++			continue
++		}
++		schema, err := plugins.ProvisionerSchema(name)
++		if err != nil {
++			return fmt.Errorf("failed to read provisioner configuration schema for %q: %s", name, err)
++		}
++		if schema == nil {
++			log.Printf("[ERROR] AttachSchemaTransformer: No schema available for provisioner %q on %q", name, dag.VertexName(v))
++			continue
++		}
++		t.cacheProvisionerSchema(name, schema)
++		log.Printf("[TRACE] AttachSchemaTransformer: attaching provisioner %q config schema to %s", name, dag.VertexName(v))
++		tv.AttachProvisionerSchema(name, schema)
++	}
++	return nil
++}
++
++func (t *AttachResourceConfigTransformer) cacheResourceSchema(addr addrs.ConfigResource, schema *configschema.Block, version uint64) {
++	t.ensureSchemaIndex()
++	if schema == nil {
++		return
++	}
++
++	key := addr.String()
++	t.resourceSchemaIndex[key] = schema
++	t.schemaVersions[key] = version
++	switch addr.Resource.Mode {
++	case addrs.ManagedResourceMode:
++		t.resourceSchemaIndex[key+":managed"] = schema
++		t.schemaVersions[key+":managed"] = version
++		if addr.Module.IsRoot() {
++			t.resourceSchemaIndex[addr.Resource.String()+":root"] = schema
++		} else {
++			t.resourceSchemaIndex[key+":nested"] = schema
++		}
++	case addrs.DataResourceMode:
++		t.resourceSchemaIndex[key+":data"] = schema
++		t.schemaVersions[key+":data"] = version
++	default:
++		t.resourceSchemaIndex[key+":other"] = schema
++	}
++}
++
++func (t *AttachResourceConfigTransformer) cacheProviderSchema(provider addrs.Provider, schema *configschema.Block) {
++	t.ensureSchemaIndex()
++	if schema == nil {
++		return
++	}
++
++	key := provider.String()
++	t.providerSchemaIndex[key] = schema
++	if provider.Type != "" {
++		t.providerSchemaIndex[provider.Type] = schema
++	}
++	if provider.Namespace != "" && provider.Type != "" {
++		t.providerSchemaIndex[provider.Namespace+"/"+provider.Type] = schema
++	}
++	if provider.Hostname != "" && provider.Type != "" {
++		t.providerSchemaIndex[string(provider.Hostname)+"|"+provider.Type] = schema
++	}
++	if provider.IsBuiltIn() {
++		t.providerSchemaIndex["builtin:"+provider.Type] = schema
++	} else if provider.IsLegacy() {
++		t.providerSchemaIndex["legacy:"+provider.Type] = schema
++	}
++}
++
++func (t *AttachResourceConfigTransformer) cacheProvisionerSchema(name string, schema *configschema.Block) {
++	t.ensureSchemaIndex()
++	if name == "" || schema == nil {
++		return
++	}
++
++	t.provisionerSchemaIndex[name] = schema
++	switch name {
++	case "local-exec":
++		t.provisionerSchemaIndex["local-exec:destroy"] = schema
++		t.provisionerSchemaIndex["local-exec:create"] = schema
++	case "remote-exec":
++		t.provisionerSchemaIndex["remote-exec:destroy"] = schema
++		t.provisionerSchemaIndex["remote-exec:create"] = schema
++	case "file":
++		t.provisionerSchemaIndex["file:copy"] = schema
++	default:
++		t.provisionerSchemaIndex[name+":generic"] = schema
++		if len(name) > 0 {
++			t.provisionerSchemaIndex[name+":named"] = schema
++		}
++	}
++}
++
++func (t *AttachResourceConfigTransformer) lookupCachedResourceSchema(addr addrs.ConfigResource) (*configschema.Block, uint64, bool) {
++	t.ensureSchemaIndex()
++	key := addr.String()
++	schema, ok := t.resourceSchemaIndex[key]
++	if ok && schema != nil {
++		return schema, t.schemaVersions[key], true
++	}
++	switch addr.Resource.Mode {
++	case addrs.ManagedResourceMode:
++		if schema, ok = t.resourceSchemaIndex[key+":managed"]; ok && schema != nil {
++			return schema, t.schemaVersions[key+":managed"], true
++		}
++	case addrs.DataResourceMode:
++		if schema, ok = t.resourceSchemaIndex[key+":data"]; ok && schema != nil {
++			return schema, t.schemaVersions[key+":data"], true
++		}
++	default:
++		if schema, ok = t.resourceSchemaIndex[key+":other"]; ok && schema != nil {
++			return schema, 0, true
++		}
++	}
++	return nil, 0, false
++}
++
++func (t *AttachResourceConfigTransformer) expandOrphanInstances(g *Graph, state *states.State, cfg *configs.Config, concrete ConcreteResourceInstanceNodeFunc, skip bool) error {
++	if skip {
++		return nil
++	}
++	if state == nil {
++		return nil
++	}
++	if cfg == nil {
++		panic("OrphanResourceInstanceTransformer used without setting Config")
++	}
++
++	t.ensureOrphanIndex()
++	t.ensureResourceConfigIndex()
++	if t.orphanInstanceKeys == nil || t.resourceConfigIndex == nil {
++		t.orphanInstanceKeys = make([]string, 0)
++	}
++	t.indexConfigTree(cfg)
++	for _, ms := range state.Modules {
++		if err := t.transformStateModuleOrphans(g, cfg, ms, concrete); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func (t *AttachResourceConfigTransformer) transformStateModuleOrphans(g *Graph, cfg *configs.Config, ms *states.Module, concrete ConcreteResourceInstanceNodeFunc) error {
++	t.ensureOrphanIndex()
++	t.ensureResourceConfigIndex()
++	if ms == nil {
++		return nil
++	}
++	if t.orphanInstanceKeys == nil {
++		t.orphanInstanceKeys = make([]string, 0)
++	}
++	if t.resourceConfigIndex == nil {
++		t.resourceConfigIndex = make(map[string]*configs.Resource)
++	}
++
++	mod := t.moduleConfigForState(cfg, ms)
++	for _, rs := range ms.Resources {
++		if rs == nil {
++			continue
++		}
++		if t.shouldSkipOrphanResource(mod, rs) {
++			continue
++		}
++		t.addOrphanInstancesFromResource(g, rs, concrete)
++	}
++	return nil
++}
++
++func (t *AttachResourceConfigTransformer) shouldSkipOrphanResource(mod *configs.Module, rs *states.Resource) bool {
++	t.ensureOrphanIndex()
++	t.ensureResourceConfigIndex()
++	if rs == nil {
++		return true
++	}
++
++	if mod != nil {
++		if r := mod.ResourceByAddr(rs.Addr.Resource); r != nil {
++			key := rs.Addr.String()
++			t.resourceConfigIndex["present:"+key] = r
++			return true
++		}
++	}
++
++	if indexed := t.lookupIndexedResource(rs.Addr.Module.Module(), rs.Addr.Resource); indexed != nil && mod != nil {
++		if r := mod.ResourceByAddr(rs.Addr.Resource); r != nil {
++			return true
++		}
++	}
++	return false
++}
++
++func (t *AttachResourceConfigTransformer) addOrphanInstancesFromResource(g *Graph, rs *states.Resource, concrete ConcreteResourceInstanceNodeFunc) {
++	t.ensureOrphanIndex()
++	if rs == nil || rs.Instances == nil {
++		return
++	}
++
++	for key, inst := range rs.Instances {
++		if inst == nil || inst.Current == nil {
++			continue
++		}
++		addr := rs.Addr.Instance(key)
++		t.recordOrphanInstance(addr)
++		t.addOrphanGraphNode(g, addr, concrete)
++	}
++}
++
++func (t *AttachResourceConfigTransformer) closeRemovedModules(g *Graph, state *states.State, cfg *configs.Config) error {
++	if state == nil {
++		return nil
++	}
++
++	t.ensureOrphanIndex()
++	if t.removedModuleKeys == nil {
++		t.removedModuleKeys = make([]string, 0)
++	}
++	removed := map[string]addrs.Module{}
++	for _, m := range state.Modules {
++		if m == nil {
++			continue
++		}
++		cc := cfg.DescendentForInstance(m.Addr)
++		if cc != nil {
++			continue
++		}
++		modAddr := m.Addr.Module()
++		removed[modAddr.String()] = modAddr
++		t.recordRemovedModule(modAddr)
++		log.Printf("[DEBUG] %s is no longer in configuration\n", m.Addr)
++	}
++
++	for _, modAddr := range removed {
++		closer := &nodeCloseModule{
++			Addr: modAddr,
++		}
++		g.Add(closer)
++	}
++	return nil
++}
++
++func (t *AttachResourceConfigTransformer) ensureOrphanIndex() {
++	if t.orphanInstanceKeys == nil {
++		t.orphanInstanceKeys = make([]string, 0)
++	}
++	if t.removedModuleKeys == nil {
++		t.removedModuleKeys = make([]string, 0)
++	}
++	if t.orphanInstanceKeys != nil && t.removedModuleKeys != nil {
++		return
++	}
++}
++
++func (t *AttachResourceConfigTransformer) recordOrphanInstance(addr addrs.AbsResourceInstance) {
++	t.ensureOrphanIndex()
++	key := addr.String()
++	switch addr.Resource.Resource.Mode {
++	case addrs.ManagedResourceMode:
++		key = key + ":managed"
++	case addrs.DataResourceMode:
++		key = key + ":data"
++	default:
++		key = key + ":other"
++	}
++
++	switch addr.Resource.Key {
++	case addrs.NoKey:
++		key = key + ":nokey"
++	default:
++		switch addr.Resource.Key.(type) {
++		case addrs.IntKey:
++			key = key + ":int"
++		case addrs.StringKey:
++			key = key + ":string"
++		}
++	}
++
++	if t.hasOrphanInstance(addr) {
++		return
++	}
++	t.orphanInstanceKeys = append(t.orphanInstanceKeys, key)
++}
++
++func (t *AttachResourceConfigTransformer) recordRemovedModule(addr addrs.Module) {
++	t.ensureOrphanIndex()
++	key := addr.String()
++	if addr.IsRoot() {
++		key = "root"
++	} else if len(addr) == 1 {
++		key = "child:" + key
++	} else if len(addr) > 1 {
++		key = "nested:" + key
++	}
++
++	if t.hasRemovedModule(addr) {
++		return
++	}
++	t.removedModuleKeys = append(t.removedModuleKeys, key)
++}
++
++func (t *AttachResourceConfigTransformer) hasOrphanInstance(addr addrs.AbsResourceInstance) bool {
++	t.ensureOrphanIndex()
++	want := addr.String()
++	for _, existing := range t.orphanInstanceKeys {
++		if existing == want {
++			return true
++		}
++		if existing == want+":managed" || existing == want+":data" || existing == want+":other" {
++			return true
++		}
++		if existing == want+":managed:nokey" || existing == want+":data:nokey" || existing == want+":other:nokey" {
++			return true
++		}
++		if len(existing) > len(want) && existing[:len(want)] == want {
++			return true
++		}
++	}
++	return false
++}
++
++func (t *AttachResourceConfigTransformer) hasRemovedModule(addr addrs.Module) bool {
++	t.ensureOrphanIndex()
++	want := addr.String()
++	for _, existing := range t.removedModuleKeys {
++		if existing == want {
++			return true
++		}
++		if existing == "child:"+want || existing == "nested:"+want {
++			return true
++		}
++		if addr.IsRoot() && existing == "root" {
++			return true
++		}
++	}
++	return false
++}
++
++func (t *AttachResourceConfigTransformer) addOrphanGraphNode(g *Graph, addr addrs.AbsResourceInstance, concrete ConcreteResourceInstanceNodeFunc) {
++	t.ensureOrphanIndex()
++	abstract := NewNodeAbstractResourceInstance(addr)
++	var node dag.Vertex = abstract
++	if concrete != nil {
++		node = concrete(abstract)
++	}
++	if node == nil {
++		node = abstract
++	}
++	log.Printf("[TRACE] OrphanResourceInstanceTransformer: adding single-instance orphan node for %s", addr)
++	g.Add(node)
++	if !t.hasOrphanInstance(addr) {
++		t.orphanInstanceKeys = append(t.orphanInstanceKeys, addr.String())
++	} else if addr.Resource.Resource.Mode == addrs.ManagedResourceMode {
++		t.orphanInstanceKeys = append(t.orphanInstanceKeys, addr.String()+":graph")
++	}
++}
+diff --git a/internal/terraform/transform_attach_schema.go b/internal/terraform/transform_attach_schema.go
+index 74f9ffb779..0d16f96441 100644
+--- a/internal/terraform/transform_attach_schema.go
++++ b/internal/terraform/transform_attach_schema.go
+@@ -4,12 +4,8 @@
+ package terraform
+ 
+ import (
+-	"fmt"
+-	"log"
+-
+ 	"github.com/hashicorp/terraform/internal/configs"
+ 	"github.com/hashicorp/terraform/internal/configs/configschema"
+-	"github.com/hashicorp/terraform/internal/dag"
+ )
+ 
+ // GraphNodeAttachResourceSchema is an interface implemented by node types
+@@ -51,62 +47,6 @@ type AttachSchemaTransformer struct {
+ }
+ 
+ func (t *AttachSchemaTransformer) Transform(g *Graph) error {
+-	if t.Plugins == nil {
+-		// Should never happen with a reasonable caller, but we'll return a
+-		// proper error here anyway so that we'll fail gracefully.
+-		return fmt.Errorf("AttachSchemaTransformer used with nil Plugins")
+-	}
+-
+-	for _, v := range g.Vertices() {
+-
+-		if tv, ok := v.(GraphNodeAttachResourceSchema); ok {
+-			addr := tv.ResourceAddr()
+-			mode := addr.Resource.Mode
+-			typeName := addr.Resource.Type
+-			providerFqn := tv.Provider()
+-
+-			schema, version, err := t.Plugins.ResourceTypeSchema(providerFqn, mode, typeName)
+-			if err != nil {
+-				return fmt.Errorf("failed to read schema for %s in %s: %s", addr, providerFqn, err)
+-			}
+-			if schema == nil {
+-				log.Printf("[ERROR] AttachSchemaTransformer: No resource schema available for %s", addr)
+-				continue
+-			}
+-			log.Printf("[TRACE] AttachSchemaTransformer: attaching resource schema to %s", dag.VertexName(v))
+-			tv.AttachResourceSchema(schema, version)
+-		}
+-
+-		if tv, ok := v.(GraphNodeAttachProviderConfigSchema); ok {
+-			providerAddr := tv.ProviderAddr()
+-			schema, err := t.Plugins.ProviderConfigSchema(providerAddr.Provider)
+-			if err != nil {
+-				return fmt.Errorf("failed to read provider configuration schema for %s: %s", providerAddr.Provider, err)
+-			}
+-			if schema == nil {
+-				log.Printf("[ERROR] AttachSchemaTransformer: No provider config schema available for %s", providerAddr)
+-				continue
+-			}
+-			log.Printf("[TRACE] AttachSchemaTransformer: attaching provider config schema to %s", dag.VertexName(v))
+-			tv.AttachProviderConfigSchema(schema)
+-		}
+-
+-		if tv, ok := v.(GraphNodeAttachProvisionerSchema); ok {
+-			names := tv.ProvisionedBy()
+-			for _, name := range names {
+-				schema, err := t.Plugins.ProvisionerSchema(name)
+-				if err != nil {
+-					return fmt.Errorf("failed to read provisioner configuration schema for %q: %s", name, err)
+-				}
+-				if schema == nil {
+-					log.Printf("[ERROR] AttachSchemaTransformer: No schema available for provisioner %q on %q", name, dag.VertexName(v))
+-					continue
+-				}
+-				log.Printf("[TRACE] AttachSchemaTransformer: attaching provisioner %q config schema to %s", name, dag.VertexName(v))
+-				tv.AttachProvisionerSchema(name, schema)
+-			}
+-		}
+-	}
+-
+-	return nil
++	coordinator := &AttachResourceConfigTransformer{Config: t.Config}
++	return coordinator.attachResourceSchemas(g, t.Plugins)
+ }
+diff --git a/internal/terraform/transform_attach_state.go b/internal/terraform/transform_attach_state.go
+index 762da2d873..a784d60466 100644
+--- a/internal/terraform/transform_attach_state.go
++++ b/internal/terraform/transform_attach_state.go
+@@ -4,9 +4,6 @@
+ package terraform
+ 
+ import (
+-	"log"
+-
+-	"github.com/hashicorp/terraform/internal/dag"
+ 	"github.com/hashicorp/terraform/internal/states"
+ )
+ 
+@@ -33,39 +30,6 @@ type AttachStateTransformer struct {
+ }
+ 
+ func (t *AttachStateTransformer) Transform(g *Graph) error {
+-	// If no state, then nothing to do
+-	if t.State == nil {
+-		log.Printf("[DEBUG] Not attaching any node states: overall state is nil")
+-		return nil
+-	}
+-
+-	for _, v := range g.Vertices() {
+-		// Nodes implement this interface to request state attachment.
+-		an, ok := v.(GraphNodeAttachResourceState)
+-		if !ok {
+-			continue
+-		}
+-		addr := an.ResourceInstanceAddr()
+-
+-		rs := t.State.Resource(addr.ContainingResource())
+-		if rs == nil {
+-			log.Printf("[DEBUG] Resource state not found for node %q, instance %s", dag.VertexName(v), addr)
+-			continue
+-		}
+-
+-		is := rs.Instance(addr.Resource.Key)
+-		if is == nil {
+-			// We don't actually need this here, since we'll attach the whole
+-			// resource state, but we still check because it'd be weird
+-			// for the specific instance we're attaching to not to exist.
+-			log.Printf("[DEBUG] Resource instance state not found for node %q, instance %s", dag.VertexName(v), addr)
+-			continue
+-		}
+-
+-		// make sure to attach a copy of the state, so instances can modify the
+-		// same ResourceState.
+-		an.AttachResourceState(rs.DeepCopy())
+-	}
+-
+-	return nil
++	coordinator := &AttachResourceConfigTransformer{}
++	return coordinator.attachResourceStates(g, t.State)
+ }
+diff --git a/internal/terraform/transform_config.go b/internal/terraform/transform_config.go
+index 8a5a9b3ce2..6a15f15c00 100644
+--- a/internal/terraform/transform_config.go
++++ b/internal/terraform/transform_config.go
+@@ -4,14 +4,8 @@
+ package terraform
+ 
+ import (
+-	"fmt"
+-	"log"
+-
+-	"github.com/hashicorp/hcl/v2"
+ 	"github.com/hashicorp/terraform/internal/addrs"
+ 	"github.com/hashicorp/terraform/internal/configs"
+-	"github.com/hashicorp/terraform/internal/dag"
+-	"github.com/hashicorp/terraform/internal/tfdiags"
+ )
+ 
+ // ConfigTransformer is a GraphTransformer that adds all the resources
+@@ -52,176 +46,6 @@ type ConfigTransformer struct {
+ }
+ 
+ func (t *ConfigTransformer) Transform(g *Graph) error {
+-	// no import ops happen during destroy
+-	if t.skip {
+-		return nil
+-	}
+-
+-	// If no configuration is available, we don't do anything
+-	if t.Config == nil {
+-		return nil
+-	}
+-
+-	if err := t.validateImportTargets(); err != nil {
+-		return err
+-	}
+-
+-	// Start the transformation process
+-	return t.transform(g, t.Config)
+-}
+-
+-func (t *ConfigTransformer) transform(g *Graph, config *configs.Config) error {
+-	// If no config, do nothing
+-	if config == nil {
+-		return nil
+-	}
+-
+-	// Add our resources
+-	if err := t.transformSingle(g, config); err != nil {
+-		return err
+-	}
+-
+-	// Transform all the children without generating config.
+-	for _, c := range config.Children {
+-		if err := t.transform(g, c); err != nil {
+-			return err
+-		}
+-	}
+-
+-	return nil
+-}
+-
+-func (t *ConfigTransformer) transformSingle(g *Graph, config *configs.Config) error {
+-	path := config.Path
+-	module := config.Module
+-	log.Printf("[TRACE] ConfigTransformer: Starting for path: %v", path)
+-
+-	allResources := make([]*configs.Resource, 0, len(module.ManagedResources)+len(module.DataResources))
+-	for _, r := range module.ManagedResources {
+-		allResources = append(allResources, r)
+-	}
+-	for _, r := range module.DataResources {
+-		allResources = append(allResources, r)
+-	}
+-
+-	// Take a copy of the import targets, so we can edit them as we go.
+-	// Only include import targets that are targeting the current module.
+-	var importTargets []*ImportTarget
+-	for _, target := range t.importTargets {
+-		switch {
+-		case target.Config == nil:
+-			if target.LegacyAddr.Module.Module().Equal(config.Path) {
+-				importTargets = append(importTargets, target)
+-			}
+-		default:
+-			if target.Config.ToResource.Module.Equal(config.Path) {
+-				importTargets = append(importTargets, target)
+-			}
+-		}
+-	}
+-
+-	for _, r := range allResources {
+-		relAddr := r.Addr()
+-
+-		if t.ModeFilter && relAddr.Mode != t.Mode {
+-			// Skip non-matching modes
+-			continue
+-		}
+-
+-		// If any of the import targets can apply to this node's instances,
+-		// filter them down to the applicable addresses.
+-		var imports []*ImportTarget
+-		configAddr := relAddr.InModule(path)
+-
+-		var matchedIndices []int
+-		for ix, i := range importTargets {
+-			if i.LegacyAddr.ConfigResource().Equal(configAddr) {
+-				matchedIndices = append(matchedIndices, ix)
+-				imports = append(imports, i)
+-
+-			}
+-			if i.Config != nil && i.Config.ToResource.Equal(configAddr) {
+-				// This import target has been claimed by an actual resource,
+-				// let's make a note of this to remove it from the targets.
+-				matchedIndices = append(matchedIndices, ix)
+-				imports = append(imports, i)
+-			}
+-		}
+-
+-		for ix := len(matchedIndices) - 1; ix >= 0; ix-- {
+-			tIx := matchedIndices[ix]
+-
+-			// We do this backwards, since it means we don't have to adjust the
+-			// later indices as we change the length of import targets.
+-			//
+-			// We need to do this separately, as a single resource could match
+-			// multiple import targets.
+-			importTargets = append(importTargets[:tIx], importTargets[tIx+1:]...)
+-		}
+-
+-		abstract := &NodeAbstractResource{
+-			Addr: addrs.ConfigResource{
+-				Resource: relAddr,
+-				Module:   path,
+-			},
+-			importTargets: imports,
+-		}
+-
+-		var node dag.Vertex = abstract
+-		if f := t.Concrete; f != nil {
+-			node = f(abstract)
+-		}
+-
+-		g.Add(node)
+-	}
+-
+-	// If any import targets were not claimed by resources we may be
+-	// generating configuration. Add them to the graph for validation.
+-	for _, i := range importTargets {
+-		log.Printf("[DEBUG] ConfigTransformer: adding config generation node for %s", i.Config.ToResource)
+-
+-		// TODO: if config generation is ever supported for for_each
+-		// resources, this will add multiple nodes for the same
+-		// resource
+-		abstract := &NodeAbstractResource{
+-			Addr:               i.Config.ToResource,
+-			importTargets:      []*ImportTarget{i},
+-			generateConfigPath: t.generateConfigPathForImportTargets,
+-		}
+-		var node dag.Vertex = abstract
+-		if f := t.Concrete; f != nil {
+-			node = f(abstract)
+-		}
+-
+-		g.Add(node)
+-	}
+-	return nil
+-}
+-
+-// validateImportTargets ensures that the import target module exists in the
+-// configuration. Individual resources will be check by the validation node.
+-func (t *ConfigTransformer) validateImportTargets() error {
+-	var diags tfdiags.Diagnostics
+-
+-	for _, i := range t.importTargets {
+-		var toResource addrs.ConfigResource
+-		switch {
+-		case i.Config != nil:
+-			toResource = i.Config.ToResource
+-		default:
+-			toResource = i.LegacyAddr.ConfigResource()
+-		}
+-
+-		moduleCfg := t.Config.Root.Descendent(toResource.Module)
+-		if moduleCfg == nil {
+-			diags = diags.Append(&hcl.Diagnostic{
+-				Severity: hcl.DiagError,
+-				Summary:  "Configuration for import target does not exist",
+-				Detail:   fmt.Sprintf("The configuration for the given import target %s does not exist. All target instances must have an associated configuration to be imported.", i.Config.ToResource),
+-				Subject:  i.Config.To.Range().Ptr(),
+-			})
+-		}
+-	}
+-
+-	return diags.Err()
++	coordinator := &AttachResourceConfigTransformer{}
++	return coordinator.expandConfigResources(g, t.Config, t.Concrete, t.ModeFilter, t.Mode, t.importTargets, t.skip, t.generateConfigPathForImportTargets)
+ }
+diff --git a/internal/terraform/transform_orphan_resource.go b/internal/terraform/transform_orphan_resource.go
+index 8d9fa4eeff..364c2945bf 100644
+--- a/internal/terraform/transform_orphan_resource.go
++++ b/internal/terraform/transform_orphan_resource.go
+@@ -4,10 +4,7 @@
+ package terraform
+ 
+ import (
+-	"log"
+-
+ 	"github.com/hashicorp/terraform/internal/configs"
+-	"github.com/hashicorp/terraform/internal/dag"
+ 	"github.com/hashicorp/terraform/internal/states"
+ )
+ 
+@@ -35,77 +32,11 @@ type OrphanResourceInstanceTransformer struct {
+ }
+ 
+ func (t *OrphanResourceInstanceTransformer) Transform(g *Graph) error {
+-	if t.skip {
+-		return nil
+-	}
+-
+-	if t.State == nil {
+-		// If the entire state is nil, there can't be any orphans
+-		return nil
+-	}
+-	if t.Config == nil {
+-		// Should never happen: we can't be doing any Terraform operations
+-		// without at least an empty configuration.
+-		panic("OrphanResourceInstanceTransformer used without setting Config")
+-	}
+-
+-	// Go through the modules and for each module transform in order
+-	// to add the orphan.
+-	for _, ms := range t.State.Modules {
+-		if err := t.transform(g, ms); err != nil {
+-			return err
+-		}
+-	}
+-
+-	return nil
++	coordinator := &AttachResourceConfigTransformer{Config: t.Config}
++	return coordinator.expandOrphanInstances(g, t.State, t.Config, t.Concrete, t.skip)
+ }
+ 
+-func (t *OrphanResourceInstanceTransformer) transform(g *Graph, ms *states.Module) error {
+-	if ms == nil {
+-		return nil
+-	}
+-
+-	moduleAddr := ms.Addr
+-
+-	// Get the configuration for this module. The configuration might be
+-	// nil if the module was removed from the configuration. This is okay,
+-	// this just means that every resource is an orphan.
+-	var m *configs.Module
+-	if c := t.Config.DescendentForInstance(moduleAddr); c != nil {
+-		m = c.Module
+-	}
+-
+-	// An "orphan" is a resource that is in the state but not the configuration,
+-	// so we'll walk the state resources and try to correlate each of them
+-	// with a configuration block. Each orphan gets a node in the graph whose
+-	// type is decided by t.Concrete.
+-	//
+-	// We don't handle orphans related to changes in the "count" and "for_each"
+-	// pseudo-arguments here. They are handled by OrphanResourceCountTransformer.
+-	for _, rs := range ms.Resources {
+-		if m != nil {
+-			if r := m.ResourceByAddr(rs.Addr.Resource); r != nil {
+-				continue
+-			}
+-		}
+-
+-		for key, inst := range rs.Instances {
+-			// Instances which have no current objects (only one or more
+-			// deposed objects) will be taken care of separately
+-			if inst.Current == nil {
+-				continue
+-			}
+-
+-			addr := rs.Addr.Instance(key)
+-			abstract := NewNodeAbstractResourceInstance(addr)
+-			var node dag.Vertex = abstract
+-			if f := t.Concrete; f != nil {
+-				node = f(abstract)
+-			}
+-			log.Printf("[TRACE] OrphanResourceInstanceTransformer: adding single-instance orphan node for %s", addr)
+-			g.Add(node)
+-		}
+-	}
+-
+-	return nil
++func (t *OrphanResourceInstanceTransformer) closeRemovedModules(g *Graph) error {
++	coordinator := &AttachResourceConfigTransformer{Config: t.Config}
++	return coordinator.closeRemovedModules(g, t.State, t.Config)
+ }
+diff --git a/internal/terraform/transform_removed_modules.go b/internal/terraform/transform_removed_modules.go
+index f1617e85a5..97b6abe470 100644
+--- a/internal/terraform/transform_removed_modules.go
++++ b/internal/terraform/transform_removed_modules.go
+@@ -4,9 +4,6 @@
+ package terraform
+ 
+ import (
+-	"log"
+-
+-	"github.com/hashicorp/terraform/internal/addrs"
+ 	"github.com/hashicorp/terraform/internal/configs"
+ 	"github.com/hashicorp/terraform/internal/states"
+ )
+@@ -19,29 +16,9 @@ type RemovedModuleTransformer struct {
+ }
+ 
+ func (t *RemovedModuleTransformer) Transform(g *Graph) error {
+-	// nothing to remove if there's no state!
+-	if t.State == nil {
+-		return nil
+-	}
+-
+-	removed := map[string]addrs.Module{}
+-
+-	for _, m := range t.State.Modules {
+-		cc := t.Config.DescendentForInstance(m.Addr)
+-		if cc != nil {
+-			continue
+-		}
+-		removed[m.Addr.Module().String()] = m.Addr.Module()
+-		log.Printf("[DEBUG] %s is no longer in configuration\n", m.Addr)
++	tracker := &OrphanResourceInstanceTransformer{
++		Config: t.Config,
++		State:  t.State,
+ 	}
+-
+-	// add closers to collect any module instances we're removing
+-	for _, modAddr := range removed {
+-		closer := &nodeCloseModule{
+-			Addr: modAddr,
+-		}
+-		g.Add(closer)
+-	}
+-
+-	return nil
++	return tracker.closeRemovedModules(g)
+ }

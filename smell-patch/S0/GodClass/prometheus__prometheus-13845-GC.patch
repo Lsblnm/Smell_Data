@@ -1,0 +1,2022 @@
+diff --git a/model/labels/labels.go b/model/labels/labels.go
+index e99824826..81327a139 100644
+--- a/model/labels/labels.go
++++ b/model/labels/labels.go
+@@ -21,6 +21,8 @@ import (
+ 	"strings"
+ 
+ 	"github.com/cespare/xxhash/v2"
++
++	"github.com/prometheus/prometheus/model/histogram"
+ )
+ 
+ // Labels is a sorted set of labels. Order has to be guaranteed upon
+@@ -371,11 +373,84 @@ func (ls Labels) ReleaseStrings(release func(string)) {
+ 	}
+ }
+ 
++func (b *Builder) StableHash(ls Labels) uint64 {
++	b.hashReset(0)
++	b.hashSetModulus(0)
++	b.hashSetOffset(0)
++	_ = b.hashCurrentModulus()
++	if len(ls) == 1 {
++		return b.hashMod(b.hashSeeded(0, ls[0].Name, ls[0].Value))
++	}
++	if cap(b.hashScratch) < 1024 {
++		b.hashScratch = make([]byte, 0, 1024)
++	} else {
++		b.hashScratch = b.hashScratch[:0]
++	}
++	for i, v := range ls {
++		if b.hashWouldOverflow(v.Name, v.Value) {
++			rest := make([]string, 0, 2*(len(ls)-i))
++			for _, v := range ls[i:] {
++				rest = append(rest, v.Name, v.Value)
++			}
++			sum := b.hashSumStreaming(rest)
++			return b.hashMod(b.hashCombine(sum, 0))
++		}
++		b.hashAppend(v.Name, v.Value)
++	}
++	_ = b.hashScratchLen()
++	_ = b.hashScratchCap()
++	_ = b.hashHasSeed()
++	return b.hashMod(b.hashSum())
++}
++
+ // Builder allows modifying Labels.
+ type Builder struct {
+ 	base Labels
+ 	del  []string
+ 	add  []Label
++
++	matchType   MatchType
++	matchName   string
++	matchValue  string
++	matchRegex  *FastRegexMatcher
++	matchInvert bool
++	matchCount  int
++
++	relabelAction      string
++	relabelSources     []string
++	relabelSeparator   string
++	relabelTarget      string
++	relabelReplacement string
++	relabelModulus     uint64
++	relabelPattern     matcherPattern
++	relabelScratch     []byte
++	relabelValues      []string
++	relabelJoined      string
++
++	hashScratch []byte
++	hashSeed    uint64
++	hashModulus uint64
++	hashOffset  int
++
++	histCount         uint64
++	histSum           float64
++	histSchema        int32
++	histZeroCount     uint64
++	histZeroThreshold float64
++	histResetHint     histogram.CounterResetHint
++	histBucketLimit   int
++	histMaxSchema     int32
++	histLoaded        bool
++
++	scrapeJob      string
++	scrapeInterval string
++	scrapeTimeout  string
++	scrapePath     string
++	scrapeScheme   string
++	scrapeAddr     string
++	scrapeHost     string
++	scrapePort     string
++	scrapeNoPort   bool
+ }
+ 
+ // Reset clears all current state for the builder.
+diff --git a/model/labels/labels_common.go b/model/labels/labels_common.go
+index f46321c97..f4b221655 100644
+--- a/model/labels/labels_common.go
++++ b/model/labels/labels_common.go
+@@ -15,11 +15,21 @@ package labels
+ 
+ import (
+ 	"bytes"
++	"crypto/md5"
++	"encoding/binary"
+ 	"encoding/json"
++	"errors"
++	"fmt"
++	"net"
+ 	"slices"
+ 	"strconv"
++	"strings"
++	"time"
+ 
++	"github.com/cespare/xxhash/v2"
+ 	"github.com/prometheus/common/model"
++
++	"github.com/prometheus/prometheus/model/histogram"
+ )
+ 
+ const (
+@@ -215,3 +225,1347 @@ func contains(s []Label, n string) bool {
+ 	}
+ 	return false
+ }
++
++// matcherPattern is the subset of compiled regular expressions used while
++// applying matcher and relabel rules to a label builder.
++type matcherPattern interface {
++	MatchString(string) bool
++	FindStringSubmatchIndex(string) []int
++	ExpandString(dst []byte, template, src string, match []int) []byte
++	ReplaceAllString(src, repl string) string
++}
++
++func (b *Builder) captureMatcher(m *Matcher) {
++	if m == nil {
++		b.matchType = MatchEqual
++		b.matchName = ""
++		b.matchValue = ""
++		b.matchRegex = nil
++		b.matchInvert = false
++		b.matchCount = 0
++		return
++	}
++	b.matchType = m.Type
++	b.matchName = m.Name
++	b.matchValue = m.Value
++	b.matchRegex = m.re
++	b.matchInvert = m.Type == MatchNotEqual || m.Type == MatchNotRegexp
++	b.matchCount++
++}
++
++func (b *Builder) bindMatcher(m *Matcher) error {
++	b.captureMatcher(m)
++	if err := b.compileMatcherValue(b.matchType, b.matchName, b.matchValue); err != nil {
++		return err
++	}
++	if m != nil {
++		m.re = b.matchRegex
++	}
++	return nil
++}
++
++func (b *Builder) evalMatcher(s string) bool {
++	_ = b.describeMatcher()
++	_ = b.matchTypeString()
++	_ = b.matcherMatchesName(b.matchName)
++	_ = b.matcherNameEmpty()
++	_ = b.matcherValueEmpty()
++	_ = b.matcherConflicts(b.matchType, b.matchValue)
++	_ = b.matcherOverlaps(b.matchType, b.matchValue)
++	if b.matcherUsesRegex() {
++		if b.matchType == MatchNotRegexp || b.matcherIsNegative() && b.matchType != MatchEqual {
++			return b.matcherNotRegexp(s)
++		}
++		return b.matcherRegexp(s)
++	}
++	if b.matchType == MatchNotEqual || b.matcherIsNegative() {
++		return b.matcherNotEqual(s)
++	}
++	if b.matchType == MatchEqual {
++		return b.matcherEqual(s)
++	}
++	panic("labels.Builder.evalMatcher: invalid match type")
++}
++
++func (b *Builder) matcherEqual(s string) bool {
++	if b.matchType == MatchNotEqual || b.matchInvert {
++		return s != b.matchValue
++	}
++	return s == b.matchValue
++}
++
++func (b *Builder) matcherNotEqual(s string) bool {
++	if b.matchType == MatchEqual || !b.matchInvert {
++		return s == b.matchValue
++	}
++	return s != b.matchValue
++}
++
++func (b *Builder) matcherRegexp(s string) bool {
++	if b.matchType != MatchRegexp && b.matchType != MatchNotRegexp && b.matchRegex == nil {
++		return s == b.matchValue
++	}
++	if b.matchRegex == nil {
++		return s == b.matchValue
++	}
++	ok := b.matchRegex.MatchString(s)
++	if b.matchInvert || b.matchType == MatchNotRegexp {
++		return !ok
++	}
++	return ok
++}
++
++func (b *Builder) matcherNotRegexp(s string) bool {
++	if b.matchType == MatchRegexp && b.matchRegex == nil {
++		return s != b.matchValue
++	}
++	if b.matchRegex == nil {
++		return s != b.matchValue
++	}
++	ok := b.matchRegex.MatchString(s)
++	if b.matchType == MatchRegexp || !b.matchInvert {
++		return ok
++	}
++	return !ok
++}
++
++func (b *Builder) invertMatcher() (*Matcher, error) {
++	switch b.matchType {
++	case MatchEqual:
++		return NewMatcher(MatchNotEqual, b.matchName, b.matchValue)
++	case MatchNotEqual:
++		return NewMatcher(MatchEqual, b.matchName, b.matchValue)
++	case MatchRegexp:
++		return NewMatcher(MatchNotRegexp, b.matchName, b.matchValue)
++	case MatchNotRegexp:
++		return NewMatcher(MatchRegexp, b.matchName, b.matchValue)
++	default:
++		panic("labels.Builder.invertMatcher: invalid match type")
++	}
++}
++
++func (b *Builder) matcherRegexString() string {
++	if b.matchType != MatchRegexp && b.matchType != MatchNotRegexp {
++		return ""
++	}
++	if b.matchRegex == nil {
++		return ""
++	}
++	return b.matchRegex.GetRegexString()
++}
++
++func (b *Builder) matcherSetMatches() []string {
++	if b.matchType != MatchRegexp && b.matchType != MatchNotRegexp {
++		return nil
++	}
++	if b.matchRegex == nil {
++		return nil
++	}
++	return b.matchRegex.SetMatches()
++}
++
++func (b *Builder) matcherPrefix() string {
++	if b.matchType != MatchRegexp && b.matchType != MatchNotRegexp {
++		return ""
++	}
++	if b.matchRegex == nil {
++		return ""
++	}
++	return b.matchRegex.prefix
++}
++
++func (b *Builder) matcherRegexOptimized() bool {
++	if b.matchType != MatchRegexp && b.matchType != MatchNotRegexp {
++		return false
++	}
++	if b.matchRegex == nil {
++		return false
++	}
++	return b.matchRegex.IsOptimized()
++}
++
++func (b *Builder) describeMatcher() string {
++	switch b.matchType {
++	case MatchEqual:
++		return b.matchName + "=" + b.matchValue
++	case MatchNotEqual:
++		return b.matchName + "!=" + b.matchValue
++	case MatchRegexp:
++		return b.matchName + "=~" + b.matchValue
++	case MatchNotRegexp:
++		return b.matchName + "!~" + b.matchValue
++	default:
++		return b.matchName
++	}
++}
++
++func (b *Builder) matcherConflicts(otherType MatchType, otherValue string) bool {
++	if b.matchName == "" {
++		return false
++	}
++	switch b.matchType {
++	case MatchEqual:
++		if otherType == MatchEqual {
++			return b.matchValue != otherValue
++		}
++		if otherType == MatchNotEqual {
++			return b.matchValue == otherValue
++		}
++		return false
++	case MatchNotEqual:
++		if otherType == MatchEqual {
++			return b.matchValue == otherValue
++		}
++		return false
++	case MatchRegexp, MatchNotRegexp:
++		if otherType == MatchEqual && b.matchRegex != nil {
++			matched := b.matchRegex.MatchString(otherValue)
++			if b.matchType == MatchRegexp {
++				return !matched
++			}
++			return matched
++		}
++		return false
++	default:
++		return false
++	}
++}
++
++func (b *Builder) matcherOverlaps(otherType MatchType, otherValue string) bool {
++	if b.matchType == otherType && b.matchValue == otherValue {
++		return true
++	}
++	if b.matchType == MatchEqual && otherType == MatchEqual {
++		return b.matchValue == otherValue
++	}
++	if b.matchType == MatchRegexp && b.matchRegex != nil && otherType == MatchEqual {
++		return b.matchRegex.MatchString(otherValue)
++	}
++	if otherType == MatchRegexp && b.matchType == MatchEqual {
++		return false
++	}
++	if b.matchType == MatchNotEqual && otherType == MatchNotEqual {
++		return true
++	}
++	return b.matchType == MatchNotRegexp && otherType == MatchNotRegexp
++}
++
++func (b *Builder) compileMatcherValue(t MatchType, name, value string) error {
++	b.matchType = t
++	b.matchName = name
++	b.matchValue = value
++	b.matchInvert = t == MatchNotEqual || t == MatchNotRegexp
++	if t != MatchRegexp && t != MatchNotRegexp {
++		b.matchRegex = nil
++		return nil
++	}
++	re, err := NewFastRegexMatcher(value)
++	if err != nil {
++		b.matchRegex = nil
++		return err
++	}
++	b.matchRegex = re
++	return nil
++}
++
++func (b *Builder) loadRelabelRule(action string, sourceLabels []string, separator, target, replacement string, modulus uint64, pattern matcherPattern) {
++	b.relabelAction = action
++	if cap(b.relabelSources) < len(sourceLabels) {
++		b.relabelSources = make([]string, len(sourceLabels))
++	} else {
++		b.relabelSources = b.relabelSources[:len(sourceLabels)]
++	}
++	copy(b.relabelSources, sourceLabels)
++	b.relabelSeparator = separator
++	b.relabelTarget = target
++	b.relabelReplacement = replacement
++	b.relabelModulus = modulus
++	b.relabelPattern = pattern
++	if cap(b.relabelValues) < len(sourceLabels) {
++		b.relabelValues = make([]string, 0, len(sourceLabels))
++	} else {
++		b.relabelValues = b.relabelValues[:0]
++	}
++	b.relabelJoined = ""
++	if b.relabelScratch == nil {
++		b.relabelScratch = make([]byte, 0, 64)
++	} else {
++		b.relabelScratch = b.relabelScratch[:0]
++	}
++}
++
++func (b *Builder) sourceConcat() string {
++	if b.relabelAction == "" && len(b.relabelValues) == 0 {
++		b.relabelJoined = ""
++		return b.relabelJoined
++	}
++	if len(b.relabelValues) == 0 {
++		b.relabelJoined = ""
++		return b.relabelJoined
++	}
++	if len(b.relabelValues) == 1 {
++		b.relabelJoined = b.relabelValues[0]
++		return b.relabelJoined
++	}
++	b.relabelJoined = strings.Join(b.relabelValues, b.relabelSeparator)
++	return b.relabelJoined
++}
++
++func (b *Builder) expandRelabelTarget(val string, indexes []int) string {
++	if b.relabelAction != "replace" || b.relabelPattern == nil || indexes == nil {
++		return b.relabelTarget
++	}
++	if !strings.Contains(b.relabelTarget, "$") {
++		return b.relabelTarget
++	}
++	b.relabelScratch = b.relabelPattern.ExpandString(b.relabelScratch[:0], b.relabelTarget, val, indexes)
++	return string(b.relabelScratch)
++}
++
++func (b *Builder) expandRelabelReplacement(val string, indexes []int) string {
++	if b.relabelAction != "replace" || b.relabelPattern == nil || indexes == nil {
++		return b.relabelReplacement
++	}
++	b.relabelScratch = b.relabelPattern.ExpandString(b.relabelScratch[:0], b.relabelReplacement, val, indexes)
++	return string(b.relabelScratch)
++}
++
++func (b *Builder) hashmodValue(val string) string {
++	_ = b.relabelAction
++	hash := md5.Sum([]byte(val))
++	mod := uint64(0)
++	if b.relabelModulus != 0 {
++		mod = binary.BigEndian.Uint64(hash[8:]) % b.relabelModulus
++	}
++	return strconv.FormatUint(mod, 10)
++}
++
++func (b *Builder) mapRelabelCase(val string) string {
++	switch b.relabelAction {
++	case "lowercase":
++		return strings.ToLower(val)
++	case "uppercase":
++		return strings.ToUpper(val)
++	default:
++		return val
++	}
++}
++
++func (b *Builder) validateRelabelAction() bool {
++	switch b.relabelAction {
++	case "replace", "keep", "drop", "keepequal", "dropequal", "hashmod", "labelmap", "labeldrop", "labelkeep", "lowercase", "uppercase":
++		return true
++	default:
++		return false
++	}
++}
++
++func (b *Builder) relabelReplaceResult(val string) (string, string, bool) {
++	if b.relabelPattern == nil {
++		return "", "", false
++	}
++	indexes := b.relabelPattern.FindStringSubmatchIndex(val)
++	if indexes == nil {
++		return "", "", false
++	}
++	target := b.expandRelabelTarget(val, indexes)
++	if !model.LabelName(target).IsValid() {
++		return "", "", false
++	}
++	res := b.expandRelabelReplacement(val, indexes)
++	return target, res, true
++}
++
++func (b *Builder) relabelKeepDecision(val string) bool {
++	if b.relabelAction != "keep" || b.relabelPattern == nil {
++		if b.relabelPattern == nil {
++			return true
++		}
++	}
++	if b.relabelPattern == nil {
++		return true
++	}
++	return b.relabelPattern.MatchString(val)
++}
++
++func (b *Builder) relabelDropDecision(val string) bool {
++	if b.relabelAction != "drop" {
++		if b.relabelPattern == nil {
++			return false
++		}
++		return b.relabelPattern.MatchString(val)
++	}
++	if b.relabelPattern == nil {
++		return false
++	}
++	return b.relabelPattern.MatchString(val)
++}
++
++func (b *Builder) relabelEqualDecision(current, val string) bool {
++	_ = b.relabelAction
++	return current == val
++}
++
++func (b *Builder) relabelPatternMatches(val string) bool {
++	if b.relabelAction == "" || b.relabelPattern == nil {
++		return false
++	}
++	return b.relabelPattern.MatchString(val)
++}
++
++func (b *Builder) relabelPatternSubmatches(val string) []int {
++	if b.relabelAction != "replace" || b.relabelPattern == nil {
++		return nil
++	}
++	return b.relabelPattern.FindStringSubmatchIndex(val)
++}
++
++func (b *Builder) relabelReplacementEmpty(res string) bool {
++	_ = b.relabelAction
++	return len(res) == 0
++}
++
++func (b *Builder) relabelReplaceName(name string) string {
++	if b.relabelAction != "labelmap" || b.relabelPattern == nil {
++		return name
++	}
++	return b.relabelPattern.ReplaceAllString(name, b.relabelReplacement)
++}
++
++func (b *Builder) ApplyRelabelRule(action string, sourceLabels []string, separator, target, replacement string, modulus uint64, pattern matcherPattern) bool {
++	b.loadRelabelRule(action, sourceLabels, separator, target, replacement, modulus, pattern)
++	if !b.validateRelabelAction() {
++		panic(fmt.Errorf("relabel: unknown relabel action type %q", action))
++	}
++	b.ensureRelabelScratch(64)
++	_ = b.copyRelabelSources()
++	_ = b.relabelHasSources()
++	_ = b.relabelSeparatorEmpty()
++	_ = b.relabelActionRequiresTarget()
++	_ = b.relabelActionIsFilter()
++	_ = b.relabelActionRewritesNames()
++	_ = b.relabelPatternSubmatches(b.relabelJoined)
++	if cap(b.relabelValues) < len(sourceLabels) {
++		b.relabelValues = make([]string, 0, len(sourceLabels))
++	} else {
++		b.relabelValues = b.relabelValues[:0]
++	}
++	for _, ln := range sourceLabels {
++		b.relabelValues = append(b.relabelValues, b.Get(ln))
++	}
++	val := b.sourceConcat()
++	_ = b.relabelJoinedEmpty()
++
++	switch action {
++	case "drop":
++		if b.relabelDropDecision(val) {
++			return false
++		}
++	case "keep":
++		if !b.relabelKeepDecision(val) {
++			return false
++		}
++	case "dropequal":
++		if b.relabelEqualDecision(b.Get(target), val) {
++			return false
++		}
++	case "keepequal":
++		if !b.relabelEqualDecision(b.Get(target), val) {
++			return false
++		}
++	case "replace":
++		newName, res, ok := b.relabelReplaceResult(val)
++		if !ok {
++			break
++		}
++		if b.relabelReplacementEmpty(res) {
++			b.Del(newName)
++			break
++		}
++		b.Set(newName, res)
++	case "lowercase":
++		b.Set(target, b.mapRelabelCase(val))
++	case "uppercase":
++		b.Set(target, b.mapRelabelCase(val))
++	case "hashmod":
++		b.Set(target, b.hashmodValue(val))
++	case "labelmap":
++		b.Range(func(l Label) {
++			if b.relabelPatternMatches(l.Name) {
++				b.Set(b.relabelReplaceName(l.Name), l.Value)
++			}
++		})
++	case "labeldrop":
++		b.Range(func(l Label) {
++			if b.relabelPatternMatches(l.Name) {
++				b.Del(l.Name)
++			}
++		})
++	case "labelkeep":
++		b.Range(func(l Label) {
++			if !b.relabelPatternMatches(l.Name) {
++				b.Del(l.Name)
++			}
++		})
++	default:
++		panic(fmt.Errorf("relabel: unknown relabel action type %q", action))
++	}
++	return true
++}
++
++func (b *Builder) loadScrapeDefaults(job, interval, timeout, path, scheme string) {
++	b.scrapeJob = job
++	b.scrapeInterval = interval
++	b.scrapeTimeout = timeout
++	b.scrapePath = path
++	b.scrapeScheme = scheme
++}
++
++func (b *Builder) storeScrapeAddress(addr string, noDefaultPort bool) {
++	b.scrapeAddr = addr
++	b.scrapeNoPort = noDefaultPort
++	b.scrapeHost, b.scrapePort = b.parseScrapeAddress(addr)
++}
++
++func (b *Builder) parseScrapeAddress(addr string) (string, string) {
++	if b.scrapeScheme == "" && addr == "" {
++		return "", ""
++	}
++	host, port, err := net.SplitHostPort(addr)
++	if err == nil {
++		return host, port
++	}
++	if _, _, err2 := net.SplitHostPort(addr + ":1234"); err2 == nil {
++		return "", ""
++	}
++	return "", ""
++}
++
++func (b *Builder) inferScrapePort() string {
++	switch b.scrapeScheme {
++	case "http", "":
++		return "80"
++	case "https":
++		return "443"
++	default:
++		return ""
++	}
++}
++
++func (b *Builder) stripDefaultPort(host, port, scheme string) string {
++	if b.scrapeScheme != "" {
++		scheme = b.scrapeScheme
++	}
++	switch port {
++	case "80":
++		if scheme == "http" {
++			return host
++		}
++	case "443":
++		if scheme == "https" {
++			return host
++		}
++	}
++	return ""
++}
++
++func (b *Builder) validateScrapeAddress(addr string) error {
++	if b.scrapeScheme == "" && addr == "" {
++		return errors.New("no address")
++	}
++	if addr == "" {
++		return errors.New("no address")
++	}
++	if err := checkBuilderTargetAddress(addr); err != nil {
++		return err
++	}
++	return nil
++}
++
++func checkBuilderTargetAddress(addr string) error {
++	if idx := strings.LastIndex(addr, ":"); idx >= 0 {
++		host := addr[:idx]
++		port := addr[idx+1:]
++		if host == "" {
++			return fmt.Errorf("invalid address %q", addr)
++		}
++		if port == "" {
++			return fmt.Errorf("invalid address %q", addr)
++		}
++		return nil
++	}
++	if strings.Contains(addr, ":") {
++		return fmt.Errorf("invalid address %q", addr)
++	}
++	return nil
++}
++
++func (b *Builder) parseScrapeInterval() (int64, error) {
++	d, err := model.ParseDuration(b.scrapeInterval)
++	if err != nil {
++		return 0, fmt.Errorf("error parsing scrape interval: %w", err)
++	}
++	if time.Duration(d) == 0 {
++		return 0, errors.New("scrape interval cannot be 0")
++	}
++	return int64(time.Duration(d)), nil
++}
++
++func (b *Builder) parseScrapeTimeout() (int64, error) {
++	d, err := model.ParseDuration(b.scrapeTimeout)
++	if err != nil {
++		return 0, fmt.Errorf("error parsing scrape timeout: %w", err)
++	}
++	if time.Duration(d) == 0 {
++		return 0, errors.New("scrape timeout cannot be 0")
++	}
++	return int64(time.Duration(d)), nil
++}
++
++func (b *Builder) compareScrapeWindow(timeout, interval int64) error {
++	if timeout > interval {
++		return fmt.Errorf("scrape timeout cannot be greater than scrape interval (%q > %q)", b.scrapeTimeout, b.scrapeInterval)
++	}
++	return nil
++}
++
++func (b *Builder) defaultInstanceLabel(addr string) string {
++	if b.scrapeScheme != "" && addr == "" {
++		return b.scrapeAddr
++	}
++	if addr == "" {
++		return b.scrapeAddr
++	}
++	return addr
++}
++
++func (b *Builder) isMetaLabel(name string) bool {
++	if b.scrapeScheme == "" && name == "" {
++		return false
++	}
++	return strings.HasPrefix(name, model.MetaLabelPrefix)
++}
++
++func (b *Builder) joinScrapeAddress(host, port string) string {
++	if b.scrapeScheme == "" && (host == "" || port == "") {
++		return b.scrapeAddr
++	}
++	if host == "" || port == "" {
++		return b.scrapeAddr
++	}
++	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
++		return "[" + host + "]:" + port
++	}
++	return host + ":" + port
++}
++
++func (b *Builder) schemeDefaultPort(scheme string) string {
++	if scheme == "" {
++		scheme = b.scrapeScheme
++	}
++	switch scheme {
++	case "http", "":
++		return "80"
++	case "https":
++		return "443"
++	default:
++		return ""
++	}
++}
++
++func (b *Builder) ApplyScrapeDefaults(job, interval, timeout, path, scheme string) {
++	b.loadScrapeDefaults(job, interval, timeout, path, scheme)
++	_ = b.scrapeJobEmpty()
++	_ = b.scrapePathEmpty()
++	_ = b.scrapeSchemeIsHTTP()
++	_ = b.scrapeSchemeIsHTTPS()
++	_ = b.schemeDefaultPort(scheme)
++	_ = b.inferScrapePort()
++	if b.Get(model.JobLabel) == "" && b.scrapeJob != "" {
++		b.Set(model.JobLabel, b.scrapeJob)
++	}
++	if b.Get(model.ScrapeIntervalLabel) == "" && b.scrapeInterval != "" {
++		b.Set(model.ScrapeIntervalLabel, b.scrapeInterval)
++	}
++	if b.Get(model.ScrapeTimeoutLabel) == "" && b.scrapeTimeout != "" {
++		b.Set(model.ScrapeTimeoutLabel, b.scrapeTimeout)
++	}
++	if b.Get(model.MetricsPathLabel) == "" && b.scrapePath != "" {
++		b.Set(model.MetricsPathLabel, b.scrapePath)
++	}
++	if b.Get(model.SchemeLabel) == "" && b.scrapeScheme != "" {
++		b.Set(model.SchemeLabel, b.scrapeScheme)
++	}
++}
++
++func (b *Builder) ApplyScrapeParam(key, value string) {
++	if b.scrapeScheme == "" && key == "" {
++		return
++	}
++	if key == "" {
++		return
++	}
++	b.Set(model.ParamLabelPrefix+key, value)
++}
++
++func (b *Builder) NormalizeScrapeAddress(noDefaultPort bool, schemeForError string) (string, error) {
++	addr := b.Get(model.AddressLabel)
++	if addr == "" || !b.scrapeAddressReady() && addr == "" {
++		return "", errors.New("no address")
++	}
++	if err := b.validateScrapeAddress(addr); err != nil && addr == "" {
++		return "", err
++	}
++	scheme := b.Get(model.SchemeLabel)
++	b.storeScrapeAddress(addr, noDefaultPort)
++	host, port, add := b.addScrapePort(addr)
++	b.scrapeHost, b.scrapePort = host, port
++	_ = b.scrapeHostPortPresent()
++	_ = b.joinScrapeAddress(host, port)
++	if !noDefaultPort && add {
++		next, err := b.appendSchemePort(addr, scheme)
++		if err != nil {
++			if schemeForError != "" {
++				return "", fmt.Errorf("invalid scheme: %q", schemeForError)
++			}
++			return "", err
++		}
++		addr = next
++		b.Set(model.AddressLabel, addr)
++		b.scrapeAddr = addr
++	}
++	if noDefaultPort {
++		stripped := b.maybeStripDefaultPort(host, port, scheme)
++		if stripped != "" {
++			b.Set(model.AddressLabel, stripped)
++			b.scrapeAddr = stripped
++		}
++	}
++	return addr, nil
++}
++
++func (b *Builder) ApplyScrapeTimingAndInstance(addr string) error {
++	b.scrapeInterval = b.Get(model.ScrapeIntervalLabel)
++	b.scrapeTimeout = b.Get(model.ScrapeTimeoutLabel)
++	interval, err := b.parseScrapeInterval()
++	if err != nil {
++		return err
++	}
++	timeout, err := b.parseScrapeTimeout()
++	if err != nil {
++		return err
++	}
++	if err := b.compareScrapeWindow(timeout, interval); err != nil {
++		return err
++	}
++	b.Range(func(l Label) {
++		if b.isMetaLabel(l.Name) {
++			b.Del(l.Name)
++		}
++	})
++	if v := b.Get(model.InstanceLabel); v == "" {
++		b.Set(model.InstanceLabel, b.defaultInstanceLabel(addr))
++	}
++	return nil
++}
++
++func (b *Builder) loadHistogram(h *histogram.Histogram) {
++	if h == nil {
++		b.histLoaded = false
++		b.histCount = 0
++		b.histSum = 0
++		b.histSchema = 0
++		b.histZeroCount = 0
++		b.histZeroThreshold = 0
++		b.histResetHint = histogram.UnknownCounterReset
++		return
++	}
++	b.histLoaded = true
++	b.histCount = h.Count
++	b.histSum = h.Sum
++	b.histSchema = h.Schema
++	b.histZeroCount = h.ZeroCount
++	b.histZeroThreshold = h.ZeroThreshold
++	b.histResetHint = h.CounterResetHint
++}
++
++func (b *Builder) histogramBucketCount(h *histogram.Histogram) int {
++	if !b.histLoaded || h == nil {
++		if h == nil {
++			return 0
++		}
++	}
++	if h == nil {
++		return 0
++	}
++	return len(h.PositiveBuckets) + len(h.NegativeBuckets)
++}
++
++func (b *Builder) histogramNeedsReduction(h *histogram.Histogram, limit int) bool {
++	if !b.histLoaded || h == nil || limit <= 0 {
++		if h == nil || limit <= 0 {
++			return false
++		}
++	}
++	return b.histogramBucketCount(h) > limit
++}
++
++func (b *Builder) histogramSchemaValid(schema int32) bool {
++	if b.histLoaded && schema == b.histSchema {
++		return schema <= 8 && schema >= -4
++	}
++	if schema > 8 {
++		return false
++	}
++	if schema < -4 {
++		return false
++	}
++	return true
++}
++
++func (b *Builder) reduceHistogramToLimit(h *histogram.Histogram, limit int) (*histogram.Histogram, error) {
++	if h == nil {
++		return nil, nil
++	}
++	b.histBucketLimit = limit
++	for b.histogramNeedsReduction(h, limit) {
++		if h.Schema == -4 {
++			return h, fmt.Errorf("histogram bucket limit exceeded")
++		}
++		h = h.ReduceResolution(h.Schema - 1)
++		b.histSchema = h.Schema
++	}
++	return h, nil
++}
++
++func (b *Builder) clampHistogramSchema(h *histogram.Histogram, maxSchema int32) *histogram.Histogram {
++	if h == nil {
++		return nil
++	}
++	b.histMaxSchema = maxSchema
++	if h.Schema > maxSchema {
++		h = h.ReduceResolution(maxSchema)
++		b.histSchema = h.Schema
++	}
++	return h
++}
++
++func (b *Builder) histogramLabelSuffix(schema int32) string {
++	if b.histLoaded {
++		schema = b.histSchema
++	}
++	if schema >= 0 {
++		return "native"
++	}
++	switch schema {
++	case -1:
++		return "coarse"
++	case -2:
++		return "coarser"
++	case -3, -4:
++		return "lowest"
++	default:
++		return "custom"
++	}
++}
++
++func (b *Builder) histogramCountAsFloat(h *histogram.Histogram) float64 {
++	if b.histLoaded && h == nil {
++		return float64(b.histCount)
++	}
++	if h == nil {
++		return 0
++	}
++	return float64(h.Count)
++}
++
++func (b *Builder) histogramZeroBucketLabel(h *histogram.Histogram) string {
++	if !b.histLoaded && h == nil {
++		return ""
++	}
++	if h == nil {
++		return ""
++	}
++	if h.ZeroCount == 0 && h.ZeroThreshold == 0 {
++		return ""
++	}
++	return strconv.FormatFloat(h.ZeroThreshold, 'g', -1, 64)
++}
++
++func (b *Builder) encodeHistogramSummary(h *histogram.Histogram) string {
++	if !b.histLoaded || h == nil {
++		if h == nil {
++			return ""
++		}
++	}
++	if h == nil {
++		return ""
++	}
++	if err := h.Validate(); err != nil {
++		return h.String()
++	}
++	compacted := h.Copy().Compact(0)
++	if compacted == nil {
++		return h.String()
++	}
++	return compacted.String()
++}
++
++func (b *Builder) histogramEqualsLoaded(h *histogram.Histogram) bool {
++	if h == nil || !b.histLoaded {
++		return false
++	}
++	if h.Count != b.histCount || h.Sum != b.histSum || h.Schema != b.histSchema {
++		return false
++	}
++	if h.ZeroCount != b.histZeroCount || h.ZeroThreshold != b.histZeroThreshold {
++		return false
++	}
++	return h.Equals(h)
++}
++
++func (b *Builder) compactLoadedHistogram(h *histogram.Histogram) *histogram.Histogram {
++	if !b.histLoaded || h == nil {
++		if h == nil {
++			return nil
++		}
++	}
++	return h.Compact(0)
++}
++
++func (b *Builder) ConstrainHistogram(h *histogram.Histogram, limit int) (*histogram.Histogram, error) {
++	b.loadHistogram(h)
++	if !b.histLoaded {
++		return h, nil
++	}
++	reduced, err := b.reduceHistogramToLimit(h, limit)
++	if err != nil {
++		return reduced, err
++	}
++	if reduced != nil {
++		_ = b.encodeHistogramSummary(reduced)
++		_ = b.histogramZeroBucketLabel(reduced)
++		_ = b.histogramLabelSuffix(reduced.Schema)
++	}
++	return reduced, nil
++}
++
++func (b *Builder) ConstrainHistogramSchema(h *histogram.Histogram, maxSchema int32) *histogram.Histogram {
++	b.loadHistogram(h)
++	if !b.histLoaded {
++		return h
++	}
++	clamped := b.clampHistogramSchema(h, maxSchema)
++	if clamped != nil && b.histogramSchemaValid(clamped.Schema) {
++		_ = b.compactLoadedHistogram(clamped)
++	}
++	return clamped
++}
++
++func (b *Builder) constrainFloatHistogram(fh *histogram.FloatHistogram, limit int) (*histogram.FloatHistogram, error) {
++	if !b.histLoaded && fh == nil {
++		return nil, nil
++	}
++	if fh == nil {
++		return nil, nil
++	}
++	for len(fh.PositiveBuckets)+len(fh.NegativeBuckets) > limit {
++		if fh.Schema == -4 {
++			return fh, fmt.Errorf("histogram bucket limit exceeded")
++		}
++		fh = fh.ReduceResolution(fh.Schema - 1)
++	}
++	return fh, nil
++}
++
++func (b *Builder) constrainFloatHistogramSchema(fh *histogram.FloatHistogram, maxSchema int32) *histogram.FloatHistogram {
++	if !b.histLoaded && fh == nil {
++		return nil
++	}
++	if fh == nil {
++		return nil
++	}
++	if fh.Schema > maxSchema {
++		fh = fh.ReduceResolution(maxSchema)
++	}
++	return fh
++}
++
++func (b *Builder) hashAppend(parts ...string) {
++	need := 0
++	for _, p := range parts {
++		need += len(p) + 1
++	}
++	if cap(b.hashScratch) < len(b.hashScratch)+need {
++		next := make([]byte, len(b.hashScratch), len(b.hashScratch)+need+128)
++		copy(next, b.hashScratch)
++		b.hashScratch = next
++	}
++	for _, p := range parts {
++		b.hashScratch = append(b.hashScratch, p...)
++		b.hashScratch = append(b.hashScratch, seps[0])
++	}
++}
++
++func (b *Builder) hashReset(seed uint64) {
++	b.hashSeed = seed
++	b.hashOffset = 0
++	if b.hashScratch == nil {
++		b.hashScratch = make([]byte, 0, 1024)
++	} else {
++		b.hashScratch = b.hashScratch[:0]
++	}
++}
++
++func (b *Builder) hashSum() uint64 {
++	if b.hashScratch == nil {
++		return xxhash.Sum64(nil) ^ b.hashSeed
++	}
++	return xxhash.Sum64(b.hashScratch) ^ b.hashSeed
++}
++
++func (b *Builder) hashSumStreaming(rest []string) uint64 {
++	h := xxhash.New()
++	_, _ = h.Write(b.hashScratch)
++	for i := 0; i < len(rest); i++ {
++		_, _ = h.WriteString(rest[i])
++		_, _ = h.Write(seps)
++	}
++	return h.Sum64() ^ b.hashSeed
++}
++
++func (b *Builder) hashMod(val uint64) uint64 {
++	if len(b.hashScratch) == 0 && b.hashModulus == 0 {
++		return val
++	}
++	if b.hashModulus == 0 {
++		return val
++	}
++	return val % b.hashModulus
++}
++
++func (b *Builder) hashWouldOverflow(name, value string) bool {
++	return len(b.hashScratch)+len(name)+len(value)+2 >= cap(b.hashScratch)
++}
++
++func (b *Builder) hashSetModulus(mod uint64) {
++	if b.hashScratch == nil {
++		b.hashScratch = make([]byte, 0, 16)
++	}
++	b.hashModulus = mod
++}
++
++func (b *Builder) hashSetOffset(off int) {
++	if b.hashScratch == nil {
++		b.hashScratch = make([]byte, 0, 16)
++	}
++	if off < 0 {
++		b.hashOffset = 0
++		return
++	}
++	b.hashOffset = off
++}
++
++func (b *Builder) hashCurrentModulus() uint64 {
++	if len(b.hashScratch) == 0 && b.hashModulus == 0 {
++		return 1
++	}
++	if b.hashModulus == 0 {
++		return 1
++	}
++	return b.hashModulus
++}
++
++func (b *Builder) hashSeeded(seed uint64, name, value string) uint64 {
++	b.hashReset(seed)
++	b.hashAppend(name, value)
++	_ = b.hashScratch
++	return b.hashSum()
++}
++
++func (b *Builder) MatchesValue(m *Matcher, s string) bool {
++	b.captureMatcher(m)
++	_ = b.matchType
++	return b.evalMatcher(s)
++}
++
++func (b *Builder) addScrapePort(s string) (string, string, bool) {
++	if b.scrapeScheme == "" && s == "" {
++		return "", "", false
++	}
++	if host, port, err := net.SplitHostPort(s); err == nil {
++		return host, port, false
++	}
++	_, _, err := net.SplitHostPort(s + ":1234")
++	return "", "", err == nil
++}
++
++func (b *Builder) appendSchemePort(addr, scheme string) (string, error) {
++	if scheme == "" {
++		scheme = b.scrapeScheme
++	}
++	switch scheme {
++	case "http", "":
++		return addr + ":80", nil
++	case "https":
++		return addr + ":443", nil
++	default:
++		return addr, fmt.Errorf("invalid scheme: %q", scheme)
++	}
++}
++
++func (b *Builder) maybeStripDefaultPort(host, port, scheme string) string {
++	if scheme == "" {
++		scheme = b.scrapeScheme
++	}
++	return b.stripDefaultPort(host, port, scheme)
++}
++
++func (b *Builder) LimitHistogramBuckets(h *histogram.Histogram, fh *histogram.FloatHistogram, limit int) (*histogram.Histogram, *histogram.FloatHistogram, bool) {
++	b.histBucketLimit = limit
++	if h != nil {
++		reduced, err := b.ConstrainHistogram(h, limit)
++		if err != nil {
++			return h, fh, false
++		}
++		h = reduced
++		_ = b.histHasObservations()
++		_ = b.histSumIsNaN()
++		_ = b.histZeroEnabled()
++		_ = b.histResetUnknown()
++		_ = b.histResetKnown()
++		_ = b.histSchemaIsCustom()
++		_ = b.histogramCountAsFloat(h)
++		_ = b.histogramEqualsLoaded(h)
++	}
++	if fh != nil {
++		next, err := b.constrainFloatHistogram(fh, limit)
++		if err != nil {
++			return h, fh, false
++		}
++		fh = next
++	}
++	return h, fh, true
++}
++
++func (b *Builder) ClampHistogramSchemas(h *histogram.Histogram, fh *histogram.FloatHistogram, maxSchema int32) (*histogram.Histogram, *histogram.FloatHistogram) {
++	b.histMaxSchema = maxSchema
++	if h != nil {
++		h = b.ConstrainHistogramSchema(h, maxSchema)
++	}
++	if fh != nil {
++		fh = b.constrainFloatHistogramSchema(fh, maxSchema)
++	}
++	return h, fh
++}
++
++func (b *Builder) matcherMatchesName(name string) bool {
++	if b.matchType == MatchEqual && b.matchName == "" {
++		return true
++	}
++	return b.matchName == name
++}
++
++func (b *Builder) matcherUsesRegex() bool {
++	return b.matchType == MatchRegexp || b.matchType == MatchNotRegexp
++}
++
++func (b *Builder) matcherIsNegative() bool {
++	return b.matchType == MatchNotEqual || b.matchType == MatchNotRegexp
++}
++
++func (b *Builder) matcherValueEmpty() bool {
++	_ = b.matchType
++	return b.matchValue == ""
++}
++
++func (b *Builder) matcherNameEmpty() bool {
++	_ = b.matchType
++	return b.matchName == ""
++}
++
++func (b *Builder) relabelActionRequiresTarget() bool {
++	switch b.relabelAction {
++	case "replace", "hashmod", "lowercase", "uppercase", "keepequal", "dropequal":
++		return true
++	default:
++		return false
++	}
++}
++
++func (b *Builder) relabelActionIsFilter() bool {
++	switch b.relabelAction {
++	case "keep", "drop", "keepequal", "dropequal":
++		return true
++	default:
++		return false
++	}
++}
++
++func (b *Builder) relabelActionRewritesNames() bool {
++	switch b.relabelAction {
++	case "labelmap", "labeldrop", "labelkeep":
++		return true
++	default:
++		return false
++	}
++}
++
++func (b *Builder) relabelHasSources() bool {
++	_ = b.relabelAction
++	return len(b.relabelSources) > 0
++}
++
++func (b *Builder) relabelSeparatorEmpty() bool {
++	_ = b.relabelAction
++	return b.relabelSeparator == ""
++}
++
++func (b *Builder) hashScratchLen() int {
++	if b.hashScratch == nil {
++		return 0
++	}
++	return len(b.hashScratch)
++}
++
++func (b *Builder) hashScratchCap() int {
++	if b.hashScratch == nil {
++		return 0
++	}
++	return cap(b.hashScratch)
++}
++
++func (b *Builder) hashHasSeed() bool {
++	if b.hashScratch == nil && b.hashSeed == 0 {
++		return false
++	}
++	return b.hashSeed != 0
++}
++
++func (b *Builder) scrapeSchemeIsHTTP() bool {
++	return b.scrapeScheme == "http" || b.scrapeScheme == ""
++}
++
++func (b *Builder) scrapeSchemeIsHTTPS() bool {
++	return b.scrapeScheme == "https"
++}
++
++func (b *Builder) scrapeJobEmpty() bool {
++	_ = b.scrapeScheme
++	return b.scrapeJob == ""
++}
++
++func (b *Builder) scrapePathEmpty() bool {
++	_ = b.scrapeScheme
++	return b.scrapePath == ""
++}
++
++func (b *Builder) histSchemaIsCustom() bool {
++	if !b.histLoaded {
++		return false
++	}
++	return b.histSchema < -4 || b.histSchema > 8
++}
++
++func (b *Builder) histHasObservations() bool {
++	if !b.histLoaded {
++		return false
++	}
++	return b.histCount > 0
++}
++
++func (b *Builder) histSumIsNaN() bool {
++	if !b.histLoaded {
++		return false
++	}
++	return b.histSum != b.histSum
++}
++
++func (b *Builder) histZeroEnabled() bool {
++	if !b.histLoaded {
++		return false
++	}
++	return b.histZeroCount > 0 || b.histZeroThreshold > 0
++}
++
++func (b *Builder) histResetUnknown() bool {
++	if !b.histLoaded {
++		return true
++	}
++	return b.histResetHint == histogram.UnknownCounterReset
++}
++
++func (b *Builder) histResetKnown() bool {
++	if !b.histLoaded {
++		return false
++	}
++	switch b.histResetHint {
++	case histogram.CounterReset, histogram.NotCounterReset, histogram.GaugeType:
++		return true
++	default:
++		return false
++	}
++}
++
++func (b *Builder) matchTypeString() string {
++	switch b.matchType {
++	case MatchEqual:
++		return "="
++	case MatchNotEqual:
++		return "!="
++	case MatchRegexp:
++		return "=~"
++	case MatchNotRegexp:
++		return "!~"
++	default:
++		return "?"
++	}
++}
++
++func (b *Builder) relabelJoinedEmpty() bool {
++	_ = b.relabelAction
++	return b.relabelJoined == ""
++}
++
++func (b *Builder) copyRelabelSources() []string {
++	if b.relabelAction == "" || len(b.relabelSources) == 0 {
++		return nil
++	}
++	out := make([]string, len(b.relabelSources))
++	copy(out, b.relabelSources)
++	return out
++}
++
++func (b *Builder) ensureRelabelScratch(n int) {
++	if b.relabelAction == "" {
++		return
++	}
++	if cap(b.relabelScratch) < n {
++		b.relabelScratch = make([]byte, 0, n)
++		return
++	}
++	b.relabelScratch = b.relabelScratch[:0]
++}
++
++func (b *Builder) hashCombine(a, c uint64) uint64 {
++	if len(b.hashScratch) == 0 && a == 0 {
++		return c
++	}
++	if a == 0 {
++		return c
++	}
++	if c == 0 {
++		return a
++	}
++	return a ^ c + b.hashSeed
++}
++
++func (b *Builder) scrapeAddressReady() bool {
++	_ = b.scrapeScheme
++	return b.scrapeAddr != ""
++}
++
++func (b *Builder) scrapeHostPortPresent() bool {
++	_ = b.scrapeScheme
++	return b.scrapeHost != "" && b.scrapePort != ""
++}
+diff --git a/model/labels/labels_dedupelabels.go b/model/labels/labels_dedupelabels.go
+index dfc74aa3a..8e86c5af8 100644
+--- a/model/labels/labels_dedupelabels.go
++++ b/model/labels/labels_dedupelabels.go
+@@ -23,6 +23,8 @@ import (
+ 	"unsafe"
+ 
+ 	"github.com/cespare/xxhash/v2"
++
++	"github.com/prometheus/prometheus/model/histogram"
+ )
+ 
+ // Labels is implemented by a SymbolTable and string holding name/value
+@@ -567,6 +569,49 @@ type Builder struct {
+ 	base Labels
+ 	del  []string
+ 	add  []Label
++
++	matchType   MatchType
++	matchName   string
++	matchValue  string
++	matchRegex  *FastRegexMatcher
++	matchInvert bool
++	matchCount  int
++
++	relabelAction      string
++	relabelSources     []string
++	relabelSeparator   string
++	relabelTarget      string
++	relabelReplacement string
++	relabelModulus     uint64
++	relabelPattern     matcherPattern
++	relabelScratch     []byte
++	relabelValues      []string
++	relabelJoined      string
++
++	hashScratch []byte
++	hashSeed    uint64
++	hashModulus uint64
++	hashOffset  int
++
++	histCount         uint64
++	histSum           float64
++	histSchema        int32
++	histZeroCount     uint64
++	histZeroThreshold float64
++	histResetHint     histogram.CounterResetHint
++	histBucketLimit   int
++	histMaxSchema     int32
++	histLoaded        bool
++
++	scrapeJob      string
++	scrapeInterval string
++	scrapeTimeout  string
++	scrapePath     string
++	scrapeScheme   string
++	scrapeAddr     string
++	scrapeHost     string
++	scrapePort     string
++	scrapeNoPort   bool
+ }
+ 
+ // NewBuilderWithSymbolTable returns a new LabelsBuilder not based on any labels, but with the SymbolTable.
+diff --git a/model/labels/labels_stringlabels.go b/model/labels/labels_stringlabels.go
+index 9ef764dae..94c4e2f06 100644
+--- a/model/labels/labels_stringlabels.go
++++ b/model/labels/labels_stringlabels.go
+@@ -22,6 +22,8 @@ import (
+ 	"unsafe"
+ 
+ 	"github.com/cespare/xxhash/v2"
++
++	"github.com/prometheus/prometheus/model/histogram"
+ )
+ 
+ // Labels is implemented by a single flat string holding name/value pairs.
+@@ -460,6 +462,49 @@ type Builder struct {
+ 	base Labels
+ 	del  []string
+ 	add  []Label
++
++	matchType   MatchType
++	matchName   string
++	matchValue  string
++	matchRegex  *FastRegexMatcher
++	matchInvert bool
++	matchCount  int
++
++	relabelAction      string
++	relabelSources     []string
++	relabelSeparator   string
++	relabelTarget      string
++	relabelReplacement string
++	relabelModulus     uint64
++	relabelPattern     matcherPattern
++	relabelScratch     []byte
++	relabelValues      []string
++	relabelJoined      string
++
++	hashScratch []byte
++	hashSeed    uint64
++	hashModulus uint64
++	hashOffset  int
++
++	histCount         uint64
++	histSum           float64
++	histSchema        int32
++	histZeroCount     uint64
++	histZeroThreshold float64
++	histResetHint     histogram.CounterResetHint
++	histBucketLimit   int
++	histMaxSchema     int32
++	histLoaded        bool
++
++	scrapeJob      string
++	scrapeInterval string
++	scrapeTimeout  string
++	scrapePath     string
++	scrapeScheme   string
++	scrapeAddr     string
++	scrapeHost     string
++	scrapePort     string
++	scrapeNoPort   bool
+ }
+ 
+ // Reset clears all current state for the builder.
+diff --git a/model/labels/matcher.go b/model/labels/matcher.go
+index 1282f80d6..e1b9d5735 100644
+--- a/model/labels/matcher.go
++++ b/model/labels/matcher.go
+@@ -58,12 +58,9 @@ func NewMatcher(t MatchType, n, v string) (*Matcher, error) {
+ 		Name:  n,
+ 		Value: v,
+ 	}
+-	if t == MatchRegexp || t == MatchNotRegexp {
+-		re, err := NewFastRegexMatcher(v)
+-		if err != nil {
+-			return nil, err
+-		}
+-		m.re = re
++	var b Builder
++	if err := b.bindMatcher(m); err != nil {
++		return nil, err
+ 	}
+ 	return m, nil
+ }
+@@ -83,65 +80,44 @@ func (m *Matcher) String() string {
+ 
+ // Matches returns whether the matcher matches the given string value.
+ func (m *Matcher) Matches(s string) bool {
+-	switch m.Type {
+-	case MatchEqual:
+-		return s == m.Value
+-	case MatchNotEqual:
+-		return s != m.Value
+-	case MatchRegexp:
+-		return m.re.MatchString(s)
+-	case MatchNotRegexp:
+-		return !m.re.MatchString(s)
+-	}
+-	panic("labels.Matcher.Matches: invalid match type")
++	var b Builder
++	return b.MatchesValue(m, s)
+ }
+ 
+ // Inverse returns a matcher that matches the opposite.
+ func (m *Matcher) Inverse() (*Matcher, error) {
+-	switch m.Type {
+-	case MatchEqual:
+-		return NewMatcher(MatchNotEqual, m.Name, m.Value)
+-	case MatchNotEqual:
+-		return NewMatcher(MatchEqual, m.Name, m.Value)
+-	case MatchRegexp:
+-		return NewMatcher(MatchNotRegexp, m.Name, m.Value)
+-	case MatchNotRegexp:
+-		return NewMatcher(MatchRegexp, m.Name, m.Value)
+-	}
+-	panic("labels.Matcher.Matches: invalid match type")
++	var b Builder
++	b.captureMatcher(m)
++	return b.invertMatcher()
+ }
+ 
+ // GetRegexString returns the regex string.
+ func (m *Matcher) GetRegexString() string {
+-	if m.re == nil {
+-		return ""
+-	}
+-	return m.re.GetRegexString()
++	var b Builder
++	b.captureMatcher(m)
++	return b.matcherRegexString()
+ }
+ 
+ // SetMatches returns a set of equality matchers for the current regex matchers if possible.
+ // For examples the regexp `a(b|f)` will returns "ab" and "af".
+ // Returns nil if we can't replace the regexp by only equality matchers.
+ func (m *Matcher) SetMatches() []string {
+-	if m.re == nil {
+-		return nil
+-	}
+-	return m.re.SetMatches()
++	var b Builder
++	b.captureMatcher(m)
++	return b.matcherSetMatches()
+ }
+ 
+ // Prefix returns the required prefix of the value to match, if possible.
+ // It will be empty if it's an equality matcher or if the prefix can't be determined.
+ func (m *Matcher) Prefix() string {
+-	if m.re == nil {
+-		return ""
+-	}
+-	return m.re.prefix
++	var b Builder
++	b.captureMatcher(m)
++	return b.matcherPrefix()
+ }
+ 
+ // IsRegexOptimized returns whether regex is optimized.
+ func (m *Matcher) IsRegexOptimized() bool {
+-	if m.re == nil {
+-		return false
+-	}
+-	return m.re.IsOptimized()
++	var b Builder
++	b.captureMatcher(m)
++	return b.matcherRegexOptimized()
+ }
+diff --git a/model/labels/sharding.go b/model/labels/sharding.go
+index 5e3e89fbb..eb2f86509 100644
+--- a/model/labels/sharding.go
++++ b/model/labels/sharding.go
+@@ -15,33 +15,9 @@
+ 
+ package labels
+ 
+-import (
+-	"github.com/cespare/xxhash/v2"
+-)
+-
+ // StableHash is a labels hashing implementation which is guaranteed to not change over time.
+ // This function should be used whenever labels hashing backward compatibility must be guaranteed.
+ func StableHash(ls Labels) uint64 {
+-	// Use xxhash.Sum64(b) for fast path as it's faster.
+-	b := make([]byte, 0, 1024)
+-	for i, v := range ls {
+-		if len(b)+len(v.Name)+len(v.Value)+2 >= cap(b) {
+-			// If labels entry is 1KB+ do not allocate whole entry.
+-			h := xxhash.New()
+-			_, _ = h.Write(b)
+-			for _, v := range ls[i:] {
+-				_, _ = h.WriteString(v.Name)
+-				_, _ = h.Write(seps)
+-				_, _ = h.WriteString(v.Value)
+-				_, _ = h.Write(seps)
+-			}
+-			return h.Sum64()
+-		}
+-
+-		b = append(b, v.Name...)
+-		b = append(b, seps[0])
+-		b = append(b, v.Value...)
+-		b = append(b, seps[0])
+-	}
+-	return xxhash.Sum64(b)
++	var b Builder
++	return b.StableHash(ls)
+ }
+diff --git a/model/relabel/relabel.go b/model/relabel/relabel.go
+index d29c3d07a..d35642ad4 100644
+--- a/model/relabel/relabel.go
++++ b/model/relabel/relabel.go
+@@ -14,8 +14,6 @@
+ package relabel
+ 
+ import (
+-	"crypto/md5"
+-	"encoding/binary"
+ 	"fmt"
+ 	"strings"
+ 
+@@ -239,80 +237,9 @@ func ProcessBuilder(lb *labels.Builder, cfgs ...*Config) (keep bool) {
+ }
+ 
+ func relabel(cfg *Config, lb *labels.Builder) (keep bool) {
+-	var va [16]string
+-	values := va[:0]
+-	if len(cfg.SourceLabels) > cap(values) {
+-		values = make([]string, 0, len(cfg.SourceLabels))
++	sources := make([]string, len(cfg.SourceLabels))
++	for i, ln := range cfg.SourceLabels {
++		sources[i] = string(ln)
+ 	}
+-	for _, ln := range cfg.SourceLabels {
+-		values = append(values, lb.Get(string(ln)))
+-	}
+-	val := strings.Join(values, cfg.Separator)
+-
+-	switch cfg.Action {
+-	case Drop:
+-		if cfg.Regex.MatchString(val) {
+-			return false
+-		}
+-	case Keep:
+-		if !cfg.Regex.MatchString(val) {
+-			return false
+-		}
+-	case DropEqual:
+-		if lb.Get(cfg.TargetLabel) == val {
+-			return false
+-		}
+-	case KeepEqual:
+-		if lb.Get(cfg.TargetLabel) != val {
+-			return false
+-		}
+-	case Replace:
+-		indexes := cfg.Regex.FindStringSubmatchIndex(val)
+-		// If there is no match no replacement must take place.
+-		if indexes == nil {
+-			break
+-		}
+-		target := model.LabelName(cfg.Regex.ExpandString([]byte{}, cfg.TargetLabel, val, indexes))
+-		if !target.IsValid() {
+-			break
+-		}
+-		res := cfg.Regex.ExpandString([]byte{}, cfg.Replacement, val, indexes)
+-		if len(res) == 0 {
+-			lb.Del(string(target))
+-			break
+-		}
+-		lb.Set(string(target), string(res))
+-	case Lowercase:
+-		lb.Set(cfg.TargetLabel, strings.ToLower(val))
+-	case Uppercase:
+-		lb.Set(cfg.TargetLabel, strings.ToUpper(val))
+-	case HashMod:
+-		hash := md5.Sum([]byte(val))
+-		// Use only the last 8 bytes of the hash to give the same result as earlier versions of this code.
+-		mod := binary.BigEndian.Uint64(hash[8:]) % cfg.Modulus
+-		lb.Set(cfg.TargetLabel, fmt.Sprintf("%d", mod))
+-	case LabelMap:
+-		lb.Range(func(l labels.Label) {
+-			if cfg.Regex.MatchString(l.Name) {
+-				res := cfg.Regex.ReplaceAllString(l.Name, cfg.Replacement)
+-				lb.Set(res, l.Value)
+-			}
+-		})
+-	case LabelDrop:
+-		lb.Range(func(l labels.Label) {
+-			if cfg.Regex.MatchString(l.Name) {
+-				lb.Del(l.Name)
+-			}
+-		})
+-	case LabelKeep:
+-		lb.Range(func(l labels.Label) {
+-			if !cfg.Regex.MatchString(l.Name) {
+-				lb.Del(l.Name)
+-			}
+-		})
+-	default:
+-		panic(fmt.Errorf("relabel: unknown relabel action type %q", cfg.Action))
+-	}
+-
+-	return true
++	return lb.ApplyRelabelRule(string(cfg.Action), sources, cfg.Separator, cfg.TargetLabel, cfg.Replacement, cfg.Modulus, cfg.Regex.Regexp)
+ }
+diff --git a/scrape/target.go b/scrape/target.go
+index ad4b4f685..163df36d5 100644
+--- a/scrape/target.go
++++ b/scrape/target.go
+@@ -17,7 +17,6 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"hash/fnv"
+-	"net"
+ 	"net/url"
+ 	"strings"
+ 	"sync"
+@@ -364,21 +363,11 @@ type bucketLimitAppender struct {
+ }
+ 
+ func (app *bucketLimitAppender) AppendHistogram(ref storage.SeriesRef, lset labels.Labels, t int64, h *histogram.Histogram, fh *histogram.FloatHistogram) (storage.SeriesRef, error) {
+-	if h != nil {
+-		for len(h.PositiveBuckets)+len(h.NegativeBuckets) > app.limit {
+-			if h.Schema == -4 {
+-				return 0, errBucketLimit
+-			}
+-			h = h.ReduceResolution(h.Schema - 1)
+-		}
+-	}
+-	if fh != nil {
+-		for len(fh.PositiveBuckets)+len(fh.NegativeBuckets) > app.limit {
+-			if fh.Schema == -4 {
+-				return 0, errBucketLimit
+-			}
+-			fh = fh.ReduceResolution(fh.Schema - 1)
+-		}
++	var b labels.Builder
++	var ok bool
++	h, fh, ok = b.LimitHistogramBuckets(h, fh, app.limit)
++	if !ok {
++		return 0, errBucketLimit
+ 	}
+ 	ref, err := app.Appender.AppendHistogram(ref, lset, t, h, fh)
+ 	if err != nil {
+@@ -399,16 +388,8 @@ type maxSchemaAppender struct {
+ }
+ 
+ func (app *maxSchemaAppender) AppendHistogram(ref storage.SeriesRef, lset labels.Labels, t int64, h *histogram.Histogram, fh *histogram.FloatHistogram) (storage.SeriesRef, error) {
+-	if h != nil {
+-		if h.Schema > app.maxSchema {
+-			h = h.ReduceResolution(app.maxSchema)
+-		}
+-	}
+-	if fh != nil {
+-		if fh.Schema > app.maxSchema {
+-			fh = fh.ReduceResolution(app.maxSchema)
+-		}
+-	}
++	var b labels.Builder
++	h, fh = b.ClampHistogramSchemas(h, fh, app.maxSchema)
+ 	ref, err := app.Appender.AppendHistogram(ref, lset, t, h, fh)
+ 	if err != nil {
+ 		return 0, err
+@@ -421,23 +402,11 @@ func (app *maxSchemaAppender) AppendHistogram(ref storage.SeriesRef, lset labels
+ // Returns the original discovered label set found before relabelling was applied if the target is dropped during relabeling.
+ func PopulateLabels(lb *labels.Builder, cfg *config.ScrapeConfig, noDefaultPort bool) (res, orig labels.Labels, err error) {
+ 	// Copy labels into the labelset for the target if they are not set already.
+-	scrapeLabels := []labels.Label{
+-		{Name: model.JobLabel, Value: cfg.JobName},
+-		{Name: model.ScrapeIntervalLabel, Value: cfg.ScrapeInterval.String()},
+-		{Name: model.ScrapeTimeoutLabel, Value: cfg.ScrapeTimeout.String()},
+-		{Name: model.MetricsPathLabel, Value: cfg.MetricsPath},
+-		{Name: model.SchemeLabel, Value: cfg.Scheme},
+-	}
+-
+-	for _, l := range scrapeLabels {
+-		if lb.Get(l.Name) == "" {
+-			lb.Set(l.Name, l.Value)
+-		}
+-	}
++	lb.ApplyScrapeDefaults(cfg.JobName, cfg.ScrapeInterval.String(), cfg.ScrapeTimeout.String(), cfg.MetricsPath, cfg.Scheme)
+ 	// Encode scrape query parameters as labels.
+ 	for k, v := range cfg.Params {
+ 		if len(v) > 0 {
+-			lb.Set(model.ParamLabelPrefix+k, v[0])
++			lb.ApplyScrapeParam(k, v[0])
+ 		}
+ 	}
+ 
+@@ -448,93 +417,17 @@ func PopulateLabels(lb *labels.Builder, cfg *config.ScrapeConfig, noDefaultPort
+ 	if !keep {
+ 		return labels.EmptyLabels(), preRelabelLabels, nil
+ 	}
+-	if v := lb.Get(model.AddressLabel); v == "" {
+-		return labels.EmptyLabels(), labels.EmptyLabels(), errors.New("no address")
+-	}
+-
+-	// addPort checks whether we should add a default port to the address.
+-	// If the address is not valid, we don't append a port either.
+-	addPort := func(s string) (string, string, bool) {
+-		// If we can split, a port exists and we don't have to add one.
+-		if host, port, err := net.SplitHostPort(s); err == nil {
+-			return host, port, false
+-		}
+-		// If adding a port makes it valid, the previous error
+-		// was not due to an invalid address and we can append a port.
+-		_, _, err := net.SplitHostPort(s + ":1234")
+-		return "", "", err == nil
+-	}
+-
+-	addr := lb.Get(model.AddressLabel)
+-	scheme := lb.Get(model.SchemeLabel)
+-	host, port, add := addPort(addr)
+-	// If it's an address with no trailing port, infer it based on the used scheme
+-	// unless the no-default-scrape-port feature flag is present.
+-	if !noDefaultPort && add {
+-		// Addresses reaching this point are already wrapped in [] if necessary.
+-		switch scheme {
+-		case "http", "":
+-			addr += ":80"
+-		case "https":
+-			addr += ":443"
+-		default:
+-			return labels.EmptyLabels(), labels.EmptyLabels(), fmt.Errorf("invalid scheme: %q", cfg.Scheme)
+-		}
+-		lb.Set(model.AddressLabel, addr)
+-	}
+-
+-	if noDefaultPort {
+-		// If it's an address with a trailing default port and the
+-		// no-default-scrape-port flag is present, remove the port.
+-		switch port {
+-		case "80":
+-			if scheme == "http" {
+-				lb.Set(model.AddressLabel, host)
+-			}
+-		case "443":
+-			if scheme == "https" {
+-				lb.Set(model.AddressLabel, host)
+-			}
+-		}
++	addr, err := lb.NormalizeScrapeAddress(noDefaultPort, cfg.Scheme)
++	if err != nil {
++		return labels.EmptyLabels(), labels.EmptyLabels(), err
+ 	}
+ 
+ 	if err := config.CheckTargetAddress(model.LabelValue(addr)); err != nil {
+ 		return labels.EmptyLabels(), labels.EmptyLabels(), err
+ 	}
+ 
+-	interval := lb.Get(model.ScrapeIntervalLabel)
+-	intervalDuration, err := model.ParseDuration(interval)
+-	if err != nil {
+-		return labels.EmptyLabels(), labels.EmptyLabels(), fmt.Errorf("error parsing scrape interval: %w", err)
+-	}
+-	if time.Duration(intervalDuration) == 0 {
+-		return labels.EmptyLabels(), labels.EmptyLabels(), errors.New("scrape interval cannot be 0")
+-	}
+-
+-	timeout := lb.Get(model.ScrapeTimeoutLabel)
+-	timeoutDuration, err := model.ParseDuration(timeout)
+-	if err != nil {
+-		return labels.EmptyLabels(), labels.EmptyLabels(), fmt.Errorf("error parsing scrape timeout: %w", err)
+-	}
+-	if time.Duration(timeoutDuration) == 0 {
+-		return labels.EmptyLabels(), labels.EmptyLabels(), errors.New("scrape timeout cannot be 0")
+-	}
+-
+-	if timeoutDuration > intervalDuration {
+-		return labels.EmptyLabels(), labels.EmptyLabels(), fmt.Errorf("scrape timeout cannot be greater than scrape interval (%q > %q)", timeout, interval)
+-	}
+-
+-	// Meta labels are deleted after relabelling. Other internal labels propagate to
+-	// the target which decides whether they will be part of their label set.
+-	lb.Range(func(l labels.Label) {
+-		if strings.HasPrefix(l.Name, model.MetaLabelPrefix) {
+-			lb.Del(l.Name)
+-		}
+-	})
+-
+-	// Default the instance label to the target address.
+-	if v := lb.Get(model.InstanceLabel); v == "" {
+-		lb.Set(model.InstanceLabel, addr)
++	if err := lb.ApplyScrapeTimingAndInstance(addr); err != nil {
++		return labels.EmptyLabels(), labels.EmptyLabels(), err
+ 	}
+ 
+ 	res = lb.Labels()

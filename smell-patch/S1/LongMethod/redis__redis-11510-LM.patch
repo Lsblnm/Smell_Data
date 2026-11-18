@@ -1,0 +1,230 @@
+diff --git a/src/functions.c b/src/functions.c
+index f51aa62d0..9d6284842 100644
+--- a/src/functions.c
++++ b/src/functions.c
+@@ -621,31 +621,179 @@ static void fcallCommandGeneric(client *c, int ro) {
+     if (!fi) {
+         addReplyError(c, "Function not found");
+         return;
+-    }
+-    engine *engine = fi->li->ei->engine;
++    } else {
++        engine *engine = fi->li->ei->engine;
+ 
+-    long long numkeys;
+-    /* Get the number of arguments that are keys */
+-    if (getLongLongFromObject(c->argv[2], &numkeys) != C_OK) {
+-        addReplyError(c, "Bad number of keys provided");
+-        return;
+-    }
+-    if (numkeys > (c->argc - 3)) {
+-        addReplyError(c, "Number of keys can't be greater than number of args");
+-        return;
+-    } else if (numkeys < 0) {
+-        addReplyError(c, "Number of keys can't be negative");
+-        return;
+-    }
++        long long numkeys;
++        /* Get the number of arguments that are keys */
++        if (getLongLongFromObject(c->argv[2], &numkeys) != C_OK) {
++            addReplyError(c, "Bad number of keys provided");
++            return;
++        }
++        if (numkeys > (c->argc - 3)) {
++            addReplyError(c, "Number of keys can't be greater than number of args");
++            return;
++        }
++        if (numkeys < 0) {
++            addReplyError(c, "Number of keys can't be negative");
++            return;
++        } else {
++            scriptRunCtx run_ctx;
++            client *engine_client = fi->li->ei->c;
++            client *caller = c;
++            const char *funcname = fi->name;
++            uint64_t script_flags = fi->f_flags;
++
++            serverAssert(!curr_run_ctx);
++            int client_allow_oom = caller->flags & CLIENT_ALLOW_OOM;
++
++            int running_stale = server.masterhost &&
++                    server.repl_state != REPL_STATE_CONNECTED &&
++                    server.repl_serve_stale_data == 0;
++            int obey_client = mustObeyClient(caller);
++
++            if (!(script_flags & SCRIPT_FLAG_EVAL_COMPAT_MODE)) {
++                if ((script_flags & SCRIPT_FLAG_NO_CLUSTER) && server.cluster_enabled) {
++                    addReplyError(caller, "Can not run script on cluster, 'no-cluster' flag is set.");
++                    return;
++                }
+ 
+-    scriptRunCtx run_ctx;
++                if (running_stale && !(script_flags & SCRIPT_FLAG_ALLOW_STALE)) {
++                    addReplyError(caller, "-MASTERDOWN Link with MASTER is down, "
++                                     "replica-serve-stale-data is set to 'no' "
++                                     "and 'allow-stale' flag is not set on the script.");
++                    return;
++                }
+ 
+-    if (scriptPrepareForRun(&run_ctx, fi->li->ei->c, c, fi->name, fi->f_flags, ro) != C_OK)
+-        return;
++                if (!(script_flags & SCRIPT_FLAG_NO_WRITES)) {
++                    /* Script may perform writes we need to verify:
++                     * 1. we are not a readonly replica
++                     * 2. no disk error detected
++                     * 3. command is not `fcall_ro`/`eval[sha]_ro` */
++                    if (server.masterhost && server.repl_slave_ro && !obey_client) {
++                        addReplyError(caller, "-READONLY Can not run script with write flag on readonly replica");
++                        return;
++                    }
++
++                    /* Deny writes if we're unale to persist. */
++                    int deny_write_type = writeCommandsDeniedByDiskError();
++                    if (deny_write_type != DISK_ERROR_TYPE_NONE && !obey_client) {
++                        if (deny_write_type == DISK_ERROR_TYPE_RDB)
++                            addReplyError(caller, "-MISCONF Redis is configured to save RDB snapshots, "
++                                             "but it's currently unable to persist to disk. "
++                                             "Writable scripts are blocked. Use 'no-writes' flag for read only scripts.");
++                        else
++                            addReplyErrorFormat(caller, "-MISCONF Redis is configured to persist data to AOF, "
++                                                   "but it's currently unable to persist to disk. "
++                                                   "Writable scripts are blocked. Use 'no-writes' flag for read only scripts. "
++                                                   "AOF error: %s", strerror(server.aof_last_write_errno));
++                        return;
++                    }
++
++                    if (ro) {
++                        addReplyError(caller, "Can not execute a script with write flag using *_ro command.");
++                        return;
++                    }
++
++                    /* Don't accept write commands if there are not enough good slaves and
++                     * user configured the min-slaves-to-write option. */
++                    if (!checkGoodReplicasStatus()) {
++                        addReplyErrorObject(caller, shared.noreplicaserr);
++                        return;
++                    }
++                }
++
++                /* Check OOM state. the no-writes flag imply allow-oom. we tested it
++                 * after the no-write error, so no need to mention it in the error reply. */
++                if (!client_allow_oom && server.pre_command_oom_state && server.maxmemory &&
++                    !(script_flags & (SCRIPT_FLAG_ALLOW_OOM|SCRIPT_FLAG_NO_WRITES)))
++                {
++                    addReplyError(caller, "-OOM allow-oom flag is not set on the script, "
++                                          "can not run it when used memory > 'maxmemory'");
++                    return;
++                }
++
++            } else {
++                /* Special handling for backwards compatibility (no shebang eval[sha]) mode */
++                if (running_stale) {
++                    addReplyErrorObject(caller, shared.masterdownerr);
++                    return;
++                }
++            }
+ 
+-    engine->call(&run_ctx, engine->engine_ctx, fi->function, c->argv + 3, numkeys,
+-                 c->argv + 3 + numkeys, c->argc - 3 - numkeys);
+-    scriptResetRun(&run_ctx);
++            run_ctx.c = engine_client;
++            run_ctx.original_client = caller;
++            run_ctx.funcname = funcname;
++
++            client *script_client = run_ctx.c;
++            client *curr_client = run_ctx.original_client;
++            server.script_caller = curr_client;
++
++            /* Select the right DB in the context of the Lua client */
++            selectDb(script_client, curr_client->db->id);
++            script_client->resp = 2; /* Default is RESP2, scripts can change it. */
++
++            /* If we are in MULTI context, flag Lua client as CLIENT_MULTI. */
++            if (curr_client->flags & CLIENT_MULTI) {
++                script_client->flags |= CLIENT_MULTI;
++            }
++
++            run_ctx.start_time = getMonotonicUs();
++            run_ctx.snapshot_time = mstime();
++
++            run_ctx.flags = 0;
++            run_ctx.repl_flags = PROPAGATE_AOF | PROPAGATE_REPL;
++
++            if (ro || (!(script_flags & SCRIPT_FLAG_EVAL_COMPAT_MODE) && (script_flags & SCRIPT_FLAG_NO_WRITES))) {
++                /* On fcall_ro or on functions that do not have the 'write'
++                 * flag, we will not allow write commands. */
++                run_ctx.flags |= SCRIPT_READ_ONLY;
++            }
++            if (client_allow_oom || (!(script_flags & SCRIPT_FLAG_EVAL_COMPAT_MODE) && (script_flags & SCRIPT_FLAG_ALLOW_OOM))) {
++                /* Note: we don't need to test the no-writes flag here and set this run_ctx flag,
++                 * since only write commands can are deny-oom. */
++                run_ctx.flags |= SCRIPT_ALLOW_OOM;
++            }
++
++            if ((script_flags & SCRIPT_FLAG_EVAL_COMPAT_MODE) || (script_flags & SCRIPT_FLAG_ALLOW_CROSS_SLOT)) {
++                run_ctx.flags |= SCRIPT_ALLOW_CROSS_SLOT;
++            }
++
++            /* set the curr_run_ctx so we can use it to kill the script if needed */
++            curr_run_ctx = &run_ctx;
++
++            engine->call(&run_ctx, engine->engine_ctx, fi->function, c->argv + 3, numkeys,
++                         c->argv + 3 + numkeys, c->argc - 3 - numkeys);
++
++            serverAssert(curr_run_ctx);
++
++            /* After the script done, remove the MULTI state. */
++            run_ctx.c->flags &= ~CLIENT_MULTI;
++
++            server.script_caller = NULL;
++
++            if (scriptIsTimedout()) {
++                serverAssert(&run_ctx == curr_run_ctx);
++                run_ctx.flags &= ~SCRIPT_TIMEDOUT;
++                blockingOperationEnds();
++                /* if we are a replica and we have an active master, set it for continue processing */
++                if (server.masterhost && server.master) {
++                    if (!(server.master->flags & CLIENT_UNBLOCKED)) {
++                        server.master->flags |= CLIENT_UNBLOCKED;
++                        listAddNodeTail(server.unblocked_clients, server.master);
++                    }
++                }
++                /* Restore the client that was protected when the script timeout
++                 * was detected. */
++                unprotectClient(run_ctx.original_client);
++            }
++
++            run_ctx.original_client->flags |= CLIENT_PREVENT_PROP;
++
++            /*  unset curr_run_ctx so we will know there is no running script */
++            curr_run_ctx = NULL;
++        }
++    }
+ }
+ 
+ /*
+diff --git a/src/script.c b/src/script.c
+index 57fa7eeba..45852034a 100644
+--- a/src/script.c
++++ b/src/script.c
+@@ -41,7 +41,7 @@ scriptFlag scripts_flags_def[] = {
+ };
+ 
+ /* On script invocation, holding the current run context */
+-static scriptRunCtx *curr_run_ctx = NULL;
++scriptRunCtx *curr_run_ctx = NULL;
+ 
+ static void exitScriptTimedoutMode(scriptRunCtx *run_ctx) {
+     serverAssert(run_ctx == curr_run_ctx);
+diff --git a/src/script.h b/src/script.h
+index b601342c5..c34f038c8 100644
+--- a/src/script.h
++++ b/src/script.h
+@@ -92,6 +92,7 @@ typedef struct scriptFlag {
+ } scriptFlag;
+ 
+ extern scriptFlag scripts_flags_def[];
++extern scriptRunCtx *curr_run_ctx;
+ 
+ uint64_t scriptFlagsToCmdFlags(uint64_t cmd_flags, uint64_t script_flags);
+ int scriptPrepareForRun(scriptRunCtx *r_ctx, client *engine_client, client *caller, const char *funcname, uint64_t script_flags, int ro);

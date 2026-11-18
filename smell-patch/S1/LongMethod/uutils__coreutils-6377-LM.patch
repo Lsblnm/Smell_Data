@@ -1,0 +1,474 @@
+diff --git a/src/uu/env/src/env.rs b/src/uu/env/src/env.rs
+index 6fad45e5e..019dcf5ef 100644
+--- a/src/uu/env/src/env.rs
++++ b/src/uu/env/src/env.rs
+@@ -16,7 +16,8 @@ use clap::builder::ValueParser;
+ use clap::{crate_name, crate_version, Arg, ArgAction, Command};
+ use ini::Ini;
+ use native_int_str::{
+-    from_native_int_representation_owned, Convert, NCvt, NativeIntStr, NativeIntString, NativeStr,
++    from_native_int_representation_owned, get_single_native_int_value, to_native_int_representation,
++    Convert, NCvt, NativeIntStr, NativeIntString, NativeStr,
+ };
+ #[cfg(unix)]
+ use nix::sys::signal::{raise, sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+@@ -24,7 +25,6 @@ use std::borrow::Cow;
+ use std::env;
+ use std::ffi::{OsStr, OsString};
+ use std::io::{self, Write};
+-use std::ops::Deref;
+ 
+ #[cfg(unix)]
+ use std::os::unix::process::{CommandExt, ExitStatusExt};
+@@ -51,16 +51,6 @@ struct Options<'a> {
+     argv0: Option<&'a OsStr>,
+ }
+ 
+-// print name=value env pairs on screen
+-// if null is true, separate pairs with a \0, \n otherwise
+-fn print_env(line_ending: LineEnding) {
+-    let stdout_raw = io::stdout();
+-    let mut stdout = stdout_raw.lock();
+-    for (n, v) in env::vars() {
+-        write!(stdout, "{}={}{}", n, v, line_ending).unwrap();
+-    }
+-}
+-
+ fn parse_name_value_opt<'a>(opts: &mut Options<'a>, opt: &'a OsStr) -> UResult<bool> {
+     // is it a NAME=VALUE like opt ?
+     let wrap = NativeStr::<'a>::new(opt);
+@@ -87,32 +77,6 @@ fn parse_program_opt<'a>(opts: &mut Options<'a>, opt: &'a OsStr) -> UResult<()>
+     }
+ }
+ 
+-fn load_config_file(opts: &mut Options) -> UResult<()> {
+-    // NOTE: config files are parsed using an INI parser b/c it's available and compatible with ".env"-style files
+-    //   ... * but support for actual INI files, although working, is not intended, nor claimed
+-    for &file in &opts.files {
+-        let conf = if file == "-" {
+-            let stdin = io::stdin();
+-            let mut stdin_locked = stdin.lock();
+-            Ini::read_from(&mut stdin_locked)
+-        } else {
+-            Ini::load_from_file(file)
+-        };
+-
+-        let conf =
+-            conf.map_err(|e| USimpleError::new(1, format!("{}: {}", file.maybe_quote(), e)))?;
+-
+-        for (_, prop) in &conf {
+-            // ignore all INI section lines (treat them as comments)
+-            for (key, value) in prop {
+-                env::set_var(key, value);
+-            }
+-        }
+-    }
+-
+-    Ok(())
+-}
+-
+ pub fn uu_app() -> Command {
+     Command::new(crate_name!())
+         .version(crate_version!())
+@@ -264,12 +228,209 @@ struct EnvAppData {
+ }
+ 
+ impl EnvAppData {
+-    fn make_error_no_such_file_or_dir(&self, prog: &OsStr) -> Box<dyn UError> {
+-        uucore::show_error!("{}: No such file or directory", prog.quote());
+-        if !self.had_string_argument {
+-            uucore::show_error!("{}", ERROR_MSG_S_SHEBANG);
++    fn run_env(&mut self, original_args: impl uucore::Args) -> UResult<()> {
++        let (original_args, matches) = self.parse_arguments(original_args)?;
++
++        self.do_debug_printing = self.do_debug_printing || (0 != matches.get_count("debug"));
++        self.do_input_debug_printing = self
++            .do_input_debug_printing
++            .or(Some(matches.get_count("debug") >= 2));
++        if let Some(value) = self.do_input_debug_printing {
++            if value {
++                debug_print_args(&original_args);
++                self.do_input_debug_printing = Some(false);
++            }
+         }
+-        ExitCode::new(127)
++
++        let opts = make_options(&matches)?;
++
++        // GNU env tests this behavior
++        if opts.program.is_empty() && opts.running_directory.is_some() {
++            return Err(UUsageError::new(
++                125,
++                "must specify command with --chdir (-C)".to_string(),
++            ));
++        }
++
++        if let Some(d) = opts.running_directory {
++            match env::set_current_dir(d) {
++                Ok(()) => d,
++                Err(error) => {
++                    return Err(USimpleError::new(
++                        125,
++                        format!("cannot change directory to {}: {error}", d.quote()),
++                    ));
++                }
++            };
++        }
++
++        // NOTE: we manually set and unset the env vars below rather than using Command::env() to more
++        //       easily handle the case where no command is given
++
++        apply_removal_of_all_env_vars(&opts);
++
++        // load .env-style config file prior to those given on the command-line
++        for &file in &opts.files {
++            if file == "-" {
++                let stdin = io::stdin();
++                let mut stdin_locked = stdin.lock();
++                match Ini::read_from(&mut stdin_locked) {
++                    Ok(conf) => {
++                        for (_, prop) in &conf {
++                            for (key, value) in prop {
++                                env::set_var(key, value);
++                            }
++                        }
++                    }
++                    Err(e) => {
++                        return Err(USimpleError::new(
++                            1,
++                            format!("{}: {}", file.maybe_quote(), e),
++                        ));
++                    }
++                }
++            } else {
++                match Ini::load_from_file(file) {
++                    Ok(conf) => {
++                        for (_, prop) in &conf {
++                            for (key, value) in prop {
++                                env::set_var(key, value);
++                            }
++                        }
++                    }
++                    Err(e) => {
++                        return Err(USimpleError::new(
++                            1,
++                            format!("{}: {}", file.maybe_quote(), e),
++                        ));
++                    }
++                }
++            }
++        }
++
++        for name in &opts.unsets {
++            let native_name = to_native_int_representation(name);
++            if name.is_empty()
++                || native_name.contains(&get_single_native_int_value(&'\0').unwrap())
++                || native_name.contains(&get_single_native_int_value(&'=').unwrap())
++            {
++                return Err(USimpleError::new(
++                    125,
++                    format!("cannot unset {}: Invalid argument", name.quote()),
++                ));
++            }
++
++            env::remove_var(name);
++        }
++
++        apply_specified_env_vars(&opts);
++
++        if opts.program.is_empty() {
++            // no program provided, so just dump all env vars to stdout
++            let stdout_raw = io::stdout();
++            let mut stdout = stdout_raw.lock();
++            for (n, v) in env::vars() {
++                match opts.line_ending {
++                    LineEnding::Newline => {
++                        write!(stdout, "{}={}{}", n, v, '\n').unwrap();
++                    }
++                    LineEnding::Nul => {
++                        write!(stdout, "{}={}{}", n, v, '\0').unwrap();
++                    }
++                }
++            }
++        } else {
++            let prog = Cow::from(opts.program[0]);
++            #[cfg(unix)]
++            let mut arg0 = prog.clone();
++            #[cfg(not(unix))]
++            let arg0 = prog.clone();
++            let args = &opts.program[1..];
++
++            /*
++             * On Unix-like systems Command::status either ends up calling either fork or posix_spawnp
++             * (which ends up calling clone). Keep using the current process would be ideal, but the
++             * standard library contains many checks and fail-safes to ensure the process ends up being
++             * created. This is much simpler than dealing with the hassles of calling execvp directly.
++             */
++            let mut cmd = process::Command::new(&*prog);
++            cmd.args(args);
++
++            if let Some(_argv0) = opts.argv0 {
++                #[cfg(unix)]
++                {
++                    cmd.arg0(_argv0);
++                    arg0 = Cow::Borrowed(_argv0);
++                    if self.do_debug_printing {
++                        eprintln!("argv0:     {}", arg0.quote());
++                    }
++                }
++
++                #[cfg(not(unix))]
++                return Err(USimpleError::new(
++                    2,
++                    "--argv0 is currently not supported on this platform",
++                ));
++            }
++
++            if self.do_debug_printing {
++                eprintln!("executing: {}", prog.maybe_quote());
++                let arg_prefix = "   arg";
++                eprintln!("{}[{}]= {}", arg_prefix, 0, arg0.quote());
++                for (i, arg) in args.iter().enumerate() {
++                    eprintln!("{}[{}]= {}", arg_prefix, i + 1, arg.quote());
++                }
++            }
++
++            match cmd.status() {
++                Ok(exit) if !exit.success() => {
++                    #[cfg(unix)]
++                    if let Some(exit_code) = exit.code() {
++                        return Err(exit_code.into());
++                    } else {
++                        // `exit.code()` returns `None` on Unix when the process is terminated by a signal.
++                        // See std::os::unix::process::ExitStatusExt for more information. This prints out
++                        // the interrupted process and the signal it received.
++                        let signal_code = exit.signal().unwrap();
++                        let signal = Signal::try_from(signal_code).unwrap();
++
++                        // We have to disable any handler that's installed by default.
++                        // This ensures that we exit on this signal.
++                        // For example, `SIGSEGV` and `SIGBUS` have default handlers installed in Rust.
++                        // We ignore the errors because there is not much we can do if that fails anyway.
++                        // SAFETY: The function is unsafe because installing functions is unsafe, but we are
++                        // just defaulting to default behavior and not installing a function. Hence, the call
++                        // is safe.
++                        let _ = unsafe {
++                            sigaction(
++                                signal,
++                                &SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::all()),
++                            )
++                        };
++
++                        let _ = raise(signal);
++                    }
++                    return Err(exit.code().unwrap().into());
++                }
++                Err(ref err)
++                    if (err.kind() == io::ErrorKind::NotFound)
++                        || (err.kind() == io::ErrorKind::InvalidInput) =>
++                {
++                    uucore::show_error!("{}: No such file or directory", prog.quote());
++                    if !self.had_string_argument {
++                        uucore::show_error!("{}", ERROR_MSG_S_SHEBANG);
++                    }
++                    return Err(ExitCode::new(127));
++                }
++                Err(e) => {
++                    uucore::show_error!("unknown error: {:?}", e);
++                    return Err(126.into());
++                }
++                Ok(_) => (),
++            }
++        }
++
++        Ok(())
+     }
+ 
+     fn process_all_string_arguments(
+@@ -336,138 +497,6 @@ impl EnvAppData {
+             })?;
+         Ok((original_args, matches))
+     }
+-
+-    fn run_env(&mut self, original_args: impl uucore::Args) -> UResult<()> {
+-        let (original_args, matches) = self.parse_arguments(original_args)?;
+-
+-        self.do_debug_printing = self.do_debug_printing || (0 != matches.get_count("debug"));
+-        self.do_input_debug_printing = self
+-            .do_input_debug_printing
+-            .or(Some(matches.get_count("debug") >= 2));
+-        if let Some(value) = self.do_input_debug_printing {
+-            if value {
+-                debug_print_args(&original_args);
+-                self.do_input_debug_printing = Some(false);
+-            }
+-        }
+-
+-        let mut opts = make_options(&matches)?;
+-
+-        apply_change_directory(&opts)?;
+-
+-        // NOTE: we manually set and unset the env vars below rather than using Command::env() to more
+-        //       easily handle the case where no command is given
+-
+-        apply_removal_of_all_env_vars(&opts);
+-
+-        // load .env-style config file prior to those given on the command-line
+-        load_config_file(&mut opts)?;
+-
+-        apply_unset_env_vars(&opts)?;
+-
+-        apply_specified_env_vars(&opts);
+-
+-        if opts.program.is_empty() {
+-            // no program provided, so just dump all env vars to stdout
+-            print_env(opts.line_ending);
+-        } else {
+-            return self.run_program(&opts, self.do_debug_printing);
+-        }
+-
+-        Ok(())
+-    }
+-
+-    fn run_program(
+-        &mut self,
+-        opts: &Options<'_>,
+-        do_debug_printing: bool,
+-    ) -> Result<(), Box<dyn UError>> {
+-        let prog = Cow::from(opts.program[0]);
+-        #[cfg(unix)]
+-        let mut arg0 = prog.clone();
+-        #[cfg(not(unix))]
+-        let arg0 = prog.clone();
+-        let args = &opts.program[1..];
+-
+-        /*
+-         * On Unix-like systems Command::status either ends up calling either fork or posix_spawnp
+-         * (which ends up calling clone). Keep using the current process would be ideal, but the
+-         * standard library contains many checks and fail-safes to ensure the process ends up being
+-         * created. This is much simpler than dealing with the hassles of calling execvp directly.
+-         */
+-        let mut cmd = process::Command::new(&*prog);
+-        cmd.args(args);
+-
+-        if let Some(_argv0) = opts.argv0 {
+-            #[cfg(unix)]
+-            {
+-                cmd.arg0(_argv0);
+-                arg0 = Cow::Borrowed(_argv0);
+-                if do_debug_printing {
+-                    eprintln!("argv0:     {}", arg0.quote());
+-                }
+-            }
+-
+-            #[cfg(not(unix))]
+-            return Err(USimpleError::new(
+-                2,
+-                "--argv0 is currently not supported on this platform",
+-            ));
+-        }
+-
+-        if do_debug_printing {
+-            eprintln!("executing: {}", prog.maybe_quote());
+-            let arg_prefix = "   arg";
+-            eprintln!("{}[{}]= {}", arg_prefix, 0, arg0.quote());
+-            for (i, arg) in args.iter().enumerate() {
+-                eprintln!("{}[{}]= {}", arg_prefix, i + 1, arg.quote());
+-            }
+-        }
+-
+-        match cmd.status() {
+-            Ok(exit) if !exit.success() => {
+-                #[cfg(unix)]
+-                if let Some(exit_code) = exit.code() {
+-                    return Err(exit_code.into());
+-                } else {
+-                    // `exit.code()` returns `None` on Unix when the process is terminated by a signal.
+-                    // See std::os::unix::process::ExitStatusExt for more information. This prints out
+-                    // the interrupted process and the signal it received.
+-                    let signal_code = exit.signal().unwrap();
+-                    let signal = Signal::try_from(signal_code).unwrap();
+-
+-                    // We have to disable any handler that's installed by default.
+-                    // This ensures that we exit on this signal.
+-                    // For example, `SIGSEGV` and `SIGBUS` have default handlers installed in Rust.
+-                    // We ignore the errors because there is not much we can do if that fails anyway.
+-                    // SAFETY: The function is unsafe because installing functions is unsafe, but we are
+-                    // just defaulting to default behavior and not installing a function. Hence, the call
+-                    // is safe.
+-                    let _ = unsafe {
+-                        sigaction(
+-                            signal,
+-                            &SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::all()),
+-                        )
+-                    };
+-
+-                    let _ = raise(signal);
+-                }
+-                return Err(exit.code().unwrap().into());
+-            }
+-            Err(ref err)
+-                if (err.kind() == io::ErrorKind::NotFound)
+-                    || (err.kind() == io::ErrorKind::InvalidInput) =>
+-            {
+-                return Err(self.make_error_no_such_file_or_dir(prog.deref()));
+-            }
+-            Err(e) => {
+-                uucore::show_error!("unknown error: {:?}", e);
+-                return Err(126.into());
+-            }
+-            Ok(_) => (),
+-        }
+-        Ok(())
+-    }
+ }
+ 
+ fn apply_removal_of_all_env_vars(opts: &Options<'_>) {
+@@ -528,47 +557,6 @@ fn make_options(matches: &clap::ArgMatches) -> UResult<Options<'_>> {
+     Ok(opts)
+ }
+ 
+-fn apply_unset_env_vars(opts: &Options<'_>) -> Result<(), Box<dyn UError>> {
+-    for name in &opts.unsets {
+-        let native_name = NativeStr::new(name);
+-        if name.is_empty()
+-            || native_name.contains(&'\0').unwrap()
+-            || native_name.contains(&'=').unwrap()
+-        {
+-            return Err(USimpleError::new(
+-                125,
+-                format!("cannot unset {}: Invalid argument", name.quote()),
+-            ));
+-        }
+-
+-        env::remove_var(name);
+-    }
+-    Ok(())
+-}
+-
+-fn apply_change_directory(opts: &Options<'_>) -> Result<(), Box<dyn UError>> {
+-    // GNU env tests this behavior
+-    if opts.program.is_empty() && opts.running_directory.is_some() {
+-        return Err(UUsageError::new(
+-            125,
+-            "must specify command with --chdir (-C)".to_string(),
+-        ));
+-    }
+-
+-    if let Some(d) = opts.running_directory {
+-        match env::set_current_dir(d) {
+-            Ok(()) => d,
+-            Err(error) => {
+-                return Err(USimpleError::new(
+-                    125,
+-                    format!("cannot change directory to {}: {error}", d.quote()),
+-                ));
+-            }
+-        };
+-    }
+-    Ok(())
+-}
+-
+ fn apply_specified_env_vars(opts: &Options<'_>) {
+     // set specified env vars
+     for (name, val) in &opts.sets {

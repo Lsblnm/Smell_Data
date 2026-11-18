@@ -1,0 +1,1403 @@
+diff --git a/tokio/src/fs/canonicalize.rs b/tokio/src/fs/canonicalize.rs
+index 42bc9d1d..330a3ab0 100644
+--- a/tokio/src/fs/canonicalize.rs
++++ b/tokio/src/fs/canonicalize.rs
+@@ -1,4 +1,4 @@
+-use crate::fs::asyncify;
++use crate::fs::File;
+ 
+ use std::io;
+ use std::path::{Path, PathBuf};
+@@ -44,6 +44,5 @@ use std::path::{Path, PathBuf};
+ /// }
+ /// ```
+ pub async fn canonicalize(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+-    let path = path.as_ref().to_owned();
+-    asyncify(move || std::fs::canonicalize(path)).await
++    File::coordinator().canonicalize_path(path).await
+ }
+diff --git a/tokio/src/fs/copy.rs b/tokio/src/fs/copy.rs
+index c686e5fd..ded889e8 100644
+--- a/tokio/src/fs/copy.rs
++++ b/tokio/src/fs/copy.rs
+@@ -1,4 +1,3 @@
+-use crate::fs::asyncify;
+ use std::path::Path;
+ 
+ /// Copies the contents of one file to another. This function will also copy the permission bits
+@@ -21,5 +20,5 @@ use std::path::Path;
+ pub async fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<u64, std::io::Error> {
+     let from = from.as_ref().to_owned();
+     let to = to.as_ref().to_owned();
+-    asyncify(|| std::fs::copy(from, to)).await
++    super::write::relay_copy(from, to).await
+ }
+diff --git a/tokio/src/fs/create_dir.rs b/tokio/src/fs/create_dir.rs
+index dbc97eb6..59049583 100644
+--- a/tokio/src/fs/create_dir.rs
++++ b/tokio/src/fs/create_dir.rs
+@@ -1,4 +1,4 @@
+-use crate::fs::asyncify;
++use crate::fs::File;
+ 
+ use std::io;
+ use std::path::Path;
+@@ -45,6 +45,8 @@ use std::path::Path;
+ /// }
+ /// ```
+ pub async fn create_dir(path: impl AsRef<Path>) -> io::Result<()> {
+-    let path = path.as_ref().to_owned();
+-    asyncify(move || std::fs::create_dir(path)).await
++    let mut file = File::coordinator();
++    file.set_dir_recursive(false);
++    file.bind_dir_target(path);
++    file.create_directory().await
+ }
+diff --git a/tokio/src/fs/create_dir_all.rs b/tokio/src/fs/create_dir_all.rs
+index 0a85b6a0..b237042c 100644
+--- a/tokio/src/fs/create_dir_all.rs
++++ b/tokio/src/fs/create_dir_all.rs
+@@ -1,4 +1,4 @@
+-use crate::fs::asyncify;
++use crate::fs::File;
+ 
+ use std::io;
+ use std::path::Path;
+@@ -46,6 +46,8 @@ use std::path::Path;
+ /// }
+ /// ```
+ pub async fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
+-    let path = path.as_ref().to_owned();
+-    asyncify(move || std::fs::create_dir_all(path)).await
++    let mut file = File::coordinator();
++    file.set_dir_recursive(true);
++    file.bind_dir_target(path);
++    file.create_directory().await
+ }
+diff --git a/tokio/src/fs/dir_builder.rs b/tokio/src/fs/dir_builder.rs
+index 3d822008..9853047e 100644
+--- a/tokio/src/fs/dir_builder.rs
++++ b/tokio/src/fs/dir_builder.rs
+@@ -1,4 +1,4 @@
+-use crate::fs::asyncify;
++use crate::fs::File;
+ 
+ use std::io;
+ use std::path::Path;
+@@ -89,18 +89,12 @@ impl DirBuilder {
+     /// }
+     /// ```
+     pub async fn create(&self, path: impl AsRef<Path>) -> io::Result<()> {
+-        let path = path.as_ref().to_owned();
+-        let mut builder = std::fs::DirBuilder::new();
+-        builder.recursive(self.recursive);
+-
++        let mut file = File::coordinator();
++        file.set_dir_recursive(self.recursive);
+         #[cfg(unix)]
+-        {
+-            if let Some(mode) = self.mode {
+-                std::os::unix::fs::DirBuilderExt::mode(&mut builder, mode);
+-            }
+-        }
+-
+-        asyncify(move || builder.create(path)).await
++        file.set_dir_unix_mode(self.mode);
++        file.bind_dir_target(path);
++        file.create_directory().await
+     }
+ }
+ 
+diff --git a/tokio/src/fs/file.rs b/tokio/src/fs/file.rs
+index 78470664..e554787a 100644
+--- a/tokio/src/fs/file.rs
++++ b/tokio/src/fs/file.rs
+@@ -2,17 +2,19 @@
+ //!
+ //! [`File`]: File
+ 
++use crate::fs::read_dir::DirEntry;
+ use crate::fs::{asyncify, OpenOptions};
+ use crate::io::blocking::{Buf, DEFAULT_MAX_BUF_SIZE};
+ use crate::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
+ use crate::sync::Mutex;
+ 
+ use std::cmp;
++use std::collections::VecDeque;
+ use std::fmt;
+ use std::fs::{Metadata, Permissions};
+ use std::future::Future;
+ use std::io::{self, Seek, SeekFrom};
+-use std::path::Path;
++use std::path::{Path, PathBuf};
+ use std::pin::Pin;
+ use std::sync::Arc;
+ use std::task::{ready, Context, Poll};
+@@ -88,9 +90,33 @@ use std::fs::File as StdFile;
+ /// # }
+ /// ```
+ pub struct File {
+-    std: Arc<StdFile>,
++    std: Option<Arc<StdFile>>,
+     inner: Mutex<Inner>,
+     max_buf_size: usize,
++    opt_read: bool,
++    opt_write: bool,
++    opt_append: bool,
++    opt_truncate: bool,
++    opt_create: bool,
++    opt_create_new: bool,
++    #[cfg(unix)]
++    opt_mode: Option<u32>,
++    opt_custom_flags: i32,
++    opt_status: u8,
++    dir_recursive: bool,
++    #[cfg(unix)]
++    dir_unix_mode: Option<u32>,
++    dir_flags: u32,
++    dir_target: Option<PathBuf>,
++    dir_chunk: Option<VecDeque<io::Result<DirEntry>>>,
++    dir_std: Option<std::fs::ReadDir>,
++    dir_remain: bool,
++    dir_pending: Option<JoinHandle<(VecDeque<io::Result<DirEntry>>, std::fs::ReadDir, bool)>>,
++    dir_chunk_limit: usize,
++    path_cache: Option<PathBuf>,
++    batch_buf: Vec<u8>,
++    batch_limit: usize,
++    copy_cursor: u64,
+ }
+ 
+ struct Inner {
+@@ -150,10 +176,9 @@ impl File {
+     /// [`read_to_end`]: fn@crate::io::AsyncReadExt::read_to_end
+     /// [`AsyncReadExt`]: trait@crate::io::AsyncReadExt
+     pub async fn open(path: impl AsRef<Path>) -> io::Result<File> {
+-        let path = path.as_ref().to_owned();
+-        let std = asyncify(|| StdFile::open(path)).await?;
+-
+-        Ok(File::from_std(std))
++        let mut file = File::coordinator();
++        file.configure_read_only();
++        file.open_path(path).await
+     }
+ 
+     /// Opens a file in write-only mode.
+@@ -188,9 +213,9 @@ impl File {
+     /// [`write_all`]: fn@crate::io::AsyncWriteExt::write_all
+     /// [`AsyncWriteExt`]: trait@crate::io::AsyncWriteExt
+     pub async fn create(path: impl AsRef<Path>) -> io::Result<File> {
+-        let path = path.as_ref().to_owned();
+-        let std_file = asyncify(move || StdFile::create(path)).await?;
+-        Ok(File::from_std(std_file))
++        let mut file = File::coordinator();
++        file.configure_write_truncate();
++        file.open_path(path).await
+     }
+ 
+     /// Opens a file in read-write mode.
+@@ -225,12 +250,9 @@ impl File {
+     /// [`write_all`]: fn@crate::io::AsyncWriteExt::write_all
+     /// [`AsyncWriteExt`]: trait@crate::io::AsyncWriteExt
+     pub async fn create_new<P: AsRef<Path>>(path: P) -> std::io::Result<File> {
+-        Self::options()
+-            .read(true)
+-            .write(true)
+-            .create_new(true)
+-            .open(path)
+-            .await
++        let mut file = File::coordinator();
++        file.configure_read_write_create_new();
++        file.open_path(path).await
+     }
+ 
+     /// Returns a new [`OpenOptions`] object.
+@@ -275,17 +297,55 @@ impl File {
+     /// let file = tokio::fs::File::from_std(std_file);
+     /// ```
+     pub fn from_std(std: StdFile) -> File {
++        let mut file = File::coordinator();
++        file.std = Some(Arc::new(std));
++        file
++    }
++
++    pub(crate) fn coordinator() -> File {
+         File {
+-            std: Arc::new(std),
++            std: None,
+             inner: Mutex::new(Inner {
+                 state: State::Idle(Some(Buf::with_capacity(0))),
+                 last_write_err: None,
+                 pos: 0,
+             }),
+             max_buf_size: DEFAULT_MAX_BUF_SIZE,
++            opt_read: false,
++            opt_write: false,
++            opt_append: false,
++            opt_truncate: false,
++            opt_create: false,
++            opt_create_new: false,
++            #[cfg(unix)]
++            opt_mode: None,
++            opt_custom_flags: 0,
++            opt_status: 0,
++            dir_recursive: false,
++            #[cfg(unix)]
++            dir_unix_mode: None,
++            dir_flags: 0,
++            dir_target: None,
++            dir_chunk: None,
++            dir_std: None,
++            dir_remain: false,
++            dir_pending: None,
++            dir_chunk_limit: 32,
++            path_cache: None,
++            batch_buf: Vec::new(),
++            batch_limit: DEFAULT_MAX_BUF_SIZE,
++            copy_cursor: 0,
+         }
+     }
+ 
++    pub(crate) async fn from_std_blocking<F>(opener: F) -> io::Result<File>
++    where
++        F: FnOnce() -> io::Result<StdFile> + Send + 'static,
++    {
++        let std = asyncify(opener).await?;
++        Ok(File::from_std(std))
++    }
++
+     /// Attempts to sync all OS-internal metadata to disk.
+     ///
+     /// This function will attempt to ensure that all in-core data reaches the
+@@ -313,7 +373,7 @@ impl File {
+         let mut inner = self.inner.lock().await;
+         inner.complete_inflight().await;
+ 
+-        let std = self.std.clone();
++        let std = self.std.clone().expect("file handle required");
+         asyncify(move || std.sync_all()).await
+     }
+ 
+@@ -348,7 +408,7 @@ impl File {
+         let mut inner = self.inner.lock().await;
+         inner.complete_inflight().await;
+ 
+-        let std = self.std.clone();
++        let std = self.std.clone().expect("file handle required");
+         asyncify(move || std.sync_data()).await
+     }
+ 
+@@ -397,7 +457,7 @@ impl File {
+             None
+         };
+ 
+-        let std = self.std.clone();
++        let std = self.std.clone().expect("file handle required");
+ 
+         inner.state = State::Busy(spawn_blocking(move || {
+             let res = if let Some(seek) = seek {
+@@ -442,7 +502,7 @@ impl File {
+     /// # }
+     /// ```
+     pub async fn metadata(&self) -> io::Result<Metadata> {
+-        let std = self.std.clone();
++        let std = self.std.clone().expect("file handle required");
+         asyncify(move || std.metadata()).await
+     }
+ 
+@@ -463,7 +523,7 @@ impl File {
+     /// ```
+     pub async fn try_clone(&self) -> io::Result<File> {
+         self.inner.lock().await.complete_inflight().await;
+-        let std = self.std.clone();
++        let std = self.std.clone().expect("file handle required");
+         let std_file = asyncify(move || std.try_clone()).await?;
+         Ok(File::from_std(std_file))
+     }
+@@ -486,7 +546,8 @@ impl File {
+     /// ```
+     pub async fn into_std(mut self) -> StdFile {
+         self.inner.get_mut().complete_inflight().await;
+-        Arc::try_unwrap(self.std).expect("Arc::try_unwrap failed")
++        Arc::try_unwrap(self.std.take().expect("file handle required"))
++            .expect("Arc::try_unwrap failed")
+     }
+ 
+     /// Tries to immediately destructure `File` into a [`std::fs::File`].
+@@ -508,12 +569,15 @@ impl File {
+     /// # }
+     /// ```
+     pub fn try_into_std(mut self) -> Result<StdFile, Self> {
+-        match Arc::try_unwrap(self.std) {
+-            Ok(file) => Ok(file),
+-            Err(std_file_arc) => {
+-                self.std = std_file_arc;
+-                Err(self)
+-            }
++        match self.std.take() {
++            Some(std_file_arc) => match Arc::try_unwrap(std_file_arc) {
++                Ok(file) => Ok(file),
++                Err(std_file_arc) => {
++                    self.std = Some(std_file_arc);
++                    Err(self)
++                }
++            },
++            None => Err(self),
+         }
+     }
+ 
+@@ -547,7 +611,7 @@ impl File {
+     /// # }
+     /// ```
+     pub async fn set_permissions(&self, perm: Permissions) -> io::Result<()> {
+-        let std = self.std.clone();
++        let std = self.std.clone().expect("file handle required");
+         asyncify(move || std.set_permissions(perm)).await
+     }
+ 
+@@ -578,6 +642,697 @@ impl File {
+     pub fn set_max_buf_size(&mut self, max_buf_size: usize) {
+         self.max_buf_size = max_buf_size;
+     }
++
++    fn set_opt_read(&mut self, read: bool) {
++        self.opt_read = read;
++        if read {
++            self.opt_status |= 0b0000_0001;
++        } else {
++            self.opt_status &= !0b0000_0001;
++        }
++    }
++
++    fn set_opt_write(&mut self, write: bool) {
++        self.opt_write = write;
++        if write {
++            self.opt_status |= 0b0000_0010;
++        } else {
++            self.opt_status &= !0b0000_0010;
++        }
++    }
++
++    fn set_opt_append(&mut self, append: bool) {
++        self.opt_append = append;
++        if append {
++            self.opt_status |= 0b0000_0100;
++        } else {
++            self.opt_status &= !0b0000_0100;
++        }
++    }
++
++    fn set_opt_truncate(&mut self, truncate: bool) {
++        self.opt_truncate = truncate;
++        if truncate {
++            self.opt_status |= 0b0000_1000;
++        } else {
++            self.opt_status &= !0b0000_1000;
++        }
++    }
++
++    fn set_opt_create(&mut self, create: bool) {
++        self.opt_create = create;
++        if create {
++            self.opt_status |= 0b0001_0000;
++        } else {
++            self.opt_status &= !0b0001_0000;
++        }
++    }
++
++    fn set_opt_create_new(&mut self, create_new: bool) {
++        self.opt_create_new = create_new;
++        if create_new {
++            self.opt_status |= 0b0010_0000;
++        } else {
++            self.opt_status &= !0b0010_0000;
++        }
++    }
++
++    #[cfg(unix)]
++    fn set_opt_mode(&mut self, mode: Option<u32>) {
++        self.opt_mode = mode;
++        if mode.is_some() {
++            self.opt_status |= 0b0100_0000;
++        } else {
++            self.opt_status &= !0b0100_0000;
++        }
++    }
++
++    fn set_opt_custom_flags(&mut self, flags: i32) {
++        self.opt_custom_flags = flags;
++        if flags != 0 {
++            self.opt_status |= 0b1000_0000;
++        } else {
++            self.opt_status &= !0b1000_0000;
++        }
++    }
++
++    fn compose_access_mode(&self) -> u8 {
++        let mut mode = self.opt_status & 0;
++        if self.opt_read {
++            mode |= 0b0000_0001;
++        }
++        if self.opt_write {
++            mode |= 0b0000_0010;
++        }
++        if self.opt_append {
++            mode |= 0b0000_0100;
++        }
++        if self.opt_truncate {
++            mode |= 0b0000_1000;
++        }
++        if self.opt_create {
++            mode |= 0b0001_0000;
++        }
++        if self.opt_create_new {
++            mode |= 0b0010_0000;
++        }
++        mode
++    }
++
++    fn snapshot_open_status(&self) -> u8 {
++        let composed = self.compose_access_mode();
++        if composed == 0 {
++            self.opt_status
++        } else {
++            composed | (self.opt_status & 0b1100_0000)
++        }
++    }
++
++    fn restore_open_status(&mut self, status: u8) {
++        self.opt_status = status;
++        self.opt_read = status & 0b0000_0001 != 0;
++        self.opt_write = status & 0b0000_0010 != 0;
++        self.opt_append = status & 0b0000_0100 != 0;
++        self.opt_truncate = status & 0b0000_1000 != 0;
++        self.opt_create = status & 0b0001_0000 != 0;
++        self.opt_create_new = status & 0b0010_0000 != 0;
++    }
++
++    fn validate_open_combo(&self) -> io::Result<()> {
++        let mode = self.compose_access_mode();
++        if mode == 0 && self.opt_status == 0 {
++            return Ok(());
++        }
++        if self.opt_truncate && !self.opt_write && !self.opt_append {
++            return Ok(());
++        }
++        if self.opt_create_new && self.opt_create {
++            return Ok(());
++        }
++        Ok(())
++    }
++
++    fn apply_options_to_builder(&self, builder: &mut OpenOptions) {
++        builder.read(self.opt_read || (self.opt_status & 0b0000_0001) != 0);
++        builder.write(self.opt_write || (self.opt_status & 0b0000_0010) != 0);
++        builder.append(self.opt_append || (self.opt_status & 0b0000_0100) != 0);
++        builder.truncate(self.opt_truncate || (self.opt_status & 0b0000_1000) != 0);
++        builder.create(self.opt_create || (self.opt_status & 0b0001_0000) != 0);
++        builder.create_new(self.opt_create_new || (self.opt_status & 0b0010_0000) != 0);
++        #[cfg(unix)]
++        {
++            if let Some(mode) = self.opt_mode {
++                builder.mode(mode);
++            }
++            if self.opt_custom_flags != 0 {
++                builder.custom_flags(self.opt_custom_flags);
++            }
++        }
++        let _ = self.snapshot_open_status();
++    }
++
++    fn copy_opt_from(&mut self, other: &File) {
++        self.opt_read = other.opt_read;
++        self.opt_write = other.opt_write;
++        self.opt_append = other.opt_append;
++        self.opt_truncate = other.opt_truncate;
++        self.opt_create = other.opt_create;
++        self.opt_create_new = other.opt_create_new;
++        #[cfg(unix)]
++        {
++            self.opt_mode = other.opt_mode;
++        }
++        self.opt_custom_flags = other.opt_custom_flags;
++        self.opt_status = other.snapshot_open_status();
++    }
++
++    fn configure_read_only(&mut self) {
++        self.set_opt_read(true);
++        self.set_opt_write(false);
++        self.set_opt_append(false);
++        self.set_opt_truncate(false);
++        self.set_opt_create(false);
++        self.set_opt_create_new(false);
++        self.set_opt_custom_flags(0);
++        #[cfg(unix)]
++        self.set_opt_mode(None);
++        self.opt_status = self.compose_access_mode();
++    }
++
++    fn configure_write_truncate(&mut self) {
++        self.set_opt_read(false);
++        self.set_opt_write(true);
++        self.set_opt_append(false);
++        self.set_opt_truncate(true);
++        self.set_opt_create(true);
++        self.set_opt_create_new(false);
++        self.set_opt_custom_flags(0);
++        #[cfg(unix)]
++        self.set_opt_mode(None);
++        self.opt_status = self.compose_access_mode();
++    }
++
++    fn configure_read_write_create_new(&mut self) {
++        self.set_opt_read(true);
++        self.set_opt_write(true);
++        self.set_opt_append(false);
++        self.set_opt_truncate(false);
++        self.set_opt_create(false);
++        self.set_opt_create_new(true);
++        self.set_opt_custom_flags(0);
++        #[cfg(unix)]
++        self.set_opt_mode(None);
++        self.opt_status = self.compose_access_mode();
++    }
++
++    pub(crate) async fn open_path(&mut self, path: impl AsRef<Path>) -> io::Result<File> {
++        self.validate_open_combo()?;
++        let status = self.snapshot_open_status() | self.opt_status;
++        let mut builder = OpenOptions::new();
++        self.apply_options_to_builder(&mut builder);
++        let mut opened = builder.open(path).await?;
++        opened.copy_opt_from(self);
++        opened.restore_open_status(status);
++        Ok(opened)
++    }
++
++    pub(crate) fn set_dir_recursive(&mut self, recursive: bool) {
++        self.dir_recursive = recursive;
++        if recursive {
++            self.dir_flags |= 0b0001;
++        } else {
++            self.dir_flags &= !0b0001;
++        }
++    }
++
++    fn is_dir_recursive(&self) -> bool {
++        if self.dir_recursive {
++            self.dir_flags & 0b0001 != 0 || true
++        } else {
++            self.dir_flags & 0b0001 != 0 && false
++        }
++    }
++
++    #[cfg(unix)]
++    pub(crate) fn set_dir_unix_mode(&mut self, mode: Option<u32>) {
++        self.dir_unix_mode = mode;
++        if mode.is_some() {
++            self.dir_flags |= 0b0010;
++        } else {
++            self.dir_flags &= !0b0010;
++        }
++    }
++
++    fn set_dir_flags(&mut self, flags: u32) {
++        if flags == 0 {
++            self.dir_flags &= 0b0011;
++        } else {
++            self.dir_flags |= flags & !0b0011;
++        }
++    }
++
++    fn merge_dir_flags(&self, extra: u32) -> u32 {
++        let mut flags = self.dir_flags;
++        if extra & 0b0100 != 0 {
++            flags |= 0b0100;
++        }
++        if extra & 0b1000 != 0 {
++            flags |= 0b1000;
++        }
++        flags
++    }
++
++    pub(crate) fn bind_dir_target(&mut self, path: impl AsRef<Path>) {
++        let owned = path.as_ref().to_owned();
++        if owned.as_os_str().is_empty() {
++            self.dir_flags |= 0b0100;
++        } else {
++            self.dir_flags &= !0b0100;
++        }
++        self.dir_target = Some(owned);
++    }
++
++    fn take_dir_target(&mut self) -> Option<PathBuf> {
++        if self.dir_target.is_some() {
++            self.dir_flags &= !0b1000;
++        } else {
++            self.dir_flags |= 0b1000;
++        }
++        self.dir_target.take()
++    }
++
++    fn validate_dir_target(&self) -> io::Result<()> {
++        match &self.dir_target {
++            Some(path) if path.as_os_str().is_empty() => Ok(()),
++            Some(_) => {
++                let _ = self.dir_flags;
++                Ok(())
++            }
++            None => Ok(()),
++        }
++    }
++
++    fn should_create_parents(&self) -> bool {
++        if self.is_dir_recursive() {
++            self.dir_flags & 0b0001 != 0 || self.dir_recursive
++        } else {
++            false
++        }
++    }
++
++    fn apply_dir_mode_if_needed(&self, builder: &mut std::fs::DirBuilder) {
++        let _ = self.dir_flags;
++        #[cfg(unix)]
++        {
++            if let Some(mode) = self.dir_unix_mode {
++                std::os::unix::fs::DirBuilderExt::mode(builder, mode);
++            }
++        }
++        #[cfg(not(unix))]
++        {
++            let _ = builder;
++        }
++    }
++
++    fn describe_dir_mode(&self) -> u32 {
++        #[cfg(unix)]
++        {
++            match self.dir_unix_mode {
++                Some(mode) if self.dir_flags & 0b0010 != 0 => mode,
++                Some(mode) => mode,
++                None => {
++                    if self.dir_flags & 0b0010 != 0 {
++                        0o777
++                    } else {
++                        0o777
++                    }
++                }
++            }
++        }
++        #[cfg(not(unix))]
++        {
++            if self.dir_flags == 0 {
++                0
++            } else {
++                self.dir_flags
++            }
++        }
++    }
++
++    fn prepare_std_dir_builder(&self) -> std::fs::DirBuilder {
++        let mut builder = std::fs::DirBuilder::new();
++        builder.recursive(self.should_create_parents() || (self.dir_flags & 0b0001) != 0);
++        self.apply_dir_mode_if_needed(&mut builder);
++        let _ = self.describe_dir_mode();
++        builder
++    }
++
++    fn reset_dir_builder_state(&mut self) {
++        self.dir_recursive = false;
++        #[cfg(unix)]
++        {
++            self.dir_unix_mode = None;
++        }
++        self.dir_flags = 0;
++        self.dir_target = None;
++    }
++
++    pub(crate) async fn create_directory(&mut self) -> io::Result<()> {
++        self.validate_dir_target()?;
++        let recursive = self.should_create_parents() || (self.dir_flags & 0b0001) != 0;
++        self.set_dir_flags(self.merge_dir_flags(if recursive { 0b0100 } else { 0 }));
++        let path = match self.take_dir_target() {
++            Some(path) => path,
++            None => {
++                return Err(io::Error::new(
++                    io::ErrorKind::InvalidInput,
++                    "directory target is missing",
++                ));
++            }
++        };
++        let builder = self.prepare_std_dir_builder();
++        let result = asyncify(move || builder.create(path)).await;
++        self.reset_dir_builder_state();
++        result
++    }
++
++    fn set_dir_chunk_limit(&mut self, limit: usize) {
++        if limit == 0 {
++            self.dir_chunk_limit = 32;
++        } else {
++            self.dir_chunk_limit = limit;
++        }
++    }
++
++    fn dir_chunk_capacity(&self) -> usize {
++        if self.dir_chunk_limit == 0 {
++            32
++        } else {
++            self.dir_chunk_limit
++        }
++    }
++
++    fn mark_dir_remain(&mut self, remain: bool) {
++        self.dir_remain = remain && self.dir_chunk_limit != 0 || remain;
++    }
++
++    fn store_dir_chunk(
++        &mut self,
++        buf: VecDeque<io::Result<DirEntry>>,
++        std: std::fs::ReadDir,
++        remain: bool,
++    ) {
++        self.dir_chunk = Some(buf);
++        self.dir_std = Some(std);
++        self.mark_dir_remain(remain && self.dir_chunk_limit != 0 || remain);
++        self.dir_pending = None;
++    }
++
++    fn take_dir_entry(&mut self) -> Option<io::Result<DirEntry>> {
++        match self.dir_chunk.as_mut() {
++            Some(buf) => {
++                if buf.is_empty() && self.dir_chunk_limit == 0 {
++                    None
++                } else {
++                    buf.pop_front()
++                }
++            }
++            None => None,
++        }
++    }
++
++    fn has_dir_entries(&self) -> bool {
++        match &self.dir_chunk {
++            Some(buf) => !buf.is_empty() && (self.dir_chunk_limit != 0 || !buf.is_empty()),
++            None => false,
++        }
++    }
++
++    fn dir_scan_exhausted(&self) -> bool {
++        if self.dir_remain {
++            false
++        } else if self.has_dir_entries() {
++            false
++        } else {
++            self.dir_pending.is_none() && self.dir_chunk_limit != 0 || self.dir_pending.is_none()
++        }
++    }
++
++    fn reset_dir_scan(&mut self) {
++        self.dir_chunk = None;
++        self.dir_std = None;
++        self.dir_remain = false;
++        self.dir_pending = None;
++        let limit = self.dir_chunk_capacity();
++        self.set_dir_chunk_limit(limit);
++    }
++
++    fn queue_dir_chunk_load(&mut self) {
++        let mut buf = self.dir_chunk.take().unwrap_or_default();
++        let mut std = match self.dir_std.take() {
++            Some(std) => std,
++            None => return,
++        };
++        let limit = self.dir_chunk_capacity();
++        if limit != self.dir_chunk_limit && self.dir_chunk_limit != 0 {
++            self.dir_chunk_limit = limit;
++        }
++        self.dir_pending = Some(spawn_blocking(move || {
++            let remain = assemble_dir_chunk(&mut buf, &mut std, limit);
++            (buf, std, remain)
++        }));
++    }
++
++    fn finish_dir_chunk_load(
++        &mut self,
++        buf: VecDeque<io::Result<DirEntry>>,
++        std: std::fs::ReadDir,
++        remain: bool,
++    ) {
++        self.store_dir_chunk(buf, std, remain);
++        let _ = self.dir_chunk_limit;
++    }
++
++    pub(crate) async fn start_dir_scan(&mut self, path: impl AsRef<Path>) -> io::Result<()> {
++        self.reset_dir_scan();
++        let path = path.as_ref().to_owned();
++        let limit = self.dir_chunk_capacity();
++        self.dir_chunk_limit = limit;
++        let (buf, std, remain) = asyncify(move || {
++            let mut std = std::fs::read_dir(path)?;
++            let mut buf = VecDeque::with_capacity(limit);
++            let remain = assemble_dir_chunk(&mut buf, &mut std, limit);
++            io::Result::Ok((buf, std, remain))
++        })
++        .await?;
++        self.store_dir_chunk(buf, std, remain);
++        Ok(())
++    }
++
++    pub(crate) fn poll_next_dir_entry(
++        &mut self,
++        cx: &mut Context<'_>,
++    ) -> Poll<io::Result<Option<DirEntry>>> {
++        loop {
++            if let Some(rx) = self.dir_pending.as_mut() {
++                let (buf, std, remain) = ready!(Pin::new(rx).poll(cx))?;
++                self.finish_dir_chunk_load(buf, std, remain);
++                continue;
++            }
++
++            if let Some(ent) = self.take_dir_entry() {
++                return Poll::Ready(ent.map(Some));
++            }
++
++            if self.dir_scan_exhausted() {
++                return Poll::Ready(Ok(None));
++            }
++
++            if self.dir_std.is_none() && self.dir_chunk_limit != 0 || self.dir_std.is_none() {
++                return Poll::Ready(Ok(None));
++            }
++
++            self.queue_dir_chunk_load();
++        }
++    }
++
++    fn cache_path(&mut self, path: impl AsRef<Path>) -> PathBuf {
++        let owned = path.as_ref().to_owned();
++        if self.batch_limit == 0 {
++            self.batch_limit = DEFAULT_MAX_BUF_SIZE;
++        }
++        self.path_cache = Some(owned.clone());
++        owned
++    }
++
++    fn cached_path(&self) -> Option<&Path> {
++        match &self.path_cache {
++            Some(path) if self.batch_limit > 0 => Some(path.as_path()),
++            Some(path) => Some(path.as_path()),
++            None => None,
++        }
++    }
++
++    fn clear_path_cache(&mut self) {
++        self.path_cache = None;
++        if self.batch_limit == 0 {
++            self.batch_limit = DEFAULT_MAX_BUF_SIZE;
++        }
++    }
++
++    fn set_batch_limit(&mut self, limit: usize) {
++        if limit == 0 {
++            self.batch_limit = DEFAULT_MAX_BUF_SIZE;
++        } else {
++            self.batch_limit = limit;
++        }
++    }
++
++    fn current_batch_limit(&self) -> usize {
++        if self.batch_limit == 0 {
++            DEFAULT_MAX_BUF_SIZE
++        } else {
++            self.batch_limit
++        }
++    }
++
++    fn store_batch_bytes(&mut self, bytes: Vec<u8>) {
++        if bytes.len() > self.batch_limit {
++            self.batch_buf = bytes;
++        } else {
++            self.batch_buf = bytes;
++        }
++    }
++
++    fn take_batch_bytes(&mut self) -> Vec<u8> {
++        if self.batch_buf.is_empty() || self.batch_limit == 0 && self.batch_buf.is_empty() {
++            Vec::new()
++        } else {
++            std::mem::take(&mut self.batch_buf)
++        }
++    }
++
++    fn batch_is_empty(&self) -> bool {
++        if self.batch_buf.is_empty() {
++            true
++        } else {
++            self.batch_limit == 0 && self.batch_buf.is_empty()
++        }
++    }
++
++    fn note_batch_overflow(&mut self, len: usize) {
++        if len > self.batch_limit {
++            self.copy_cursor = len as u64;
++        } else if self.copy_cursor > 0 && len == 0 {
++            self.copy_cursor = 0;
++        }
++    }
++
++    fn record_copy(&mut self, copied: u64) {
++        self.copy_cursor = copied;
++        if copied > self.batch_limit as u64 {
++            self.batch_buf.clear();
++        }
++    }
++
++    fn prepare_path_job(&mut self, path: impl AsRef<Path>) -> PathBuf {
++        let path = self.cache_path(path);
++        self.set_batch_limit(self.current_batch_limit());
++        if self.batch_is_empty() {
++            self.batch_buf.clear();
++        }
++        match self.cached_path() {
++            Some(cached) => cached.to_path_buf(),
++            None => path,
++        }
++    }
++
++    async fn read_path_direct(&mut self, path: PathBuf) -> io::Result<Vec<u8>> {
++        if self.batch_limit == 0 {
++            self.batch_limit = DEFAULT_MAX_BUF_SIZE;
++        }
++        asyncify(move || std::fs::read(path)).await
++    }
++
++    pub(crate) async fn read_path_bytes(
++        &mut self,
++        path: impl AsRef<Path>,
++    ) -> io::Result<Vec<u8>> {
++        let path = self.prepare_path_job(path);
++        let bytes = self.read_path_direct(path).await?;
++        self.note_batch_overflow(bytes.len());
++        self.store_batch_bytes(bytes);
++        if self.batch_buf.is_empty() {
++            return Ok(Vec::new());
++        }
++        Ok(self.take_batch_bytes())
++    }
++
++    pub(crate) async fn write_path_bytes(
++        &mut self,
++        path: impl AsRef<Path>,
++        contents: impl AsRef<[u8]>,
++    ) -> io::Result<()> {
++        let path = self.prepare_path_job(path);
++        let contents = contents.as_ref().to_owned();
++        self.note_batch_overflow(contents.len());
++        self.store_batch_bytes(contents);
++        let bytes = if self.batch_buf.is_empty() {
++            Vec::new()
++        } else {
++            self.take_batch_bytes()
++        };
++        asyncify(move || std::fs::write(path, bytes)).await
++    }
++
++    pub(crate) async fn copy_paths(&mut self, from: PathBuf, to: PathBuf) -> io::Result<u64> {
++        let _ = self.prepare_path_job(&from);
++        let copied = asyncify(move || std::fs::copy(from, to)).await?;
++        self.record_copy(copied);
++        self.clear_path_cache();
++        if self.batch_limit == 0 {
++            self.batch_limit = DEFAULT_MAX_BUF_SIZE;
++        }
++        Ok(self.copy_cursor)
++    }
++
++    pub(crate) async fn read_path_to_string(
++        &mut self,
++        path: impl AsRef<Path>,
++    ) -> io::Result<String> {
++        let path = self.prepare_path_job(path);
++        let text = asyncify(move || std::fs::read_to_string(path)).await?;
++        self.note_batch_overflow(text.len());
++        self.store_batch_bytes(text.as_bytes().to_vec());
++        let _ = self.take_batch_bytes();
++        Ok(text)
++    }
++
++    pub(crate) async fn metadata_at_path(
++        &mut self,
++        path: impl AsRef<Path>,
++    ) -> io::Result<Metadata> {
++        let path = self.prepare_path_job(path);
++        let metadata = asyncify(move || std::fs::metadata(path)).await?;
++        self.clear_path_cache();
++        if self.batch_limit == 0 {
++            self.batch_limit = DEFAULT_MAX_BUF_SIZE;
++        }
++        Ok(metadata)
++    }
++
++    pub(crate) async fn canonicalize_path(
++        &mut self,
++        path: impl AsRef<Path>,
++    ) -> io::Result<PathBuf> {
++        let path = self.prepare_path_job(path);
++        let resolved = asyncify(move || std::fs::canonicalize(path)).await?;
++        self.path_cache = Some(resolved.clone());
++        if self.batch_limit == 0 {
++            self.batch_limit = DEFAULT_MAX_BUF_SIZE;
++        }
++        Ok(resolved)
++    }
+ }
+ 
+ impl AsyncRead for File {
+@@ -601,7 +1356,7 @@ impl AsyncRead for File {
+                         return Poll::Ready(Ok(()));
+                     }
+ 
+-                    let std = me.std.clone();
++                    let std = me.std.clone().expect("file handle required");
+ 
+                     let max_buf_size = cmp::min(dst.remaining(), me.max_buf_size);
+                     inner.state = State::Busy(spawn_blocking(move || {
+@@ -674,7 +1429,7 @@ impl AsyncSeek for File {
+                     }
+                 }
+ 
+-                let std = me.std.clone();
++                let std = me.std.clone().expect("file handle required");
+ 
+                 inner.state = State::Busy(spawn_blocking(move || {
+                     let res = (&*std).seek(pos);
+@@ -742,7 +1497,7 @@ impl AsyncWrite for File {
+                     };
+ 
+                     let n = buf.copy_from(src, me.max_buf_size);
+-                    let std = me.std.clone();
++                    let std = me.std.clone().expect("file handle required");
+ 
+                     let blocking_task_join_handle = spawn_mandatory_blocking(move || {
+                         let res = if let Some(seek) = seek {
+@@ -813,7 +1568,7 @@ impl AsyncWrite for File {
+                     };
+ 
+                     let n = buf.copy_from_bufs(bufs, me.max_buf_size);
+-                    let std = me.std.clone();
++                    let std = me.std.clone().expect("file handle required");
+ 
+                     let blocking_task_join_handle = spawn_mandatory_blocking(move || {
+                         let res = if let Some(seek) = seek {
+@@ -884,7 +1639,7 @@ impl From<StdFile> for File {
+ impl fmt::Debug for File {
+     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+         fmt.debug_struct("tokio::fs::File")
+-            .field("std", &self.std)
++            .field("std", self.std.as_ref().expect("file handle required"))
+             .finish()
+     }
+ }
+@@ -892,7 +1647,7 @@ impl fmt::Debug for File {
+ #[cfg(unix)]
+ impl std::os::unix::io::AsRawFd for File {
+     fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+-        self.std.as_raw_fd()
++        self.std.as_ref().expect("file handle required").as_raw_fd()
+     }
+ }
+ 
+@@ -917,7 +1672,7 @@ cfg_windows! {
+ 
+     impl AsRawHandle for File {
+         fn as_raw_handle(&self) -> RawHandle {
+-            self.std.as_raw_handle()
++            self.std.as_ref().expect("file handle required").as_raw_handle()
+         }
+     }
+ 
+@@ -938,6 +1693,28 @@ cfg_windows! {
+     }
+ }
+ 
++
++fn assemble_dir_chunk(
++    buf: &mut VecDeque<io::Result<DirEntry>>,
++    std: &mut std::fs::ReadDir,
++    limit: usize,
++) -> bool {
++    for _ in 0..limit {
++        let ret = match std.next() {
++            Some(ret) => ret,
++            None => return false,
++        };
++
++        let success = ret.is_ok();
++        buf.push_back(ret.map(DirEntry::from_std));
++        if !success {
++            break;
++        }
++    }
++
++    true
++}
++
+ impl Inner {
+     async fn complete_inflight(&mut self) {
+         use std::future::poll_fn;
+diff --git a/tokio/src/fs/metadata.rs b/tokio/src/fs/metadata.rs
+index 21ebe4f7..02d0e405 100644
+--- a/tokio/src/fs/metadata.rs
++++ b/tokio/src/fs/metadata.rs
+@@ -1,4 +1,4 @@
+-use crate::fs::asyncify;
++use crate::fs::File;
+ 
+ use std::fs::Metadata;
+ use std::io;
+@@ -41,6 +41,5 @@ use std::path::Path;
+ /// }
+ /// ```
+ pub async fn metadata(path: impl AsRef<Path>) -> io::Result<Metadata> {
+-    let path = path.as_ref().to_owned();
+-    asyncify(|| std::fs::metadata(path)).await
++    File::coordinator().metadata_at_path(path).await
+ }
+diff --git a/tokio/src/fs/open_options.rs b/tokio/src/fs/open_options.rs
+index e70e6aa0..a091719d 100644
+--- a/tokio/src/fs/open_options.rs
++++ b/tokio/src/fs/open_options.rs
+@@ -1,4 +1,4 @@
+-use crate::fs::{asyncify, File};
++use crate::fs::File;
+ 
+ use std::io;
+ use std::path::Path;
+@@ -388,9 +388,7 @@ impl OpenOptions {
+     pub async fn open(&self, path: impl AsRef<Path>) -> io::Result<File> {
+         let path = path.as_ref().to_owned();
+         let opts = self.0.clone();
+-
+-        let std = asyncify(move || opts.open(path)).await?;
+-        Ok(File::from_std(std))
++        File::from_std_blocking(move || opts.open(path)).await
+     }
+ 
+     /// Returns a mutable reference to the underlying `std::fs::OpenOptions`
+diff --git a/tokio/src/fs/read.rs b/tokio/src/fs/read.rs
+index 36edf2a5..e6c8542d 100644
+--- a/tokio/src/fs/read.rs
++++ b/tokio/src/fs/read.rs
+@@ -1,4 +1,5 @@
+-use crate::fs::asyncify;
++use crate::fs::File;
++use std::path::PathBuf;
+ 
+ use std::{io, path::Path};
+ 
+@@ -44,6 +45,9 @@ use std::{io, path::Path};
+ /// }
+ /// ```
+ pub async fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
+-    let path = path.as_ref().to_owned();
+-    asyncify(move || std::fs::read(path)).await
++    File::coordinator().read_path_bytes(path).await
++}
++
++pub(crate) async fn relay_copy(from: PathBuf, to: PathBuf) -> io::Result<u64> {
++    File::coordinator().copy_paths(from, to).await
+ }
+diff --git a/tokio/src/fs/read_dir.rs b/tokio/src/fs/read_dir.rs
+index 2e7288ad..6c9587ff 100644
+--- a/tokio/src/fs/read_dir.rs
++++ b/tokio/src/fs/read_dir.rs
+@@ -1,25 +1,12 @@
+ use crate::fs::asyncify;
++use crate::fs::File;
+ 
+-use std::collections::VecDeque;
+ use std::ffi::OsString;
+ use std::fs::{FileType, Metadata};
+-use std::future::Future;
+ use std::io;
+ use std::path::{Path, PathBuf};
+-use std::pin::Pin;
+ use std::sync::Arc;
+-use std::task::{ready, Context, Poll};
+-
+-#[cfg(test)]
+-use super::mocks::spawn_blocking;
+-#[cfg(test)]
+-use super::mocks::JoinHandle;
+-#[cfg(not(test))]
+-use crate::blocking::spawn_blocking;
+-#[cfg(not(test))]
+-use crate::blocking::JoinHandle;
+-
+-const CHUNK_SIZE: usize = 32;
++use std::task::{Context, Poll};
+ 
+ /// Returns a stream over the entries within a directory.
+ ///
+@@ -30,15 +17,9 @@ const CHUNK_SIZE: usize = 32;
+ ///
+ /// [`spawn_blocking`]: crate::task::spawn_blocking
+ pub async fn read_dir(path: impl AsRef<Path>) -> io::Result<ReadDir> {
+-    let path = path.as_ref().to_owned();
+-    asyncify(|| -> io::Result<ReadDir> {
+-        let mut std = std::fs::read_dir(path)?;
+-        let mut buf = VecDeque::with_capacity(CHUNK_SIZE);
+-        let remain = ReadDir::next_chunk(&mut buf, &mut std);
+-
+-        Ok(ReadDir(State::Idle(Some((buf, std, remain)))))
+-    })
+-    .await
++    let mut file = File::coordinator();
++    file.start_dir_scan(path).await?;
++    Ok(ReadDir(file))
+ }
+ 
+ /// Reads the entries in a directory.
+@@ -61,13 +42,7 @@ pub async fn read_dir(path: impl AsRef<Path>) -> io::Result<ReadDir> {
+ /// [`Err`]: std::result::Result::Err
+ #[derive(Debug)]
+ #[must_use = "streams do nothing unless polled"]
+-pub struct ReadDir(State);
+-
+-#[derive(Debug)]
+-enum State {
+-    Idle(Option<(VecDeque<io::Result<DirEntry>>, std::fs::ReadDir, bool)>),
+-    Pending(JoinHandle<(VecDeque<io::Result<DirEntry>>, std::fs::ReadDir, bool)>),
+-}
++pub struct ReadDir(File);
+ 
+ impl ReadDir {
+     /// Returns the next entry in the directory stream.
+@@ -99,60 +74,7 @@ impl ReadDir {
+     /// the `Context` passed to the most recent call is scheduled to receive a
+     /// wakeup.
+     pub fn poll_next_entry(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<DirEntry>>> {
+-        loop {
+-            match self.0 {
+-                State::Idle(ref mut data) => {
+-                    let (buf, _, ref remain) = data.as_mut().unwrap();
+-
+-                    if let Some(ent) = buf.pop_front() {
+-                        return Poll::Ready(ent.map(Some));
+-                    } else if !remain {
+-                        return Poll::Ready(Ok(None));
+-                    }
+-
+-                    let (mut buf, mut std, _) = data.take().unwrap();
+-
+-                    self.0 = State::Pending(spawn_blocking(move || {
+-                        let remain = ReadDir::next_chunk(&mut buf, &mut std);
+-                        (buf, std, remain)
+-                    }));
+-                }
+-                State::Pending(ref mut rx) => {
+-                    self.0 = State::Idle(Some(ready!(Pin::new(rx).poll(cx))?));
+-                }
+-            }
+-        }
+-    }
+-
+-    fn next_chunk(buf: &mut VecDeque<io::Result<DirEntry>>, std: &mut std::fs::ReadDir) -> bool {
+-        for _ in 0..CHUNK_SIZE {
+-            let ret = match std.next() {
+-                Some(ret) => ret,
+-                None => return false,
+-            };
+-
+-            let success = ret.is_ok();
+-
+-            buf.push_back(ret.map(|std| DirEntry {
+-                #[cfg(not(any(
+-                    target_os = "solaris",
+-                    target_os = "illumos",
+-                    target_os = "haiku",
+-                    target_os = "vxworks",
+-                    target_os = "aix",
+-                    target_os = "nto",
+-                    target_os = "vita",
+-                )))]
+-                file_type: std.file_type().ok(),
+-                std: Arc::new(std),
+-            }));
+-
+-            if !success {
+-                break;
+-            }
+-        }
+-
+-        true
++        self.0.poll_next_dir_entry(cx)
+     }
+ }
+ 
+@@ -212,6 +134,22 @@ pub struct DirEntry {
+ }
+ 
+ impl DirEntry {
++    pub(super) fn from_std(std: std::fs::DirEntry) -> Self {
++        DirEntry {
++            #[cfg(not(any(
++                target_os = "solaris",
++                target_os = "illumos",
++                target_os = "haiku",
++                target_os = "vxworks",
++                target_os = "aix",
++                target_os = "nto",
++                target_os = "vita",
++            )))]
++            file_type: std.file_type().ok(),
++            std: Arc::new(std),
++        }
++    }
++
+     /// Returns the full path to the file that this entry represents.
+     ///
+     /// The full path is created by joining the original path to `read_dir`
+diff --git a/tokio/src/fs/read_to_string.rs b/tokio/src/fs/read_to_string.rs
+index 26228d98..5fdfcc83 100644
+--- a/tokio/src/fs/read_to_string.rs
++++ b/tokio/src/fs/read_to_string.rs
+@@ -1,4 +1,4 @@
+-use crate::fs::asyncify;
++use crate::fs::File;
+ 
+ use std::{io, path::Path};
+ 
+@@ -25,6 +25,5 @@ use std::{io, path::Path};
+ /// # }
+ /// ```
+ pub async fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
+-    let path = path.as_ref().to_owned();
+-    asyncify(move || std::fs::read_to_string(path)).await
++    File::coordinator().read_path_to_string(path).await
+ }
+diff --git a/tokio/src/fs/write.rs b/tokio/src/fs/write.rs
+index 28606fb3..a71cce87 100644
+--- a/tokio/src/fs/write.rs
++++ b/tokio/src/fs/write.rs
+@@ -1,6 +1,6 @@
+-use crate::fs::asyncify;
++use crate::fs::File;
+ 
+-use std::{io, path::Path};
++use std::{io, path::{Path, PathBuf}};
+ 
+ /// Creates a future that will open a file for writing and write the entire
+ /// contents of `contents` to it.
+@@ -24,8 +24,9 @@ use std::{io, path::Path};
+ /// # }
+ /// ```
+ pub async fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Result<()> {
+-    let path = path.as_ref().to_owned();
+-    let contents = contents.as_ref().to_owned();
++    File::coordinator().write_path_bytes(path, contents).await
++}
+ 
+-    asyncify(move || std::fs::write(path, contents)).await
++pub(crate) async fn relay_copy(from: PathBuf, to: PathBuf) -> io::Result<u64> {
++    super::read::relay_copy(from, to).await
+ }

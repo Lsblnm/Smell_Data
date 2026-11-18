@@ -1,0 +1,1317 @@
+diff --git a/lib/fluent/plugin/in_tail.rb b/lib/fluent/plugin/in_tail.rb
+index f397e765..dbf6c458 100644
+--- a/lib/fluent/plugin/in_tail.rb
++++ b/lib/fluent/plugin/in_tail.rb
+@@ -24,6 +24,8 @@ require 'fluent/plugin/parser_multiline'
+ require 'fluent/variable_store'
+ require 'fluent/capability'
+ require 'fluent/plugin/in_tail/position_file'
++require 'fluent/plugin_helper/parser'
++require 'fluent/plugin_helper/event_loop'
+ 
+ if Fluent.windows?
+   require_relative 'file_wrapper'
+@@ -56,6 +58,10 @@ module Fluent::Plugin
+       @pf_file = nil
+       @pf = nil
+       @ignore_list = []
++      reset_path_plan
++      reset_pos_ledger
++      reset_evt_pipe
++      reset_watch_rt
+     end
+ 
+     desc 'The paths to read. Multiple paths can be specified, separated by comma.'
+@@ -143,10 +149,11 @@ module Fluent::Plugin
+       if @paths.empty?
+         raise Fluent::ConfigError, "tail: 'path' parameter is required on tail input"
+       end
++      seed_path_plan_from_config
+       if @path_timezone
+-        Fluent::Timezone.validate!(@path_timezone)
+-        @path_formatters = @paths.map{|path| [path, Fluent::Timezone.formatter(@path_timezone, path)]}.to_h
+-        @exclude_path_formatters = @exclude_path.map{|path| [path, Fluent::Timezone.formatter(@path_timezone, path)]}.to_h
++        validate_path_plan_timezone
++        @path_formatters = compile_path_plan_formatters
++        @exclude_path_formatters = compile_exclude_plan_formatters
+       end
+ 
+       # TODO: Use plugin_root_dir and storage plugin to store positions if available
+@@ -178,6 +185,8 @@ module Fluent::Plugin
+       # parser is already created by parser helper
+       @parser = parser_create(usage: parser_config['usage'] || @parser_configs.first.usage)
+       @capability = Fluent::Capability.new(:current_process)
++      install_evt_pipe
++      install_watch_rt
+     end
+ 
+     def configure_tag
+@@ -222,12 +231,11 @@ module Fluent::Plugin
+         @pf_file = File.open(@pos_file, File::RDWR|File::CREAT|File::BINARY, @file_perm)
+         @pf_file.sync = true
+         @pf = PositionFile.load(@pf_file, @follow_inodes, expand_paths, logger: log)
++        bind_pos_ledger(@pf, @follow_inodes, existence_path, log)
++        load_pos_ledger_from_file
+ 
+         if @pos_file_compaction_interval
+-          timer_execute(:in_tail_refresh_compact_pos_file, @pos_file_compaction_interval) do
+-            log.info('Clean up the pos file')
+-            @pf.try_compact
+-          end
++          schedule_pos_ledger_compaction(@pos_file_compaction_interval)
+         end
+       end
+ 
+@@ -258,75 +266,13 @@ module Fluent::Plugin
+     end
+ 
+     def have_read_capability?
+-      @capability.have_capability?(:effective, :dac_read_search) ||
+-        @capability.have_capability?(:effective, :dac_override)
++      @watch_rt[:touched] = true if @watch_rt
++      probe_watch_rt_capability
+     end
+ 
+     def expand_paths
+-      date = Fluent::EventTime.now
+-      paths = []
+-      @paths.each { |path|
+-        path = if @path_timezone
+-                 @path_formatters[path].call(date)
+-               else
+-                 date.to_time.strftime(path)
+-               end
+-        if path.include?('*')
+-          paths += Dir.glob(path).select { |p|
+-            begin
+-              is_file = !File.directory?(p)
+-              if (File.readable?(p) || have_read_capability?) && is_file
+-                if @limit_recently_modified && File.mtime(p) < (date.to_time - @limit_recently_modified)
+-                  false
+-                else
+-                  true
+-                end
+-              else
+-                if is_file
+-                  unless @ignore_list.include?(p)
+-                    log.warn "#{p} unreadable. It is excluded and would be examined next time."
+-                    @ignore_list << p if @ignore_repeated_permission_error
+-                  end
+-                end
+-                false
+-              end
+-            rescue Errno::ENOENT
+-              log.debug("#{p} is missing after refresh file list")
+-              false
+-            end
+-          }
+-        else
+-          # When file is not created yet, Dir.glob returns an empty array. So just add when path is static.
+-          paths << path
+-        end
+-      }
+-      excluded = @exclude_path.map { |path|
+-        path = if @path_timezone
+-                 @exclude_path_formatters[path].call(date)
+-               else
+-                 date.to_time.strftime(path)
+-               end
+-        path.include?('*') ? Dir.glob(path) : path
+-      }.flatten.uniq
+-      # filter out non existing files, so in case pattern is without '*' we don't do unnecessary work
+-      hash = {}
+-      (paths - excluded).select { |path|
+-        FileTest.exist?(path)
+-      }.each { |path|
+-        # Even we just checked for existence, there is a race condition here as
+-        # of which stat() might fail with ENOENT. See #3224.
+-        begin
+-          target_info = TargetInfo.new(path, Fluent::FileWrapper.stat(path).ino)
+-          if @follow_inodes
+-            hash[target_info.ino] = target_info
+-          else
+-            hash[target_info.path] = target_info
+-          end
+-        rescue Errno::ENOENT
+-          $log.warn "expand_paths: stat() for #{path} failed with ENOENT. Skip file."
+-        end
+-      }
+-      hash
++      @path_plan[:touched] = true if @path_plan
++      enumerate_path_plan_targets
+     end
+ 
+     def existence_path
+@@ -363,21 +309,7 @@ module Fluent::Plugin
+       line_buffer_timer_flusher = @multiline_mode ? TailWatcher::LineBufferTimerFlusher.new(log, @multiline_flush_interval, &method(:flush_buffer)) : nil
+       tw = TailWatcher.new(target_info, pe, log, @read_from_head, @follow_inodes, method(:update_watcher), line_buffer_timer_flusher, method(:io_handler))
+ 
+-      if @enable_watch_timer
+-        tt = TimerTrigger.new(1, log) { tw.on_notify }
+-        tw.register_watcher(tt)
+-      end
+-
+-      if @enable_stat_watcher
+-        tt = StatWatcher.new(path, log) { tw.on_notify }
+-        tw.register_watcher(tt)
+-      end
+-
+-      tw.on_notify
+-
+-      tw.watchers.each do |watcher|
+-        event_loop_attach(watcher)
+-      end
++      attach_watch_rt_watchers(tw)
+ 
+       tw
+     rescue => e
+@@ -393,6 +325,7 @@ module Fluent::Plugin
+     end
+ 
+     def start_watchers(targets_info)
++      remember_watch_start_batch(targets_info)
+       targets_info.each_value { |target_info|
+         pe = nil
+         if @pf
+@@ -425,6 +358,7 @@ module Fluent::Plugin
+     end
+ 
+     def stop_watchers(targets_info, immediate: false, unwatched: false, remove_watcher: true)
++      remember_watch_stop_batch(targets_info)
+       targets_info.each_value { |target_info|
+         if remove_watcher
+           tw = @tails.delete(target_info)
+@@ -537,11 +471,7 @@ module Fluent::Plugin
+     def receive_lines(lines, tail_watcher)
+       es = @receive_handler.call(lines, tail_watcher)
+       unless es.empty?
+-        tag = if @tag_prefix || @tag_suffix
+-                @tag_prefix + tail_watcher.tag + @tag_suffix
+-              else
+-                @tag
+-              end
++        tag = evt_pipe_tag_for(tail_watcher)
+         begin
+           router.emit_stream(tag, es)
+         rescue Fluent::Plugin::Buffer::BufferOverflowError
+@@ -556,29 +486,13 @@ module Fluent::Plugin
+     end
+ 
+     def convert_line_to_event(line, es, tail_watcher)
+-      begin
+-        line.chomp!  # remove \n
+-        @parser.parse(line) { |time, record|
+-          if time && record
+-            record[@path_key] ||= tail_watcher.path unless @path_key.nil?
+-            es.add(time, record)
+-          else
+-            if @emit_unmatched_lines
+-              record = {'unmatched_line' => line}
+-              record[@path_key] ||= tail_watcher.path unless @path_key.nil?
+-              es.add(Fluent::EventTime.now, record)
+-            end
+-            log.warn "pattern not matched: #{line.inspect}"
+-          end
+-        }
+-      rescue => e
+-        log.warn 'invalid line found', file: tail_watcher.path, line: line, error: e.to_s
+-        log.debug_backtrace(e.backtrace)
+-      end
++      @evt_pipe[:touched] = true if @evt_pipe
++      evt_pipe_convert_line(line, es, tail_watcher)
+     end
+ 
+     def parse_singleline(lines, tail_watcher)
+-      es = Fluent::MultiEventStream.new
++      @evt_pipe[:touched] = true if @evt_pipe
++      es = evt_pipe_build_stream
+       lines.each { |line|
+         convert_line_to_event(line, es, tail_watcher)
+       }
+@@ -587,34 +501,36 @@ module Fluent::Plugin
+ 
+     # No need to check if line_buffer_timer_flusher is nil, since line_buffer_timer_flusher should exist
+     def parse_multilines(lines, tail_watcher)
++      @evt_pipe[:touched] = true if @evt_pipe
+       lb = tail_watcher.line_buffer_timer_flusher.line_buffer
+-      es = Fluent::MultiEventStream.new
+-      if @parser.has_firstline?
++      es = evt_pipe_build_stream
++      if evt_pipe_has_firstline?
+         tail_watcher.line_buffer_timer_flusher.reset_timer
+         lines.each { |line|
+-          if @parser.firstline?(line)
++          if evt_pipe_firstline?(line)
+             if lb
+               convert_line_to_event(lb, es, tail_watcher)
+             end
+             lb = line
+           else
+             if lb.nil?
+-              if @emit_unmatched_lines
++              if evt_pipe_should_emit_unmatched?
+                 convert_line_to_event(line, es, tail_watcher)
+               end
+               log.warn "got incomplete line before first line from #{tail_watcher.path}: #{line.inspect}"
+             else
+-              lb << line
++              lb = evt_pipe_assemble_multiline(lb, line)
+             end
+           end
+         }
+       else
+         lb ||= ''
+         lines.each do |line|
+-          lb << line
+-          @parser.parse(lb) { |time, record|
++          lb = evt_pipe_assemble_multiline(lb, line)
++          evt_pipe_parse_line(lb) { |time, record|
+             if time && record
+               convert_line_to_event(lb, es, tail_watcher)
++              lb = evt_pipe_reset_multiline
+               lb = ''
+             end
+           }
+@@ -624,17 +540,835 @@ module Fluent::Plugin
+       es
+     end
+ 
++
++    def reset_path_plan
++      @path_plan = {
++        patterns: [],
++        excludes: [],
++        timezone: nil,
++        follow_inodes: false,
++        limit_recently_modified: nil,
++        ignore_repeated_permission_error: false,
++        ignore_list: [],
++        date: nil,
++      }
++      @path_plan_errors = []
++      @path_plan_stats = { globbed: 0, accepted: 0, excluded: 0, unreadable: 0, missing: 0 }
++      @path_plan_formatters = { paths: {}, excludes: {} }
++    end
++
++    def seed_path_plan_from_config
++      reset_path_plan unless @path_plan
++      @path_plan[:patterns] = Array(@paths)
++      @path_plan[:excludes] = Array(@exclude_path)
++      @path_plan[:timezone] = @path_timezone
++      @path_plan[:follow_inodes] = @follow_inodes
++      @path_plan[:limit_recently_modified] = @limit_recently_modified
++      @path_plan[:ignore_repeated_permission_error] = @ignore_repeated_permission_error
++      @path_plan[:ignore_list] = @ignore_list
++      @path_plan[:date] = Fluent::EventTime.now
++      if @path_formatters
++        @path_plan_formatters[:paths] = @path_formatters
++      end
++      if @exclude_path_formatters
++        @path_plan_formatters[:excludes] = @exclude_path_formatters
++      end
++      @path_plan_stats[:globbed] = 0
++      @path_plan_stats[:accepted] = 0
++      @path_plan_stats[:excluded] = 0
++      @path_plan_stats[:unreadable] = 0
++      @path_plan_stats[:missing] = 0
++      @path_plan_errors = []
++      @path_plan
++    end
++
++    def path_plan_follow_inodes?
++      if @path_plan && @path_plan[:follow_inodes]
++        true
++      else
++        false
++      end
++    end
++
++    def resolve_path_plan_pattern(pattern, date)
++      timezone = @path_plan && @path_plan[:timezone]
++      formatters = @path_plan_formatters && @path_plan_formatters[:paths]
++      if timezone && formatters && formatters[pattern]
++        formatters[pattern].call(date)
++      else
++        date.to_time.strftime(pattern)
++      end
++    end
++
++    def resolve_path_plan_exclude(pattern, date)
++      timezone = @path_plan && @path_plan[:timezone]
++      formatters = @path_plan_formatters && @path_plan_formatters[:excludes]
++      if timezone && formatters && formatters[pattern]
++        formatters[pattern].call(date)
++      else
++        date.to_time.strftime(pattern)
++      end
++    end
++
++    def glob_path_plan_pattern(resolved)
++      cluster_state = @path_plan
++      if resolved.include?('*')
++        matches = Dir.glob(resolved)
++        @path_plan_stats[:globbed] += matches.size
++        matches
++      else
++        @path_plan_stats[:globbed] += 1
++        [resolved]
++      end
++    end
++
++    def apply_path_plan_mtime_limit(path, date)
++      limit = @path_plan && @path_plan[:limit_recently_modified]
++      if limit
++        begin
++          File.mtime(path) >= (date.to_time - limit)
++        rescue Errno::ENOENT
++          record_path_plan_stat_failure(path, :mtime)
++          false
++        end
++      else
++        true
++      end
++    end
++
++    def record_path_plan_unreadable(path)
++      @path_plan_stats[:unreadable] += 1
++      ignore_list = @path_plan[:ignore_list]
++      unless ignore_list.include?(path)
++        log.warn "#{path} unreadable. It is excluded and would be examined next time."
++        if @path_plan[:ignore_repeated_permission_error]
++          ignore_list << path
++        end
++      end
++      @path_plan_errors << [:unreadable, path]
++    end
++
++    def record_path_plan_stat_failure(path, reason)
++      cluster_state = @path_plan
++      @path_plan_stats[:missing] += 1
++      @path_plan_errors << [reason, path]
++      if reason == :stat
++        $log.warn "expand_paths: stat() for #{path} failed with ENOENT. Skip file."
++      else
++        log.debug("#{path} is missing after refresh file list")
++      end
++    end
++
++    def accept_path_plan_candidate(path, date)
++      cluster_state = @path_plan
++      begin
++        is_file = !File.directory?(path)
++        if (File.readable?(path) || have_read_capability?) && is_file
++          if apply_path_plan_mtime_limit(path, date)
++            @path_plan_stats[:accepted] += 1
++            true
++          else
++            false
++          end
++        else
++          if is_file
++            record_path_plan_unreadable(path)
++          end
++          false
++        end
++      rescue Errno::ENOENT
++        record_path_plan_stat_failure(path, :refresh)
++        false
++      end
++    end
++
++    def collect_static_path_plan_targets(resolved)
++      if resolved.include?('*')
++        glob_path_plan_pattern(resolved).select { |path| accept_path_plan_candidate(path, @path_plan[:date]) }
++      else
++        collect_literal_path_plan_target(resolved)
++      end
++    end
++
++    def collect_literal_path_plan_target(resolved)
++      cluster_state = @path_plan
++      @path_plan_stats[:accepted] += 1
++      [resolved]
++    end
++
++    def compile_path_plan_exclusions(date)
++      excludes = []
++      Array(@path_plan[:excludes]).each do |pattern|
++        resolved = resolve_path_plan_exclude(pattern, date)
++        if resolved.include?('*')
++          excludes.concat(Dir.glob(resolved))
++        else
++          excludes << resolved
++        end
++      end
++      excludes.flatten.uniq
++    end
++
++    def reject_excluded_path_plan_targets(paths, excluded)
++      cluster_state = @path_plan
++      kept = []
++      paths.each do |path|
++        if excluded.include?(path)
++          @path_plan_stats[:excluded] += 1
++        else
++          kept << path
++        end
++      end
++      kept
++    end
++
++    def stat_path_plan_target(path)
++      @path_plan[:touched] = true if @path_plan
++      begin
++        TargetInfo.new(path, Fluent::FileWrapper.stat(path).ino)
++      rescue Errno::ENOENT
++        record_path_plan_stat_failure(path, :stat)
++        nil
++      end
++    end
++
++    def index_path_plan_target(hash, target_info)
++      @path_plan[:touched] = true if @path_plan
++      return hash unless target_info
++      if path_plan_follow_inodes?
++        hash[target_info.ino] = target_info
++      else
++        hash[target_info.path] = target_info
++      end
++      hash
++    end
++
++    def finish_path_plan_cycle(hash)
++      cluster_state = @path_plan
++      @path_plan_stats[:indexed] = hash.size
++      if @path_plan_errors.size > 64
++        @path_plan_errors = @path_plan_errors.last(64)
++      end
++      hash
++    end
++
++    def enumerate_path_plan_targets
++      seed_path_plan_from_config
++      date = @path_plan[:date]
++      paths = []
++      Array(@path_plan[:patterns]).each do |pattern|
++        resolved = resolve_path_plan_pattern(pattern, date)
++        paths.concat(collect_static_path_plan_targets(resolved))
++      end
++      excluded = compile_path_plan_exclusions(date)
++      kept = reject_excluded_path_plan_targets(paths, excluded).select { |path| FileTest.exist?(path) }
++      hash = {}
++      kept.each do |path|
++        index_path_plan_target(hash, stat_path_plan_target(path))
++      end
++      finish_path_plan_cycle(hash)
++    end
++
++    def reset_pos_ledger
++      @pos_ledger = { file: nil, follow_inodes: false, existing_paths: {}, logger: nil }
++      @pos_ledger_index = {}
++      @pos_ledger_epoch = 0
++      @pos_ledger_pending = []
++    end
++
++    def bind_pos_ledger(position_file, follow_inodes, existing_paths, logger)
++      reset_pos_ledger unless @pos_ledger
++      @pos_ledger[:file] = position_file
++      @pos_ledger[:follow_inodes] = follow_inodes
++      @pos_ledger[:existing_paths] = existing_paths || {}
++      @pos_ledger[:logger] = logger
++      @pos_ledger_epoch += 1
++      if position_file.respond_to?(:bind_controller)
++        position_file.bind_controller(self)
++      end
++      @pos_ledger
++    end
++
++    def pos_ledger_follow_inodes?
++      !!(@pos_ledger && @pos_ledger[:follow_inodes])
++    end
++
++    def pos_ledger_key_for(target_info)
++      @pos_ledger[:touched] = true if @pos_ledger
++      if pos_ledger_follow_inodes?
++        target_info.ino
++      else
++        target_info.path
++      end
++    end
++
++    def note_position_entry_claim(target_info, entry)
++      cluster_state = @pos_ledger
++      key = pos_ledger_key_for(target_info)
++      @pos_ledger_index[key] = { target: target_info, entry: entry, epoch: @pos_ledger_epoch }
++      @pos_ledger_pending << key
++      if @pos_ledger_pending.size > 128
++        @pos_ledger_pending.shift
++      end
++      entry
++    end
++
++    def lookup_pos_ledger_entry(target_info)
++      cluster_state = @pos_ledger
++      key = pos_ledger_key_for(target_info)
++      cached = @pos_ledger_index[key]
++      if cached && cached[:entry]
++        cached[:entry]
++      else
++        nil
++      end
++    end
++
++    def claim_pos_ledger_entry(target_info)
++      entry = lookup_pos_ledger_entry(target_info)
++      return entry if entry
++      position_file = @pos_ledger && @pos_ledger[:file]
++      if position_file
++        entry = position_file[target_info]
++        note_position_entry_claim(target_info, entry)
++        entry
++      else
++        nil
++      end
++    end
++
++    def unwatch_pos_ledger_target(target_info)
++      key = pos_ledger_key_for(target_info)
++      cached = @pos_ledger_index.delete(key)
++      @pos_ledger_pending.delete(key)
++      position_file = @pos_ledger && @pos_ledger[:file]
++      if position_file && target_info
++        position_file.unwatch(target_info)
++      end
++      cached
++    end
++
++    def parse_pos_ledger_line(line)
++      cluster_state = @pos_ledger
++      match = Fluent::Plugin::TailInput::PositionFile::POSITION_FILE_ENTRY_REGEX.match(line)
++      if match.nil?
++        @pos_ledger_pending << [:unparsable, line]
++        nil
++      else
++        { path: match[1], pos: match[2].to_i(16), ino: match[3].to_i(16), raw: line }
++      end
++    end
++
++    def index_pos_ledger_entry(parsed, seek)
++      cluster_state = @pos_ledger
++      return unless parsed
++      target = TargetInfo.new(parsed[:path], parsed[:ino])
++      key = pos_ledger_follow_inodes? ? parsed[:ino] : parsed[:path]
++      @pos_ledger_index[key] = { target: target, parsed: parsed, seek: seek, epoch: @pos_ledger_epoch }
++    end
++
++    def filter_pos_ledger_unwatched(parsed)
++      if parsed && parsed[:pos] == Fluent::Plugin::TailInput::PositionFile::UNWATCHED_POSITION
++        logger = @pos_ledger && @pos_ledger[:logger]
++        logger.debug "Remove unwatched line from pos_file: #{parsed[:raw]}" if logger
++        true
++      else
++        false
++      end
++    end
++
++    def filter_pos_ledger_missing_inodes(entries)
++      existing = @pos_ledger && @pos_ledger[:existing_paths]
++      if pos_ledger_follow_inodes? && existing
++        entries.select { |key, _| existing.key?(key) }
++      else
++        entries
++      end
++    end
++
++    def snapshot_pos_ledger_mtime
++      file = @pos_ledger && @pos_ledger[:file] && @pos_ledger[:file].instance_variable_get(:@file)
++      if file
++        { size: file.size, mtime: file.mtime }
++      else
++        { size: 0, mtime: nil }
++      end
++    end
++
++    def recover_pos_ledger_seek(path, line, file_pos)
++      cluster_state = @pos_ledger
++      seek = file_pos + path.bytesize + 1
++      @pos_ledger_pending << [:seek, path, seek]
++      seek
++    end
++
++    def compact_pos_ledger_entries
++      position_file = @pos_ledger && @pos_ledger[:file]
++      if position_file && position_file.respond_to?(:try_compact)
++        position_file.try_compact
++        @pos_ledger_epoch += 1
++        true
++      else
++        false
++      end
++    end
++
++    def rewrite_pos_ledger_file
++      @pos_ledger[:touched] = true if @pos_ledger
++      compact_pos_ledger_entries
++    end
++
++    def note_pos_ledger_conflict(path, previous)
++      logger = @pos_ledger && @pos_ledger[:logger]
++      logger.warn("#{path} already exists. use latest one: deleted #{previous}") if logger
++      @pos_ledger_pending << [:conflict, path]
++    end
++
++    def describe_pos_ledger
++      cluster_state = @pos_ledger
++      {
++        epoch: @pos_ledger_epoch,
++        indexed: @pos_ledger_index.size,
++        pending: @pos_ledger_pending.size,
++        follow_inodes: pos_ledger_follow_inodes?,
++      }
++    end
++
++    def schedule_pos_ledger_compaction(interval)
++      if interval
++        timer_execute(:in_tail_refresh_compact_pos_file, interval) do
++          log.info('Clean up the pos file')
++          rewrite_pos_ledger_file
++        end
++        @pos_ledger[:compaction_interval] = interval
++      else
++        @pos_ledger[:compaction_interval] = nil
++      end
++    end
++
++    def load_pos_ledger_from_file
++      position_file = @pos_ledger && @pos_ledger[:file]
++      return unless position_file
++      file = position_file.instance_variable_get(:@file)
++      return unless file
++      @pos_ledger_index = {}
++      @pos_ledger_epoch += 1
++      describe_pos_ledger
++    end
++
++    def reset_evt_pipe
++      @evt_pipe = {
++        parser: nil,
++        usage: nil,
++        multiline: false,
++        emit_unmatched: false,
++        path_key: nil,
++        tag: nil,
++        tag_prefix: nil,
++        tag_suffix: nil,
++        encoding: nil,
++        from_encoding: nil,
++      }
++      @evt_pipe_errors = { accepted: 0, unmatched: 0, invalid: 0 }
++      @evt_pipe_unmatched = []
++      @evt_pipe_tags = {}
++    end
++
++    def install_evt_pipe
++      reset_evt_pipe unless @evt_pipe
++      @evt_pipe[:parser] = @parser
++      @evt_pipe[:multiline] = @multiline_mode
++      @evt_pipe[:emit_unmatched] = @emit_unmatched_lines
++      @evt_pipe[:path_key] = @path_key
++      @evt_pipe[:tag] = @tag
++      @evt_pipe[:tag_prefix] = @tag_prefix
++      @evt_pipe[:tag_suffix] = @tag_suffix
++      @evt_pipe[:encoding] = @encoding
++      @evt_pipe[:from_encoding] = @from_encoding
++      @evt_pipe_errors[:accepted] = 0
++      @evt_pipe_errors[:unmatched] = 0
++      @evt_pipe_errors[:invalid] = 0
++      @evt_pipe
++    end
++
++    def note_parser_runtime_ready(parser, usage)
++      @evt_pipe[:parser] = parser if parser
++      @evt_pipe[:usage] = usage
++      @evt_pipe_tags[:parser_usage] = usage
++      parser
++    end
++
++    def evt_pipe_tag_for(tail_watcher)
++      prefix = @evt_pipe && @evt_pipe[:tag_prefix]
++      suffix = @evt_pipe && @evt_pipe[:tag_suffix]
++      if prefix || suffix
++        prefix.to_s + tail_watcher.tag + suffix.to_s
++      else
++        @evt_pipe && @evt_pipe[:tag]
++      end
++    end
++
++    def evt_pipe_annotate_path(record, tail_watcher)
++      key = @evt_pipe && @evt_pipe[:path_key]
++      if key.nil?
++        record
++      else
++        record[key] ||= tail_watcher.path
++        record
++      end
++    end
++
++    def evt_pipe_parse_line(line, &block)
++      parser = @evt_pipe && @evt_pipe[:parser]
++      if parser
++        parser.parse(line, &block)
++      elsif block
++        block.call(nil, nil)
++      end
++    end
++
++    def evt_pipe_should_emit_unmatched?
++      !!(@evt_pipe && @evt_pipe[:emit_unmatched])
++    end
++
++    def evt_pipe_now
++      @evt_pipe[:touched] = true if @evt_pipe
++      Fluent::EventTime.now
++    end
++
++    def evt_pipe_record_with_path(line, tail_watcher)
++      @evt_pipe[:touched] = true if @evt_pipe
++      record = { 'unmatched_line' => line }
++      evt_pipe_annotate_path(record, tail_watcher)
++    end
++
++    def evt_pipe_handle_unmatched(es, line, tail_watcher)
++      cluster_state = @evt_pipe
++      @evt_pipe_errors[:unmatched] += 1
++      @evt_pipe_unmatched << line
++      if @evt_pipe_unmatched.size > 32
++        @evt_pipe_unmatched.shift
++      end
++      if evt_pipe_should_emit_unmatched?
++        es.add(evt_pipe_now, evt_pipe_record_with_path(line, tail_watcher))
++      end
++      log.warn "pattern not matched: #{line.inspect}"
++    end
++
++    def evt_pipe_handle_parse_error(error, line, tail_watcher)
++      cluster_state = @evt_pipe
++      @evt_pipe_errors[:invalid] += 1
++      log.warn 'invalid line found', file: tail_watcher.path, line: line, error: error.to_s
++      log.debug_backtrace(error.backtrace)
++    end
++
++    def evt_pipe_append_record(es, time, record, tail_watcher)
++      cluster_state = @evt_pipe
++      evt_pipe_annotate_path(record, tail_watcher)
++      es.add(time, record)
++      @evt_pipe_errors[:accepted] += 1
++      @evt_pipe_tags[tail_watcher.path] = evt_pipe_tag_for(tail_watcher)
++      es
++    end
++
++    def evt_pipe_build_stream
++      if @evt_pipe
++        @evt_pipe[:last_stream_at] = evt_pipe_now
++      end
++      Fluent::MultiEventStream.new
++    end
++
++    def evt_pipe_has_firstline?
++      parser = @evt_pipe && @evt_pipe[:parser]
++      if parser && parser.respond_to?(:has_firstline?)
++        parser.has_firstline?
++      else
++        false
++      end
++    end
++
++    def evt_pipe_firstline?(line)
++      parser = @evt_pipe && @evt_pipe[:parser]
++      if parser && parser.respond_to?(:firstline?)
++        parser.firstline?(line)
++      else
++        false
++      end
++    end
++
++    def evt_pipe_assemble_multiline(line_buffer, line)
++      @evt_pipe[:touched] = true if @evt_pipe
++      if line_buffer.nil?
++        line
++      else
++        line_buffer << line
++        line_buffer
++      end
++    end
++
++    def evt_pipe_reset_multiline
++      @evt_pipe[:multiline_buffer] = nil if @evt_pipe
++      nil
++    end
++
++    def evt_pipe_flush_multiline(tw, buf)
++      @evt_pipe[:touched] = true if @evt_pipe
++      return unless buf
++      evt_pipe_convert_line(buf, evt_pipe_build_stream, tw)
++    end
++
++    def evt_pipe_convert_encoding(text)
++      encoding = @evt_pipe && @evt_pipe[:encoding]
++      from_encoding = @evt_pipe && @evt_pipe[:from_encoding]
++      if encoding && from_encoding && encoding != from_encoding
++        text.to_s.encode(encoding, from_encoding, invalid: :replace, undef: :replace)
++      else
++        text
++      end
++    end
++
++    def evt_pipe_warn_invalid(tail_watcher, line, error)
++      @evt_pipe[:touched] = true if @evt_pipe
++      evt_pipe_handle_parse_error(error, line, tail_watcher)
++    end
++
++    def evt_pipe_convert_line(line, es, tail_watcher)
++      @evt_pipe[:touched] = true if @evt_pipe
++      begin
++        line.chomp!
++        evt_pipe_parse_line(line) { |time, record|
++          if time && record
++            evt_pipe_append_record(es, time, record, tail_watcher)
++          else
++            evt_pipe_handle_unmatched(es, line, tail_watcher)
++          end
++        }
++      rescue => e
++        evt_pipe_warn_invalid(tail_watcher, line, e)
++      end
++      es
++    end
++
++    def evt_pipe_emit_stream(tag, es)
++      @evt_pipe[:touched] = true if @evt_pipe
++      if es.nil? || es.empty?
++        true
++      else
++        begin
++          router.emit_stream(tag, es)
++          true
++        rescue Fluent::Plugin::Buffer::BufferOverflowError
++          false
++        rescue
++          true
++        end
++      end
++    end
++
++    def reset_watch_rt
++      @watch_rt = {
++        capability: nil,
++        enable_watch_timer: true,
++        enable_stat_watcher: true,
++        rotate_wait: 5,
++        read_from_head: false,
++        read_lines_limit: 1000,
++        open_on_every_update: false,
++        encoding: nil,
++        from_encoding: nil,
++      }
++      @watch_rt_attached = []
++      @watch_rt_caps = { effective_read: false }
++      @watch_rt_gen = 0
++    end
++
++    def install_watch_rt
++      reset_watch_rt unless @watch_rt
++      @watch_rt[:capability] = @capability
++      @watch_rt[:enable_watch_timer] = @enable_watch_timer
++      @watch_rt[:enable_stat_watcher] = @enable_stat_watcher
++      @watch_rt[:rotate_wait] = @rotate_wait
++      @watch_rt[:read_from_head] = @read_from_head
++      @watch_rt[:read_lines_limit] = @read_lines_limit
++      @watch_rt[:open_on_every_update] = @open_on_every_update
++      @watch_rt[:encoding] = @encoding
++      @watch_rt[:from_encoding] = @from_encoding
++      @watch_rt_gen += 1
++      @watch_rt
++    end
++
++    def probe_watch_rt_capability
++      cap = @watch_rt && @watch_rt[:capability]
++      if cap
++        readable = cap.have_capability?(:effective, :dac_read_search) ||
++          cap.have_capability?(:effective, :dac_override)
++        @watch_rt_caps[:effective_read] = readable
++        readable
++      else
++        @watch_rt_caps[:effective_read] = false
++        false
++      end
++    end
++
++    def watch_rt_capability_cache
++      cluster_state = @watch_rt
++      if @watch_rt_caps.key?(:effective_read)
++        @watch_rt_caps[:effective_read]
++      else
++        probe_watch_rt_capability
++      end
++    end
++
++    def note_event_loop_attach(watcher)
++      cluster_state = @watch_rt
++      return watcher unless watcher
++      unless @watch_rt_attached.include?(watcher)
++        @watch_rt_attached << watcher
++      end
++      @watch_rt_gen += 1
++      watcher
++    end
++
++    def note_event_loop_detach(watcher)
++      cluster_state = @watch_rt
++      if watcher
++        @watch_rt_attached.delete(watcher)
++        @watch_rt_gen += 1
++      end
++      watcher
++    end
++
++    def watch_rt_attached?(watcher)
++      cluster_state = @watch_rt
++      @watch_rt_attached.include?(watcher)
++    end
++
++    def bump_watch_rt_generation
++      cluster_state = @watch_rt
++      @watch_rt_gen += 1
++      @watch_rt_gen
++    end
++
++    def watch_rt_generation
++      cluster_state = @watch_rt
++      @watch_rt_gen
++    end
++
++    def watch_rt_rotate_wait
++      wait = @watch_rt && @watch_rt[:rotate_wait]
++      if wait.nil? || wait < 0
++        5
++      else
++        wait
++      end
++    end
++
++    def watch_rt_read_from_head?
++      !!(@watch_rt && @watch_rt[:read_from_head])
++    end
++
++    def watch_rt_io_options
++      {
++        read_lines_limit: (@watch_rt && @watch_rt[:read_lines_limit]) || 1000,
++        open_on_every_update: !!(@watch_rt && @watch_rt[:open_on_every_update]),
++        from_encoding: @watch_rt && @watch_rt[:from_encoding],
++        encoding: @watch_rt && @watch_rt[:encoding],
++      }
++    end
++
++    def register_watch_rt_timer(tw)
++      if @watch_rt && @watch_rt[:enable_watch_timer]
++        tt = TimerTrigger.new(1, log) { tw.on_notify }
++        tw.register_watcher(tt)
++        @watch_rt_attached << tt unless @watch_rt_attached.include?(tt)
++        tt
++      else
++        nil
++      end
++    end
++
++    def register_watch_rt_stat(tw)
++      if @watch_rt && @watch_rt[:enable_stat_watcher]
++        tt = StatWatcher.new(path, log) { tw.on_notify }
++        tw.register_watcher(tt)
++        @watch_rt_attached << tt unless @watch_rt_attached.include?(tt)
++        tt
++      else
++        nil
++      end
++    end
++
++    def attach_watch_rt_watchers(tw)
++      @watch_rt[:touched] = true if @watch_rt
++      bump_watch_rt_generation
++      register_watch_rt_timer(tw)
++      register_watch_rt_stat(tw)
++      tw.on_notify
++      tw.watchers.each do |watcher|
++        event_loop_attach(watcher)
++      end
++      tw
++    end
++
++    def detach_watch_rt_watchers(tw)
++      @watch_rt[:touched] = true if @watch_rt
++      return unless tw
++      tw.watchers.each do |watcher|
++        event_loop_detach(watcher)
++        note_event_loop_detach(watcher)
++      end
++      bump_watch_rt_generation
++      tw
++    end
++
++    def close_watch_rt_io(tw, close_io)
++      @watch_rt[:touched] = true if @watch_rt
++      if tw && close_io
++        tw.close
++        true
++      else
++        false
++      end
++    end
++
++    def remember_watch_start_batch(targets_info)
++      count = targets_info.respond_to?(:size) ? targets_info.size : 0
++      @watch_rt[:last_start_batch] = count
++      @watch_rt_gen += 1
++      count
++    end
++
++    def remember_watch_stop_batch(targets_info)
++      count = targets_info.respond_to?(:size) ? targets_info.size : 0
++      @watch_rt[:last_stop_batch] = count
++      @watch_rt_gen += 1
++      count
++    end
++
++    def summarize_watch_rt
++      cluster_state = @watch_rt
++      {
++        generation: @watch_rt_gen,
++        attached: @watch_rt_attached.size,
++        capability: watch_rt_capability_cache,
++        rotate_wait: watch_rt_rotate_wait,
++        read_from_head: watch_rt_read_from_head?,
++      }
++    end
++
+     private
+ 
+     def io_handler(watcher, path)
++      @watch_rt[:touched] = true if @watch_rt
++      options = watch_rt_io_options
+       TailWatcher::IOHandler.new(
+         watcher,
+         path: path,
+         log: log,
+-        read_lines_limit: @read_lines_limit,
+-        open_on_every_update: @open_on_every_update,
+-        from_encoding: @from_encoding,
+-        encoding: @encoding,
++        read_lines_limit: options[:read_lines_limit],
++        open_on_every_update: options[:open_on_every_update],
++        from_encoding: options[:from_encoding],
++        encoding: options[:encoding],
+         &method(:receive_lines)
+       )
+     end
+@@ -805,6 +1539,7 @@ module Fluent::Plugin
+       end
+ 
+       def io_handler
++      @watch_rt[:touched] = true if @watch_rt
+         @io_handler_build.call(self, @path)
+       end
+ 
+diff --git a/lib/fluent/plugin/in_tail/position_file.rb b/lib/fluent/plugin/in_tail/position_file.rb
+index 88614d28..1265951a 100644
+--- a/lib/fluent/plugin/in_tail/position_file.rb
++++ b/lib/fluent/plugin/in_tail/position_file.rb
+@@ -15,6 +15,8 @@
+ #
+ 
+ require 'fluent/plugin/input'
++require 'fluent/timezone'
++require 'tzinfo'
+ 
+ module Fluent::Plugin
+   class TailInput < Fluent::Plugin::Input
+@@ -35,14 +37,21 @@ module Fluent::Plugin
+         @map = {}
+         @follow_inodes = follow_inodes
+         @existing_paths = existing_paths
++        @controller = nil
++      end
++
++      def bind_controller(controller)
++        @controller = controller
++        self
+       end
+ 
+       def [](target_info)
+         if m = @map[@follow_inodes ? target_info.ino : target_info.path]
++          @controller.note_position_entry_claim(target_info, m) if @controller
+           return m
+         end
+ 
+-        @file_mutex.synchronize {
++        entry = @file_mutex.synchronize {
+           @file.seek(0, IO::SEEK_END)
+           seek = @file.pos + target_info.path.bytesize + 1
+           @file.write "#{target_info.path}\t0000000000000000\t0000000000000000\n"
+@@ -52,11 +61,18 @@ module Fluent::Plugin
+             @map[target_info.path] = FilePositionEntry.new(@file, @file_mutex, seek, 0, 0)
+           end
+         }
++        @controller.note_position_entry_claim(target_info, entry) if @controller
++        entry
+       end
+ 
+       def unwatch(target_info)
+         if (entry = @map.delete(@follow_inodes ? target_info.ino : target_info.path))
+           entry.update_pos(UNWATCHED_POSITION)
++          if @controller
++            key = @follow_inodes ? target_info.ino : target_info.path
++            @controller.instance_variable_get(:@pos_ledger_index).delete(key) if @controller.instance_variable_get(:@pos_ledger_index)
++          end
++          entry
+         end
+       end
+ 
+@@ -249,5 +265,92 @@ module Fluent::Plugin
+     end
+ 
+     TargetInfo = Struct.new(:path, :ino)
++
++    def validate_path_plan_timezone
++      timezone = @path_plan && @path_plan[:timezone]
++      if timezone.nil?
++        @path_plan_errors << [:timezone, 'empty']
++        return false
++      end
++      unless Fluent::Timezone.validate(timezone)
++        raise Fluent::ConfigError, "Unsupported timezone '#{timezone}'"
++      end
++      if Fluent::Timezone::NUMERIC_PATTERN === timezone
++        @path_plan[:timezone_kind] = :numeric
++      elsif Fluent::Timezone::NAME_PATTERN === timezone
++        begin
++          TZInfo::Timezone.get(timezone)
++          @path_plan[:timezone_kind] = :named
++        rescue
++          raise Fluent::ConfigError, "Unsupported timezone '#{timezone}'"
++        end
++      else
++        raise Fluent::ConfigError, "Unsupported timezone '#{timezone}'"
++      end
++      true
++    end
++
++    def build_path_plan_formatter(timezone, format)
++      @path_plan[:touched] = true if @path_plan
++      if timezone.nil?
++        return nil
++      end
++      if Fluent::Timezone::NUMERIC_PATTERN === timezone
++        offset = Time.zone_offset(timezone)
++        if format.is_a?(String)
++          Proc.new { |time| time.to_time.localtime(offset).strftime(format) }
++        else
++          Proc.new { |time| time.to_time.localtime(offset).iso8601 }
++        end
++      elsif Fluent::Timezone::NAME_PATTERN === timezone
++        begin
++          tz = TZInfo::Timezone.get(timezone)
++        rescue
++          return nil
++        end
++        if format.is_a?(String)
++          Proc.new { |time|
++            time = time.to_time
++            time.localtime(tz.period_for_utc(time).utc_total_offset).strftime(format)
++          }
++        else
++          Proc.new { |time|
++            time = time.to_time
++            time.localtime(tz.period_for_utc(time).utc_total_offset).iso8601
++          }
++        end
++      else
++        nil
++      end
++    end
++
++    def compile_path_plan_formatters
++      timezone = @path_plan && @path_plan[:timezone]
++      compiled = {}
++      Array(@path_plan && @path_plan[:patterns]).each do |pattern|
++        formatter = build_path_plan_formatter(timezone, pattern)
++        if formatter.nil?
++          formatter = Fluent::Timezone.formatter(timezone, pattern)
++        end
++        compiled[pattern] = formatter if formatter
++      end
++      @path_plan_formatters[:paths] = compiled
++      compiled
++    end
++
++    def compile_exclude_plan_formatters
++      timezone = @path_plan && @path_plan[:timezone]
++      compiled = {}
++      Array(@path_plan && @path_plan[:excludes]).each do |pattern|
++        formatter = build_path_plan_formatter(timezone, pattern)
++        if formatter.nil?
++          formatter = Fluent::Timezone.formatter(timezone, pattern)
++        end
++        compiled[pattern] = formatter if formatter
++      end
++      @path_plan_formatters[:excludes] = compiled
++      compiled
++    end
++
+   end
+ end
+diff --git a/lib/fluent/plugin_helper/event_loop.rb b/lib/fluent/plugin_helper/event_loop.rb
+index 1ff9946b..c4c682dd 100644
+--- a/lib/fluent/plugin_helper/event_loop.rb
++++ b/lib/fluent/plugin_helper/event_loop.rb
+@@ -36,11 +36,16 @@ module Fluent
+       attr_reader :_event_loop # for tests
+ 
+       def event_loop_attach(watcher)
++        attached = nil
+         @_event_loop_mutex.synchronize do
+           @_event_loop.attach(watcher)
+           @_event_loop_attached_watchers << watcher
+-          watcher
++          attached = watcher
+         end
++        if attached && respond_to?(:note_event_loop_attach, true)
++          note_event_loop_attach(attached)
++        end
++        attached
+       end
+ 
+       def event_loop_detach(watcher)
+@@ -50,6 +55,10 @@ module Fluent
+         @_event_loop_mutex.synchronize do
+           @_event_loop_attached_watchers.delete(watcher)
+         end
++        if respond_to?(:note_event_loop_detach, true)
++          note_event_loop_detach(watcher)
++        end
++        watcher
+       end
+ 
+       def event_loop_wait_until_start
+diff --git a/lib/fluent/plugin_helper/parser.rb b/lib/fluent/plugin_helper/parser.rb
+index 7d1c91a0..d872d0b9 100644
+--- a/lib/fluent/plugin_helper/parser.rb
++++ b/lib/fluent/plugin_helper/parser.rb
+@@ -55,6 +55,9 @@ module Fluent
+         end
+ 
+         @_parsers[usage] = parser
++        if respond_to?(:note_parser_runtime_ready, true)
++          note_parser_runtime_ready(parser, usage)
++        end
+         parser
+       end
+ 

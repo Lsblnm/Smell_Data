@@ -1,0 +1,195 @@
+diff --git a/lib/fluent/plugin/out_forward.rb b/lib/fluent/plugin/out_forward.rb
+index a6209b09..97ec287b 100644
+--- a/lib/fluent/plugin/out_forward.rb
++++ b/lib/fluent/plugin/out_forward.rb
+@@ -220,7 +220,6 @@ module Fluent::Plugin
+         end
+       end
+ 
+-      @ack_handler = @require_ack_response ? AckHandler.new(timeout: @ack_response_timeout, log: @log, read_length: @read_length) : nil
+       socket_cache = @keepalive ? SocketCache.new(@keepalive_timeout, @log) : nil
+       @connection_manager = ConnectionManager.new(
+         log: @log,
+@@ -228,6 +227,7 @@ module Fluent::Plugin
+         connection_factory: method(:create_transfer_socket),
+         socket_cache: socket_cache,
+       )
++      @ack_handler = @require_ack_response ? AckHandler.new(timeout: @ack_response_timeout, log: @log, read_length: @read_length, connection_manager: @connection_manager) : nil
+ 
+       service_discovery_configure(
+         :out_forward_service_discovery_watcher,
+@@ -586,6 +586,7 @@ module Fluent::Plugin
+       attr_reader :state
+       attr_reader :sockaddr  # used by on_udp_heatbeat_response_recv
+       attr_reader :failure # for test
++      attr_reader :handshake
+ 
+       def validate_host_resolution!
+         resolved_host
+diff --git a/lib/fluent/plugin/out_forward/ack_handler.rb b/lib/fluent/plugin/out_forward/ack_handler.rb
+index 362117b9..c02e392a 100644
+--- a/lib/fluent/plugin/out_forward/ack_handler.rb
++++ b/lib/fluent/plugin/out_forward/ack_handler.rb
+@@ -18,6 +18,7 @@ require 'fluent/plugin/output'
+ require 'fluent/plugin_helper/socket'
+ require 'fluent/engine'
+ require 'fluent/clock'
++require 'fluent/plugin/out_forward/connection_manager'
+ 
+ module Fluent::Plugin
+   class ForwardOutput < Output
+@@ -28,13 +29,16 @@ module Fluent::Plugin
+         CHUNKID_UNMATCHED = :chunkid_unmatched
+       end
+ 
+-      def initialize(timeout:, log:, read_length:)
++      attr_reader :read_length, :unpacker
++
++      def initialize(timeout:, log:, read_length:, connection_manager: nil)
+         @mutex = Mutex.new
+         @ack_waitings = []
+         @timeout = timeout
+         @log = log
+         @read_length = read_length
+         @unpacker = Fluent::MessagePackFactory.msgpack_unpacker
++        @connection_manager = connection_manager || ConnectionManager.new(log: log, secure: false, connection_factory: nil, socket_cache: nil)
+       end
+ 
+       def collect_response(select_interval)
+@@ -62,7 +66,7 @@ module Fluent::Plugin
+           readable_sockets, _, _ = IO.select(sockets, nil, nil, select_interval)
+           if readable_sockets
+             readable_sockets.each do |sock|
+-              results << read_ack_from_sock(sock)
++              results << @connection_manager.read_ack_from_sock(self, sock)
+             end
+           end
+ 
+@@ -102,49 +106,6 @@ module Fluent::Plugin
+         end
+       end
+ 
+-      private
+-
+-      def read_ack_from_sock(sock)
+-        begin
+-          raw_data = sock.instance_of?(Fluent::PluginHelper::Socket::WrappedSocket::TLS) ? sock.readpartial(@read_length) : sock.recv(@read_length)
+-        rescue Errno::ECONNRESET, EOFError # ECONNRESET for #recv, #EOFError for #readpartial
+-          raw_data = ''
+-        end
+-
+-        info = find(sock)
+-
+-        # When connection is closed by remote host, socket is ready to read and #recv returns an empty string that means EOF.
+-        # If this happens we assume the data wasn't delivered and retry it.
+-        if raw_data.empty?
+-          @log.warn 'destination node closed the connection. regard it as unavailable.', host: info.node.host, port: info.node.port
+-          # info.node.disable!
+-          return info, Result::FAILED
+-        else
+-          @unpacker.feed(raw_data)
+-          res = @unpacker.read
+-          @log.trace 'getting response from destination', host: info.node.host, port: info.node.port, chunk_id: dump_unique_id_hex(info.chunk_id), response: res
+-          if res['ack'] != info.chunk_id_base64
+-            # Some errors may have occurred when ack and chunk id is different, so send the chunk again.
+-            @log.warn 'ack in response and chunk id in sent data are different', chunk_id: dump_unique_id_hex(info.chunk_id), ack: res['ack']
+-            return info, Result::CHUNKID_UNMATCHED
+-          else
+-            @log.trace 'got a correct ack response', chunk_id: dump_unique_id_hex(info.chunk_id)
+-          end
+-
+-          return info, Result::SUCCESS
+-        end
+-      rescue => e
+-        @log.error 'unexpected error while receiving ack message', error: e
+-        @log.error_backtrace
+-        [nil, Result::FAILED]
+-      ensure
+-        delete(info)
+-      end
+-
+-      def dump_unique_id_hex(unique_id)
+-        Fluent::UniqueId.hex(unique_id)
+-      end
+-
+       def find(sock)
+         @mutex.synchronize do
+           @ack_waitings.find { |info| info.sock == sock }
+diff --git a/lib/fluent/plugin/out_forward/connection_manager.rb b/lib/fluent/plugin/out_forward/connection_manager.rb
+index af7096ea..2886a760 100644
+--- a/lib/fluent/plugin/out_forward/connection_manager.rb
++++ b/lib/fluent/plugin/out_forward/connection_manager.rb
+@@ -78,6 +78,47 @@ module Fluent::Plugin
+         end
+       end
+ 
++      def read_ack_from_sock(ack_handler, sock)
++        begin
++          raw_data = sock.instance_of?(Fluent::PluginHelper::Socket::WrappedSocket::TLS) ? sock.readpartial(ack_handler.read_length) : sock.recv(ack_handler.read_length)
++        rescue Errno::ECONNRESET, EOFError # ECONNRESET for #recv, #EOFError for #readpartial
++          raw_data = ''
++        end
++
++        info = ack_handler.find(sock)
++
++        # When connection is closed by remote host, socket is ready to read and #recv returns an empty string that means EOF.
++        # If this happens we assume the data wasn't delivered and retry it.
++        if raw_data.empty?
++          node = info.node
++          @log.warn 'destination node closed the connection. regard it as unavailable.', host: node.host, port: node.port, handshake_hostname: node.handshake.hostname, hard_timeout: node.failure.hard_timeout
++          # info.node.disable!
++          return info, AckHandler::Result::FAILED
++        else
++          unpacker = ack_handler.unpacker
++          unpacker.feed(raw_data)
++          res = unpacker.read
++          node = info.node
++          chunk_id = info.chunk_id
++          @log.trace 'getting response from destination', host: node.host, port: node.port, chunk_id: Fluent::UniqueId.hex(chunk_id), response: res, handshake_hostname: node.handshake.hostname, hard_timeout: node.failure.hard_timeout
++          if res['ack'] != info.chunk_id_base64
++            # Some errors may have occurred when ack and chunk id is different, so send the chunk again.
++            @log.warn 'ack in response and chunk id in sent data are different', chunk_id: Fluent::UniqueId.hex(chunk_id), ack: res['ack']
++            return info, AckHandler::Result::CHUNKID_UNMATCHED
++          else
++            @log.trace 'got a correct ack response', chunk_id: Fluent::UniqueId.hex(chunk_id)
++          end
++
++          return info, AckHandler::Result::SUCCESS
++        end
++      rescue => e
++        @log.error 'unexpected error while receiving ack message', error: e
++        @log.error_backtrace
++        [nil, AckHandler::Result::FAILED]
++      ensure
++        ack_handler.delete(info)
++      end
++
+       private
+ 
+       def connect_keepalive(host:, port:, hostname:, ack: nil)
+diff --git a/lib/fluent/plugin/out_forward/failure_detector.rb b/lib/fluent/plugin/out_forward/failure_detector.rb
+index 63417081..16abd5ca 100644
+--- a/lib/fluent/plugin/out_forward/failure_detector.rb
++++ b/lib/fluent/plugin/out_forward/failure_detector.rb
+@@ -22,6 +22,8 @@ module Fluent::Plugin
+       PHI_FACTOR = 1.0 / Math.log(10.0)
+       SAMPLE_SIZE = 1000
+ 
++      attr_reader :hard_timeout
++
+       def initialize(heartbeat_interval, hard_timeout, init_last)
+         @heartbeat_interval = heartbeat_interval
+         @last = init_last
+diff --git a/lib/fluent/plugin/out_forward/handshake_protocol.rb b/lib/fluent/plugin/out_forward/handshake_protocol.rb
+index 8cf4e04d..f7ec6e76 100644
+--- a/lib/fluent/plugin/out_forward/handshake_protocol.rb
++++ b/lib/fluent/plugin/out_forward/handshake_protocol.rb
+@@ -21,6 +21,8 @@ require 'digest'
+ module Fluent::Plugin
+   class ForwardOutput < Output
+     class HandshakeProtocol
++      attr_reader :hostname
++
+       def initialize(log:, hostname:, shared_key:, password:, username:)
+         @log = log
+         @hostname = hostname

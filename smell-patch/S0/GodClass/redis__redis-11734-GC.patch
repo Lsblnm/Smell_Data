@@ -1,0 +1,2265 @@
+diff --git a/src/bitops.c b/src/bitops.c
+index e2384d814..ea0d3528f 100644
+--- a/src/bitops.c
++++ b/src/bitops.c
+@@ -30,6 +30,999 @@
+ 
+ #include "server.h"
+ 
++#ifndef OBJ_ENCODING_EMBSTR_SIZE_LIMIT
++#define OBJ_ENCODING_EMBSTR_SIZE_LIMIT 44
++#endif
++#define BFOVERFLOW_WRAP 0
++#define BFOVERFLOW_SAT 1
++#define BFOVERFLOW_FAIL 2
++
++/* Coordinate string, keyspace, range, parsing and bitfield work used by
++ * bit commands and related string operations. */
++typedef struct bitOpCoordinator {
++    redisDb *db;
++    robj *key;
++    robj *obj;
++    int missing_key;
++    int lookup_flags;
++
++    unsigned char *bytes;
++    long nbytes;
++    char intbuf[LONG_STR_SIZE];
++    int encoding;
++
++    long long range_start;
++    long long range_end;
++    long long range_total;
++    int range_is_bit;
++    unsigned char first_byte_mask;
++    unsigned char last_byte_mask;
++
++    long long parsed_integer;
++    long parsed_long;
++    int parse_status;
++    int parsed_unit_is_bit;
++    double parsed_double;
++    long double parsed_ld;
++
++    long long grow_offset;
++    long long grow_extra;
++    int mutated;
++    long long length_limit;
++
++    int type_error;
++    robj *pending_reply;
++    int reply_kind;
++
++    uint64_t field_offset;
++    uint64_t field_bits;
++    int field_signed;
++    int overflow_policy;
++    int64_t signed_value;
++    uint64_t unsigned_value;
++} bitOpCoordinator;
++
++static void bitOpCoordinatorClearKeyspace(bitOpCoordinator *coord) {
++    coord->db = NULL;
++    coord->key = NULL;
++    coord->obj = NULL;
++    coord->missing_key = 0;
++    coord->lookup_flags = LOOKUP_NONE;
++}
++
++static void bitOpCoordinatorBindKeyspace(bitOpCoordinator *coord, redisDb *db, robj *key) {
++    coord->db = db;
++    coord->key = key;
++    coord->obj = NULL;
++    coord->missing_key = 0;
++    coord->lookup_flags = LOOKUP_NONE;
++    if (coord->db == NULL || coord->key == NULL) {
++        coord->missing_key = 1;
++        coord->lookup_flags = LOOKUP_NONOTIFY;
++    }
++}
++
++static robj *bitOpCoordinatorLookupReadLocked(bitOpCoordinator *coord) {
++    if (coord->db == NULL || coord->key == NULL) {
++        coord->obj = NULL;
++        coord->missing_key = 1;
++        return NULL;
++    }
++    coord->obj = lookupKeyReadWithFlags(coord->db, coord->key, coord->lookup_flags);
++    coord->missing_key = (coord->obj == NULL);
++    return coord->obj;
++}
++
++static robj *bitOpCoordinatorLookupWriteLocked(bitOpCoordinator *coord) {
++    if (coord->db == NULL || coord->key == NULL) {
++        coord->obj = NULL;
++        coord->missing_key = 1;
++        return NULL;
++    }
++    coord->obj = lookupKeyWrite(coord->db, coord->key);
++    coord->missing_key = (coord->obj == NULL);
++    return coord->obj;
++}
++
++robj *bitOpCoordinatorLookupReadOrReply(client *c, robj *key, robj *reply) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearKeyspace(&coord);
++    bitOpCoordinatorBindKeyspace(&coord, c->db, key);
++    bitOpCoordinatorLookupReadLocked(&coord);
++    if (coord.missing_key) {
++        addReplyOrErrorObject(c, reply);
++        return NULL;
++    }
++    return coord.obj;
++}
++
++robj *bitOpCoordinatorLookupWriteOrReply(client *c, robj *key, robj *reply) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearKeyspace(&coord);
++    bitOpCoordinatorBindKeyspace(&coord, c->db, key);
++    bitOpCoordinatorLookupWriteLocked(&coord);
++    if (coord.missing_key) {
++        addReplyOrErrorObject(c, reply);
++        return NULL;
++    }
++    return coord.obj;
++}
++
++robj *bitOpCoordinatorUnshareStringValue(redisDb *db, robj *key, robj *o) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearKeyspace(&coord);
++    bitOpCoordinatorBindKeyspace(&coord, db, key);
++    coord.obj = o;
++    if (coord.obj == NULL) {
++        coord.missing_key = 1;
++        return NULL;
++    }
++    serverAssert(coord.obj->type == OBJ_STRING);
++    if (coord.obj->refcount != 1 || coord.obj->encoding != OBJ_ENCODING_RAW) {
++        robj *decoded = getDecodedObject(coord.obj);
++        coord.obj = createRawStringObject(decoded->ptr, sdslen(decoded->ptr));
++        decrRefCount(decoded);
++        dbReplaceValue(coord.db, coord.key, coord.obj);
++        coord.missing_key = 0;
++    }
++    return coord.obj;
++}
++
++static void bitOpCoordinatorClearPayload(bitOpCoordinator *coord) {
++    coord->bytes = NULL;
++    coord->nbytes = 0;
++    coord->encoding = 0;
++    coord->intbuf[0] = '\0';
++}
++
++static void bitOpCoordinatorLoadPayload(bitOpCoordinator *coord, robj *o) {
++    bitOpCoordinatorClearPayload(coord);
++    if (o == NULL) {
++        coord->nbytes = 0;
++        coord->bytes = NULL;
++        coord->encoding = 0;
++        return;
++    }
++    coord->encoding = o->encoding;
++    if (o->encoding == OBJ_ENCODING_INT) {
++        coord->bytes = (unsigned char *)coord->intbuf;
++        coord->nbytes = ll2string(coord->intbuf, LONG_STR_SIZE, (long)o->ptr);
++    } else {
++        coord->bytes = (unsigned char *)o->ptr;
++        coord->nbytes = sdslen(o->ptr);
++    }
++}
++
++static int bitOpCoordinatorPayloadIsIntEncoded(bitOpCoordinator *coord) {
++    if (coord->encoding == OBJ_ENCODING_INT) {
++        if (coord->bytes != (unsigned char *)coord->intbuf) {
++            coord->bytes = (unsigned char *)coord->intbuf;
++        }
++        return 1;
++    }
++    return 0;
++}
++
++static long bitOpCoordinatorPayloadLength(bitOpCoordinator *coord) {
++    if (coord->bytes == NULL) {
++        coord->nbytes = 0;
++        return 0;
++    }
++    return coord->nbytes;
++}
++
++size_t bitOpCoordinatorStringObjectLen(robj *o) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearPayload(&coord);
++    serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
++    bitOpCoordinatorLoadPayload(&coord, o);
++    if (bitOpCoordinatorPayloadIsIntEncoded(&coord)) {
++        return (size_t) coord.nbytes;
++    }
++    return (size_t) bitOpCoordinatorPayloadLength(&coord);
++}
++
++robj *bitOpCoordinatorGetDecodedObject(robj *o) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearPayload(&coord);
++    if (sdsEncodedObject(o)) {
++        coord.encoding = o->encoding;
++        coord.bytes = (unsigned char *)o->ptr;
++        coord.nbytes = sdslen(o->ptr);
++        incrRefCount(o);
++        return o;
++    }
++    if (o->type == OBJ_STRING && o->encoding == OBJ_ENCODING_INT) {
++        coord.encoding = OBJ_ENCODING_INT;
++        coord.bytes = (unsigned char *)coord.intbuf;
++        coord.nbytes = ll2string(coord.intbuf, sizeof(coord.intbuf), (long)o->ptr);
++        return createStringObject((char *)coord.bytes, (size_t)coord.nbytes);
++    }
++    serverPanic("Unknown encoding type");
++    return NULL;
++}
++
++static void bitOpCoordinatorClearRange(bitOpCoordinator *coord) {
++    coord->range_start = 0;
++    coord->range_end = -1;
++    coord->range_total = 0;
++    coord->range_is_bit = 0;
++    coord->first_byte_mask = 0;
++    coord->last_byte_mask = 0;
++}
++
++static void bitOpCoordinatorSetRangeBounds(bitOpCoordinator *coord, long long start, long long end, long long total, int isbit) {
++    coord->range_start = start;
++    coord->range_end = end;
++    coord->range_total = total;
++    coord->range_is_bit = isbit ? 1 : 0;
++    coord->first_byte_mask = 0;
++    coord->last_byte_mask = 0;
++}
++
++static int bitOpCoordinatorNegativeIndexesCross(bitOpCoordinator *coord) {
++    if (coord->range_start < 0 && coord->range_end < 0 && coord->range_start > coord->range_end) {
++        return 1;
++    }
++    if (coord->range_total < 0) {
++        coord->range_total = 0;
++        return 1;
++    }
++    return 0;
++}
++
++static void bitOpCoordinatorApplyNegativeIndexes(bitOpCoordinator *coord) {
++    if (coord->range_start < 0) {
++        coord->range_start = coord->range_total + coord->range_start;
++    }
++    if (coord->range_end < 0) {
++        coord->range_end = coord->range_total + coord->range_end;
++    }
++    if (coord->range_start < 0) coord->range_start = 0;
++    if (coord->range_end < 0) coord->range_end = 0;
++}
++
++static void bitOpCoordinatorClampRange(bitOpCoordinator *coord) {
++    if (coord->range_total <= 0) {
++        coord->range_start = 0;
++        coord->range_end = -1;
++        return;
++    }
++    if (coord->range_end >= coord->range_total) {
++        coord->range_end = coord->range_total - 1;
++    }
++    if (coord->range_start >= coord->range_total) {
++        coord->range_start = coord->range_total;
++    }
++}
++
++static int bitOpCoordinatorRangeIsEmpty(bitOpCoordinator *coord) {
++    if (coord->range_total <= 0) return 1;
++    if (coord->range_start > coord->range_end) return 1;
++    if (coord->range_end < 0) return 1;
++    return 0;
++}
++
++static void bitOpCoordinatorConvertBitRangeToBytes(bitOpCoordinator *coord) {
++    if (!coord->range_is_bit) return;
++    if (coord->range_start > coord->range_end) return;
++    coord->first_byte_mask = ~((1<<(8-(coord->range_start&7)))-1) & 0xFF;
++    coord->last_byte_mask = (1<<(7-(coord->range_end&7)))-1;
++    coord->range_start >>= 3;
++    coord->range_end >>= 3;
++}
++
++static int bitOpCoordinatorNormalizeStringRange(bitOpCoordinator *coord) {
++    if (bitOpCoordinatorNegativeIndexesCross(coord)) return 0;
++    bitOpCoordinatorApplyNegativeIndexes(coord);
++    bitOpCoordinatorClampRange(coord);
++    if (coord->range_is_bit) bitOpCoordinatorConvertBitRangeToBytes(coord);
++    if (bitOpCoordinatorRangeIsEmpty(coord)) return 0;
++    return 1;
++}
++
++static void bitOpCoordinatorClearParse(bitOpCoordinator *coord) {
++    coord->parsed_integer = 0;
++    coord->parsed_long = 0;
++    coord->parse_status = C_OK;
++    coord->parsed_unit_is_bit = 0;
++    coord->parsed_double = 0;
++    coord->parsed_ld = 0;
++}
++
++int bitOpCoordinatorGetLongLongFromObject(robj *o, long long *target) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearParse(&coord);
++    if (o == NULL) {
++        coord.parsed_integer = 0;
++        coord.parse_status = C_OK;
++        if (target) *target = coord.parsed_integer;
++        return coord.parse_status;
++    }
++    serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
++    if (sdsEncodedObject(o)) {
++        if (string2ll(o->ptr,sdslen(o->ptr),&coord.parsed_integer) == 0) {
++            coord.parse_status = C_ERR;
++            return coord.parse_status;
++        }
++    } else if (o->encoding == OBJ_ENCODING_INT) {
++        coord.parsed_integer = (long) o->ptr;
++        coord.parse_status = C_OK;
++    } else {
++        serverPanic("Unknown string encoding");
++    }
++    if (target) *target = coord.parsed_integer;
++    return coord.parse_status;
++}
++
++int bitOpCoordinatorGetLongLongFromObjectOrReply(client *c, robj *o, long long *target, const char *msg) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearParse(&coord);
++    coord.parse_status = bitOpCoordinatorGetLongLongFromObject(o, &coord.parsed_integer);
++    if (coord.parse_status != C_OK) {
++        if (msg != NULL) {
++            addReplyError(c,(char*)msg);
++        } else {
++            addReplyError(c,"value is not an integer or out of range");
++        }
++        return coord.parse_status;
++    }
++    if (target) *target = coord.parsed_integer;
++    return coord.parse_status;
++}
++
++int bitOpCoordinatorGetLongFromObjectOrReply(client *c, robj *o, long *target, const char *msg) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearParse(&coord);
++    if (bitOpCoordinatorGetLongLongFromObjectOrReply(c, o, &coord.parsed_integer, msg) != C_OK) {
++        coord.parse_status = C_ERR;
++        return coord.parse_status;
++    }
++    if (coord.parsed_integer < LONG_MIN || coord.parsed_integer > LONG_MAX) {
++        coord.parse_status = C_ERR;
++        if (msg != NULL) {
++            addReplyError(c,(char*)msg);
++        } else {
++            addReplyError(c,"value is out of range");
++        }
++        return coord.parse_status;
++    }
++    coord.parsed_long = (long) coord.parsed_integer;
++    coord.parse_status = C_OK;
++    if (target) *target = coord.parsed_long;
++    return coord.parse_status;
++}
++
++int bitOpCoordinatorGetRangeLongFromObjectOrReply(client *c, robj *o, long min, long max, long *target, const char *msg) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearParse(&coord);
++    if (bitOpCoordinatorGetLongFromObjectOrReply(c, o, &coord.parsed_long, msg) != C_OK) {
++        coord.parse_status = C_ERR;
++        return coord.parse_status;
++    }
++    if (coord.parsed_long < min || coord.parsed_long > max) {
++        coord.parse_status = C_ERR;
++        if (msg != NULL) {
++            addReplyError(c,(char*)msg);
++        } else {
++            addReplyErrorFormat(c,"value is out of range, value must between %ld and %ld", min, max);
++        }
++        return coord.parse_status;
++    }
++    coord.parse_status = C_OK;
++    if (target) *target = coord.parsed_long;
++    return coord.parse_status;
++}
++
++int bitOpCoordinatorGetPositiveLongFromObjectOrReply(client *c, robj *o, long *target, const char *msg) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearParse(&coord);
++    if (msg) {
++        coord.parse_status = bitOpCoordinatorGetRangeLongFromObjectOrReply(c, o, 0, LONG_MAX, &coord.parsed_long, msg);
++    } else {
++        coord.parse_status = bitOpCoordinatorGetRangeLongFromObjectOrReply(c, o, 0, LONG_MAX, &coord.parsed_long, "value is out of range, must be positive");
++    }
++    if (coord.parse_status == C_OK && target) *target = coord.parsed_long;
++    return coord.parse_status;
++}
++
++int bitOpCoordinatorGetIntFromObjectOrReply(client *c, robj *o, int *target, const char *msg) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearParse(&coord);
++    if (bitOpCoordinatorGetRangeLongFromObjectOrReply(c, o, INT_MIN, INT_MAX, &coord.parsed_long, msg) != C_OK) {
++        coord.parse_status = C_ERR;
++        return coord.parse_status;
++    }
++    coord.parse_status = C_OK;
++    if (target) *target = (int) coord.parsed_long;
++    return coord.parse_status;
++}
++
++int bitOpCoordinatorIsSdsRepresentableAsLongLong(sds s, long long *llval) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearParse(&coord);
++    if (s == NULL) {
++        coord.parse_status = C_ERR;
++        return coord.parse_status;
++    }
++    if (string2ll(s,sdslen(s),&coord.parsed_integer)) {
++        coord.parse_status = C_OK;
++        if (llval) *llval = coord.parsed_integer;
++    } else {
++        coord.parse_status = C_ERR;
++    }
++    return coord.parse_status;
++}
++
++int bitOpCoordinatorIsObjectRepresentableAsLongLong(robj *o, long long *llval) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearParse(&coord);
++    serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
++    if (o->encoding == OBJ_ENCODING_INT) {
++        coord.parsed_integer = (long) o->ptr;
++        coord.parse_status = C_OK;
++        if (llval) *llval = coord.parsed_integer;
++        return coord.parse_status;
++    }
++    coord.parse_status = bitOpCoordinatorIsSdsRepresentableAsLongLong(o->ptr, &coord.parsed_integer);
++    if (coord.parse_status == C_OK && llval) *llval = coord.parsed_integer;
++    return coord.parse_status;
++}
++
++int bitOpCoordinatorGetDoubleFromObject(const robj *o, double *target) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearParse(&coord);
++    if (o == NULL) {
++        coord.parsed_double = 0;
++        coord.parse_status = C_OK;
++    } else {
++        serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
++        if (sdsEncodedObject(o)) {
++            if (!string2d(o->ptr, sdslen(o->ptr), &coord.parsed_double)) {
++                coord.parse_status = C_ERR;
++                return coord.parse_status;
++            }
++            coord.parse_status = C_OK;
++        } else if (o->encoding == OBJ_ENCODING_INT) {
++            coord.parsed_double = (long)o->ptr;
++            coord.parse_status = C_OK;
++        } else {
++            serverPanic("Unknown string encoding");
++        }
++    }
++    if (target) *target = coord.parsed_double;
++    return coord.parse_status;
++}
++
++int bitOpCoordinatorGetDoubleFromObjectOrReply(client *c, robj *o, double *target, const char *msg) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearParse(&coord);
++    coord.parse_status = bitOpCoordinatorGetDoubleFromObject(o, &coord.parsed_double);
++    if (coord.parse_status != C_OK) {
++        if (msg != NULL) {
++            addReplyError(c,(char*)msg);
++        } else {
++            addReplyError(c,"value is not a valid float");
++        }
++        return coord.parse_status;
++    }
++    if (target) *target = coord.parsed_double;
++    return coord.parse_status;
++}
++
++int bitOpCoordinatorGetLongDoubleFromObject(robj *o, long double *target) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearParse(&coord);
++    if (o == NULL) {
++        coord.parsed_ld = 0;
++        coord.parse_status = C_OK;
++    } else {
++        serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
++        if (sdsEncodedObject(o)) {
++            if (!string2ld(o->ptr, sdslen(o->ptr), &coord.parsed_ld)) {
++                coord.parse_status = C_ERR;
++                return coord.parse_status;
++            }
++            coord.parse_status = C_OK;
++        } else if (o->encoding == OBJ_ENCODING_INT) {
++            coord.parsed_ld = (long)o->ptr;
++            coord.parse_status = C_OK;
++        } else {
++            serverPanic("Unknown string encoding");
++        }
++    }
++    if (target) *target = coord.parsed_ld;
++    return coord.parse_status;
++}
++
++int bitOpCoordinatorGetLongDoubleFromObjectOrReply(client *c, robj *o, long double *target, const char *msg) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearParse(&coord);
++    coord.parse_status = bitOpCoordinatorGetLongDoubleFromObject(o, &coord.parsed_ld);
++    if (coord.parse_status != C_OK) {
++        if (msg != NULL) {
++            addReplyError(c,(char*)msg);
++        } else {
++            addReplyError(c,"value is not a valid float");
++        }
++        return coord.parse_status;
++    }
++    if (target) *target = coord.parsed_ld;
++    return coord.parse_status;
++}
++
++static void bitOpCoordinatorClearMutation(bitOpCoordinator *coord) {
++    coord->grow_offset = 0;
++    coord->grow_extra = 0;
++    coord->mutated = 0;
++    coord->length_limit = server.proto_max_bulk_len;
++}
++
++int bitOpCoordinatorCheckStringLength(client *c, long long size, long long append) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearMutation(&coord);
++    coord.grow_offset = size;
++    coord.grow_extra = append;
++    if (mustObeyClient(c)) {
++        coord.mutated = 0;
++        return C_OK;
++    }
++    coord.length_limit = server.proto_max_bulk_len;
++    {
++        long long total = (uint64_t)coord.grow_offset + coord.grow_extra;
++        if (total > coord.length_limit || total < coord.grow_offset || total < coord.grow_extra) {
++            coord.mutated = 0;
++            addReplyError(c,"string exceeds maximum allowed size (proto-max-bulk-len)");
++            return C_ERR;
++        }
++    }
++    coord.mutated = 1;
++    return C_OK;
++}
++
++void bitOpCoordinatorTrimStringObjectIfNeeded(robj *o, int trim_small_values) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearMutation(&coord);
++    if (o->encoding != OBJ_ENCODING_RAW) return;
++    coord.length_limit = (long long) sdslen(o->ptr);
++    coord.grow_offset = coord.length_limit;
++    coord.grow_extra = (long long) sdsavail(o->ptr);
++    if (coord.grow_offset >= PROTO_MBULK_BIG_ARG ||
++        trim_small_values ||
++        (server.executing_client && server.executing_client->flags & CLIENT_SCRIPT && coord.grow_offset < LUA_CMD_OBJCACHE_MAX_LEN)) {
++        if (coord.grow_extra > coord.grow_offset/10) {
++            o->ptr = sdsRemoveFreeSpace(o->ptr, 0);
++            coord.mutated = 1;
++        }
++    }
++}
++
++robj *bitOpCoordinatorTryObjectEncodingEx(robj *o, int try_trim) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearParse(&coord);
++    long value;
++    sds s = o->ptr;
++    size_t len;
++
++    serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
++    if (!sdsEncodedObject(o)) return o;
++    if (o->refcount > 1) return o;
++
++    len = sdslen(s);
++    coord.parsed_long = 0;
++    if (len <= 20 && string2l(s,len,&value)) {
++        coord.parsed_integer = value;
++        coord.parse_status = C_OK;
++        if ((server.maxmemory == 0 ||
++            !(server.maxmemory_policy & MAXMEMORY_FLAG_NO_SHARED_INTEGERS)) &&
++            coord.parsed_integer >= 0 &&
++            coord.parsed_integer < OBJ_SHARED_INTEGERS)
++        {
++            decrRefCount(o);
++            return shared.integers[coord.parsed_integer];
++        } else {
++            if (o->encoding == OBJ_ENCODING_RAW) {
++                sdsfree(o->ptr);
++                o->encoding = OBJ_ENCODING_INT;
++                o->ptr = (void*) value;
++                return o;
++            } else if (o->encoding == OBJ_ENCODING_EMBSTR) {
++                decrRefCount(o);
++                return createStringObjectFromLongLongForValue(value);
++            }
++        }
++    } else {
++        coord.parse_status = C_ERR;
++    }
++
++    if (len <= OBJ_ENCODING_EMBSTR_SIZE_LIMIT) {
++        robj *emb;
++        if (o->encoding == OBJ_ENCODING_EMBSTR) return o;
++        emb = createEmbeddedStringObject(s,sdslen(s));
++        decrRefCount(o);
++        return emb;
++    }
++
++    if (try_trim)
++        bitOpCoordinatorTrimStringObjectIfNeeded(o, 0);
++    return o;
++}
++
++robj *bitOpCoordinatorTryObjectEncoding(robj *o) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearParse(&coord);
++    coord.parse_status = C_OK;
++    coord.parsed_integer = 0;
++    return bitOpCoordinatorTryObjectEncodingEx(o, 1);
++}
++
++static void bitOpCoordinatorClearTypeError(bitOpCoordinator *coord) {
++    coord->type_error = 0;
++    coord->pending_reply = NULL;
++    coord->reply_kind = 0;
++}
++
++int bitOpCoordinatorCheckType(client *c, robj *o, int type) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearTypeError(&coord);
++    if (o && o->type != type) {
++        coord.type_error = 1;
++        coord.pending_reply = shared.wrongtypeerr;
++        coord.reply_kind = 1;
++        addReplyErrorObject(c, coord.pending_reply);
++        return coord.type_error;
++    }
++    coord.type_error = 0;
++    coord.pending_reply = NULL;
++    coord.reply_kind = 0;
++    return coord.type_error;
++}
++
++void bitOpCoordinatorReadStringRange(client *c) {
++    bitOpCoordinator coord;
++    robj *o;
++    char *str, llbuf[32];
++    size_t len;
++    long long start, end;
++
++    bitOpCoordinatorClearRange(&coord);
++    if (bitOpCoordinatorGetLongLongFromObjectOrReply(c,c->argv[2],&start,NULL) != C_OK)
++        return;
++    if (bitOpCoordinatorGetLongLongFromObjectOrReply(c,c->argv[3],&end,NULL) != C_OK)
++        return;
++    if ((o = bitOpCoordinatorLookupReadOrReply(c,c->argv[1],shared.emptybulk)) == NULL ||
++        bitOpCoordinatorCheckType(c,o,OBJ_STRING)) return;
++
++    if (o->encoding == OBJ_ENCODING_INT) {
++        str = llbuf;
++        len = ll2string(llbuf,sizeof(llbuf),(long)o->ptr);
++    } else {
++        str = o->ptr;
++        len = sdslen(str);
++    }
++    bitOpCoordinatorSetRangeBounds(&coord, start, end, (long long)len, 0);
++    if (!bitOpCoordinatorNormalizeStringRange(&coord)) {
++        addReply(c,shared.emptybulk);
++        return;
++    }
++    addReplyBulkCBuffer(c,(char*)str+coord.range_start,coord.range_end-coord.range_start+1);
++}
++
++void bitOpCoordinatorWriteStringRange(client *c) {
++    bitOpCoordinator coord;
++    robj *o;
++    sds value = c->argv[3]->ptr;
++    long offset;
++
++    bitOpCoordinatorClearMutation(&coord);
++    if (bitOpCoordinatorGetLongFromObjectOrReply(c,c->argv[2],&offset,NULL) != C_OK)
++        return;
++
++    coord.grow_offset = offset;
++    if (coord.grow_offset < 0) {
++        addReplyError(c,"offset is out of range");
++        return;
++    }
++
++    o = lookupKeyWrite(c->db,c->argv[1]);
++    if (o == NULL) {
++        if (sdslen(value) == 0) {
++            addReply(c,shared.czero);
++            return;
++        }
++        if (bitOpCoordinatorCheckStringLength(c,coord.grow_offset,sdslen(value)) != C_OK)
++            return;
++        o = createObject(OBJ_STRING,sdsnewlen(NULL, coord.grow_offset+sdslen(value)));
++        dbAdd(c->db,c->argv[1],o);
++        coord.mutated = 1;
++    } else {
++        size_t olen;
++        if (bitOpCoordinatorCheckType(c,o,OBJ_STRING))
++            return;
++        olen = bitOpCoordinatorStringObjectLen(o);
++        if (sdslen(value) == 0) {
++            addReplyLongLong(c,olen);
++            return;
++        }
++        if (bitOpCoordinatorCheckStringLength(c,coord.grow_offset,sdslen(value)) != C_OK)
++            return;
++        o = bitOpCoordinatorUnshareStringValue(c->db,c->argv[1],o);
++        coord.mutated = 1;
++    }
++
++    coord.grow_extra = sdslen(value);
++    if (coord.grow_extra > 0) {
++        o->ptr = sdsgrowzero(o->ptr,coord.grow_offset+coord.grow_extra);
++        memcpy((char*)o->ptr+coord.grow_offset,value,coord.grow_extra);
++        signalModifiedKey(c,c->db,c->argv[1]);
++        notifyKeyspaceEvent(NOTIFY_STRING,
++            "setrange",c->argv[1],c->db->id);
++        server.dirty++;
++        coord.mutated = 1;
++    }
++    addReplyLongLong(c,sdslen(o->ptr));
++}
++
++void bitOpCoordinatorStrlen(client *c) {
++    bitOpCoordinator coord;
++    robj *o;
++    bitOpCoordinatorClearTypeError(&coord);
++    if ((o = bitOpCoordinatorLookupReadOrReply(c,c->argv[1],shared.czero)) == NULL ||
++        bitOpCoordinatorCheckType(c,o,OBJ_STRING)) {
++        coord.type_error = 1;
++        coord.pending_reply = shared.wrongtypeerr;
++        coord.reply_kind = 1;
++        return;
++    }
++    coord.type_error = 0;
++    coord.pending_reply = NULL;
++    coord.reply_kind = 0;
++    addReplyLongLong(c,bitOpCoordinatorStringObjectLen(o));
++}
++
++void bitOpCoordinatorAppend(client *c) {
++    bitOpCoordinator coord;
++    size_t totlen;
++    robj *o, *append;
++
++    bitOpCoordinatorClearMutation(&coord);
++    o = lookupKeyWrite(c->db,c->argv[1]);
++    if (o == NULL) {
++        c->argv[2] = bitOpCoordinatorTryObjectEncoding(c->argv[2]);
++        dbAdd(c->db,c->argv[1],c->argv[2]);
++        incrRefCount(c->argv[2]);
++        totlen = bitOpCoordinatorStringObjectLen(c->argv[2]);
++        coord.mutated = 1;
++        coord.grow_offset = 0;
++        coord.grow_extra = totlen;
++    } else {
++        if (bitOpCoordinatorCheckType(c,o,OBJ_STRING))
++            return;
++        append = c->argv[2];
++        coord.grow_offset = bitOpCoordinatorStringObjectLen(o);
++        coord.grow_extra = sdslen(append->ptr);
++        if (bitOpCoordinatorCheckStringLength(c,coord.grow_offset,coord.grow_extra) != C_OK)
++            return;
++        o = bitOpCoordinatorUnshareStringValue(c->db,c->argv[1],o);
++        o->ptr = sdscatlen(o->ptr,append->ptr,sdslen(append->ptr));
++        totlen = sdslen(o->ptr);
++        coord.mutated = 1;
++    }
++    signalModifiedKey(c,c->db,c->argv[1]);
++    notifyKeyspaceEvent(NOTIFY_STRING,"append",c->argv[1],c->db->id);
++    server.dirty++;
++    addReplyLongLong(c,totlen);
++}
++
++void bitOpCoordinatorIncrDecr(client *c, long long incr) {
++    bitOpCoordinator coord;
++    long long value, oldvalue;
++    robj *o, *new;
++
++    bitOpCoordinatorClearParse(&coord);
++    o = lookupKeyWrite(c->db,c->argv[1]);
++    if (bitOpCoordinatorCheckType(c,o,OBJ_STRING)) return;
++    if (bitOpCoordinatorGetLongLongFromObjectOrReply(c,o,&coord.parsed_integer,NULL) != C_OK) return;
++
++    value = coord.parsed_integer;
++    oldvalue = value;
++    if ((incr < 0 && oldvalue < 0 && incr < (LLONG_MIN-oldvalue)) ||
++        (incr > 0 && oldvalue > 0 && incr > (LLONG_MAX-oldvalue))) {
++        coord.parse_status = C_ERR;
++        addReplyError(c,"increment or decrement would overflow");
++        return;
++    }
++    value += incr;
++    coord.parsed_integer = value;
++    coord.parse_status = C_OK;
++
++    if (o && o->refcount == 1 && o->encoding == OBJ_ENCODING_INT &&
++        (value < 0 || value >= OBJ_SHARED_INTEGERS) &&
++        value >= LONG_MIN && value <= LONG_MAX)
++    {
++        new = o;
++        o->ptr = (void*)((long)value);
++    } else {
++        new = createStringObjectFromLongLongForValue(value);
++        if (o) {
++            dbReplaceValue(c->db,c->argv[1],new);
++        } else {
++            dbAdd(c->db,c->argv[1],new);
++        }
++    }
++    signalModifiedKey(c,c->db,c->argv[1]);
++    notifyKeyspaceEvent(NOTIFY_STRING,"incrby",c->argv[1],c->db->id);
++    server.dirty++;
++    addReplyLongLong(c, value);
++}
++
++static void bitOpCoordinatorClearBitfield(bitOpCoordinator *coord) {
++    coord->field_offset = 0;
++    coord->field_bits = 0;
++    coord->field_signed = 0;
++    coord->overflow_policy = BFOVERFLOW_WRAP;
++    coord->signed_value = 0;
++    coord->unsigned_value = 0;
++}
++
++void bitOpCoordinatorSetUnsignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits, uint64_t value) {
++    bitOpCoordinator coord;
++    uint64_t byte, bit, byteval, bitval, j;
++    bitOpCoordinatorClearBitfield(&coord);
++    coord.field_offset = offset;
++    coord.field_bits = bits;
++    coord.unsigned_value = value;
++    for (j = 0; j < coord.field_bits; j++) {
++        bitval = (coord.unsigned_value & ((uint64_t)1<<(coord.field_bits-1-j))) != 0;
++        byte = coord.field_offset >> 3;
++        bit = 7 - (coord.field_offset & 0x7);
++        byteval = p[byte];
++        byteval &= ~(1 << bit);
++        byteval |= bitval << bit;
++        p[byte] = byteval & 0xff;
++        coord.field_offset++;
++    }
++}
++
++void bitOpCoordinatorSetSignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits, int64_t value) {
++    bitOpCoordinator coord;
++    bitOpCoordinatorClearBitfield(&coord);
++    coord.field_offset = offset;
++    coord.field_bits = bits;
++    coord.signed_value = value;
++    coord.unsigned_value = (uint64_t) value;
++    coord.field_signed = 1;
++    bitOpCoordinatorSetUnsignedBitfield(p, coord.field_offset, coord.field_bits, coord.unsigned_value);
++}
++
++uint64_t bitOpCoordinatorGetUnsignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits) {
++    bitOpCoordinator coord;
++    uint64_t byte, bit, byteval, bitval, j;
++    bitOpCoordinatorClearBitfield(&coord);
++    coord.field_offset = offset;
++    coord.field_bits = bits;
++    coord.unsigned_value = 0;
++    for (j = 0; j < coord.field_bits; j++) {
++        byte = coord.field_offset >> 3;
++        bit = 7 - (coord.field_offset & 0x7);
++        byteval = p[byte];
++        bitval = (byteval >> bit) & 1;
++        coord.unsigned_value = (coord.unsigned_value<<1) | bitval;
++        coord.field_offset++;
++    }
++    return coord.unsigned_value;
++}
++
++int64_t bitOpCoordinatorGetSignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits) {
++    bitOpCoordinator coord;
++    union {uint64_t u; int64_t i;} conv;
++    bitOpCoordinatorClearBitfield(&coord);
++    coord.field_offset = offset;
++    coord.field_bits = bits;
++    coord.field_signed = 1;
++    conv.u = bitOpCoordinatorGetUnsignedBitfield(p, coord.field_offset, coord.field_bits);
++    coord.signed_value = conv.i;
++    if (coord.field_bits < 64 && (coord.signed_value & ((uint64_t)1 << (coord.field_bits-1))))
++        coord.signed_value |= ((uint64_t)-1) << coord.field_bits;
++    return coord.signed_value;
++}
++
++int bitOpCoordinatorCheckUnsignedBitfieldOverflow(uint64_t value, int64_t incr, uint64_t bits, int owtype, uint64_t *limit) {
++    bitOpCoordinator coord;
++    uint64_t max;
++    int64_t maxincr, minincr;
++    bitOpCoordinatorClearBitfield(&coord);
++    coord.field_bits = bits;
++    coord.overflow_policy = owtype;
++    coord.unsigned_value = value;
++    max = (coord.field_bits == 64) ? UINT64_MAX : (((uint64_t)1<<coord.field_bits)-1);
++    maxincr = max-coord.unsigned_value;
++    minincr = -((int64_t)coord.unsigned_value);
++
++    if (coord.unsigned_value > max || (incr > 0 && incr > maxincr)) {
++        if (limit) {
++            if (coord.overflow_policy == BFOVERFLOW_WRAP) {
++                goto handle_wrap;
++            } else if (coord.overflow_policy == BFOVERFLOW_SAT) {
++                *limit = max;
++            }
++        }
++        return 1;
++    } else if (incr < 0 && incr < minincr) {
++        if (limit) {
++            if (coord.overflow_policy == BFOVERFLOW_WRAP) {
++                goto handle_wrap;
++            } else if (coord.overflow_policy == BFOVERFLOW_SAT) {
++                *limit = 0;
++            }
++        }
++        return -1;
++    }
++    return 0;
++
++handle_wrap:
++    {
++        uint64_t mask = ((uint64_t)-1) << coord.field_bits;
++        uint64_t res = coord.unsigned_value+incr;
++        res &= ~mask;
++        *limit = res;
++    }
++    return 1;
++}
++
++int bitOpCoordinatorCheckSignedBitfieldOverflow(int64_t value, int64_t incr, uint64_t bits, int owtype, int64_t *limit) {
++    bitOpCoordinator coord;
++    int64_t max, min, maxincr, minincr;
++    bitOpCoordinatorClearBitfield(&coord);
++    coord.field_bits = bits;
++    coord.overflow_policy = owtype;
++    coord.signed_value = value;
++    coord.field_signed = 1;
++    max = (coord.field_bits == 64) ? INT64_MAX : (((int64_t)1<<(coord.field_bits-1))-1);
++    min = (-max)-1;
++    maxincr = (uint64_t)max-coord.signed_value;
++    minincr = min-coord.signed_value;
++
++    if (coord.signed_value > max || (coord.field_bits != 64 && incr > maxincr) || (coord.signed_value >= 0 && incr > 0 && incr > maxincr))
++    {
++        if (limit) {
++            if (coord.overflow_policy == BFOVERFLOW_WRAP) {
++                goto handle_wrap;
++            } else if (coord.overflow_policy == BFOVERFLOW_SAT) {
++                *limit = max;
++            }
++        }
++        return 1;
++    } else if (coord.signed_value < min || (coord.field_bits != 64 && incr < minincr) || (coord.signed_value < 0 && incr < 0 && incr < minincr)) {
++        if (limit) {
++            if (coord.overflow_policy == BFOVERFLOW_WRAP) {
++                goto handle_wrap;
++            } else if (coord.overflow_policy == BFOVERFLOW_SAT) {
++                *limit = min;
++            }
++        }
++        return -1;
++    }
++    return 0;
++
++handle_wrap:
++    {
++        uint64_t msb = (uint64_t)1 << (coord.field_bits-1);
++        uint64_t a = coord.signed_value, b = incr, c;
++        c = a+b;
++        if (coord.field_bits < 64) {
++            uint64_t mask = ((uint64_t)-1) << coord.field_bits;
++            if (c & msb) {
++                c |= mask;
++            } else {
++                c &= ~mask;
++            }
++        }
++        *limit = c;
++    }
++    return 1;
++}
++
+ /* -----------------------------------------------------------------------------
+  * Helpers and low level bit functions.
+  * -------------------------------------------------------------------------- */
+@@ -38,9 +1031,16 @@
+  * 'count' bytes. The implementation of this function is required to
+  * work with an input string length up to 512 MB or more (server.proto_max_bulk_len) */
+ long long redisPopcount(void *s, long count) {
++    bitOpCoordinator coord;
+     long long bits = 0;
+-    unsigned char *p = s;
++    unsigned char *p;
+     uint32_t *p4;
++    bitOpCoordinatorClearPayload(&coord);
++    coord.bytes = s;
++    coord.nbytes = count;
++    coord.encoding = OBJ_ENCODING_RAW;
++    p = coord.bytes;
++    count = coord.nbytes;
+     static const unsigned char bitsinbyte[256] = {0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4,1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,4,5,5,6,5,6,6,7,5,6,6,7,6,7,7,8};
+ 
+     /* Count initial bytes not aligned to 32 bit. */
+@@ -99,8 +1099,15 @@ long long redisPopcount(void *s, long count) {
+  * padded on the right. However if 'bit' is 1 it is possible that there is
+  * not a single set bit in the bitmap. In this special case -1 is returned. */
+ long long redisBitpos(void *s, unsigned long count, int bit) {
++    bitOpCoordinator coord;
+     unsigned long *l;
+     unsigned char *c;
++    bitOpCoordinatorClearPayload(&coord);
++    coord.bytes = s;
++    coord.nbytes = count;
++    coord.encoding = OBJ_ENCODING_RAW;
++    s = coord.bytes;
++    count = coord.nbytes;
+     unsigned long skipval, word = 0, one;
+     long long pos = 0; /* Position of bit, to return to the caller. */
+     unsigned long j;
+@@ -207,59 +1214,19 @@ long long redisBitpos(void *s, unsigned long count, int bit) {
+  */
+ 
+ void setUnsignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits, uint64_t value) {
+-    uint64_t byte, bit, byteval, bitval, j;
+-
+-    for (j = 0; j < bits; j++) {
+-        bitval = (value & ((uint64_t)1<<(bits-1-j))) != 0;
+-        byte = offset >> 3;
+-        bit = 7 - (offset & 0x7);
+-        byteval = p[byte];
+-        byteval &= ~(1 << bit);
+-        byteval |= bitval << bit;
+-        p[byte] = byteval & 0xff;
+-        offset++;
+-    }
++    bitOpCoordinatorSetUnsignedBitfield(p, offset, bits, value);
+ }
+ 
+ void setSignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits, int64_t value) {
+-    uint64_t uv = value; /* Casting will add UINT64_MAX + 1 if v is negative. */
+-    setUnsignedBitfield(p,offset,bits,uv);
++    bitOpCoordinatorSetSignedBitfield(p, offset, bits, value);
+ }
+ 
+ uint64_t getUnsignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits) {
+-    uint64_t byte, bit, byteval, bitval, j, value = 0;
+-
+-    for (j = 0; j < bits; j++) {
+-        byte = offset >> 3;
+-        bit = 7 - (offset & 0x7);
+-        byteval = p[byte];
+-        bitval = (byteval >> bit) & 1;
+-        value = (value<<1) | bitval;
+-        offset++;
+-    }
+-    return value;
++    return bitOpCoordinatorGetUnsignedBitfield(p, offset, bits);
+ }
+ 
+ int64_t getSignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits) {
+-    int64_t value;
+-    union {uint64_t u; int64_t i;} conv;
+-
+-    /* Converting from unsigned to signed is undefined when the value does
+-     * not fit, however here we assume two's complement and the original value
+-     * was obtained from signed -> unsigned conversion, so we'll find the
+-     * most significant bit set if the original value was negative.
+-     *
+-     * Note that two's complement is mandatory for exact-width types
+-     * according to the C99 standard. */
+-    conv.u = getUnsignedBitfield(p,offset,bits);
+-    value = conv.i;
+-
+-    /* If the top significant bit is 1, propagate it to all the
+-     * higher bits for two's complement representation of signed
+-     * integers. */
+-    if (bits < 64 && (value & ((uint64_t)1 << (bits-1))))
+-        value |= ((uint64_t)-1) << bits;
+-    return value;
++    return bitOpCoordinatorGetSignedBitfield(p, offset, bits);
+ }
+ 
+ /* The following two functions detect overflow of a value in the context
+@@ -281,109 +1248,27 @@ int64_t getSignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits) {
+  * "wrap" around towards zero for unsigned integers, or towards the most
+  * negative number that is possible to represent for signed integers. */
+ 
+-#define BFOVERFLOW_WRAP 0
+-#define BFOVERFLOW_SAT 1
+-#define BFOVERFLOW_FAIL 2 /* Used by the BITFIELD command implementation. */
++/* Overflow policy constants are defined with bitOpCoordinator. */
+ 
+ int checkUnsignedBitfieldOverflow(uint64_t value, int64_t incr, uint64_t bits, int owtype, uint64_t *limit) {
+-    uint64_t max = (bits == 64) ? UINT64_MAX : (((uint64_t)1<<bits)-1);
+-    int64_t maxincr = max-value;
+-    int64_t minincr = -value;
+-
+-    if (value > max || (incr > 0 && incr > maxincr)) {
+-        if (limit) {
+-            if (owtype == BFOVERFLOW_WRAP) {
+-                goto handle_wrap;
+-            } else if (owtype == BFOVERFLOW_SAT) {
+-                *limit = max;
+-            }
+-        }
+-        return 1;
+-    } else if (incr < 0 && incr < minincr) {
+-        if (limit) {
+-            if (owtype == BFOVERFLOW_WRAP) {
+-                goto handle_wrap;
+-            } else if (owtype == BFOVERFLOW_SAT) {
+-                *limit = 0;
+-            }
+-        }
+-        return -1;
+-    }
+-    return 0;
+-
+-handle_wrap:
+-    {
+-        uint64_t mask = ((uint64_t)-1) << bits;
+-        uint64_t res = value+incr;
+-
+-        res &= ~mask;
+-        *limit = res;
+-    }
+-    return 1;
++    return bitOpCoordinatorCheckUnsignedBitfieldOverflow(value, incr, bits, owtype, limit);
+ }
+ 
+ int checkSignedBitfieldOverflow(int64_t value, int64_t incr, uint64_t bits, int owtype, int64_t *limit) {
+-    int64_t max = (bits == 64) ? INT64_MAX : (((int64_t)1<<(bits-1))-1);
+-    int64_t min = (-max)-1;
+-
+-    /* Note that maxincr and minincr could overflow, but we use the values
+-     * only after checking 'value' range, so when we use it no overflow
+-     * happens. 'uint64_t' cast is there just to prevent undefined behavior on
+-     * overflow */
+-    int64_t maxincr = (uint64_t)max-value;
+-    int64_t minincr = min-value;
+-
+-    if (value > max || (bits != 64 && incr > maxincr) || (value >= 0 && incr > 0 && incr > maxincr))
+-    {
+-        if (limit) {
+-            if (owtype == BFOVERFLOW_WRAP) {
+-                goto handle_wrap;
+-            } else if (owtype == BFOVERFLOW_SAT) {
+-                *limit = max;
+-            }
+-        }
+-        return 1;
+-    } else if (value < min || (bits != 64 && incr < minincr) || (value < 0 && incr < 0 && incr < minincr)) {
+-        if (limit) {
+-            if (owtype == BFOVERFLOW_WRAP) {
+-                goto handle_wrap;
+-            } else if (owtype == BFOVERFLOW_SAT) {
+-                *limit = min;
+-            }
+-        }
+-        return -1;
+-    }
+-    return 0;
+-
+-handle_wrap:
+-    {
+-        uint64_t msb = (uint64_t)1 << (bits-1);
+-        uint64_t a = value, b = incr, c;
+-        c = a+b; /* Perform addition as unsigned so that's defined. */
+-
+-        /* If the sign bit is set, propagate to all the higher order
+-         * bits, to cap the negative value. If it's clear, mask to
+-         * the positive integer limit. */
+-        if (bits < 64) {
+-            uint64_t mask = ((uint64_t)-1) << bits;
+-            if (c & msb) {
+-                c |= mask;
+-            } else {
+-                c &= ~mask;
+-            }
+-        }
+-        *limit = c;
+-    }
+-    return 1;
++    return bitOpCoordinatorCheckSignedBitfieldOverflow(value, incr, bits, owtype, limit);
+ }
+ 
+ /* Debugging function. Just show bits in the specified bitmap. Not used
+  * but here for not having to rewrite it when debugging is needed. */
+ void printBits(unsigned char *p, unsigned long count) {
++    bitOpCoordinator coord;
+     unsigned long j, i, byte;
+-
+-    for (j = 0; j < count; j++) {
+-        byte = p[j];
++    bitOpCoordinatorClearPayload(&coord);
++    coord.bytes = p;
++    coord.nbytes = count;
++    coord.encoding = OBJ_ENCODING_RAW;
++    for (j = 0; j < (unsigned long)coord.nbytes; j++) {
++        byte = coord.bytes[j];
+         for (i = 0x80; i > 0; i /= 2)
+             printf("%c", (byte & i) ? '1' : '0');
+         printf("|");
+@@ -412,32 +1297,36 @@ void printBits(unsigned char *p, unsigned long count) {
+  * will also parse bit offsets prefixed by "#". In such a case the offset
+  * is multiplied by 'bits'. This is useful for the BITFIELD command. */
+ int getBitOffsetFromArgument(client *c, robj *o, uint64_t *offset, int hash, int bits) {
+-    long long loffset;
++    bitOpCoordinator coord;
+     char *err = "bit offset is not an integer or out of range";
+     char *p = o->ptr;
+     size_t plen = sdslen(p);
+     int usehash = 0;
++    bitOpCoordinatorClearParse(&coord);
+ 
+     /* Handle #<offset> form. */
+     if (p[0] == '#' && hash && bits > 0) usehash = 1;
+ 
+-    if (string2ll(p+usehash,plen-usehash,&loffset) == 0) {
++    if (string2ll(p+usehash,plen-usehash,&coord.parsed_integer) == 0) {
++        coord.parse_status = C_ERR;
+         addReplyError(c,err);
+-        return C_ERR;
++        return coord.parse_status;
+     }
+ 
+     /* Adjust the offset by 'bits' for #<offset> form. */
+-    if (usehash) loffset *= bits;
++    if (usehash) coord.parsed_integer *= bits;
+ 
+     /* Limit offset to server.proto_max_bulk_len (512MB in bytes by default) */
+-    if (loffset < 0 || (!mustObeyClient(c) && (loffset >> 3) >= server.proto_max_bulk_len))
++    if (coord.parsed_integer < 0 || (!mustObeyClient(c) && (coord.parsed_integer >> 3) >= server.proto_max_bulk_len))
+     {
++        coord.parse_status = C_ERR;
+         addReplyError(c,err);
+-        return C_ERR;
++        return coord.parse_status;
+     }
+ 
+-    *offset = loffset;
+-    return C_OK;
++    coord.parse_status = C_OK;
++    *offset = coord.parsed_integer;
++    return coord.parse_status;
+ }
+ 
+ /* This helper function for BITFIELD parses a bitfield type in the form
+@@ -448,28 +1337,35 @@ int getBitOffsetFromArgument(client *c, robj *o, uint64_t *offset, int hash, int
+  *
+  * On error C_ERR is returned and an error is sent to the client. */
+ int getBitfieldTypeFromArgument(client *c, robj *o, int *sign, int *bits) {
++    bitOpCoordinator coord;
+     char *p = o->ptr;
+     char *err = "Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.";
+-    long long llbits;
++    bitOpCoordinatorClearBitfield(&coord);
+ 
+     if (p[0] == 'i') {
+-        *sign = 1;
++        coord.field_signed = 1;
+     } else if (p[0] == 'u') {
+-        *sign = 0;
++        coord.field_signed = 0;
+     } else {
+         addReplyError(c,err);
+         return C_ERR;
+     }
+ 
+-    if ((string2ll(p+1,strlen(p+1),&llbits)) == 0 ||
+-        llbits < 1 ||
+-        (*sign == 1 && llbits > 64) ||
+-        (*sign == 0 && llbits > 63))
+     {
+-        addReplyError(c,err);
+-        return C_ERR;
++        long long llbits;
++        if ((string2ll(p+1,strlen(p+1),&llbits)) == 0 ||
++            llbits < 1 ||
++            (coord.field_signed == 1 && llbits > 64) ||
++            (coord.field_signed == 0 && llbits > 63))
++        {
++            addReplyError(c,err);
++            return C_ERR;
++        }
++        coord.signed_value = llbits;
++        coord.field_bits = (uint64_t) llbits;
+     }
+-    *bits = llbits;
++    *sign = coord.field_signed;
++    *bits = (int) coord.field_bits;
+     return C_OK;
+ }
+ 
+@@ -479,22 +1375,28 @@ int getBitfieldTypeFromArgument(client *c, robj *o, int *sign, int *bits) {
+  * returned. Otherwise if the key holds a wrong type NULL is returned and
+  * an error is sent to the client. */
+ robj *lookupStringForBitCommand(client *c, uint64_t maxbit, int *dirty) {
++    bitOpCoordinator coord;
+     size_t byte = maxbit >> 3;
+-    robj *o = lookupKeyWrite(c->db,c->argv[1]);
+-    if (checkType(c,o,OBJ_STRING)) return NULL;
++    bitOpCoordinatorClearKeyspace(&coord);
++    bitOpCoordinatorBindKeyspace(&coord, c->db, c->argv[1]);
++    coord.obj = lookupKeyWrite(coord.db, coord.key);
++    coord.missing_key = (coord.obj == NULL);
++    if (checkType(c,coord.obj,OBJ_STRING)) return NULL;
+     if (dirty) *dirty = 0;
+ 
+-    if (o == NULL) {
+-        o = createObject(OBJ_STRING,sdsnewlen(NULL, byte+1));
+-        dbAdd(c->db,c->argv[1],o);
++    if (coord.obj == NULL) {
++        coord.obj = createObject(OBJ_STRING,sdsnewlen(NULL, byte+1));
++        dbAdd(coord.db,coord.key,coord.obj);
++        coord.missing_key = 0;
+         if (dirty) *dirty = 1;
+     } else {
+-        o = dbUnshareStringValue(c->db,c->argv[1],o);
+-        size_t oldlen = sdslen(o->ptr);
+-        o->ptr = sdsgrowzero(o->ptr,byte+1);
+-        if (dirty && oldlen != sdslen(o->ptr)) *dirty = 1;
++        coord.obj = dbUnshareStringValue(coord.db,coord.key,coord.obj);
++        size_t oldlen = sdslen(coord.obj->ptr);
++        coord.obj->ptr = sdsgrowzero(coord.obj->ptr,byte+1);
++        if (dirty && oldlen != sdslen(coord.obj->ptr)) *dirty = 1;
++        coord.missing_key = 0;
+     }
+-    return o;
++    return coord.obj;
+ }
+ 
+ /* Return a pointer to the string object content, and stores its length
+@@ -511,21 +1413,24 @@ robj *lookupStringForBitCommand(client *c, uint64_t maxbit, int *dirty) {
+  * If the source object is NULL the function is guaranteed to return NULL
+  * and set 'len' to 0. */
+ unsigned char *getObjectReadOnlyString(robj *o, long *len, char *llbuf) {
++    bitOpCoordinator coord;
+     serverAssert(!o || o->type == OBJ_STRING);
+-    unsigned char *p = NULL;
+-
+-    /* Set the 'p' pointer to the string, that can be just a stack allocated
+-     * array if our string was integer encoded. */
++    bitOpCoordinatorClearPayload(&coord);
+     if (o && o->encoding == OBJ_ENCODING_INT) {
+-        p = (unsigned char*) llbuf;
+-        if (len) *len = ll2string(llbuf,LONG_STR_SIZE,(long)o->ptr);
++        coord.encoding = OBJ_ENCODING_INT;
++        coord.bytes = (unsigned char*) llbuf;
++        coord.nbytes = ll2string(llbuf,LONG_STR_SIZE,(long)o->ptr);
+     } else if (o) {
+-        p = (unsigned char*) o->ptr;
+-        if (len) *len = sdslen(o->ptr);
++        coord.encoding = o->encoding;
++        coord.bytes = (unsigned char*) o->ptr;
++        coord.nbytes = sdslen(o->ptr);
+     } else {
+-        if (len) *len = 0;
++        coord.bytes = NULL;
++        coord.nbytes = 0;
++        coord.encoding = 0;
+     }
+-    return p;
++    if (len) *len = coord.nbytes;
++    return coord.bytes;
+ }
+ 
+ /* SETBIT key offset bitvalue */
+diff --git a/src/db.c b/src/db.c
+index 7b34fcb47..14c95d0e3 100644
+--- a/src/db.c
++++ b/src/db.c
+@@ -174,15 +174,11 @@ robj *lookupKeyWrite(redisDb *db, robj *key) {
+ }
+ 
+ robj *lookupKeyReadOrReply(client *c, robj *key, robj *reply) {
+-    robj *o = lookupKeyRead(c->db, key);
+-    if (!o) addReplyOrErrorObject(c, reply);
+-    return o;
++    return bitOpCoordinatorLookupReadOrReply(c, key, reply);
+ }
+ 
+ robj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply) {
+-    robj *o = lookupKeyWrite(c->db, key);
+-    if (!o) addReplyOrErrorObject(c, reply);
+-    return o;
++    return bitOpCoordinatorLookupWriteOrReply(c, key, reply);
+ }
+ 
+ /* Add the key to the DB. It's up to the caller to increment the reference
+@@ -432,14 +428,7 @@ int dbDelete(redisDb *db, robj *key) {
+  * using an sdscat() call to append some data, or anything else.
+  */
+ robj *dbUnshareStringValue(redisDb *db, robj *key, robj *o) {
+-    serverAssert(o->type == OBJ_STRING);
+-    if (o->refcount != 1 || o->encoding != OBJ_ENCODING_RAW) {
+-        robj *decoded = getDecodedObject(o);
+-        o = createRawStringObject(decoded->ptr, sdslen(decoded->ptr));
+-        decrRefCount(decoded);
+-        dbReplaceValue(db,key,o);
+-    }
+-    return o;
++    return bitOpCoordinatorUnshareStringValue(db, key, o);
+ }
+ 
+ /* Remove all keys from the database(s) structure. The dbarray argument
+@@ -822,16 +811,16 @@ typedef struct {
+ /* Helper function to compare key type in scan commands */
+ int objectTypeCompare(robj *o, long long target) {
+     if (o->type != OBJ_MODULE) {
+-        if (o->type != target) 
++        if (o->type != target)
+             return 0;
+-        else 
++        else
+             return 1;
+     }
+     /* module type compare */
+     long long mt = (long long)REDISMODULE_TYPE_SIGN(((moduleValue *)o->ptr)->type->id);
+     if (target != -mt)
+         return 0;
+-    else 
++    else
+         return 1;
+ }
+ /* This callback is used by scanGenericCommand in order to collect elements
+@@ -902,11 +891,11 @@ int parseScanCursorOrReply(client *c, robj *o, unsigned long *cursor) {
+ }
+ 
+ char *obj_type_name[OBJ_TYPE_MAX] = {
+-    "string", 
+-    "list", 
+-    "set", 
+-    "zset", 
+-    "hash", 
++    "string",
++    "list",
++    "set",
++    "zset",
++    "hash",
+     NULL, /* module type is special */
+     "stream"
+ };
+@@ -1359,8 +1348,8 @@ void copyCommand(client *c) {
+     long long expire;
+     int j, replace = 0, delete = 0;
+ 
+-    /* Obtain source and target DB pointers 
+-     * Default target DB is the same as the source DB 
++    /* Obtain source and target DB pointers
++     * Default target DB is the same as the source DB
+      * Parse the REPLACE option and targetDB option. */
+     src = c->db;
+     dst = c->db;
+@@ -1410,7 +1399,7 @@ void copyCommand(client *c) {
+     }
+     expire = getExpire(c->db,key);
+ 
+-    /* Return zero if the key already exists in the target DB. 
++    /* Return zero if the key already exists in the target DB.
+      * If REPLACE option is selected, delete newkey from targetDB. */
+     if (lookupKeyWrite(dst,newkey) != NULL) {
+         if (replace) {
+@@ -1579,7 +1568,7 @@ void swapMainDbWithTempDb(redisDb *tempDb) {
+         scanDatabaseForDeletedKeys(activedb, newdb);
+ 
+         /* Swap hash tables. Note that we don't swap blocking_keys,
+-         * ready_keys and watched_keys, since clients 
++         * ready_keys and watched_keys, since clients
+          * remain in the same DB they were. */
+         activedb->dict = newdb->dict;
+         activedb->expires = newdb->expires;
+@@ -1865,10 +1854,10 @@ int64_t getAllKeySpecsFlags(struct redisCommand *cmd, int inv) {
+ 
+ /* Fetch the keys based of the provided key specs. Returns the number of keys found, or -1 on error.
+  * There are several flags that can be used to modify how this function finds keys in a command.
+- * 
++ *
+  * GET_KEYSPEC_INCLUDE_NOT_KEYS: Return 'fake' keys as if they were keys.
+  * GET_KEYSPEC_RETURN_PARTIAL:   Skips invalid and incomplete keyspecs but returns the keys
+- *                               found in other valid keyspecs. 
++ *                               found in other valid keyspecs.
+  */
+ int getKeysUsingKeySpecs(struct redisCommand *cmd, robj **argv, int argc, int search_flags, getKeysResult *result) {
+     int j, i, last, first, step;
+@@ -1985,13 +1974,13 @@ invalid_spec:
+     return result->numkeys;
+ }
+ 
+-/* Return all the arguments that are keys in the command passed via argc / argv. 
++/* Return all the arguments that are keys in the command passed via argc / argv.
+  * This function will eventually replace getKeysFromCommand.
+  *
+  * The command returns the positions of all the key arguments inside the array,
+  * so the actual return value is a heap allocated array of integers. The
+  * length of the array is returned by reference into *numkeys.
+- * 
++ *
+  * Along with the position, this command also returns the flags that are
+  * associated with how Redis will access the key.
+  *
+@@ -2068,14 +2057,14 @@ int doesCommandHaveChannelsWithFlags(struct redisCommand *cmd, int flags) {
+     return 0;
+ }
+ 
+-/* Return all the arguments that are channels in the command passed via argc / argv. 
+- * This function behaves similar to getKeysFromCommandWithSpecs, but with channels 
++/* Return all the arguments that are channels in the command passed via argc / argv.
++ * This function behaves similar to getKeysFromCommandWithSpecs, but with channels
+  * instead of keys.
+- * 
++ *
+  * The command returns the positions of all the channel arguments inside the array,
+  * so the actual return value is a heap allocated array of integers. The
+  * length of the array is returned by reference into *numkeys.
+- * 
++ *
+  * Along with the position, this command also returns the flags that are
+  * associated with how Redis will access the channel.
+  *
+@@ -2109,12 +2098,12 @@ int getChannelsFromCommand(struct redisCommand *cmd, robj **argv, int argc, getK
+ /* The base case is to use the keys position as given in the command table
+  * (firstkey, lastkey, step).
+  * This function works only on command with the legacy_range_key_spec,
+- * all other commands should be handled by getkeys_proc. 
+- * 
++ * all other commands should be handled by getkeys_proc.
++ *
+  * If the commands keyspec is incomplete, no keys will be returned, and the provided
+  * keys function should be called instead.
+- * 
+- * NOTE: This function does not guarantee populating the flags for 
++ *
++ * NOTE: This function does not guarantee populating the flags for
+  * the keys, in order to get flags you should use getKeysUsingKeySpecs. */
+ int getKeysUsingLegacyRangeSpec(struct redisCommand *cmd, robj **argv, int argc, getKeysResult *result) {
+     int j, i = 0, last, first, step;
+@@ -2198,7 +2187,7 @@ void getKeysFreeResult(getKeysResult *result) {
+  * 'keyCountOfs': num-keys index.
+  * 'firstKeyOfs': firstkey index.
+  * 'keyStep': the interval of each key, usually this value is 1.
+- * 
++ *
+  * The commands using this function have a fully defined keyspec, so returning flags isn't needed. */
+ int genericGetKeys(int storeKeyOfs, int keyCountOfs, int firstKeyOfs, int keyStep,
+                     robj **argv, int argc, getKeysResult *result) {
+@@ -2221,12 +2210,12 @@ int genericGetKeys(int storeKeyOfs, int keyCountOfs, int firstKeyOfs, int keySte
+     for (i = 0; i < num; i++) {
+         keys[i].pos = firstKeyOfs+(i*keyStep);
+         keys[i].flags = 0;
+-    } 
++    }
+ 
+     if (storeKeyOfs) {
+         keys[num].pos = storeKeyOfs;
+         keys[num].flags = 0;
+-    } 
++    }
+     return result->numkeys;
+ }
+ 
+@@ -2303,8 +2292,8 @@ int sortROGetKeys(struct redisCommand *cmd, robj **argv, int argc, getKeysResult
+  *
+  * The first argument of SORT is always a key, however a list of options
+  * follow in SQL-alike style. Here we parse just the minimum in order to
+- * correctly identify keys in the "STORE" option. 
+- * 
++ * correctly identify keys in the "STORE" option.
++ *
+  * This command declares incomplete keys, so the flags are correctly set for this function */
+ int sortGetKeys(struct redisCommand *cmd, robj **argv, int argc, getKeysResult *result) {
+     int i, j, num, found_store = 0;
+@@ -2364,7 +2353,7 @@ int migrateGetKeys(struct redisCommand *cmd, robj **argv, int argc, getKeysResul
+     struct {
+         char* name;
+         int skip;
+-    } skip_keywords[] = {       
++    } skip_keywords[] = {
+         {"copy", 0},
+         {"replace", 0},
+         {"auth", 1},
+@@ -2377,7 +2366,7 @@ int migrateGetKeys(struct redisCommand *cmd, robj **argv, int argc, getKeysResul
+                 if (sdslen(argv[3]->ptr) > 0) {
+                     /* This is a syntax error. So ignore the keys and leave
+                      * the syntax error to be handled by migrateCommand. */
+-                    num = 0; 
++                    num = 0;
+                 } else {
+                     first = i + 1;
+                     num = argc - first;
+@@ -2397,7 +2386,7 @@ int migrateGetKeys(struct redisCommand *cmd, robj **argv, int argc, getKeysResul
+     for (i = 0; i < num; i++) {
+         keys[i].pos = first+i;
+         keys[i].flags = CMD_KEY_RW | CMD_KEY_ACCESS | CMD_KEY_DELETE;
+-    } 
++    }
+     result->numkeys = num;
+     return num;
+ }
+@@ -2406,7 +2395,7 @@ int migrateGetKeys(struct redisCommand *cmd, robj **argv, int argc, getKeysResul
+  * GEORADIUS key x y radius unit [WITHDIST] [WITHHASH] [WITHCOORD] [ASC|DESC]
+  *                             [COUNT count] [STORE key|STOREDIST key]
+  * GEORADIUSBYMEMBER key member radius unit ... options ...
+- * 
++ *
+  * This command has a fully defined keyspec, so returning flags isn't needed. */
+ int georadiusGetKeys(struct redisCommand *cmd, robj **argv, int argc, getKeysResult *result) {
+     int i, num;
+@@ -2489,8 +2478,8 @@ int xreadGetKeys(struct redisCommand *cmd, robj **argv, int argc, getKeysResult
+     keys = getKeysPrepareResult(result, num);
+     for (i = streams_pos+1; i < argc-num; i++) {
+         keys[i-streams_pos-1].pos = i;
+-        keys[i-streams_pos-1].flags = 0; 
+-    } 
++        keys[i-streams_pos-1].flags = 0;
++    }
+     result->numkeys = num;
+     return num;
+ }
+diff --git a/src/object.c b/src/object.c
+index 4b3526a02..3822887ba 100644
+--- a/src/object.c
++++ b/src/object.c
+@@ -591,141 +591,36 @@ void decrRefCountVoid(void *o) {
+ }
+ 
+ int checkType(client *c, robj *o, int type) {
+-    /* A NULL is considered an empty key */
+-    if (o && o->type != type) {
+-        addReplyErrorObject(c,shared.wrongtypeerr);
+-        return 1;
+-    }
+-    return 0;
++    return bitOpCoordinatorCheckType(c, o, type);
+ }
+ 
+ int isSdsRepresentableAsLongLong(sds s, long long *llval) {
+-    return string2ll(s,sdslen(s),llval) ? C_OK : C_ERR;
++    return bitOpCoordinatorIsSdsRepresentableAsLongLong(s, llval);
+ }
+ 
+ int isObjectRepresentableAsLongLong(robj *o, long long *llval) {
+-    serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
+-    if (o->encoding == OBJ_ENCODING_INT) {
+-        if (llval) *llval = (long) o->ptr;
+-        return C_OK;
+-    } else {
+-        return isSdsRepresentableAsLongLong(o->ptr,llval);
+-    }
++    return bitOpCoordinatorIsObjectRepresentableAsLongLong(o, llval);
+ }
+ 
+ /* Optimize the SDS string inside the string object to require little space,
+  * in case there is more than 10% of free space at the end of the SDS. */
+ void trimStringObjectIfNeeded(robj *o, int trim_small_values) {
+-    if (o->encoding != OBJ_ENCODING_RAW) return;
+-    /* A string may have free space in the following cases:
+-     * 1. When an arg len is greater than PROTO_MBULK_BIG_ARG the query buffer may be used directly as the SDS string.
+-     * 2. When utilizing the argument caching mechanism in Lua. 
+-     * 3. When calling from RM_TrimStringAllocation (trim_small_values is true). */
+-    size_t len = sdslen(o->ptr);
+-    if (len >= PROTO_MBULK_BIG_ARG ||
+-        trim_small_values||
+-        (server.executing_client && server.executing_client->flags & CLIENT_SCRIPT && len < LUA_CMD_OBJCACHE_MAX_LEN)) {
+-        if (sdsavail(o->ptr) > len/10) {
+-            o->ptr = sdsRemoveFreeSpace(o->ptr, 0);
+-        }
+-    }
++    bitOpCoordinatorTrimStringObjectIfNeeded(o, trim_small_values);
+ }
+ 
+ /* Try to encode a string object in order to save space */
+ robj *tryObjectEncodingEx(robj *o, int try_trim) {
+-    long value;
+-    sds s = o->ptr;
+-    size_t len;
+-
+-    /* Make sure this is a string object, the only type we encode
+-     * in this function. Other types use encoded memory efficient
+-     * representations but are handled by the commands implementing
+-     * the type. */
+-    serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
+-
+-    /* We try some specialized encoding only for objects that are
+-     * RAW or EMBSTR encoded, in other words objects that are still
+-     * in represented by an actually array of chars. */
+-    if (!sdsEncodedObject(o)) return o;
+-
+-    /* It's not safe to encode shared objects: shared objects can be shared
+-     * everywhere in the "object space" of Redis and may end in places where
+-     * they are not handled. We handle them only as values in the keyspace. */
+-     if (o->refcount > 1) return o;
+-
+-    /* Check if we can represent this string as a long integer.
+-     * Note that we are sure that a string larger than 20 chars is not
+-     * representable as a 32 nor 64 bit integer. */
+-    len = sdslen(s);
+-    if (len <= 20 && string2l(s,len,&value)) {
+-        /* This object is encodable as a long. Try to use a shared object.
+-         * Note that we avoid using shared integers when maxmemory is used
+-         * because every object needs to have a private LRU field for the LRU
+-         * algorithm to work well. */
+-        if ((server.maxmemory == 0 ||
+-            !(server.maxmemory_policy & MAXMEMORY_FLAG_NO_SHARED_INTEGERS)) &&
+-            value >= 0 &&
+-            value < OBJ_SHARED_INTEGERS)
+-        {
+-            decrRefCount(o);
+-            return shared.integers[value];
+-        } else {
+-            if (o->encoding == OBJ_ENCODING_RAW) {
+-                sdsfree(o->ptr);
+-                o->encoding = OBJ_ENCODING_INT;
+-                o->ptr = (void*) value;
+-                return o;
+-            } else if (o->encoding == OBJ_ENCODING_EMBSTR) {
+-                decrRefCount(o);
+-                return createStringObjectFromLongLongForValue(value);
+-            }
+-        }
+-    }
+-
+-    /* If the string is small and is still RAW encoded,
+-     * try the EMBSTR encoding which is more efficient.
+-     * In this representation the object and the SDS string are allocated
+-     * in the same chunk of memory to save space and cache misses. */
+-    if (len <= OBJ_ENCODING_EMBSTR_SIZE_LIMIT) {
+-        robj *emb;
+-
+-        if (o->encoding == OBJ_ENCODING_EMBSTR) return o;
+-        emb = createEmbeddedStringObject(s,sdslen(s));
+-        decrRefCount(o);
+-        return emb;
+-    }
+-
+-    /* We can't encode the object...
+-     * Do the last try, and at least optimize the SDS string inside */
+-    if (try_trim)
+-        trimStringObjectIfNeeded(o, 0);
+-
+-    /* Return the original object. */
+-    return o;
++    return bitOpCoordinatorTryObjectEncodingEx(o, try_trim);
+ }
+ 
+ robj *tryObjectEncoding(robj *o) {
+-    return tryObjectEncodingEx(o, 1);
++    return bitOpCoordinatorTryObjectEncoding(o);
+ }
+ 
+ /* Get a decoded version of an encoded object (returned as a new object).
+  * If the object is already raw-encoded just increment the ref count. */
+ robj *getDecodedObject(robj *o) {
+-    robj *dec;
+-
+-    if (sdsEncodedObject(o)) {
+-        incrRefCount(o);
+-        return o;
+-    }
+-    if (o->type == OBJ_STRING && o->encoding == OBJ_ENCODING_INT) {
+-        char buf[32];
+-
+-        ll2string(buf,32,(long)o->ptr);
+-        dec = createStringObject(buf,strlen(buf));
+-        return dec;
+-    } else {
+-        serverPanic("Unknown encoding type");
+-    }
++    return bitOpCoordinatorGetDecodedObject(o);
+ }
+ 
+ /* Compare two string objects via strcmp() or strcoll() depending on flags.
+@@ -797,160 +692,47 @@ int equalStringObjects(robj *a, robj *b) {
+ }
+ 
+ size_t stringObjectLen(robj *o) {
+-    serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
+-    if (sdsEncodedObject(o)) {
+-        return sdslen(o->ptr);
+-    } else {
+-        return sdigits10((long)o->ptr);
+-    }
++    return bitOpCoordinatorStringObjectLen(o);
+ }
+ 
+ int getDoubleFromObject(const robj *o, double *target) {
+-    double value;
+-
+-    if (o == NULL) {
+-        value = 0;
+-    } else {
+-        serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
+-        if (sdsEncodedObject(o)) {
+-            if (!string2d(o->ptr, sdslen(o->ptr), &value))
+-                return C_ERR;
+-        } else if (o->encoding == OBJ_ENCODING_INT) {
+-            value = (long)o->ptr;
+-        } else {
+-            serverPanic("Unknown string encoding");
+-        }
+-    }
+-    *target = value;
+-    return C_OK;
++    return bitOpCoordinatorGetDoubleFromObject(o, target);
+ }
+ 
+ int getDoubleFromObjectOrReply(client *c, robj *o, double *target, const char *msg) {
+-    double value;
+-    if (getDoubleFromObject(o, &value) != C_OK) {
+-        if (msg != NULL) {
+-            addReplyError(c,(char*)msg);
+-        } else {
+-            addReplyError(c,"value is not a valid float");
+-        }
+-        return C_ERR;
+-    }
+-    *target = value;
+-    return C_OK;
++    return bitOpCoordinatorGetDoubleFromObjectOrReply(c, o, target, msg);
+ }
+ 
+ int getLongDoubleFromObject(robj *o, long double *target) {
+-    long double value;
+-
+-    if (o == NULL) {
+-        value = 0;
+-    } else {
+-        serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
+-        if (sdsEncodedObject(o)) {
+-            if (!string2ld(o->ptr, sdslen(o->ptr), &value))
+-                return C_ERR;
+-        } else if (o->encoding == OBJ_ENCODING_INT) {
+-            value = (long)o->ptr;
+-        } else {
+-            serverPanic("Unknown string encoding");
+-        }
+-    }
+-    *target = value;
+-    return C_OK;
++    return bitOpCoordinatorGetLongDoubleFromObject(o, target);
+ }
+ 
+ int getLongDoubleFromObjectOrReply(client *c, robj *o, long double *target, const char *msg) {
+-    long double value;
+-    if (getLongDoubleFromObject(o, &value) != C_OK) {
+-        if (msg != NULL) {
+-            addReplyError(c,(char*)msg);
+-        } else {
+-            addReplyError(c,"value is not a valid float");
+-        }
+-        return C_ERR;
+-    }
+-    *target = value;
+-    return C_OK;
++    return bitOpCoordinatorGetLongDoubleFromObjectOrReply(c, o, target, msg);
+ }
+ 
+ int getLongLongFromObject(robj *o, long long *target) {
+-    long long value;
+-
+-    if (o == NULL) {
+-        value = 0;
+-    } else {
+-        serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
+-        if (sdsEncodedObject(o)) {
+-            if (string2ll(o->ptr,sdslen(o->ptr),&value) == 0) return C_ERR;
+-        } else if (o->encoding == OBJ_ENCODING_INT) {
+-            value = (long)o->ptr;
+-        } else {
+-            serverPanic("Unknown string encoding");
+-        }
+-    }
+-    if (target) *target = value;
+-    return C_OK;
++    return bitOpCoordinatorGetLongLongFromObject(o, target);
+ }
+ 
+ int getLongLongFromObjectOrReply(client *c, robj *o, long long *target, const char *msg) {
+-    long long value;
+-    if (getLongLongFromObject(o, &value) != C_OK) {
+-        if (msg != NULL) {
+-            addReplyError(c,(char*)msg);
+-        } else {
+-            addReplyError(c,"value is not an integer or out of range");
+-        }
+-        return C_ERR;
+-    }
+-    *target = value;
+-    return C_OK;
++    return bitOpCoordinatorGetLongLongFromObjectOrReply(c, o, target, msg);
+ }
+ 
+ int getLongFromObjectOrReply(client *c, robj *o, long *target, const char *msg) {
+-    long long value;
+-
+-    if (getLongLongFromObjectOrReply(c, o, &value, msg) != C_OK) return C_ERR;
+-    if (value < LONG_MIN || value > LONG_MAX) {
+-        if (msg != NULL) {
+-            addReplyError(c,(char*)msg);
+-        } else {
+-            addReplyError(c,"value is out of range");
+-        }
+-        return C_ERR;
+-    }
+-    *target = value;
+-    return C_OK;
++    return bitOpCoordinatorGetLongFromObjectOrReply(c, o, target, msg);
+ }
+ 
+ int getRangeLongFromObjectOrReply(client *c, robj *o, long min, long max, long *target, const char *msg) {
+-    if (getLongFromObjectOrReply(c, o, target, msg) != C_OK) return C_ERR;
+-    if (*target < min || *target > max) {
+-        if (msg != NULL) {
+-            addReplyError(c,(char*)msg);
+-        } else {
+-            addReplyErrorFormat(c,"value is out of range, value must between %ld and %ld", min, max);
+-        }
+-        return C_ERR;
+-    }
+-    return C_OK;
++    return bitOpCoordinatorGetRangeLongFromObjectOrReply(c, o, min, max, target, msg);
+ }
+ 
+ int getPositiveLongFromObjectOrReply(client *c, robj *o, long *target, const char *msg) {
+-    if (msg) {
+-        return getRangeLongFromObjectOrReply(c, o, 0, LONG_MAX, target, msg);
+-    } else {
+-        return getRangeLongFromObjectOrReply(c, o, 0, LONG_MAX, target, "value is out of range, must be positive");
+-    }
++    return bitOpCoordinatorGetPositiveLongFromObjectOrReply(c, o, target, msg);
+ }
+ 
+ int getIntFromObjectOrReply(client *c, robj *o, int *target, const char *msg) {
+-    long value;
+-
+-    if (getRangeLongFromObjectOrReply(c, o, INT_MIN, INT_MAX, &value, msg) != C_OK)
+-        return C_ERR;
+-
+-    *target = value;
+-    return C_OK;
++    return bitOpCoordinatorGetIntFromObjectOrReply(c, o, target, msg);
+ }
+ 
+ char *strEncoding(int encoding) {
+diff --git a/src/server.h b/src/server.h
+index 4f3005ae9..d25cd90da 100644
+--- a/src/server.h
++++ b/src/server.h
+@@ -285,7 +285,7 @@ extern int configOOMScoreAdjValuesDefaults[CONFIG_OOM_COUNT];
+                                   * from the value of the key. */
+ /* Other flags: */
+ #define CMD_KEY_NOT_KEY (1ULL<<8)     /* A 'fake' key that should be routed
+-                                       * like a key in cluster mode but is 
++                                       * like a key in cluster mode but is
+                                        * excluded from other key checks. */
+ #define CMD_KEY_INCOMPLETE (1ULL<<9)  /* Means that the keyspec might not point
+                                        * out to all keys it should cover */
+@@ -1317,8 +1317,8 @@ struct sharedObjectsStruct {
+     *busykeyerr, *oomerr, *plus, *messagebulk, *pmessagebulk, *subscribebulk,
+     *unsubscribebulk, *psubscribebulk, *punsubscribebulk, *del, *unlink,
+     *rpop, *lpop, *lpush, *rpoplpush, *lmove, *blmove, *zpopmin, *zpopmax,
+-    *emptyscan, *multi, *exec, *left, *right, *hset, *srem, *xgroup, *xclaim,  
+-    *script, *replconf, *eval, *persist, *set, *pexpireat, *pexpire, 
++    *emptyscan, *multi, *exec, *left, *right, *hset, *srem, *xgroup, *xclaim,
++    *script, *replconf, *eval, *persist, *set, *pexpireat, *pexpire,
+     *time, *pxat, *absttl, *retrycount, *force, *justid, *entriesread,
+     *lastid, *ping, *setid, *keepttl, *load, *createconsumer,
+     *getack, *special_asterick, *special_equals, *default_username, *redacted,
+@@ -1712,7 +1712,7 @@ struct redisServer {
+     long long el_cmd_cnt_max;
+     /* The sum of active-expire, active-defrag and all other tasks done by cron and beforeSleep,
+        but excluding read, write and AOF, which are counted by other sets of metrics. */
+-    monotime el_cron_duration; 
++    monotime el_cron_duration;
+     durationStats duration_stats[EL_DURATION_TYPE_NUM];
+ 
+     /* Configuration */
+@@ -2763,6 +2763,36 @@ robj *createModuleObject(moduleType *mt, void *value);
+ int getLongFromObjectOrReply(client *c, robj *o, long *target, const char *msg);
+ int getPositiveLongFromObjectOrReply(client *c, robj *o, long *target, const char *msg);
+ int getRangeLongFromObjectOrReply(client *c, robj *o, long min, long max, long *target, const char *msg);
++
++/* bitops.c -- string and bit coordination */
++int bitOpCoordinatorCheckType(client *c, robj *o, int type);
++int bitOpCoordinatorGetLongLongFromObject(robj *o, long long *target);
++int bitOpCoordinatorGetLongLongFromObjectOrReply(client *c, robj *o, long long *target, const char *msg);
++int bitOpCoordinatorGetLongFromObjectOrReply(client *c, robj *o, long *target, const char *msg);
++int bitOpCoordinatorGetRangeLongFromObjectOrReply(client *c, robj *o, long min, long max, long *target, const char *msg);
++int bitOpCoordinatorGetPositiveLongFromObjectOrReply(client *c, robj *o, long *target, const char *msg);
++int bitOpCoordinatorGetIntFromObjectOrReply(client *c, robj *o, int *target, const char *msg);
++int bitOpCoordinatorIsSdsRepresentableAsLongLong(sds s, long long *llval);
++int bitOpCoordinatorIsObjectRepresentableAsLongLong(robj *o, long long *llval);
++int bitOpCoordinatorGetDoubleFromObject(const robj *o, double *target);
++int bitOpCoordinatorGetDoubleFromObjectOrReply(client *c, robj *o, double *target, const char *msg);
++int bitOpCoordinatorGetLongDoubleFromObject(robj *o, long double *target);
++int bitOpCoordinatorGetLongDoubleFromObjectOrReply(client *c, robj *o, long double *target, const char *msg);
++size_t bitOpCoordinatorStringObjectLen(robj *o);
++robj *bitOpCoordinatorGetDecodedObject(robj *o);
++void bitOpCoordinatorTrimStringObjectIfNeeded(robj *o, int trim_small_values);
++robj *bitOpCoordinatorTryObjectEncodingEx(robj *o, int try_trim);
++robj *bitOpCoordinatorTryObjectEncoding(robj *o);
++int bitOpCoordinatorCheckStringLength(client *c, long long size, long long append);
++robj *bitOpCoordinatorLookupReadOrReply(client *c, robj *key, robj *reply);
++robj *bitOpCoordinatorLookupWriteOrReply(client *c, robj *key, robj *reply);
++robj *bitOpCoordinatorUnshareStringValue(redisDb *db, robj *key, robj *o);
++void bitOpCoordinatorReadStringRange(client *c);
++void bitOpCoordinatorWriteStringRange(client *c);
++void bitOpCoordinatorStrlen(client *c);
++void bitOpCoordinatorAppend(client *c);
++void bitOpCoordinatorIncrDecr(client *c, long long incr);
++
+ int checkType(client *c, robj *o, int type);
+ int getLongLongFromObjectOrReply(client *c, robj *o, long long *target, const char *msg);
+ int getDoubleFromObjectOrReply(client *c, robj *o, double *target, const char *msg);
+@@ -3149,7 +3179,7 @@ sds keyspaceEventsFlagsToString(int flags);
+ 
+ /* Configuration */
+ /* Configuration Flags */
+-#define MODIFIABLE_CONFIG 0 /* This is the implied default for a standard 
++#define MODIFIABLE_CONFIG 0 /* This is the implied default for a standard
+                              * config, which is mutable. */
+ #define IMMUTABLE_CONFIG (1ULL<<0) /* Can this value only be set at startup? */
+ #define SENSITIVE_CONFIG (1ULL<<1) /* Does this value contain sensitive information */
+diff --git a/src/t_string.c b/src/t_string.c
+index 2bce3acc8..9a958709c 100644
+--- a/src/t_string.c
++++ b/src/t_string.c
+@@ -37,20 +37,6 @@ int getGenericCommand(client *c);
+  * String Commands
+  *----------------------------------------------------------------------------*/
+ 
+-static int checkStringLength(client *c, long long size, long long append) {
+-    if (mustObeyClient(c))
+-        return C_OK;
+-    /* 'uint64_t' cast is there just to prevent undefined behavior on overflow */
+-    long long total = (uint64_t)size + append;
+-    /* Test configured max-bulk-len represending a limit of the biggest string object,
+-     * and also test for overflow. */
+-    if (total > server.proto_max_bulk_len || total < size || total < append) {
+-        addReplyError(c,"string exceeds maximum allowed size (proto-max-bulk-len)");
+-        return C_ERR;
+-    }
+-    return C_OK;
+-}
+-
+ /* The setGenericCommand() function implements the SET operation with different
+  * options and variants. This function is called in order to implement the
+  * following commands: SET, SETEX, PSETEX, SETNX, GETSET.
+@@ -440,104 +426,11 @@ void getsetCommand(client *c) {
+ }
+ 
+ void setrangeCommand(client *c) {
+-    robj *o;
+-    long offset;
+-    sds value = c->argv[3]->ptr;
+-
+-    if (getLongFromObjectOrReply(c,c->argv[2],&offset,NULL) != C_OK)
+-        return;
+-
+-    if (offset < 0) {
+-        addReplyError(c,"offset is out of range");
+-        return;
+-    }
+-
+-    o = lookupKeyWrite(c->db,c->argv[1]);
+-    if (o == NULL) {
+-        /* Return 0 when setting nothing on a non-existing string */
+-        if (sdslen(value) == 0) {
+-            addReply(c,shared.czero);
+-            return;
+-        }
+-
+-        /* Return when the resulting string exceeds allowed size */
+-        if (checkStringLength(c,offset,sdslen(value)) != C_OK)
+-            return;
+-
+-        o = createObject(OBJ_STRING,sdsnewlen(NULL, offset+sdslen(value)));
+-        dbAdd(c->db,c->argv[1],o);
+-    } else {
+-        size_t olen;
+-
+-        /* Key exists, check type */
+-        if (checkType(c,o,OBJ_STRING))
+-            return;
+-
+-        /* Return existing string length when setting nothing */
+-        olen = stringObjectLen(o);
+-        if (sdslen(value) == 0) {
+-            addReplyLongLong(c,olen);
+-            return;
+-        }
+-
+-        /* Return when the resulting string exceeds allowed size */
+-        if (checkStringLength(c,offset,sdslen(value)) != C_OK)
+-            return;
+-
+-        /* Create a copy when the object is shared or encoded. */
+-        o = dbUnshareStringValue(c->db,c->argv[1],o);
+-    }
+-
+-    if (sdslen(value) > 0) {
+-        o->ptr = sdsgrowzero(o->ptr,offset+sdslen(value));
+-        memcpy((char*)o->ptr+offset,value,sdslen(value));
+-        signalModifiedKey(c,c->db,c->argv[1]);
+-        notifyKeyspaceEvent(NOTIFY_STRING,
+-            "setrange",c->argv[1],c->db->id);
+-        server.dirty++;
+-    }
+-    addReplyLongLong(c,sdslen(o->ptr));
++    bitOpCoordinatorWriteStringRange(c);
+ }
+ 
+ void getrangeCommand(client *c) {
+-    robj *o;
+-    long long start, end;
+-    char *str, llbuf[32];
+-    size_t strlen;
+-
+-    if (getLongLongFromObjectOrReply(c,c->argv[2],&start,NULL) != C_OK)
+-        return;
+-    if (getLongLongFromObjectOrReply(c,c->argv[3],&end,NULL) != C_OK)
+-        return;
+-    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.emptybulk)) == NULL ||
+-        checkType(c,o,OBJ_STRING)) return;
+-
+-    if (o->encoding == OBJ_ENCODING_INT) {
+-        str = llbuf;
+-        strlen = ll2string(llbuf,sizeof(llbuf),(long)o->ptr);
+-    } else {
+-        str = o->ptr;
+-        strlen = sdslen(str);
+-    }
+-
+-    /* Convert negative indexes */
+-    if (start < 0 && end < 0 && start > end) {
+-        addReply(c,shared.emptybulk);
+-        return;
+-    }
+-    if (start < 0) start = strlen+start;
+-    if (end < 0) end = strlen+end;
+-    if (start < 0) start = 0;
+-    if (end < 0) end = 0;
+-    if ((unsigned long long)end >= strlen) end = strlen-1;
+-
+-    /* Precondition: end >= 0 && end < strlen, so the only condition where
+-     * nothing can be returned is: start > end. */
+-    if (start > end || strlen == 0) {
+-        addReply(c,shared.emptybulk);
+-    } else {
+-        addReplyBulkCBuffer(c,(char*)str+start,end-start+1);
+-    }
++    bitOpCoordinatorReadStringRange(c);
+ }
+ 
+ void mgetCommand(client *c) {
+@@ -599,39 +492,7 @@ void msetnxCommand(client *c) {
+ }
+ 
+ void incrDecrCommand(client *c, long long incr) {
+-    long long value, oldvalue;
+-    robj *o, *new;
+-
+-    o = lookupKeyWrite(c->db,c->argv[1]);
+-    if (checkType(c,o,OBJ_STRING)) return;
+-    if (getLongLongFromObjectOrReply(c,o,&value,NULL) != C_OK) return;
+-
+-    oldvalue = value;
+-    if ((incr < 0 && oldvalue < 0 && incr < (LLONG_MIN-oldvalue)) ||
+-        (incr > 0 && oldvalue > 0 && incr > (LLONG_MAX-oldvalue))) {
+-        addReplyError(c,"increment or decrement would overflow");
+-        return;
+-    }
+-    value += incr;
+-
+-    if (o && o->refcount == 1 && o->encoding == OBJ_ENCODING_INT &&
+-        (value < 0 || value >= OBJ_SHARED_INTEGERS) &&
+-        value >= LONG_MIN && value <= LONG_MAX)
+-    {
+-        new = o;
+-        o->ptr = (void*)((long)value);
+-    } else {
+-        new = createStringObjectFromLongLongForValue(value);
+-        if (o) {
+-            dbReplaceValue(c->db,c->argv[1],new);
+-        } else {
+-            dbAdd(c->db,c->argv[1],new);
+-        }
+-    }
+-    signalModifiedKey(c,c->db,c->argv[1]);
+-    notifyKeyspaceEvent(NOTIFY_STRING,"incrby",c->argv[1],c->db->id);
+-    server.dirty++;
+-    addReplyLongLong(c, value);
++    bitOpCoordinatorIncrDecr(c, incr);
+ }
+ 
+ void incrCommand(client *c) {
+@@ -695,42 +556,11 @@ void incrbyfloatCommand(client *c) {
+ }
+ 
+ void appendCommand(client *c) {
+-    size_t totlen;
+-    robj *o, *append;
+-
+-    o = lookupKeyWrite(c->db,c->argv[1]);
+-    if (o == NULL) {
+-        /* Create the key */
+-        c->argv[2] = tryObjectEncoding(c->argv[2]);
+-        dbAdd(c->db,c->argv[1],c->argv[2]);
+-        incrRefCount(c->argv[2]);
+-        totlen = stringObjectLen(c->argv[2]);
+-    } else {
+-        /* Key exists, check type */
+-        if (checkType(c,o,OBJ_STRING))
+-            return;
+-
+-        /* "append" is an argument, so always an sds */
+-        append = c->argv[2];
+-        if (checkStringLength(c,stringObjectLen(o),sdslen(append->ptr)) != C_OK)
+-            return;
+-
+-        /* Append the value */
+-        o = dbUnshareStringValue(c->db,c->argv[1],o);
+-        o->ptr = sdscatlen(o->ptr,append->ptr,sdslen(append->ptr));
+-        totlen = sdslen(o->ptr);
+-    }
+-    signalModifiedKey(c,c->db,c->argv[1]);
+-    notifyKeyspaceEvent(NOTIFY_STRING,"append",c->argv[1],c->db->id);
+-    server.dirty++;
+-    addReplyLongLong(c,totlen);
++    bitOpCoordinatorAppend(c);
+ }
+ 
+ void strlenCommand(client *c) {
+-    robj *o;
+-    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.czero)) == NULL ||
+-        checkType(c,o,OBJ_STRING)) return;
+-    addReplyLongLong(c,stringObjectLen(o));
++    bitOpCoordinatorStrlen(c);
+ }
+ 
+ /* LCS key1 key2 [LEN] [IDX] [MINMATCHLEN <len>] [WITHMATCHLEN] */
+@@ -948,4 +778,3 @@ cleanup:
+     if (objb) decrRefCount(objb);
+     return;
+ }
+-

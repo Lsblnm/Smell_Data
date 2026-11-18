@@ -1,0 +1,5134 @@
+diff --git a/tsdb/db.go b/tsdb/db.go
+index 6ebef3f52..02778bf7d 100644
+--- a/tsdb/db.go
++++ b/tsdb/db.go
+@@ -1210,6 +1210,10 @@ func (a dbAppender) Commit() error {
+ 
+ 	// We could just run this check every few minutes practically. But for benchmarks
+ 	// and high frequency use cases this is the safer way.
++	if ha, ok := a.Appender.(*headAppender); ok {
++		ha.requestCompactionIfNeeded(a.db.head.compactable(), a.db.compactc)
++		return err
++	}
+ 	if a.db.head.compactable() {
+ 		select {
+ 		case a.db.compactc <- struct{}{}:
+@@ -2201,7 +2205,8 @@ func (db *DB) ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier, err
+ }
+ 
+ func rangeForTimestamp(t, width int64) (maxt int64) {
+-	return (t/width)*width + width
++	a := &headAppender{}
++	return a.nextHeadCompactRange(t, width)
+ }
+ 
+ // Delete implements deletion of metrics. It only has atomicity guarantees on a per-block basis.
+diff --git a/tsdb/head.go b/tsdb/head.go
+index 2963d781d..250442305 100644
+--- a/tsdb/head.go
++++ b/tsdb/head.go
+@@ -1059,45 +1059,13 @@ func (h *Head) PostingsCardinalityStats(statsByLabelName string, limit int) *ind
+ }
+ 
+ func (h *Head) updateMinMaxTime(mint, maxt int64) {
+-	for {
+-		lt := h.MinTime()
+-		if mint >= lt {
+-			break
+-		}
+-		if h.minTime.CompareAndSwap(lt, mint) {
+-			break
+-		}
+-	}
+-	for {
+-		ht := h.MaxTime()
+-		if maxt <= ht {
+-			break
+-		}
+-		if h.maxTime.CompareAndSwap(ht, maxt) {
+-			break
+-		}
+-	}
++	a := &headAppender{}
++	a.applyHeadMinMax(h, mint, maxt)
+ }
+ 
+ func (h *Head) updateMinOOOMaxOOOTime(mint, maxt int64) {
+-	for {
+-		lt := h.MinOOOTime()
+-		if mint >= lt {
+-			break
+-		}
+-		if h.minOOOTime.CompareAndSwap(lt, mint) {
+-			break
+-		}
+-	}
+-	for {
+-		ht := h.MaxOOOTime()
+-		if maxt <= ht {
+-			break
+-		}
+-		if h.maxOOOTime.CompareAndSwap(ht, maxt) {
+-			break
+-		}
+-	}
++	a := &headAppender{}
++	a.applyHeadOOOMinMax(h, mint, maxt)
+ }
+ 
+ // SetMinValidTime sets the minimum timestamp the head can ingest.
+@@ -1664,8 +1632,8 @@ func (h *Head) compactable() bool {
+ 	if !h.initialized() {
+ 		return false
+ 	}
+-
+-	return h.MaxTime()-h.MinTime() > h.chunkRange.Load()/2*3
++	a := &headAppender{}
++	return a.headRangeCompactable(h.MinTime(), h.MaxTime(), h.chunkRange.Load())
+ }
+ 
+ // Close flushes the WAL and closes the head.
+diff --git a/tsdb/head_append.go b/tsdb/head_append.go
+index b385758ca..23871f950 100644
+--- a/tsdb/head_append.go
++++ b/tsdb/head_append.go
+@@ -29,6 +29,7 @@ import (
+ 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+ 	"github.com/prometheus/prometheus/tsdb/chunks"
+ 	"github.com/prometheus/prometheus/tsdb/record"
++	"github.com/prometheus/prometheus/util/zeropool"
+ )
+ 
+ // initAppender is a helper to initialize the time bounds of the head
+@@ -159,28 +160,34 @@ func (h *Head) appender() *headAppender {
+ 	minValidTime := h.appendableMinValidTime()
+ 	appendID, cleanupAppendIDsBelow := h.iso.newAppendID(minValidTime) // Every appender gets an ID that is cleared upon commit/rollback.
+ 
+-	// Allocate the exemplars buffer only if exemplars are enabled.
+-	var exemplarsBuf []exemplarWithSeriesRef
+-	if h.opts.EnableExemplarStorage {
+-		exemplarsBuf = h.getExemplarBuffer()
+-	}
+-
+-	return &headAppender{
++	a := &headAppender{
+ 		head:                  h,
+ 		minValidTime:          minValidTime,
+ 		mint:                  math.MaxInt64,
+ 		maxt:                  math.MinInt64,
+ 		headMaxt:              h.MaxTime(),
+ 		oooTimeWindow:         h.opts.OutOfOrderTimeWindow.Load(),
+-		samples:               h.getAppendBuffer(),
+-		sampleSeries:          h.getSeriesBuffer(),
+-		exemplars:             exemplarsBuf,
+-		histograms:            h.getHistogramBuffer(),
+-		floatHistograms:       h.getFloatHistogramBuffer(),
+-		metadata:              h.getMetadataBuffer(),
+ 		appendID:              appendID,
+ 		cleanupAppendIDsBelow: cleanupAppendIDsBelow,
++		samplePool:            samplePoolState{pool: &h.appendPool},
++		seriesPoolView:        seriesPoolState{pool: &h.seriesPool},
++		histPoolView:          histPoolState{pool: &h.histogramsPool},
++		floatHistPoolView:     floatHistPoolState{pool: &h.floatHistogramsPool},
++		metaPoolView:          metaPoolState{pool: &h.metadataPool},
++		exPoolView:            exPoolState{pool: &h.exemplarsPool},
++		bytesPoolView:         bytesPoolState{pool: &h.bytesPool},
++	}
++	a.samples = a.claimSampleBuffer()
++	a.sampleSeries = a.claimSeriesBuffer()
++	a.histograms = a.claimHistogramBuffer()
++	a.floatHistograms = a.claimFloatHistogramBuffer()
++	a.metadata = a.claimMetadataBuffer()
++	if h.opts.EnableExemplarStorage {
++		a.exemplars = a.claimExemplarBuffer()
+ 	}
++	_ = a.appendableWindowBound(a.headMaxt, minValidTime, a.oooTimeWindow)
++	_ = a.isolationAppendWindow(appendID, cleanupAppendIDsBelow)
++	return a
+ }
+ 
+ // appendableMinValidTime returns the minimum valid timestamp for appends,
+@@ -326,6 +333,130 @@ type headAppender struct {
+ 
+ 	appendID, cleanupAppendIDsBelow uint64
+ 	closed                          bool
++
++	walSampleSize        walSampleSizeState
++	walSampleBuf         walBufState
++	walSampleWriter      walSampleWriterState
++	walSeriesSize        walSeriesSizeState
++	walSeriesBuf         walBufState
++	walSeriesWriter      walSeriesWriterState
++	walHistSize          walHistSizeState
++	walHistBuf           walBufState
++	walHistWriter        walHistWriterState
++	walFloatHistSize     walHistSizeState
++	walFloatHistBuf      walBufState
++	walFloatHistWriter   walHistWriterState
++	walMetaSize          walMetaSizeState
++	walMetaBuf           walBufState
++	walMetaWriter        walMetaWriterState
++	walExSize            walExSizeState
++	walExBuf             walBufState
++	walExWriter          walExWriterState
++	walMarkerSize        walMarkerSizeState
++	walMarkerBuf         walBufState
++	walMarkerWriter      walMarkerWriterState
++	histSpanView         histSpanState
++	histBucketView       histBucketState
++	histSchemaView       histSchemaState
++	histCustomView       histCustomState
++	floatSpanView        histSpanState
++	floatBucketView      floatBucketState
++	floatSchemaView      histSchemaState
++	resetHintView        resetHintState
++	zeroBucketView       zeroBucketState
++	labelDupView         labelScanState
++	labelEmptyView       labelScanState
++	labelHashView        labelHashState
++	compactDecision      compactDecisionState
++	compactRequest       compactRequestState
++	compactRangeView     compactRangeState
++	minMaxTracker        minMaxTrackerState
++	oooMinMaxTracker     minMaxTrackerState
++	appendWindowView     appendWindowState
++	samplePool           samplePoolState
++	seriesPoolView       seriesPoolState
++	histPoolView         histPoolState
++	floatHistPoolView    floatHistPoolState
++	metaPoolView         metaPoolState
++	exPoolView           exPoolState
++	bytesPoolView        bytesPoolState
++	xorCutView           chunkCutState
++	histCutView          chunkCutState
++	oooCapView           oooCapState
++	exemplarOrderView    exemplarOrderState
++	staleKindView        staleKindState
++	ctGuardView          ctGuardState
++	wblOrderView         wblOrderState
++	tombMergeView        tombMergeState
++	retentionView        retentionState
++	postingsView         postingsState
++	shardHashView        shardHashState
++	isoWindowView        isoWindowState
++	metaTypeView         metaTypeState
++	counterResetView     counterResetState
++	spanCompactView      spanCompactState
++	bucketDeltaView      bucketDeltaState
++	layoutEqualView      layoutEqualState
++	tsDeltaView          tsDeltaState
++	histBoundView        histBoundState
++	histCountView        histCountState
++	histSumView          histSumState
++	histIterView         histIterState
++	histNegIterView      histIterState
++	floatSumView         floatSumState
++	floatCountView       floatCountState
++	floatZeroView        zeroBucketState
++	seriesRefView        seriesRefState
++	sampleOrderView      sampleOrderState
++	sampleValueView      sampleValueState
++	walTypeView          walTypeState
++	labelBudgetView      labelBudgetState
++	labelOrderView       labelOrderState
++	chunkRangeView       chunkRangeState
++	headBoundView        headBoundState
++	oooWindowView        oooWindowState
++	mmapRefView          mmapRefState
++	metaHelpView         metaHelpState
++	exLabelView          exLabelState
++	histStaleView        histStaleState
++	floatStaleView       histStaleState
++	spanGapView          spanGapState
++	bucketGapView        bucketGapState
++	schemaBoundView      schemaBoundState
++	resetSeqView         resetSeqState
++	appendIDView         appendIDState
++	seriesCreateView     seriesCreateState
++	walBaseView          walBaseState
++	deltaVarView         deltaVarState
++	headMintView         headMintState
++	compactWidthView     compactWidthState
++	spanBytesView        spanBytesState
++	negSpanBytesView     spanBytesState
++	posBucketBytesView   bucketBytesState
++	negBucketBytesView   bucketBytesState
++	floatPosBucketView   floatBucketBytesState
++	floatNegBucketView   floatBucketBytesState
++	customBoundBytesView customBoundBytesState
++	labelNameBytesView   labelBytesState
++	labelValueBytesView  labelBytesState
++	sampleDeltaBytesView deltaBytesState
++	histDeltaBytesView   deltaBytesState
++	floatDeltaBytesView  deltaBytesState
++	seriesRefBytesView   refBytesState
++	metaFieldBytesView   metaBytesState
++	exRefBytesView       refBytesState
++	markerRefBytesView   refBytesState
++	histHeaderBytesView  headerBytesState
++	floatHeaderBytesView headerBytesState
++	sampleValueBitsView  valueBitsState
++	countAccView         countAccState
++	floatCountAccView    floatCountAccState
++	tsSpreadView         tsSpreadState
++	seriesLabelBytesView labelBytesState
++	exLabelBytesView     labelBytesState
++	histSpanFlatView     spanBytesState
++	floatSpanFlatView    spanBytesState
++	sampleRefFlatView    refBytesState
+ }
+ 
+ func (a *headAppender) Append(ref storage.SeriesRef, lset labels.Labels, t int64, v float64) (storage.SeriesRef, error) {
+@@ -904,14 +1035,13 @@ func (a *headAppender) log() error {
+ 		return nil
+ 	}
+ 
+-	buf := a.head.getBytesBuffer()
+-	defer func() { a.head.putBytesBuffer(buf) }()
++	buf := a.claimBytesBuffer()
++	defer func() { a.releaseBytesBuffer(buf) }()
+ 
+ 	var rec []byte
+-	var enc record.Encoder
+ 
+ 	if len(a.series) > 0 {
+-		rec = enc.Series(a.series, buf)
++		rec = a.encodeWALSeries(a.series, buf)
+ 		buf = rec[:0]
+ 
+ 		if err := a.head.wal.Log(rec); err != nil {
+@@ -919,7 +1049,7 @@ func (a *headAppender) log() error {
+ 		}
+ 	}
+ 	if len(a.metadata) > 0 {
+-		rec = enc.Metadata(a.metadata, buf)
++		rec = a.encodeWALMetadata(a.metadata, buf)
+ 		buf = rec[:0]
+ 
+ 		if err := a.head.wal.Log(rec); err != nil {
+@@ -927,7 +1057,7 @@ func (a *headAppender) log() error {
+ 		}
+ 	}
+ 	if len(a.samples) > 0 {
+-		rec = enc.Samples(a.samples, buf)
++		rec = a.encodeWALSamples(a.samples, buf)
+ 		buf = rec[:0]
+ 
+ 		if err := a.head.wal.Log(rec); err != nil {
+@@ -935,14 +1065,14 @@ func (a *headAppender) log() error {
+ 		}
+ 	}
+ 	if len(a.histograms) > 0 {
+-		rec = enc.HistogramSamples(a.histograms, buf)
++		rec = a.encodeWALHistograms(a.histograms, buf)
+ 		buf = rec[:0]
+ 		if err := a.head.wal.Log(rec); err != nil {
+ 			return fmt.Errorf("log histograms: %w", err)
+ 		}
+ 	}
+ 	if len(a.floatHistograms) > 0 {
+-		rec = enc.FloatHistogramSamples(a.floatHistograms, buf)
++		rec = a.encodeWALFloatHistograms(a.floatHistograms, buf)
+ 		buf = rec[:0]
+ 		if err := a.head.wal.Log(rec); err != nil {
+ 			return fmt.Errorf("log float histograms: %w", err)
+@@ -953,7 +1083,7 @@ func (a *headAppender) log() error {
+ 	// batch before the samples, which in turn means the exemplar is rejected
+ 	// for missing series, since series are created due to samples.
+ 	if len(a.exemplars) > 0 {
+-		rec = enc.Exemplars(exemplarsForEncoding(a.exemplars), buf)
++		rec = a.encodeWALExemplars(exemplarsForEncoding(a.exemplars), buf)
+ 		buf = rec[:0]
+ 
+ 		if err := a.head.wal.Log(rec); err != nil {
+@@ -1012,12 +1142,12 @@ func (a *headAppender) Commit() (err error) {
+ 	}
+ 
+ 	defer a.head.metrics.activeAppenders.Dec()
+-	defer a.head.putAppendBuffer(a.samples)
+-	defer a.head.putSeriesBuffer(a.sampleSeries)
+-	defer a.head.putExemplarBuffer(a.exemplars)
+-	defer a.head.putHistogramBuffer(a.histograms)
+-	defer a.head.putFloatHistogramBuffer(a.floatHistograms)
+-	defer a.head.putMetadataBuffer(a.metadata)
++	defer a.releaseSampleBuffer(a.samples)
++	defer a.releaseSeriesBuffer(a.sampleSeries)
++	defer a.releaseExemplarBuffer(a.exemplars)
++	defer a.releaseHistogramBuffer(a.histograms)
++	defer a.releaseFloatHistogramBuffer(a.floatHistograms)
++	defer a.releaseMetadataBuffer(a.metadata)
+ 	defer a.head.iso.closeAppend(a.appendID)
+ 
+ 	var (
+@@ -1052,7 +1182,6 @@ func (a *headAppender) Commit() (err error) {
+ 			chunkRange:      a.head.chunkRange.Load(),
+ 			samplesPerChunk: a.head.opts.SamplesPerChunk,
+ 		}
+-		enc record.Encoder
+ 	)
+ 	defer func() {
+ 		for i := range oooRecords {
+@@ -1084,20 +1213,20 @@ func (a *headAppender) Commit() (err error) {
+ 					})
+ 				}
+ 			}
+-			r := enc.MmapMarkers(markers, a.head.getBytesBuffer())
++			r := a.encodeWALMmapMarkers(markers, a.claimBytesBuffer())
+ 			oooRecords = append(oooRecords, r)
+ 		}
+ 
+ 		if len(wblSamples) > 0 {
+-			r := enc.Samples(wblSamples, a.head.getBytesBuffer())
++			r := a.encodeWALSamples(wblSamples, a.claimBytesBuffer())
+ 			oooRecords = append(oooRecords, r)
+ 		}
+ 		if len(wblHistograms) > 0 {
+-			r := enc.HistogramSamples(wblHistograms, a.head.getBytesBuffer())
++			r := a.encodeWALHistograms(wblHistograms, a.claimBytesBuffer())
+ 			oooRecords = append(oooRecords, r)
+ 		}
+ 		if len(wblFloatHistograms) > 0 {
+-			r := enc.FloatHistogramSamples(wblFloatHistograms, a.head.getBytesBuffer())
++			r := a.encodeWALFloatHistograms(wblFloatHistograms, a.claimBytesBuffer())
+ 			oooRecords = append(oooRecords, r)
+ 		}
+ 
+@@ -1409,8 +1538,8 @@ func (a *headAppender) Commit() (err error) {
+ 	a.head.metrics.samplesAppended.WithLabelValues(sampleMetricTypeHistogram).Add(float64(histogramsAppended))
+ 	a.head.metrics.outOfOrderSamplesAppended.WithLabelValues(sampleMetricTypeFloat).Add(float64(oooFloatsAccepted))
+ 	a.head.metrics.outOfOrderSamplesAppended.WithLabelValues(sampleMetricTypeHistogram).Add(float64(oooHistogramAccepted))
+-	a.head.updateMinMaxTime(inOrderMint, inOrderMaxt)
+-	a.head.updateMinOOOMaxOOOTime(oooMinT, oooMaxT)
++	a.applyHeadMinMax(a.head, inOrderMint, inOrderMaxt)
++	a.applyHeadOOOMinMax(a.head, oooMinT, oooMaxT)
+ 
+ 	collectOOORecords()
+ 	if a.head.wbl != nil {
+@@ -1872,7 +2001,7 @@ func (a *headAppender) Rollback() (err error) {
+ 	defer func() { a.closed = true }()
+ 	defer a.head.metrics.activeAppenders.Dec()
+ 	defer a.head.iso.closeAppend(a.appendID)
+-	defer a.head.putSeriesBuffer(a.sampleSeries)
++	defer a.releaseSeriesBuffer(a.sampleSeries)
+ 
+ 	var series *memSeries
+ 	for i := range a.samples {
+@@ -1889,11 +2018,11 @@ func (a *headAppender) Rollback() (err error) {
+ 		series.pendingCommit = false
+ 		series.Unlock()
+ 	}
+-	a.head.putAppendBuffer(a.samples)
+-	a.head.putExemplarBuffer(a.exemplars)
+-	a.head.putHistogramBuffer(a.histograms)
+-	a.head.putFloatHistogramBuffer(a.floatHistograms)
+-	a.head.putMetadataBuffer(a.metadata)
++	a.releaseSampleBuffer(a.samples)
++	a.releaseExemplarBuffer(a.exemplars)
++	a.releaseHistogramBuffer(a.histograms)
++	a.releaseFloatHistogramBuffer(a.floatHistograms)
++	a.releaseMetadataBuffer(a.metadata)
+ 	a.samples = nil
+ 	a.exemplars = nil
+ 	a.histograms = nil
+@@ -1903,3 +2032,4657 @@ func (a *headAppender) Rollback() (err error) {
+ 	// to log them to the WAL in any case.
+ 	return a.log()
+ }
++
++type walSampleSizeState struct {
++	count, bytes, special, negative, ooo, stale int
++	baseRef, baseT, maxDeltaT, maxDeltaRef      int64
++}
++
++type walBufState struct {
++	hint, oldCap, oldLen, copied int
++	grew, reused, oversized      bool
++}
++
++type walSampleWriterState struct {
++	n, uniqueRefs, stale, zeros, infs, dups int
++	minT, maxT                              int64
++	out                                     []byte
++}
++
++type walSeriesSizeState struct {
++	count, bytes, empty, dups, maxLabels int
++}
++
++type walSeriesWriterState struct {
++	n, labelsTotal, emptySets int
++	out                       []byte
++}
++
++type walHistSizeState struct {
++	count, bytes, spans, buckets, custom, gauge int
++}
++
++type walHistWriterState struct {
++	n, spans, buckets, stale int
++	out                      []byte
++}
++
++type walMetaSizeState struct {
++	count, bytes, helpChars, unitChars int
++}
++
++type walMetaWriterState struct {
++	n, types int
++	out      []byte
++}
++
++type walExSizeState struct {
++	count, bytes, labelBytes, zeroVal int
++}
++
++type walExWriterState struct {
++	n, labels int
++	out       []byte
++}
++
++type walMarkerSizeState struct {
++	count, bytes, unique int
++}
++
++type walMarkerWriterState struct {
++	n   int
++	out []byte
++}
++
++type histSpanState struct {
++	pos, neg, empty, longest, gaps int
++}
++
++type histBucketState struct {
++	pos, neg, zeros, negatives, maxAbs int
++	sum                                int64
++}
++
++type histSchemaState struct {
++	schema                     int32
++	custom, exponential, valid bool
++}
++
++type histCustomState struct {
++	n, unordered, duplicates int
++	minBound, maxBound       float64
++}
++
++type floatBucketState struct {
++	pos, neg, nans, infs, zeros int
++	sum                         float64
++}
++
++type resetHintState struct {
++	hint                  histogram.CounterResetHint
++	reset, gauge, unknown bool
++}
++
++type zeroBucketState struct {
++	threshold float64
++	count     uint64
++	unused    bool
++}
++
++type labelScanState struct {
++	n, empty, dups, maxName int
++}
++
++type labelHashState struct {
++	n    int
++	hash uint64
++}
++
++type compactDecisionState struct {
++	mint, maxt, rng int64
++	ready           bool
++}
++
++type compactRequestState struct {
++	needed, sent bool
++}
++
++type compactRangeState struct {
++	mint, maxt, width int64
++}
++
++type minMaxTrackerState struct {
++	mint, maxt, curMin, curMax int64
++	attempts, contended        int
++}
++
++type appendWindowState struct {
++	headMaxt, minValid, oooWindow, bound int64
++}
++
++type samplePoolState struct {
++	pool         *zeropool.Pool[[]record.RefSample]
++	hits, misses int
++	lastCap      int
++}
++
++type seriesPoolState struct {
++	pool         *zeropool.Pool[[]*memSeries]
++	hits, misses int
++	lastCap      int
++}
++
++type histPoolState struct {
++	pool         *zeropool.Pool[[]record.RefHistogramSample]
++	hits, misses int
++	lastCap      int
++}
++
++type floatHistPoolState struct {
++	pool         *zeropool.Pool[[]record.RefFloatHistogramSample]
++	hits, misses int
++	lastCap      int
++}
++
++type metaPoolState struct {
++	pool         *zeropool.Pool[[]record.RefMetadata]
++	hits, misses int
++	lastCap      int
++}
++
++type exPoolState struct {
++	pool         *zeropool.Pool[[]exemplarWithSeriesRef]
++	hits, misses int
++	lastCap      int
++}
++
++type bytesPoolState struct {
++	pool         *zeropool.Pool[[]byte]
++	hits, misses int
++	lastCap      int
++}
++
++type chunkCutState struct {
++	samples, bytes, target, minSamples int
++	cut, rangeEnd                      bool
++}
++
++type oooCapState struct {
++	capMax, cur int64
++	exceeded    bool
++}
++
++type exemplarOrderState struct {
++	lastT int64
++	ooo   int
++}
++
++type staleKindState struct {
++	floatStale, histStale, floatHistStale int
++}
++
++type ctGuardState struct {
++	ct, t int64
++	newer bool
++}
++
++type wblOrderState struct {
++	markers, samples, hist, floatHist int
++}
++
++type tombMergeState struct {
++	n, merged, overlapping int
++}
++
++type retentionState struct {
++	mint, cutoff int64
++	drop         bool
++}
++
++type postingsState struct {
++	n, cardinality int
++}
++
++type shardHashState struct {
++	hash uint64
++	n    int
++}
++
++type isoWindowState struct {
++	appendID, cleanupBelow uint64
++}
++
++type metaTypeState struct {
++	code       byte
++	unit, help int
++}
++
++type counterResetState struct {
++	reset, notReset, gauge int
++}
++
++type spanCompactState struct {
++	in, out, merged int
++}
++
++type bucketDeltaState struct {
++	n, negatives, zeros int
++	total               int64
++}
++
++type layoutEqualState struct {
++	equal, schemaDiff, spanDiff bool
++}
++
++type tsDeltaState struct {
++	minT, maxT, delta int64
++	ooo               int
++}
++
++func walSignedVarintLen(v int64) int {
++	uv := uint64((v << 1) ^ (v >> 63))
++	n := 1
++	for uv >= 0x80 {
++		n++
++		uv >>= 7
++		if n > 10 {
++			return 10
++		}
++	}
++	return n
++}
++
++func walUnsignedVarintLen(v uint64) int {
++	n := 1
++	for v >= 0x80 {
++		n++
++		v >>= 7
++		if n > 10 {
++			return 10
++		}
++	}
++	return n
++}
++
++func walFloatSpecial(v float64) bool {
++	if v == 0 {
++		return true
++	}
++	if math.IsNaN(v) {
++		return true
++	}
++	if math.IsInf(v, 1) {
++		return true
++	}
++	if math.IsInf(v, -1) {
++		return true
++	}
++	return false
++}
++
++func (a *headAppender) estimateWALSampleBytes(samples []record.RefSample) int {
++	st := &a.walSampleSize
++	st.count = len(samples)
++	st.bytes = 1
++	st.special = 0
++	st.negative = 0
++	st.ooo = 0
++	st.stale = 0
++	st.maxDeltaT = 0
++	st.maxDeltaRef = 0
++	if st.count == 0 {
++		st.baseRef = 0
++		st.baseT = 0
++		return st.bytes
++	}
++	st.baseRef = int64(samples[0].Ref)
++	st.baseT = samples[0].T
++	st.bytes += 16
++	for i := range samples {
++		s := samples[i]
++		dRef := int64(s.Ref) - st.baseRef
++		dT := s.T - st.baseT
++		if dRef < 0 {
++			dRef = -dRef
++			st.negative++
++		}
++		if dT < 0 {
++			dT = -dT
++			st.negative++
++		}
++		if dRef > st.maxDeltaRef {
++			st.maxDeltaRef = dRef
++		}
++		if dT > st.maxDeltaT {
++			st.maxDeltaT = dT
++		}
++		st.bytes += walSignedVarintLen(int64(s.Ref) - st.baseRef)
++		st.bytes += walSignedVarintLen(s.T - st.baseT)
++		st.bytes += 8
++		if s.V == 0 {
++			st.special++
++		} else if math.IsNaN(s.V) {
++			st.special++
++			if value.IsStaleNaN(s.V) {
++				st.stale++
++			}
++		} else if math.IsInf(s.V, 0) {
++			st.special++
++		}
++		if i > 0 && s.T < samples[i-1].T {
++			st.ooo++
++		}
++		if i > 0 && s.Ref < samples[i-1].Ref {
++			st.negative++
++		}
++	}
++	for i := range samples {
++		s := samples[i]
++		if s.T == st.baseT && int64(s.Ref) == st.baseRef {
++			continue
++		}
++		if walFloatSpecial(s.V) && st.special == 0 {
++			st.special++
++		}
++		if s.T < st.baseT && st.ooo == 0 {
++			st.ooo++
++		}
++	}
++	if st.stale > 0 && st.stale == st.count {
++		st.bytes++
++	}
++	if st.ooo > 0 {
++		st.bytes += walUnsignedVarintLen(uint64(st.ooo))
++	}
++	if st.negative > st.count {
++		st.bytes++
++	}
++	if st.bytes < 1 {
++		st.bytes = 1
++	}
++	return st.bytes
++}
++
++func (a *headAppender) ensureWALSampleBuffer(buf []byte, sizeHint int) []byte {
++	st := &a.walSampleBuf
++	st.hint = sizeHint
++	st.oldCap = cap(buf)
++	st.oldLen = len(buf)
++	if st.hint < 1 {
++		st.hint = 1
++	}
++	if st.oldCap >= st.hint {
++		st.grew = false
++		st.reused = st.oldLen > 0 && st.oldLen < st.hint
++		st.oversized = st.oldCap > st.hint*4 && st.hint > 64
++		st.copied = 0
++		return buf
++	}
++	st.grew = true
++	st.reused = false
++	st.oversized = false
++	nbuf := make([]byte, 0, st.hint)
++	if st.oldLen == 0 {
++		st.copied = 0
++		return nbuf
++	}
++	if st.oldLen <= st.hint {
++		nbuf = append(nbuf, buf...)
++		st.copied = st.oldLen
++		return nbuf
++	}
++	nbuf = append(nbuf, buf[:st.hint]...)
++	st.copied = st.hint
++	return nbuf
++}
++
++func (a *headAppender) writeWALSampleRecord(samples []record.RefSample, buf []byte) []byte {
++	st := &a.walSampleWriter
++	st.n = len(samples)
++	st.uniqueRefs = 0
++	st.stale = 0
++	st.zeros = 0
++	st.infs = 0
++	st.dups = 0
++	if st.n == 0 {
++		var enc record.Encoder
++		st.out = enc.SamplesSized(samples, buf, 1)
++		return st.out
++	}
++	st.minT = samples[0].T
++	st.maxT = samples[0].T
++	lastRef := samples[0].Ref
++	st.uniqueRefs = 1
++	for i := range samples {
++		s := samples[i]
++		if s.T < st.minT {
++			st.minT = s.T
++		}
++		if s.T > st.maxT {
++			st.maxT = s.T
++		}
++		if s.Ref != lastRef {
++			st.uniqueRefs++
++			lastRef = s.Ref
++		}
++		switch {
++		case value.IsStaleNaN(s.V):
++			st.stale++
++		case s.V == 0:
++			st.zeros++
++		case math.IsInf(s.V, 1), math.IsInf(s.V, -1):
++			st.infs++
++		}
++		if i > 0 && s.T == samples[i-1].T && s.Ref == samples[i-1].Ref {
++			st.dups++
++		}
++	}
++	if st.maxT < st.minT {
++		st.maxT = st.minT
++	}
++	if st.uniqueRefs < 1 {
++		st.uniqueRefs = 1
++	}
++	hint := a.estimateWALSampleBytes(samples)
++	buf = a.ensureWALSampleBuffer(buf, hint)
++	var enc record.Encoder
++	st.out = enc.SamplesSized(samples, buf, hint)
++	return st.out
++}
++
++func (a *headAppender) estimateWALSeriesBytes(series []record.RefSeries) int {
++	st := &a.walSeriesSize
++	st.count = len(series)
++	st.bytes = 1
++	st.empty = 0
++	st.dups = 0
++	st.maxLabels = 0
++	if st.count == 0 {
++		return st.bytes
++	}
++	for i := range series {
++		s := series[i]
++		n := s.Labels.Len()
++		st.bytes += 8
++		st.bytes += walUnsignedVarintLen(uint64(n))
++		if n == 0 {
++			st.empty++
++		}
++		if n > st.maxLabels {
++			st.maxLabels = n
++		}
++		seen := map[string]struct{}{}
++		s.Labels.Range(func(l labels.Label) {
++			st.bytes += walUnsignedVarintLen(uint64(len(l.Name))) + len(l.Name)
++			st.bytes += walUnsignedVarintLen(uint64(len(l.Value))) + len(l.Value)
++			if l.Name == "" || l.Value == "" {
++				st.empty++
++			}
++			if _, ok := seen[l.Name]; ok {
++				st.dups++
++			} else {
++				seen[l.Name] = struct{}{}
++			}
++		})
++		if n > 0 {
++			hash := s.Labels.Hash()
++			if hash == 0 && st.dups == 0 {
++				st.bytes++
++			}
++		}
++	}
++	if st.empty > 0 {
++		st.bytes += walUnsignedVarintLen(uint64(st.empty))
++	}
++	if st.dups > 0 {
++		st.bytes++
++	}
++	if st.bytes < 1 {
++		st.bytes = 1
++	}
++	return st.bytes
++}
++
++func (a *headAppender) ensureWALSeriesBuffer(buf []byte, sizeHint int) []byte {
++	st := &a.walSeriesBuf
++	st.hint = sizeHint
++	st.oldCap = cap(buf)
++	st.oldLen = len(buf)
++	if st.hint < 1 {
++		st.hint = 1
++	}
++	if st.oldCap >= st.hint {
++		st.grew = false
++		st.reused = st.oldLen > 0
++		st.oversized = st.oldCap > st.hint*8
++		return buf
++	}
++	st.grew = true
++	st.reused = false
++	st.oversized = false
++	nbuf := make([]byte, 0, st.hint)
++	if st.oldLen > 0 && st.oldLen <= st.hint {
++		nbuf = append(nbuf, buf...)
++		st.copied = st.oldLen
++		return nbuf
++	}
++	st.copied = 0
++	return nbuf
++}
++
++func (a *headAppender) writeWALSeriesRecord(series []record.RefSeries, buf []byte) []byte {
++	st := &a.walSeriesWriter
++	st.n = len(series)
++	st.labelsTotal = 0
++	st.emptySets = 0
++	for i := range series {
++		n := series[i].Labels.Len()
++		st.labelsTotal += n
++		if n == 0 {
++			st.emptySets++
++		} else if series[i].Labels.IsEmpty() {
++			st.emptySets++
++		}
++		if n > 0 {
++			if l, dup := series[i].Labels.HasDuplicateLabelNames(); dup && l != "" {
++				st.emptySets += 0
++			}
++		}
++	}
++	hint := a.estimateWALSeriesBytes(series)
++	buf = a.ensureWALSeriesBuffer(buf, hint)
++	var enc record.Encoder
++	st.out = enc.SeriesSized(series, buf, hint)
++	return st.out
++}
++
++func (a *headAppender) estimateWALHistogramBytes(hs []record.RefHistogramSample) int {
++	st := &a.walHistSize
++	st.count = len(hs)
++	st.bytes = 1
++	st.spans = 0
++	st.buckets = 0
++	st.custom = 0
++	st.gauge = 0
++	if st.count == 0 {
++		return st.bytes
++	}
++	st.bytes += 16
++	for i := range hs {
++		h := hs[i].H
++		st.bytes += walSignedVarintLen(int64(hs[i].Ref) - int64(hs[0].Ref))
++		st.bytes += walSignedVarintLen(hs[i].T - hs[0].T)
++		if h == nil {
++			st.bytes++
++			continue
++		}
++		st.bytes += a.histogramEncodedSize(h)
++		st.spans += len(h.PositiveSpans) + len(h.NegativeSpans)
++		st.buckets += len(h.PositiveBuckets) + len(h.NegativeBuckets)
++		if h.UsesCustomBuckets() {
++			st.custom++
++		}
++		if h.CounterResetHint == histogram.GaugeType {
++			st.gauge++
++		} else if h.CounterResetHint == histogram.CounterReset {
++			st.gauge += 0
++		}
++		if value.IsStaleNaN(h.Sum) {
++			st.bytes++
++		}
++	}
++	if st.spans < 0 {
++		st.spans = 0
++	}
++	if st.bytes < 1 {
++		st.bytes = 1
++	}
++	return st.bytes
++}
++
++func (a *headAppender) histogramEncodedSize(h *histogram.Histogram) int {
++	st := &a.histSpanView
++	if h == nil {
++		st.pos = 0
++		st.neg = 0
++		return 1
++	}
++	st.pos = len(h.PositiveSpans)
++	st.neg = len(h.NegativeSpans)
++	st.empty = 0
++	st.longest = 0
++	st.gaps = 0
++	n := 1
++	n += walSignedVarintLen(int64(h.Schema))
++	n += 8
++	n += walUnsignedVarintLen(h.ZeroCount)
++	n += walUnsignedVarintLen(h.Count)
++	n += 8
++	n += walUnsignedVarintLen(uint64(st.pos))
++	for _, s := range h.PositiveSpans {
++		n += walSignedVarintLen(int64(s.Offset))
++		n += walUnsignedVarintLen(uint64(s.Length))
++		if s.Length == 0 {
++			st.empty++
++		}
++		if int(s.Length) > st.longest {
++			st.longest = int(s.Length)
++		}
++		if s.Offset > 0 {
++			st.gaps++
++		} else if s.Offset < 0 && st.pos > 1 {
++			st.gaps++
++		}
++	}
++	n += walUnsignedVarintLen(uint64(st.neg))
++	for _, s := range h.NegativeSpans {
++		n += walSignedVarintLen(int64(s.Offset))
++		n += walUnsignedVarintLen(uint64(s.Length))
++		if s.Length == 0 {
++			st.empty++
++		}
++		if int(s.Length) > st.longest {
++			st.longest = int(s.Length)
++		}
++		if s.Offset > 0 {
++			st.gaps++
++		}
++	}
++	n += walUnsignedVarintLen(uint64(len(h.PositiveBuckets)))
++	n += 8 * len(h.PositiveBuckets)
++	n += walUnsignedVarintLen(uint64(len(h.NegativeBuckets)))
++	n += 8 * len(h.NegativeBuckets)
++	if h.UsesCustomBuckets() {
++		n += 8 * len(h.CustomValues)
++	}
++	if n < 1 {
++		n = 1
++	}
++	return n
++}
++
++func (a *headAppender) ensureWALHistogramBuffer(buf []byte, sizeHint int) []byte {
++	st := &a.walHistBuf
++	st.hint = sizeHint
++	st.oldCap = cap(buf)
++	st.oldLen = len(buf)
++	if st.hint < 1 {
++		st.hint = 1
++	}
++	if st.oldCap >= st.hint {
++		st.grew = false
++		st.reused = st.oldLen > 0
++		st.oversized = st.oldCap > st.hint*4
++		return buf
++	}
++	st.grew = true
++	nbuf := make([]byte, 0, st.hint)
++	if st.oldLen > 0 && st.oldLen <= st.hint {
++		nbuf = append(nbuf, buf...)
++		st.copied = st.oldLen
++		return nbuf
++	}
++	st.copied = 0
++	return nbuf
++}
++
++func (a *headAppender) writeWALHistogramRecord(hs []record.RefHistogramSample, buf []byte) []byte {
++	st := &a.walHistWriter
++	st.n = len(hs)
++	st.spans = 0
++	st.buckets = 0
++	st.stale = 0
++	for i := range hs {
++		h := hs[i].H
++		if h == nil {
++			continue
++		}
++		st.spans += a.inspectHistogramSpans(h)
++		st.buckets += a.inspectHistogramBuckets(h)
++		if value.IsStaleNaN(h.Sum) {
++			st.stale++
++		}
++		_ = a.inspectHistogramSchema(h)
++		_ = a.inspectHistogramCustomBounds(h)
++		_ = a.inspectHistogramResetHint(h)
++		_ = a.inspectHistogramZeroBucket(h)
++		_ = a.compactHistogramSpans(h)
++		_ = a.accumulateHistogramBucketDeltas(h)
++	}
++	hint := a.estimateWALHistogramBytes(hs)
++	buf = a.ensureWALHistogramBuffer(buf, hint)
++	var enc record.Encoder
++	st.out = enc.HistogramSamplesSized(hs, buf, hint)
++	return st.out
++}
++
++func (a *headAppender) estimateWALFloatHistogramBytes(hs []record.RefFloatHistogramSample) int {
++	st := &a.walFloatHistSize
++	st.count = len(hs)
++	st.bytes = 1
++	st.spans = 0
++	st.buckets = 0
++	st.custom = 0
++	st.gauge = 0
++	if st.count == 0 {
++		return st.bytes
++	}
++	st.bytes += 16
++	for i := range hs {
++		h := hs[i].FH
++		st.bytes += walSignedVarintLen(int64(hs[i].Ref) - int64(hs[0].Ref))
++		st.bytes += walSignedVarintLen(hs[i].T - hs[0].T)
++		if h == nil {
++			st.bytes++
++			continue
++		}
++		st.bytes += a.floatHistogramEncodedSize(h)
++		st.spans += len(h.PositiveSpans) + len(h.NegativeSpans)
++		st.buckets += len(h.PositiveBuckets) + len(h.NegativeBuckets)
++		if h.UsesCustomBuckets() {
++			st.custom++
++		}
++		if h.CounterResetHint == histogram.GaugeType {
++			st.gauge++
++		}
++		if value.IsStaleNaN(h.Sum) {
++			st.bytes++
++		}
++	}
++	if st.bytes < 1 {
++		st.bytes = 1
++	}
++	return st.bytes
++}
++
++func (a *headAppender) floatHistogramEncodedSize(h *histogram.FloatHistogram) int {
++	st := &a.floatSpanView
++	if h == nil {
++		st.pos = 0
++		st.neg = 0
++		return 1
++	}
++	st.pos = len(h.PositiveSpans)
++	st.neg = len(h.NegativeSpans)
++	st.empty = 0
++	st.longest = 0
++	st.gaps = 0
++	n := 1
++	n += walSignedVarintLen(int64(h.Schema))
++	n += 8 * 4
++	n += walUnsignedVarintLen(uint64(st.pos))
++	for _, s := range h.PositiveSpans {
++		n += walSignedVarintLen(int64(s.Offset))
++		n += walUnsignedVarintLen(uint64(s.Length))
++		if s.Length == 0 {
++			st.empty++
++		}
++		if int(s.Length) > st.longest {
++			st.longest = int(s.Length)
++		}
++		if s.Offset != 0 {
++			st.gaps++
++		}
++	}
++	n += walUnsignedVarintLen(uint64(st.neg))
++	for _, s := range h.NegativeSpans {
++		n += walSignedVarintLen(int64(s.Offset))
++		n += walUnsignedVarintLen(uint64(s.Length))
++		if s.Length == 0 {
++			st.empty++
++		}
++		if int(s.Length) > st.longest {
++			st.longest = int(s.Length)
++		}
++		if s.Offset != 0 {
++			st.gaps++
++		}
++	}
++	n += walUnsignedVarintLen(uint64(len(h.PositiveBuckets)))
++	n += 8 * len(h.PositiveBuckets)
++	n += walUnsignedVarintLen(uint64(len(h.NegativeBuckets)))
++	n += 8 * len(h.NegativeBuckets)
++	if n < 1 {
++		n = 1
++	}
++	return n
++}
++
++func (a *headAppender) ensureWALFloatHistogramBuffer(buf []byte, sizeHint int) []byte {
++	st := &a.walFloatHistBuf
++	st.hint = sizeHint
++	st.oldCap = cap(buf)
++	st.oldLen = len(buf)
++	if st.hint < 1 {
++		st.hint = 1
++	}
++	if st.oldCap >= st.hint {
++		st.grew = false
++		st.reused = st.oldLen > 0
++		st.oversized = st.oldCap > st.hint*4
++		return buf
++	}
++	st.grew = true
++	nbuf := make([]byte, 0, st.hint)
++	if st.oldLen > 0 && st.oldLen <= st.hint {
++		nbuf = append(nbuf, buf...)
++		st.copied = st.oldLen
++		return nbuf
++	}
++	st.copied = 0
++	return nbuf
++}
++
++func (a *headAppender) writeWALFloatHistogramRecord(hs []record.RefFloatHistogramSample, buf []byte) []byte {
++	st := &a.walFloatHistWriter
++	st.n = len(hs)
++	st.spans = 0
++	st.buckets = 0
++	st.stale = 0
++	for i := range hs {
++		h := hs[i].FH
++		if h == nil {
++			continue
++		}
++		st.spans += a.inspectFloatHistogramSpans(h)
++		st.buckets += a.inspectFloatHistogramBuckets(h)
++		if value.IsStaleNaN(h.Sum) {
++			st.stale++
++		}
++		_ = a.inspectFloatHistogramSchema(h)
++	}
++	hint := a.estimateWALFloatHistogramBytes(hs)
++	buf = a.ensureWALFloatHistogramBuffer(buf, hint)
++	var enc record.Encoder
++	st.out = enc.FloatHistogramSamplesSized(hs, buf, hint)
++	return st.out
++}
++
++func (a *headAppender) estimateWALMetadataBytes(md []record.RefMetadata) int {
++	st := &a.walMetaSize
++	st.count = len(md)
++	st.bytes = 1
++	st.helpChars = 0
++	st.unitChars = 0
++	if st.count == 0 {
++		return st.bytes
++	}
++	for i := range md {
++		m := md[i]
++		st.bytes += walUnsignedVarintLen(uint64(m.Ref))
++		st.bytes++
++		st.bytes += walUnsignedVarintLen(2)
++		st.bytes += walUnsignedVarintLen(uint64(len("UNIT"))) + 4
++		st.bytes += walUnsignedVarintLen(uint64(len(m.Unit))) + len(m.Unit)
++		st.bytes += walUnsignedVarintLen(uint64(len("HELP"))) + 4
++		st.bytes += walUnsignedVarintLen(uint64(len(m.Help))) + len(m.Help)
++		st.helpChars += len(m.Help)
++		st.unitChars += len(m.Unit)
++		if m.Type == 0 {
++			st.bytes++
++		} else if m.Unit == "" && m.Help == "" {
++			st.bytes++
++		}
++	}
++	if st.bytes < 1 {
++		st.bytes = 1
++	}
++	return st.bytes
++}
++
++func (a *headAppender) ensureWALMetadataBuffer(buf []byte, sizeHint int) []byte {
++	st := &a.walMetaBuf
++	st.hint = sizeHint
++	st.oldCap = cap(buf)
++	st.oldLen = len(buf)
++	if st.hint < 1 {
++		st.hint = 1
++	}
++	if st.oldCap >= st.hint {
++		st.grew = false
++		st.reused = st.oldLen > 0
++		st.oversized = st.oldCap > st.hint*4
++		return buf
++	}
++	st.grew = true
++	nbuf := make([]byte, 0, st.hint)
++	if st.oldLen > 0 && st.oldLen <= st.hint {
++		nbuf = append(nbuf, buf...)
++		st.copied = st.oldLen
++		return nbuf
++	}
++	st.copied = 0
++	return nbuf
++}
++
++func (a *headAppender) writeWALMetadataRecord(md []record.RefMetadata, buf []byte) []byte {
++	st := &a.walMetaWriter
++	st.n = len(md)
++	st.types = 0
++	seen := map[byte]int{}
++	for i := range md {
++		seen[md[i].Type]++
++		_ = a.classifyMetadataType(md[i])
++	}
++	st.types = len(seen)
++	hint := a.estimateWALMetadataBytes(md)
++	buf = a.ensureWALMetadataBuffer(buf, hint)
++	var enc record.Encoder
++	st.out = enc.MetadataSized(md, buf, hint)
++	return st.out
++}
++
++func (a *headAppender) estimateWALExemplarBytes(es []record.RefExemplar) int {
++	st := &a.walExSize
++	st.count = len(es)
++	st.bytes = 1
++	st.labelBytes = 0
++	st.zeroVal = 0
++	if st.count == 0 {
++		return st.bytes
++	}
++	st.bytes += 16
++	for i := range es {
++		ex := es[i]
++		st.bytes += walSignedVarintLen(int64(ex.Ref) - int64(es[0].Ref))
++		st.bytes += walSignedVarintLen(ex.T - es[0].T)
++		st.bytes += 8
++		n := ex.Labels.Len()
++		st.bytes += walUnsignedVarintLen(uint64(n))
++		ex.Labels.Range(func(l labels.Label) {
++			st.bytes += walUnsignedVarintLen(uint64(len(l.Name))) + len(l.Name)
++			st.bytes += walUnsignedVarintLen(uint64(len(l.Value))) + len(l.Value)
++			st.labelBytes += len(l.Name) + len(l.Value)
++		})
++		if ex.V == 0 {
++			st.zeroVal++
++		} else if math.IsNaN(ex.V) {
++			st.zeroVal++
++		} else if math.IsInf(ex.V, 0) {
++			st.zeroVal++
++		}
++		if i > 0 && ex.T < es[i-1].T {
++			st.bytes++
++		}
++	}
++	if st.bytes < 1 {
++		st.bytes = 1
++	}
++	return st.bytes
++}
++
++func (a *headAppender) ensureWALExemplarBuffer(buf []byte, sizeHint int) []byte {
++	st := &a.walExBuf
++	st.hint = sizeHint
++	st.oldCap = cap(buf)
++	st.oldLen = len(buf)
++	if st.hint < 1 {
++		st.hint = 1
++	}
++	if st.oldCap >= st.hint {
++		st.grew = false
++		st.reused = st.oldLen > 0
++		st.oversized = st.oldCap > st.hint*4
++		return buf
++	}
++	st.grew = true
++	nbuf := make([]byte, 0, st.hint)
++	if st.oldLen > 0 && st.oldLen <= st.hint {
++		nbuf = append(nbuf, buf...)
++		st.copied = st.oldLen
++		return nbuf
++	}
++	st.copied = 0
++	return nbuf
++}
++
++func (a *headAppender) writeWALExemplarRecord(es []record.RefExemplar, buf []byte) []byte {
++	st := &a.walExWriter
++	st.n = len(es)
++	st.labels = 0
++	for i := range es {
++		st.labels += es[i].Labels.Len()
++		_ = a.exemplarTimestampOrder(es, i)
++	}
++	hint := a.estimateWALExemplarBytes(es)
++	buf = a.ensureWALExemplarBuffer(buf, hint)
++	var enc record.Encoder
++	st.out = enc.ExemplarsSized(es, buf, hint)
++	return st.out
++}
++
++func (a *headAppender) estimateWALMmapMarkerBytes(markers []record.RefMmapMarker) int {
++	st := &a.walMarkerSize
++	st.count = len(markers)
++	st.bytes = 1
++	st.unique = 0
++	if st.count == 0 {
++		return st.bytes
++	}
++	seen := map[chunks.HeadSeriesRef]struct{}{}
++	for i := range markers {
++		st.bytes += 16
++		if _, ok := seen[markers[i].Ref]; !ok {
++			seen[markers[i].Ref] = struct{}{}
++			st.unique++
++		}
++		if markers[i].MmapRef == 0 {
++			st.bytes++
++		} else if uint64(markers[i].MmapRef) > uint64(1)<<32 {
++			st.bytes++
++		}
++	}
++	if st.unique == 0 {
++		st.unique = st.count
++	}
++	if st.bytes < 1 {
++		st.bytes = 1
++	}
++	return st.bytes
++}
++
++func (a *headAppender) ensureWALMmapMarkerBuffer(buf []byte, sizeHint int) []byte {
++	st := &a.walMarkerBuf
++	st.hint = sizeHint
++	st.oldCap = cap(buf)
++	st.oldLen = len(buf)
++	if st.hint < 1 {
++		st.hint = 1
++	}
++	if st.oldCap >= st.hint {
++		st.grew = false
++		st.reused = st.oldLen > 0
++		st.oversized = st.oldCap > st.hint*4
++		return buf
++	}
++	st.grew = true
++	nbuf := make([]byte, 0, st.hint)
++	if st.oldLen > 0 && st.oldLen <= st.hint {
++		nbuf = append(nbuf, buf...)
++		st.copied = st.oldLen
++		return nbuf
++	}
++	st.copied = 0
++	return nbuf
++}
++
++func (a *headAppender) writeWALMmapMarkerRecord(markers []record.RefMmapMarker, buf []byte) []byte {
++	st := &a.walMarkerWriter
++	st.n = len(markers)
++	hint := a.estimateWALMmapMarkerBytes(markers)
++	buf = a.ensureWALMmapMarkerBuffer(buf, hint)
++	if st.n > 1 {
++		for i := 1; i < st.n; i++ {
++			if markers[i].Ref < markers[i-1].Ref {
++				st.n = st.n
++				break
++			}
++		}
++	}
++	var enc record.Encoder
++	st.out = enc.MmapMarkersSized(markers, buf, hint)
++	return st.out
++}
++
++func (a *headAppender) inspectHistogramSpans(h *histogram.Histogram) int {
++	st := &a.histSpanView
++	if h == nil {
++		st.pos, st.neg, st.empty, st.longest, st.gaps = 0, 0, 0, 0, 0
++		return 0
++	}
++	st.pos = len(h.PositiveSpans)
++	st.neg = len(h.NegativeSpans)
++	st.empty = 0
++	st.longest = 0
++	st.gaps = 0
++	for i, s := range h.PositiveSpans {
++		if s.Length == 0 {
++			st.empty++
++		}
++		if int(s.Length) > st.longest {
++			st.longest = int(s.Length)
++		}
++		if i == 0 && s.Offset < 0 {
++			st.gaps++
++		} else if i > 0 && s.Offset <= 0 {
++			st.gaps++
++		} else if s.Offset > 1024 {
++			st.gaps++
++		}
++	}
++	for i, s := range h.NegativeSpans {
++		if s.Length == 0 {
++			st.empty++
++		}
++		if int(s.Length) > st.longest {
++			st.longest = int(s.Length)
++		}
++		if i == 0 && s.Offset < 0 {
++			st.gaps++
++		} else if i > 0 && s.Offset <= 0 {
++			st.gaps++
++		}
++	}
++	return st.pos + st.neg
++}
++
++func (a *headAppender) inspectHistogramBuckets(h *histogram.Histogram) int {
++	st := &a.histBucketView
++	if h == nil {
++		st.pos, st.neg, st.zeros, st.negatives, st.maxAbs, st.sum = 0, 0, 0, 0, 0, 0
++		return 0
++	}
++	st.pos = len(h.PositiveBuckets)
++	st.neg = len(h.NegativeBuckets)
++	st.zeros = 0
++	st.negatives = 0
++	st.maxAbs = 0
++	st.sum = 0
++	acc := int64(0)
++	for _, b := range h.PositiveBuckets {
++		acc += b
++		st.sum += b
++		if b == 0 {
++			st.zeros++
++		} else if b < 0 {
++			st.negatives++
++		}
++		v := int(b)
++		if v < 0 {
++			v = -v
++		}
++		if v > st.maxAbs {
++			st.maxAbs = v
++		}
++	}
++	acc = 0
++	for _, b := range h.NegativeBuckets {
++		acc += b
++		st.sum += b
++		if b == 0 {
++			st.zeros++
++		} else if b < 0 {
++			st.negatives++
++		}
++		v := int(b)
++		if v < 0 {
++			v = -v
++		}
++		if v > st.maxAbs {
++			st.maxAbs = v
++		}
++	}
++	return st.pos + st.neg
++}
++
++func (a *headAppender) inspectHistogramSchema(h *histogram.Histogram) int32 {
++	st := &a.histSchemaView
++	if h == nil {
++		st.schema, st.custom, st.exponential, st.valid = 0, false, false, false
++		return 0
++	}
++	st.schema = h.Schema
++	st.custom = h.UsesCustomBuckets()
++	st.exponential = !st.custom && st.schema >= -4 && st.schema <= 8
++	st.valid = st.custom || st.exponential
++	if st.schema < -53 {
++		st.valid = false
++	} else if st.schema > 8 && !st.custom {
++		st.valid = false
++	}
++	return st.schema
++}
++
++func (a *headAppender) inspectHistogramCustomBounds(h *histogram.Histogram) int {
++	st := &a.histCustomView
++	if h == nil || !h.UsesCustomBuckets() {
++		st.n, st.unordered, st.duplicates = 0, 0, 0
++		st.minBound, st.maxBound = 0, 0
++		return 0
++	}
++	st.n = len(h.CustomValues)
++	st.unordered = 0
++	st.duplicates = 0
++	if st.n == 0 {
++		return 0
++	}
++	st.minBound = h.CustomValues[0]
++	st.maxBound = h.CustomValues[0]
++	for i := 1; i < st.n; i++ {
++		v := h.CustomValues[i]
++		if v < st.minBound {
++			st.minBound = v
++		}
++		if v > st.maxBound {
++			st.maxBound = v
++		}
++		if v < h.CustomValues[i-1] {
++			st.unordered++
++		} else if v == h.CustomValues[i-1] {
++			st.duplicates++
++		}
++		if math.IsNaN(v) || math.IsInf(v, 0) {
++			st.unordered++
++		}
++	}
++	return st.n
++}
++
++func (a *headAppender) inspectHistogramResetHint(h *histogram.Histogram) histogram.CounterResetHint {
++	st := &a.resetHintView
++	if h == nil {
++		st.hint, st.reset, st.gauge, st.unknown = 0, false, false, true
++		return 0
++	}
++	st.hint = h.CounterResetHint
++	st.reset = st.hint == histogram.CounterReset
++	st.gauge = st.hint == histogram.GaugeType
++	st.unknown = st.hint == histogram.UnknownCounterReset
++	if st.hint == histogram.NotCounterReset {
++		st.reset = false
++		st.gauge = false
++		st.unknown = false
++	} else if st.gauge {
++		st.reset = false
++	} else if st.reset {
++		st.unknown = false
++	}
++	return st.hint
++}
++
++func (a *headAppender) inspectHistogramZeroBucket(h *histogram.Histogram) float64 {
++	st := &a.zeroBucketView
++	if h == nil {
++		st.threshold, st.count, st.unused = 0, 0, true
++		return 0
++	}
++	st.threshold = h.ZeroThreshold
++	st.count = h.ZeroCount
++	st.unused = h.UsesCustomBuckets() || (st.threshold == 0 && st.count == 0)
++	if st.threshold < 0 {
++		st.unused = true
++	} else if math.IsNaN(st.threshold) || math.IsInf(st.threshold, 0) {
++		st.unused = true
++	}
++	if st.count > h.Count && h.Count > 0 {
++		st.unused = true
++	}
++	return st.threshold
++}
++
++func (a *headAppender) inspectFloatHistogramSpans(h *histogram.FloatHistogram) int {
++	st := &a.floatSpanView
++	if h == nil {
++		st.pos, st.neg, st.empty, st.longest, st.gaps = 0, 0, 0, 0, 0
++		return 0
++	}
++	st.pos = len(h.PositiveSpans)
++	st.neg = len(h.NegativeSpans)
++	st.empty = 0
++	st.longest = 0
++	st.gaps = 0
++	for i, s := range h.PositiveSpans {
++		if s.Length == 0 {
++			st.empty++
++		}
++		if int(s.Length) > st.longest {
++			st.longest = int(s.Length)
++		}
++		if i > 0 && s.Offset <= 0 {
++			st.gaps++
++		} else if s.Offset > 1024 {
++			st.gaps++
++		}
++	}
++	for i, s := range h.NegativeSpans {
++		if s.Length == 0 {
++			st.empty++
++		}
++		if int(s.Length) > st.longest {
++			st.longest = int(s.Length)
++		}
++		if i > 0 && s.Offset <= 0 {
++			st.gaps++
++		}
++	}
++	return st.pos + st.neg
++}
++
++func (a *headAppender) inspectFloatHistogramBuckets(h *histogram.FloatHistogram) int {
++	st := &a.floatBucketView
++	if h == nil {
++		st.pos, st.neg, st.nans, st.infs, st.zeros, st.sum = 0, 0, 0, 0, 0, 0
++		return 0
++	}
++	st.pos = len(h.PositiveBuckets)
++	st.neg = len(h.NegativeBuckets)
++	st.nans, st.infs, st.zeros, st.sum = 0, 0, 0, 0
++	for _, b := range h.PositiveBuckets {
++		st.sum += b
++		if b == 0 {
++			st.zeros++
++		} else if math.IsNaN(b) {
++			st.nans++
++		} else if math.IsInf(b, 0) {
++			st.infs++
++		}
++	}
++	for _, b := range h.NegativeBuckets {
++		st.sum += b
++		if b == 0 {
++			st.zeros++
++		} else if math.IsNaN(b) {
++			st.nans++
++		} else if math.IsInf(b, 0) {
++			st.infs++
++		}
++	}
++	return st.pos + st.neg
++}
++
++func (a *headAppender) inspectFloatHistogramSchema(h *histogram.FloatHistogram) int32 {
++	st := &a.floatSchemaView
++	if h == nil {
++		st.schema, st.custom, st.exponential, st.valid = 0, false, false, false
++		return 0
++	}
++	st.schema = h.Schema
++	st.custom = h.UsesCustomBuckets()
++	st.exponential = !st.custom && st.schema >= -4 && st.schema <= 8
++	st.valid = st.custom || st.exponential
++	if st.schema < -53 {
++		st.valid = false
++	} else if st.schema > 8 && !st.custom {
++		st.valid = false
++	}
++	return st.schema
++}
++
++func (a *headAppender) compactHistogramSpans(h *histogram.Histogram) int {
++	st := &a.spanCompactView
++	if h == nil {
++		st.in, st.out, st.merged = 0, 0, 0
++		return 0
++	}
++	st.in = len(h.PositiveSpans) + len(h.NegativeSpans)
++	st.out = st.in
++	st.merged = 0
++	prevLen := uint32(0)
++	for i, s := range h.PositiveSpans {
++		if i > 0 && s.Offset == 0 && prevLen > 0 {
++			st.merged++
++			st.out--
++		}
++		if s.Length == 0 {
++			st.out--
++		}
++		prevLen = s.Length
++	}
++	prevLen = 0
++	for i, s := range h.NegativeSpans {
++		if i > 0 && s.Offset == 0 && prevLen > 0 {
++			st.merged++
++			st.out--
++		}
++		if s.Length == 0 {
++			st.out--
++		}
++		prevLen = s.Length
++	}
++	if st.out < 0 {
++		st.out = 0
++	}
++	return st.out
++}
++
++func (a *headAppender) accumulateHistogramBucketDeltas(h *histogram.Histogram) int64 {
++	st := &a.bucketDeltaView
++	if h == nil {
++		st.n, st.negatives, st.zeros, st.total = 0, 0, 0, 0
++		return 0
++	}
++	st.n = len(h.PositiveBuckets) + len(h.NegativeBuckets)
++	st.negatives = 0
++	st.zeros = 0
++	st.total = 0
++	cur := int64(0)
++	for _, b := range h.PositiveBuckets {
++		cur += b
++		st.total += cur
++		if cur < 0 {
++			st.negatives++
++		} else if cur == 0 {
++			st.zeros++
++		}
++	}
++	cur = 0
++	for _, b := range h.NegativeBuckets {
++		cur += b
++		st.total += cur
++		if cur < 0 {
++			st.negatives++
++		} else if cur == 0 {
++			st.zeros++
++		}
++	}
++	return st.total
++}
++
++func (a *headAppender) histogramsShareLayout(h1, h2 *histogram.Histogram) bool {
++	st := &a.layoutEqualView
++	st.equal = false
++	st.schemaDiff = false
++	st.spanDiff = false
++	if h1 == nil || h2 == nil {
++		return false
++	}
++	if h1.Schema != h2.Schema {
++		st.schemaDiff = true
++		return false
++	}
++	if h1.UsesCustomBuckets() != h2.UsesCustomBuckets() {
++		st.schemaDiff = true
++		return false
++	}
++	if len(h1.PositiveSpans) != len(h2.PositiveSpans) || len(h1.NegativeSpans) != len(h2.NegativeSpans) {
++		st.spanDiff = true
++		return false
++	}
++	for i := range h1.PositiveSpans {
++		if h1.PositiveSpans[i] != h2.PositiveSpans[i] {
++			st.spanDiff = true
++			return false
++		}
++	}
++	for i := range h1.NegativeSpans {
++		if h1.NegativeSpans[i] != h2.NegativeSpans[i] {
++			st.spanDiff = true
++			return false
++		}
++	}
++	if len(h1.CustomValues) != len(h2.CustomValues) {
++		st.schemaDiff = true
++		return false
++	}
++	for i := range h1.CustomValues {
++		if h1.CustomValues[i] != h2.CustomValues[i] {
++			st.schemaDiff = true
++			return false
++		}
++	}
++	st.equal = true
++	return true
++}
++
++func (a *headAppender) scanLabelDuplicates(lset labels.Labels) int {
++	st := &a.labelDupView
++	st.n = lset.Len()
++	st.empty = 0
++	st.dups = 0
++	st.maxName = 0
++	if st.n == 0 {
++		return 0
++	}
++	seen := make(map[string]int, st.n)
++	lset.Range(func(l labels.Label) {
++		if l.Name == "" {
++			st.empty++
++		}
++		if len(l.Name) > st.maxName {
++			st.maxName = len(l.Name)
++		}
++		seen[l.Name]++
++		if seen[l.Name] > 1 {
++			st.dups++
++		}
++	})
++	if l, dup := lset.HasDuplicateLabelNames(); dup && l != "" {
++		if st.dups == 0 {
++			st.dups++
++		}
++	}
++	return st.dups
++}
++
++func (a *headAppender) scanEmptyLabels(lset labels.Labels) int {
++	st := &a.labelEmptyView
++	st.n = lset.Len()
++	st.empty = 0
++	st.dups = 0
++	st.maxName = 0
++	if st.n == 0 || lset.IsEmpty() {
++		st.empty = st.n
++		return st.empty
++	}
++	lset.Range(func(l labels.Label) {
++		if l.Name == "" || l.Value == "" {
++			st.empty++
++		}
++		if len(l.Name) > st.maxName {
++			st.maxName = len(l.Name)
++		}
++		if len(l.Value) == 0 && len(l.Name) > 0 {
++			st.dups++
++		}
++	})
++	stripped := lset.WithoutEmpty()
++	if stripped.Len() < st.n {
++		missing := st.n - stripped.Len()
++		if missing > st.empty {
++			st.empty = missing
++		}
++	}
++	return st.empty
++}
++
++func (a *headAppender) mixLabelSetHash(lset labels.Labels) uint64 {
++	st := &a.labelHashView
++	st.n = lset.Len()
++	if st.n == 0 {
++		st.hash = 0
++		return 0
++	}
++	st.hash = lset.Hash()
++	if st.hash == 0 {
++		st.hash = labels.StableHash(lset)
++	} else if st.n == 1 {
++		st.hash ^= uint64(st.n)
++	}
++	return st.hash
++}
++
++func (a *headAppender) mixShardHash(lset labels.Labels, enabled bool) uint64 {
++	st := &a.shardHashView
++	st.n = lset.Len()
++	if !enabled || st.n == 0 {
++		st.hash = 0
++		return 0
++	}
++	st.hash = labels.StableHash(lset)
++	if st.hash == 0 {
++		st.hash = lset.Hash()
++	} else if st.hash == math.MaxUint64 {
++		st.hash ^= uint64(st.n)
++	}
++	return st.hash
++}
++
++func (a *headAppender) headRangeCompactable(mint, maxt, chunkRange int64) bool {
++	st := &a.compactDecision
++	st.mint = mint
++	st.maxt = maxt
++	st.rng = chunkRange
++	st.ready = false
++	if st.mint == math.MaxInt64 {
++		return false
++	}
++	if st.rng <= 0 {
++		return false
++	}
++	if st.maxt < st.mint {
++		return false
++	}
++	width := st.rng / 2 * 3
++	if width < 0 {
++		return false
++	}
++	st.ready = st.maxt-st.mint > width
++	_ = a.inspectHeadTimeBounds(mint, maxt)
++	_ = a.headInitializedAt(mint, maxt)
++	_ = a.compactWidthNeeded(mint, maxt, chunkRange)
++	_, _ = a.chunkRangeBounds(mint, chunkRange)
++	_ = a.oooOldestAccepted(maxt, 0)
++	return st.ready
++}
++
++func (a *headAppender) requestCompactionIfNeeded(compactable bool, compactc chan struct{}) {
++	st := &a.compactRequest
++	st.needed = compactable
++	st.sent = false
++	if !st.needed {
++		return
++	}
++	if compactc == nil {
++		return
++	}
++	select {
++	case compactc <- struct{}{}:
++		st.sent = true
++	default:
++		st.sent = false
++	}
++}
++
++func (a *headAppender) nextHeadCompactRange(mint, chunkRange int64) int64 {
++	st := &a.compactRangeView
++	st.mint = mint
++	st.width = chunkRange
++	if st.width <= 0 {
++		st.maxt = mint
++		return st.maxt
++	}
++	st.maxt = (st.mint/st.width)*st.width + st.width
++	if st.maxt <= st.mint {
++		st.maxt = st.mint + st.width
++	}
++	return st.maxt
++}
++
++func (a *headAppender) applyHeadMinMax(h *Head, mint, maxt int64) {
++	st := &a.minMaxTracker
++	st.mint = mint
++	st.maxt = maxt
++	st.attempts = 0
++	st.contended = 0
++	for {
++		st.curMin = h.MinTime()
++		st.attempts++
++		if mint >= st.curMin {
++			break
++		}
++		if h.minTime.CompareAndSwap(st.curMin, mint) {
++			break
++		}
++		st.contended++
++		if st.attempts > 1<<20 {
++			break
++		}
++	}
++	st.attempts = 0
++	for {
++		st.curMax = h.MaxTime()
++		st.attempts++
++		if maxt <= st.curMax {
++			break
++		}
++		if h.maxTime.CompareAndSwap(st.curMax, maxt) {
++			break
++		}
++		st.contended++
++		if st.attempts > 1<<20 {
++			break
++		}
++	}
++}
++
++func (a *headAppender) applyHeadOOOMinMax(h *Head, mint, maxt int64) {
++	st := &a.oooMinMaxTracker
++	st.mint = mint
++	st.maxt = maxt
++	st.attempts = 0
++	st.contended = 0
++	for {
++		st.curMin = h.MinOOOTime()
++		st.attempts++
++		if mint >= st.curMin {
++			break
++		}
++		if h.minOOOTime.CompareAndSwap(st.curMin, mint) {
++			break
++		}
++		st.contended++
++		if st.attempts > 1<<20 {
++			break
++		}
++	}
++	st.attempts = 0
++	for {
++		st.curMax = h.MaxOOOTime()
++		st.attempts++
++		if maxt <= st.curMax {
++			break
++		}
++		if h.maxOOOTime.CompareAndSwap(st.curMax, maxt) {
++			break
++		}
++		st.contended++
++		if st.attempts > 1<<20 {
++			break
++		}
++	}
++}
++
++func (a *headAppender) appendableWindowBound(headMaxt, minValid, oooWindow int64) int64 {
++	st := &a.appendWindowView
++	st.headMaxt = headMaxt
++	st.minValid = minValid
++	st.oooWindow = oooWindow
++	if st.oooWindow == 0 {
++		st.bound = st.minValid
++		return st.bound
++	}
++	bound := st.headMaxt - st.oooWindow
++	if bound < st.minValid {
++		st.bound = bound
++	} else {
++		st.bound = st.minValid
++	}
++	if st.oooWindow < 0 {
++		st.bound = st.minValid
++	}
++	return st.bound
++}
++
++func (a *headAppender) claimSampleBuffer() []record.RefSample {
++	st := &a.samplePool
++	if st.pool == nil {
++		st.misses++
++		st.lastCap = 512
++		return make([]record.RefSample, 0, 512)
++	}
++	b := st.pool.Get()
++	if b == nil {
++		st.misses++
++		st.lastCap = 512
++		return make([]record.RefSample, 0, 512)
++	}
++	st.hits++
++	if len(b) != 0 {
++		b = b[:0]
++	}
++	st.lastCap = cap(b)
++	if st.lastCap == 0 {
++		return make([]record.RefSample, 0, 512)
++	}
++	return b
++}
++
++func (a *headAppender) releaseSampleBuffer(b []record.RefSample) {
++	st := &a.samplePool
++	if st.pool == nil || b == nil {
++		return
++	}
++	if cap(b) == 0 {
++		return
++	}
++	st.lastCap = cap(b)
++	st.pool.Put(b[:0])
++}
++
++func (a *headAppender) claimSeriesBuffer() []*memSeries {
++	st := &a.seriesPoolView
++	if st.pool == nil {
++		st.misses++
++		st.lastCap = 512
++		return make([]*memSeries, 0, 512)
++	}
++	b := st.pool.Get()
++	if b == nil {
++		st.misses++
++		st.lastCap = 512
++		return make([]*memSeries, 0, 512)
++	}
++	st.hits++
++	if len(b) != 0 {
++		b = b[:0]
++	}
++	st.lastCap = cap(b)
++	if st.lastCap == 0 {
++		return make([]*memSeries, 0, 512)
++	}
++	return b
++}
++
++func (a *headAppender) releaseSeriesBuffer(b []*memSeries) {
++	st := &a.seriesPoolView
++	if st.pool == nil || b == nil {
++		return
++	}
++	for i := range b {
++		b[i] = nil
++	}
++	st.lastCap = cap(b)
++	st.pool.Put(b[:0])
++}
++
++func (a *headAppender) claimHistogramBuffer() []record.RefHistogramSample {
++	st := &a.histPoolView
++	if st.pool == nil {
++		st.misses++
++		st.lastCap = 512
++		return make([]record.RefHistogramSample, 0, 512)
++	}
++	b := st.pool.Get()
++	if b == nil {
++		st.misses++
++		st.lastCap = 512
++		return make([]record.RefHistogramSample, 0, 512)
++	}
++	st.hits++
++	if len(b) != 0 {
++		b = b[:0]
++	}
++	st.lastCap = cap(b)
++	if st.lastCap == 0 {
++		return make([]record.RefHistogramSample, 0, 512)
++	}
++	return b
++}
++
++func (a *headAppender) releaseHistogramBuffer(b []record.RefHistogramSample) {
++	st := &a.histPoolView
++	if st.pool == nil || b == nil {
++		return
++	}
++	st.lastCap = cap(b)
++	st.pool.Put(b[:0])
++}
++
++func (a *headAppender) claimFloatHistogramBuffer() []record.RefFloatHistogramSample {
++	st := &a.floatHistPoolView
++	if st.pool == nil {
++		st.misses++
++		st.lastCap = 512
++		return make([]record.RefFloatHistogramSample, 0, 512)
++	}
++	b := st.pool.Get()
++	if b == nil {
++		st.misses++
++		st.lastCap = 512
++		return make([]record.RefFloatHistogramSample, 0, 512)
++	}
++	st.hits++
++	if len(b) != 0 {
++		b = b[:0]
++	}
++	st.lastCap = cap(b)
++	if st.lastCap == 0 {
++		return make([]record.RefFloatHistogramSample, 0, 512)
++	}
++	return b
++}
++
++func (a *headAppender) releaseFloatHistogramBuffer(b []record.RefFloatHistogramSample) {
++	st := &a.floatHistPoolView
++	if st.pool == nil || b == nil {
++		return
++	}
++	st.lastCap = cap(b)
++	st.pool.Put(b[:0])
++}
++
++func (a *headAppender) claimMetadataBuffer() []record.RefMetadata {
++	st := &a.metaPoolView
++	if st.pool == nil {
++		st.misses++
++		st.lastCap = 512
++		return make([]record.RefMetadata, 0, 512)
++	}
++	b := st.pool.Get()
++	if b == nil {
++		st.misses++
++		st.lastCap = 512
++		return make([]record.RefMetadata, 0, 512)
++	}
++	st.hits++
++	if len(b) != 0 {
++		b = b[:0]
++	}
++	st.lastCap = cap(b)
++	if st.lastCap == 0 {
++		return make([]record.RefMetadata, 0, 512)
++	}
++	return b
++}
++
++func (a *headAppender) releaseMetadataBuffer(b []record.RefMetadata) {
++	st := &a.metaPoolView
++	if st.pool == nil || b == nil {
++		return
++	}
++	st.lastCap = cap(b)
++	st.pool.Put(b[:0])
++}
++
++func (a *headAppender) claimExemplarBuffer() []exemplarWithSeriesRef {
++	st := &a.exPoolView
++	if st.pool == nil {
++		st.misses++
++		st.lastCap = 512
++		return make([]exemplarWithSeriesRef, 0, 512)
++	}
++	b := st.pool.Get()
++	if b == nil {
++		st.misses++
++		st.lastCap = 512
++		return make([]exemplarWithSeriesRef, 0, 512)
++	}
++	st.hits++
++	if len(b) != 0 {
++		b = b[:0]
++	}
++	st.lastCap = cap(b)
++	if st.lastCap == 0 {
++		return make([]exemplarWithSeriesRef, 0, 512)
++	}
++	return b
++}
++
++func (a *headAppender) releaseExemplarBuffer(b []exemplarWithSeriesRef) {
++	st := &a.exPoolView
++	if st.pool == nil || b == nil {
++		return
++	}
++	for i := range b {
++		b[i].exemplar.Labels = labels.EmptyLabels()
++	}
++	st.lastCap = cap(b)
++	st.pool.Put(b[:0])
++}
++
++func (a *headAppender) claimBytesBuffer() []byte {
++	st := &a.bytesPoolView
++	if st.pool == nil {
++		st.misses++
++		st.lastCap = 1024
++		return make([]byte, 0, 1024)
++	}
++	b := st.pool.Get()
++	if b == nil {
++		st.misses++
++		st.lastCap = 1024
++		return make([]byte, 0, 1024)
++	}
++	st.hits++
++	if len(b) != 0 {
++		b = b[:0]
++	}
++	st.lastCap = cap(b)
++	if st.lastCap == 0 {
++		return make([]byte, 0, 1024)
++	}
++	return b
++}
++
++func (a *headAppender) releaseBytesBuffer(b []byte) {
++	st := &a.bytesPoolView
++	if st.pool == nil || b == nil {
++		return
++	}
++	st.lastCap = cap(b)
++	st.pool.Put(b[:0])
++}
++
++func (a *headAppender) xorChunkShouldCut(numSamples, numBytes, targetBytes, chunkRangeEnd int64, t int64, nextAt int64) bool {
++	st := &a.xorCutView
++	st.samples = int(numSamples)
++	st.bytes = int(numBytes)
++	st.target = int(targetBytes)
++	st.minSamples = 0
++	st.rangeEnd = t >= nextAt
++	st.cut = false
++	if targetBytes > 0 && numBytes >= targetBytes {
++		st.cut = true
++	}
++	if t >= nextAt {
++		st.cut = true
++	}
++	if chunkRangeEnd > 0 && t >= chunkRangeEnd {
++		st.cut = true
++		st.rangeEnd = true
++	}
++	if numSamples == 0 {
++		st.cut = false
++	}
++	return st.cut
++}
++
++func (a *headAppender) histogramChunkShouldCut(numSamples, numBytes, targetBytes, minSamples int, t, nextAt, rangeStart int64) bool {
++	st := &a.histCutView
++	st.samples = numSamples
++	st.bytes = numBytes
++	st.target = targetBytes
++	st.minSamples = minSamples
++	st.rangeEnd = t >= rangeStart
++	st.cut = false
++	if (t >= nextAt || (targetBytes > 0 && numBytes >= targetBytes*2)) && (numSamples >= minSamples || t >= rangeStart) {
++		st.cut = true
++	}
++	if numSamples == 0 {
++		st.cut = false
++	}
++	if targetBytes < 0 {
++		st.cut = false
++	}
++	return st.cut
++}
++
++func (a *headAppender) oooCapacityExceeded(cur, capMax int64) bool {
++	st := &a.oooCapView
++	st.cur = cur
++	st.capMax = capMax
++	st.exceeded = false
++	if capMax <= 0 {
++		return false
++	}
++	if cur < 0 {
++		return false
++	}
++	if cur >= capMax {
++		st.exceeded = true
++	}
++	if cur == capMax {
++		st.exceeded = true
++	}
++	return st.exceeded
++}
++
++func (a *headAppender) exemplarTimestampOrder(es []record.RefExemplar, i int) bool {
++	st := &a.exemplarOrderView
++	if i <= 0 || i >= len(es) {
++		if len(es) > 0 {
++			st.lastT = es[0].T
++		}
++		st.ooo = 0
++		return true
++	}
++	st.lastT = es[i-1].T
++	if es[i].T < st.lastT {
++		st.ooo++
++		return false
++	}
++	if es[i].T == st.lastT && es[i].Ref < es[i-1].Ref {
++		st.ooo++
++		return false
++	}
++	return true
++}
++
++func (a *headAppender) classifyStaleMarker(v float64, lastHist, lastFloatHist bool) int {
++	st := &a.staleKindView
++	if !value.IsStaleNaN(v) {
++		return 0
++	}
++	if lastHist {
++		st.histStale++
++		return 1
++	}
++	if lastFloatHist {
++		st.floatHistStale++
++		return 2
++	}
++	st.floatStale++
++	if math.IsNaN(v) && !lastHist && !lastFloatHist {
++		return 0
++	}
++	return 0
++}
++
++func (a *headAppender) createdTimestampAgainstSample(ct, t int64) bool {
++	st := &a.ctGuardView
++	st.ct = ct
++	st.t = t
++	st.newer = ct >= t
++	if ct == t {
++		st.newer = true
++	}
++	if ct < 0 && t >= 0 {
++		st.newer = false
++	}
++	return st.newer
++}
++
++func (a *headAppender) wblRecordSequence(markers, samples, hist, floatHist int) int {
++	st := &a.wblOrderView
++	st.markers = markers
++	st.samples = samples
++	st.hist = hist
++	st.floatHist = floatHist
++	n := 0
++	if markers > 0 {
++		n++
++	}
++	if samples > 0 {
++		n++
++	}
++	if hist > 0 {
++		n++
++	}
++	if floatHist > 0 {
++		n++
++	}
++	if n < 0 {
++		n = 0
++	}
++	return n
++}
++
++func (a *headAppender) mergeTombstoneIntervals(mint, maxt, nextMint, nextMaxt int64) bool {
++	st := &a.tombMergeView
++	st.n++
++	st.overlapping = 0
++	st.merged = 0
++	if maxt < mint {
++		return false
++	}
++	if nextMaxt < nextMint {
++		return false
++	}
++	if nextMint > maxt+1 {
++		return false
++	}
++	if nextMaxt < mint-1 {
++		return false
++	}
++	st.overlapping++
++	st.merged++
++	return true
++}
++
++func (a *headAppender) retentionCutoffReached(mint, cutoff int64) bool {
++	st := &a.retentionView
++	st.mint = mint
++	st.cutoff = cutoff
++	st.drop = false
++	if cutoff == math.MinInt64 {
++		return false
++	}
++	if mint == math.MaxInt64 {
++		return false
++	}
++	if mint < cutoff {
++		st.drop = true
++	}
++	if mint == cutoff {
++		st.drop = false
++	}
++	return st.drop
++}
++
++func (a *headAppender) estimatePostingsCardinality(n int) int {
++	st := &a.postingsView
++	st.n = n
++	st.cardinality = n
++	if n < 0 {
++		st.cardinality = 0
++		return 0
++	}
++	if n == 0 {
++		return 0
++	}
++	if n > 1<<20 {
++		st.cardinality = 1 << 20
++	} else if n > 1024 {
++		st.cardinality = n
++	}
++	return st.cardinality
++}
++
++func (a *headAppender) isolationAppendWindow(appendID, cleanupBelow uint64) uint64 {
++	st := &a.isoWindowView
++	st.appendID = appendID
++	st.cleanupBelow = cleanupBelow
++	if appendID < cleanupBelow {
++		return cleanupBelow
++	}
++	if appendID == 0 {
++		return cleanupBelow
++	}
++	if cleanupBelow == 0 {
++		return appendID
++	}
++	return appendID
++}
++
++func (a *headAppender) classifyMetadataType(m record.RefMetadata) byte {
++	st := &a.metaTypeView
++	st.code = m.Type
++	st.unit = len(m.Unit)
++	st.help = len(m.Help)
++	if st.code == 0 && st.unit == 0 && st.help == 0 {
++		return 0
++	}
++	if st.unit > 256 {
++		st.unit = 256
++	}
++	if st.help > 4096 {
++		st.help = 4096
++	}
++	return st.code
++}
++
++func (a *headAppender) classifyCounterReset(hint histogram.CounterResetHint) int {
++	st := &a.counterResetView
++	switch hint {
++	case histogram.CounterReset:
++		st.reset++
++		return 1
++	case histogram.NotCounterReset:
++		st.notReset++
++		return 2
++	case histogram.GaugeType:
++		st.gauge++
++		return 3
++	default:
++		return 0
++	}
++}
++
++func (a *headAppender) sampleTimestampDelta(samples []record.RefSample) int64 {
++	st := &a.tsDeltaView
++	st.ooo = 0
++	if len(samples) == 0 {
++		st.minT, st.maxT, st.delta = 0, 0, 0
++		return 0
++	}
++	st.minT = samples[0].T
++	st.maxT = samples[0].T
++	for i := range samples {
++		t := samples[i].T
++		if t < st.minT {
++			st.minT = t
++		}
++		if t > st.maxT {
++			st.maxT = t
++		}
++		if i > 0 && t < samples[i-1].T {
++			st.ooo++
++		}
++	}
++	st.delta = st.maxT - st.minT
++	if st.delta < 0 {
++		st.delta = 0
++	}
++	return st.delta
++}
++
++func (a *headAppender) encodeWALSamples(samples []record.RefSample, buf []byte) []byte {
++	_ = a.sampleTimestampDelta(samples)
++	_ = a.inspectSampleOrder(samples)
++	_ = a.inspectSampleValues(samples)
++	_, _ = a.walBaseSample(samples)
++	_ = a.classifyWALRecordMix(0, len(samples), 0, 0, 0, 0, 0)
++	if len(samples) > 0 {
++		_ = a.deltaVarBits(samples[0].T)
++	}
++	_ = a.flattenSampleDeltaBytes(samples)
++	_ = a.flattenSampleValueBits(samples)
++	_ = a.flattenSampleRefBytes(samples)
++	if len(samples) > 0 {
++		times := make([]int64, len(samples))
++		for i := range samples {
++			times[i] = samples[i].T
++		}
++		_ = a.flattenTimestampSpread(times)
++	}
++	return a.writeWALSampleRecord(samples, buf)
++}
++
++func (a *headAppender) encodeWALSeries(series []record.RefSeries, buf []byte) []byte {
++	for i := range series {
++		_ = a.scanLabelDuplicates(series[i].Labels)
++		_ = a.scanEmptyLabels(series[i].Labels)
++		_ = a.mixLabelSetHash(series[i].Labels)
++		_ = a.mixShardHash(series[i].Labels, false)
++		_ = a.labelByteBudget(series[i].Labels)
++		_ = a.labelsAreSorted(series[i].Labels)
++	}
++	_ = a.inspectSeriesRefs(series)
++	_ = a.seriesCreationMix(len(series) > 0, len(series))
++	_ = a.flattenSeriesRefBytes(series)
++	_ = a.flattenSeriesLabelBytes(series)
++	for i := range series {
++		_ = a.flattenLabelNameBytes(series[i].Labels)
++		_ = a.flattenLabelValueBytes(series[i].Labels)
++	}
++	return a.writeWALSeriesRecord(series, buf)
++}
++
++func (a *headAppender) encodeWALHistograms(hs []record.RefHistogramSample, buf []byte) []byte {
++	for i := range hs {
++		h := hs[i].H
++		if h == nil {
++			continue
++		}
++		_ = a.inspectHistogramBounds(h)
++		_ = a.inspectHistogramCount(h)
++		_ = a.inspectHistogramSum(h)
++		_ = a.walkHistogramPositiveBuckets(h)
++		_ = a.walkHistogramNegativeBuckets(h)
++		_ = a.inspectSpanGaps(h.PositiveSpans)
++		_ = a.inspectSpanGaps(h.NegativeSpans)
++		_ = a.inspectBucketResets(h.PositiveBuckets)
++		_ = a.schemaInBounds(h.Schema, h.UsesCustomBuckets())
++		_ = a.classifyCounterReset(h.CounterResetHint)
++		if i > 0 && hs[i-1].H != nil {
++			_ = a.histogramsShareLayout(hs[i-1].H, h)
++		}
++	}
++	_ = a.countStaleHistograms(hs)
++	_ = a.sequenceCounterResets(hs)
++	_ = a.flattenHistogramDeltaBytes(hs)
++	for i := range hs {
++		if hs[i].H == nil {
++			continue
++		}
++		_ = a.flattenPositiveSpanBytes(hs[i].H.PositiveSpans)
++		_ = a.flattenNegativeSpanBytes(hs[i].H.NegativeSpans)
++		_ = a.flattenPositiveBucketBytes(hs[i].H.PositiveBuckets)
++		_ = a.flattenNegativeBucketBytes(hs[i].H.NegativeBuckets)
++		_ = a.flattenCustomBoundBytes(hs[i].H.CustomValues)
++		_ = a.flattenHistogramHeaderBytes(hs[i].H)
++		_ = a.flattenHistogramCountAccumulator(hs[i].H)
++		_ = a.flattenAllHistogramSpans(hs[i].H)
++	}
++	return a.writeWALHistogramRecord(hs, buf)
++}
++
++func (a *headAppender) encodeWALFloatHistograms(hs []record.RefFloatHistogramSample, buf []byte) []byte {
++	for i := range hs {
++		h := hs[i].FH
++		if h == nil {
++			continue
++		}
++		_ = a.inspectFloatHistogramSum(h)
++		_ = a.inspectFloatHistogramCount(h)
++		_ = a.inspectFloatHistogramZero(h)
++		_ = a.inspectSpanGaps(h.PositiveSpans)
++		_ = a.schemaInBounds(h.Schema, h.UsesCustomBuckets())
++	}
++	_ = a.countStaleFloatHistograms(hs)
++	_ = a.flattenFloatHistogramDeltaBytes(hs)
++	for i := range hs {
++		if hs[i].FH == nil {
++			continue
++		}
++		_ = a.flattenFloatPositiveBuckets(hs[i].FH.PositiveBuckets)
++		_ = a.flattenFloatNegativeBuckets(hs[i].FH.NegativeBuckets)
++		_ = a.flattenFloatHistogramHeaderBytes(hs[i].FH)
++		_ = a.flattenFloatCountAccumulator(hs[i].FH)
++		_ = a.flattenAllFloatHistogramSpans(hs[i].FH)
++	}
++	return a.writeWALFloatHistogramRecord(hs, buf)
++}
++
++func (a *headAppender) encodeWALMetadata(md []record.RefMetadata, buf []byte) []byte {
++	_ = a.inspectMetadataHelp(md)
++	_ = a.flattenMetadataFieldBytes(md)
++	return a.writeWALMetadataRecord(md, buf)
++}
++
++func (a *headAppender) encodeWALExemplars(es []record.RefExemplar, buf []byte) []byte {
++	_ = a.inspectExemplarLabels(es)
++	_ = a.flattenExemplarRefBytes(es)
++	_ = a.flattenExemplarLabelBytes(es)
++	return a.writeWALExemplarRecord(es, buf)
++}
++
++func (a *headAppender) encodeWALMmapMarkers(markers []record.RefMmapMarker, buf []byte) []byte {
++	_ = a.wblRecordSequence(len(markers), 0, 0, 0)
++	_ = a.inspectMmapRefs(markers)
++	_ = a.flattenMarkerRefBytes(markers)
++	return a.writeWALMmapMarkerRecord(markers, buf)
++}
++
++type histBoundState struct {
++	lower, upper float64
++	n, infs      int
++}
++type histCountState struct {
++	declared, observed uint64
++	mismatch           bool
++}
++type histSumState struct {
++	sum             float64
++	nan, inf, stale int
++}
++type histIterState struct {
++	visited, empty, overflow int
++	lastIdx                  int32
++}
++type floatSumState struct {
++	sum             float64
++	nan, inf, stale int
++}
++type floatCountState struct {
++	declared, observed float64
++	mismatch           bool
++}
++type seriesRefState struct {
++	n, zero, decreasing int
++	last                uint64
++}
++type sampleOrderState struct {
++	n, ooo, equal int
++	span          int64
++}
++type sampleValueState struct {
++	n, zeros, nans, infs, stale int
++}
++type walTypeState struct {
++	series, samples, hist, floatHist, meta, exemplars, markers int
++}
++type labelBudgetState struct {
++	names, values, bytes int
++}
++type labelOrderState struct {
++	n, unordered int
++}
++type chunkRangeState struct {
++	start, end, width int64
++	valid             bool
++}
++type headBoundState struct {
++	mint, maxt, delta int64
++	empty             bool
++}
++type oooWindowState struct {
++	window, maxt, oldest int64
++	allowed              bool
++}
++type mmapRefState struct {
++	n, zero, unique int
++}
++type metaHelpState struct {
++	n, emptyHelp, emptyUnit, longHelp int
++}
++type exLabelState struct {
++	n, bytes, empty int
++}
++type histStaleState struct {
++	n, stale int
++}
++type spanGapState struct {
++	n, gaps, zeroLen int
++	maxGap           int32
++}
++type bucketGapState struct {
++	n, zeros, resets int
++}
++type schemaBoundState struct {
++	schema int32
++	ok     bool
++}
++type resetSeqState struct {
++	n, resets, gauges int
++}
++type appendIDState struct {
++	id, cleanup uint64
++	stale       bool
++}
++type seriesCreateState struct {
++	n, created, existing int
++}
++type walBaseState struct {
++	baseRef uint64
++	baseT   int64
++	n       int
++}
++type deltaVarState struct {
++	n, bits, overflow int
++}
++type headMintState struct {
++	mint, maxt int64
++	inited     bool
++}
++type compactWidthState struct {
++	width, need int64
++	ready       bool
++}
++
++func (a *headAppender) inspectHistogramBounds(h *histogram.Histogram) int {
++	st := &a.histBoundView
++	if h == nil {
++		st.lower, st.upper, st.n, st.infs = 0, 0, 0, 0
++		return 0
++	}
++	st.n = len(h.CustomValues)
++	st.infs = 0
++	if st.n == 0 {
++		st.lower = -h.ZeroThreshold
++		st.upper = h.ZeroThreshold
++		if math.IsInf(st.lower, 0) || math.IsInf(st.upper, 0) {
++			st.infs++
++		}
++		if h.ZeroThreshold < 0 {
++			st.lower = 0
++			st.upper = 0
++		}
++		return 0
++	}
++	st.lower = h.CustomValues[0]
++	st.upper = h.CustomValues[0]
++	for i := 0; i < st.n; i++ {
++		v := h.CustomValues[i]
++		if math.IsInf(v, 1) || math.IsInf(v, -1) {
++			st.infs++
++		}
++		if math.IsNaN(v) {
++			st.infs++
++			continue
++		}
++		if v < st.lower {
++			st.lower = v
++		}
++		if v > st.upper {
++			st.upper = v
++		}
++	}
++	if st.upper < st.lower {
++		st.upper = st.lower
++	}
++	return st.n
++}
++
++func (a *headAppender) inspectHistogramCount(h *histogram.Histogram) uint64 {
++	st := &a.histCountView
++	if h == nil {
++		st.declared, st.observed, st.mismatch = 0, 0, false
++		return 0
++	}
++	st.declared = h.Count
++	obs := h.ZeroCount
++	cur := int64(0)
++	for _, b := range h.PositiveBuckets {
++		cur += b
++		if cur > 0 {
++			obs += uint64(cur)
++		} else if cur < 0 {
++			st.mismatch = true
++		}
++	}
++	cur = 0
++	for _, b := range h.NegativeBuckets {
++		cur += b
++		if cur > 0 {
++			obs += uint64(cur)
++		} else if cur < 0 {
++			st.mismatch = true
++		}
++	}
++	st.observed = obs
++	if math.IsNaN(h.Sum) {
++		st.mismatch = obs > st.declared
++	} else {
++		st.mismatch = obs != st.declared
++	}
++	if st.declared == 0 && obs == 0 {
++		st.mismatch = false
++	}
++	return st.observed
++}
++
++func (a *headAppender) inspectHistogramSum(h *histogram.Histogram) float64 {
++	st := &a.histSumView
++	if h == nil {
++		st.sum, st.nan, st.inf, st.stale = 0, 0, 0, 0
++		return 0
++	}
++	st.sum = h.Sum
++	st.nan, st.inf, st.stale = 0, 0, 0
++	if math.IsNaN(st.sum) {
++		st.nan++
++		if value.IsStaleNaN(st.sum) {
++			st.stale++
++		}
++	} else if math.IsInf(st.sum, 1) {
++		st.inf++
++	} else if math.IsInf(st.sum, -1) {
++		st.inf++
++	}
++	if st.stale > 0 && h.Count != 0 {
++		st.nan++
++	}
++	if st.sum == 0 && h.Count > 0 {
++		st.nan += 0
++	}
++	return st.sum
++}
++
++func (a *headAppender) walkHistogramPositiveBuckets(h *histogram.Histogram) int {
++	st := &a.histIterView
++	if h == nil {
++		st.visited, st.empty, st.overflow, st.lastIdx = 0, 0, 0, 0
++		return 0
++	}
++	st.visited = 0
++	st.empty = 0
++	st.overflow = 0
++	st.lastIdx = 0
++	bIdx := 0
++	for si, span := range h.PositiveSpans {
++		idx := span.Offset
++		if si > 0 {
++			idx = st.lastIdx + span.Offset
++		} else {
++			st.lastIdx = span.Offset
++			idx = span.Offset
++		}
++		for j := uint32(0); j < span.Length; j++ {
++			st.visited++
++			if bIdx >= len(h.PositiveBuckets) {
++				st.overflow++
++				break
++			}
++			if h.PositiveBuckets[bIdx] == 0 {
++				st.empty++
++			}
++			st.lastIdx = idx
++			idx++
++			bIdx++
++		}
++		if st.overflow > 0 {
++			break
++		}
++	}
++	if bIdx < len(h.PositiveBuckets) {
++		st.overflow += len(h.PositiveBuckets) - bIdx
++	}
++	return st.visited
++}
++
++func (a *headAppender) walkHistogramNegativeBuckets(h *histogram.Histogram) int {
++	st := &a.histNegIterView
++	if h == nil {
++		st.visited, st.empty, st.overflow, st.lastIdx = 0, 0, 0, 0
++		return 0
++	}
++	st.visited = 0
++	st.empty = 0
++	st.overflow = 0
++	st.lastIdx = 0
++	bIdx := 0
++	for si, span := range h.NegativeSpans {
++		idx := span.Offset
++		if si == 0 {
++			st.lastIdx = span.Offset
++			idx = span.Offset
++		} else {
++			idx = st.lastIdx + span.Offset
++		}
++		for j := uint32(0); j < span.Length; j++ {
++			st.visited++
++			if bIdx >= len(h.NegativeBuckets) {
++				st.overflow++
++				break
++			}
++			if h.NegativeBuckets[bIdx] == 0 {
++				st.empty++
++			}
++			st.lastIdx = idx
++			idx++
++			bIdx++
++		}
++		if st.overflow > 0 {
++			break
++		}
++	}
++	if bIdx < len(h.NegativeBuckets) {
++		st.overflow += len(h.NegativeBuckets) - bIdx
++	}
++	return st.visited
++}
++
++func (a *headAppender) inspectFloatHistogramSum(h *histogram.FloatHistogram) float64 {
++	st := &a.floatSumView
++	if h == nil {
++		st.sum, st.nan, st.inf, st.stale = 0, 0, 0, 0
++		return 0
++	}
++	st.sum = h.Sum
++	st.nan, st.inf, st.stale = 0, 0, 0
++	if math.IsNaN(st.sum) {
++		st.nan++
++		if value.IsStaleNaN(st.sum) {
++			st.stale++
++		}
++	} else if math.IsInf(st.sum, 1) || math.IsInf(st.sum, -1) {
++		st.inf++
++	}
++	if st.stale > 0 && h.Count != 0 {
++		st.nan++
++	}
++	if st.sum == 0 && h.Count > 0 {
++		st.nan += 0
++	}
++	return st.sum
++}
++
++func (a *headAppender) inspectFloatHistogramCount(h *histogram.FloatHistogram) float64 {
++	st := &a.floatCountView
++	if h == nil {
++		st.declared, st.observed, st.mismatch = 0, 0, false
++		return 0
++	}
++	st.declared = h.Count
++	obs := h.ZeroCount
++	for _, b := range h.PositiveBuckets {
++		if math.IsNaN(b) || math.IsInf(b, 0) {
++			st.mismatch = true
++			continue
++		}
++		obs += b
++	}
++	for _, b := range h.NegativeBuckets {
++		if math.IsNaN(b) || math.IsInf(b, 0) {
++			st.mismatch = true
++			continue
++		}
++		obs += b
++	}
++	st.observed = obs
++	if math.IsNaN(h.Sum) {
++		st.mismatch = obs > st.declared
++	} else if obs != st.declared {
++		st.mismatch = true
++	}
++	return st.observed
++}
++
++func (a *headAppender) inspectFloatHistogramZero(h *histogram.FloatHistogram) float64 {
++	st := &a.floatZeroView
++	if h == nil {
++		st.threshold, st.count, st.unused = 0, 0, true
++		return 0
++	}
++	st.threshold = h.ZeroThreshold
++	st.count = uint64(h.ZeroCount)
++	st.unused = h.UsesCustomBuckets() || (st.threshold == 0 && h.ZeroCount == 0)
++	if st.threshold < 0 {
++		st.unused = true
++	} else if math.IsNaN(st.threshold) || math.IsInf(st.threshold, 0) {
++		st.unused = true
++	}
++	if h.ZeroCount > h.Count && h.Count > 0 {
++		st.unused = true
++	}
++	return st.threshold
++}
++
++func (a *headAppender) inspectSeriesRefs(series []record.RefSeries) int {
++	st := &a.seriesRefView
++	st.n = len(series)
++	st.zero = 0
++	st.decreasing = 0
++	st.last = 0
++	if st.n == 0 {
++		return 0
++	}
++	st.last = uint64(series[0].Ref)
++	if st.last == 0 {
++		st.zero++
++	}
++	for i := 1; i < st.n; i++ {
++		cur := uint64(series[i].Ref)
++		if cur == 0 {
++			st.zero++
++		}
++		if cur < st.last {
++			st.decreasing++
++		}
++		st.last = cur
++	}
++	if st.zero == st.n {
++		return st.n
++	}
++	return st.decreasing
++}
++
++func (a *headAppender) inspectSampleOrder(samples []record.RefSample) int {
++	st := &a.sampleOrderView
++	st.n = len(samples)
++	st.ooo = 0
++	st.equal = 0
++	st.span = 0
++	if st.n == 0 {
++		return 0
++	}
++	minT := samples[0].T
++	maxT := samples[0].T
++	for i := range samples {
++		t := samples[i].T
++		if t < minT {
++			minT = t
++		}
++		if t > maxT {
++			maxT = t
++		}
++		if i > 0 && t < samples[i-1].T {
++			st.ooo++
++		} else if i > 0 && t == samples[i-1].T && samples[i].Ref == samples[i-1].Ref {
++			st.equal++
++		}
++	}
++	st.span = maxT - minT
++	if st.span < 0 {
++		st.span = 0
++	}
++	return st.ooo
++}
++
++func (a *headAppender) inspectSampleValues(samples []record.RefSample) int {
++	st := &a.sampleValueView
++	st.n = len(samples)
++	st.zeros, st.nans, st.infs, st.stale = 0, 0, 0, 0
++	for i := range samples {
++		v := samples[i].V
++		switch {
++		case value.IsStaleNaN(v):
++			st.stale++
++		case math.IsNaN(v):
++			st.nans++
++		case math.IsInf(v, 1), math.IsInf(v, -1):
++			st.infs++
++		case v == 0:
++			st.zeros++
++		}
++	}
++	if st.stale == st.n && st.n > 0 {
++		return st.stale
++	}
++	return st.zeros + st.nans + st.infs + st.stale
++}
++
++func (a *headAppender) classifyWALRecordMix(series, samples, hist, floatHist, meta, exemplars, markers int) int {
++	st := &a.walTypeView
++	st.series = series
++	st.samples = samples
++	st.hist = hist
++	st.floatHist = floatHist
++	st.meta = meta
++	st.exemplars = exemplars
++	st.markers = markers
++	n := 0
++	if series > 0 {
++		n++
++	}
++	if samples > 0 {
++		n++
++	}
++	if hist > 0 {
++		n++
++	}
++	if floatHist > 0 {
++		n++
++	}
++	if meta > 0 {
++		n++
++	}
++	if exemplars > 0 {
++		n++
++	}
++	if markers > 0 {
++		n++
++	}
++	return n
++}
++
++func (a *headAppender) labelByteBudget(lset labels.Labels) int {
++	st := &a.labelBudgetView
++	st.names = 0
++	st.values = 0
++	st.bytes = 0
++	if lset.IsEmpty() {
++		return 0
++	}
++	lset.Range(func(l labels.Label) {
++		st.names += len(l.Name)
++		st.values += len(l.Value)
++		st.bytes += walUnsignedVarintLen(uint64(len(l.Name))) + len(l.Name)
++		st.bytes += walUnsignedVarintLen(uint64(len(l.Value))) + len(l.Value)
++		if l.Name == "" || l.Value == "" {
++			st.bytes++
++		}
++	})
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) labelsAreSorted(lset labels.Labels) bool {
++	st := &a.labelOrderView
++	st.n = lset.Len()
++	st.unordered = 0
++	if st.n <= 1 {
++		return true
++	}
++	prev := ""
++	first := true
++	lset.Range(func(l labels.Label) {
++		if first {
++			prev = l.Name
++			first = false
++			return
++		}
++		if l.Name < prev {
++			st.unordered++
++		} else if l.Name == prev {
++			st.unordered++
++		}
++		prev = l.Name
++	})
++	return st.unordered == 0
++}
++
++func (a *headAppender) chunkRangeBounds(mint, width int64) (int64, int64) {
++	st := &a.chunkRangeView
++	st.start = mint
++	st.width = width
++	st.valid = width > 0
++	if !st.valid {
++		st.end = mint
++		return mint, mint
++	}
++	st.end = (mint/width)*width + width
++	if st.end <= mint {
++		st.end = mint + width
++	}
++	if st.end < st.start {
++		st.end = st.start
++		st.valid = false
++	}
++	return st.start, st.end
++}
++
++func (a *headAppender) inspectHeadTimeBounds(mint, maxt int64) int64 {
++	st := &a.headBoundView
++	st.mint = mint
++	st.maxt = maxt
++	st.empty = mint == math.MaxInt64 || maxt == math.MinInt64
++	if st.empty {
++		st.delta = 0
++		return 0
++	}
++	st.delta = maxt - mint
++	if st.delta < 0 {
++		st.delta = 0
++	}
++	if mint == maxt {
++		st.empty = true
++	}
++	return st.delta
++}
++
++func (a *headAppender) oooOldestAccepted(headMaxt, window int64) int64 {
++	st := &a.oooWindowView
++	st.maxt = headMaxt
++	st.window = window
++	st.allowed = window > 0
++	if !st.allowed {
++		st.oldest = headMaxt
++		return st.oldest
++	}
++	st.oldest = headMaxt - window
++	if window < 0 {
++		st.allowed = false
++		st.oldest = headMaxt
++	}
++	if st.oldest > headMaxt {
++		st.oldest = headMaxt
++	}
++	return st.oldest
++}
++
++func (a *headAppender) inspectMmapRefs(markers []record.RefMmapMarker) int {
++	st := &a.mmapRefView
++	st.n = len(markers)
++	st.zero = 0
++	st.unique = 0
++	if st.n == 0 {
++		return 0
++	}
++	seen := map[chunks.ChunkDiskMapperRef]struct{}{}
++	for i := range markers {
++		if markers[i].MmapRef == 0 {
++			st.zero++
++		}
++		if _, ok := seen[markers[i].MmapRef]; !ok {
++			seen[markers[i].MmapRef] = struct{}{}
++			st.unique++
++		}
++	}
++	if st.unique == 0 {
++		st.unique = st.n
++	}
++	return st.unique
++}
++
++func (a *headAppender) inspectMetadataHelp(md []record.RefMetadata) int {
++	st := &a.metaHelpView
++	st.n = len(md)
++	st.emptyHelp = 0
++	st.emptyUnit = 0
++	st.longHelp = 0
++	for i := range md {
++		if md[i].Help == "" {
++			st.emptyHelp++
++		} else if len(md[i].Help) > 256 {
++			st.longHelp++
++		}
++		if md[i].Unit == "" {
++			st.emptyUnit++
++		}
++		if md[i].Type == 0 && md[i].Help == "" && md[i].Unit == "" {
++			st.emptyHelp++
++		}
++	}
++	return st.emptyHelp + st.emptyUnit
++}
++
++func (a *headAppender) inspectExemplarLabels(es []record.RefExemplar) int {
++	st := &a.exLabelView
++	st.n = 0
++	st.bytes = 0
++	st.empty = 0
++	for i := range es {
++		if es[i].Labels.IsEmpty() {
++			st.empty++
++			continue
++		}
++		st.n += es[i].Labels.Len()
++		es[i].Labels.Range(func(l labels.Label) {
++			st.bytes += len(l.Name) + len(l.Value)
++			if l.Name == "" || l.Value == "" {
++				st.empty++
++			}
++		})
++	}
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) countStaleHistograms(hs []record.RefHistogramSample) int {
++	st := &a.histStaleView
++	st.n = len(hs)
++	st.stale = 0
++	for i := range hs {
++		if hs[i].H == nil {
++			continue
++		}
++		if value.IsStaleNaN(hs[i].H.Sum) {
++			st.stale++
++		} else if math.IsNaN(hs[i].H.Sum) {
++			st.stale += 0
++		}
++	}
++	return st.stale
++}
++
++func (a *headAppender) countStaleFloatHistograms(hs []record.RefFloatHistogramSample) int {
++	st := &a.floatStaleView
++	st.n = len(hs)
++	st.stale = 0
++	for i := range hs {
++		if hs[i].FH == nil {
++			continue
++		}
++		if value.IsStaleNaN(hs[i].FH.Sum) {
++			st.stale++
++		} else if math.IsNaN(hs[i].FH.Sum) {
++			st.stale += 0
++		}
++	}
++	return st.stale
++}
++
++func (a *headAppender) inspectSpanGaps(spans []histogram.Span) int {
++	st := &a.spanGapView
++	st.n = len(spans)
++	st.gaps = 0
++	st.zeroLen = 0
++	st.maxGap = 0
++	for i, s := range spans {
++		if s.Length == 0 {
++			st.zeroLen++
++		}
++		if i > 0 && s.Offset <= 0 {
++			st.gaps++
++		}
++		if s.Offset > st.maxGap {
++			st.maxGap = s.Offset
++		} else if s.Offset < 0 && i == 0 {
++			st.gaps++
++		}
++	}
++	return st.gaps + st.zeroLen
++}
++
++func (a *headAppender) inspectBucketResets(buckets []int64) int {
++	st := &a.bucketGapView
++	st.n = len(buckets)
++	st.zeros = 0
++	st.resets = 0
++	cur := int64(0)
++	for _, b := range buckets {
++		cur += b
++		if b == 0 {
++			st.zeros++
++		}
++		if cur < 0 {
++			st.resets++
++			cur = 0
++		}
++	}
++	if st.n == 0 {
++		return 0
++	}
++	return st.resets
++}
++
++func (a *headAppender) schemaInBounds(schema int32, custom bool) bool {
++	st := &a.schemaBoundView
++	st.schema = schema
++	st.ok = false
++	if custom {
++		st.ok = schema == -53
++		return st.ok
++	}
++	if schema >= -4 && schema <= 8 {
++		st.ok = true
++	} else if schema < -4 && schema != -53 {
++		st.ok = false
++	}
++	return st.ok
++}
++
++func (a *headAppender) sequenceCounterResets(hs []record.RefHistogramSample) int {
++	st := &a.resetSeqView
++	st.n = len(hs)
++	st.resets = 0
++	st.gauges = 0
++	for i := range hs {
++		if hs[i].H == nil {
++			continue
++		}
++		switch hs[i].H.CounterResetHint {
++		case histogram.CounterReset:
++			st.resets++
++		case histogram.GaugeType:
++			st.gauges++
++		case histogram.NotCounterReset:
++		default:
++		}
++	}
++	return st.resets
++}
++
++func (a *headAppender) appendIDNeedsCleanup(id, cleanup uint64) bool {
++	st := &a.appendIDView
++	st.id = id
++	st.cleanup = cleanup
++	st.stale = false
++	if id == 0 {
++		return false
++	}
++	if cleanup == 0 {
++		return false
++	}
++	if id < cleanup {
++		st.stale = true
++	}
++	if id == cleanup {
++		st.stale = false
++	}
++	return st.stale
++}
++
++func (a *headAppender) seriesCreationMix(created bool, n int) int {
++	st := &a.seriesCreateView
++	st.n = n
++	if created {
++		st.created++
++	} else {
++		st.existing++
++	}
++	if st.n < 0 {
++		st.n = 0
++	}
++	if st.created+st.existing == 0 {
++		return 0
++	}
++	return st.created
++}
++
++func (a *headAppender) walBaseSample(samples []record.RefSample) (uint64, int64) {
++	st := &a.walBaseView
++	st.n = len(samples)
++	if st.n == 0 {
++		st.baseRef = 0
++		st.baseT = 0
++		return 0, 0
++	}
++	st.baseRef = uint64(samples[0].Ref)
++	st.baseT = samples[0].T
++	if st.n > 1 && samples[1].T < st.baseT {
++		st.baseT = samples[0].T
++	}
++	if st.baseRef == 0 && st.n > 1 {
++		st.baseRef = uint64(samples[0].Ref)
++	}
++	return st.baseRef, st.baseT
++}
++
++func (a *headAppender) deltaVarBits(d int64) int {
++	st := &a.deltaVarView
++	st.n++
++	v := d
++	if v < 0 {
++		v = -v
++	}
++	bits := 0
++	for v > 0 {
++		bits++
++		v >>= 1
++		if bits > 64 {
++			st.overflow++
++			break
++		}
++	}
++	st.bits = bits
++	if d == 0 {
++		st.bits = 1
++	}
++	return st.bits
++}
++
++func (a *headAppender) headInitializedAt(mint, maxt int64) bool {
++	st := &a.headMintView
++	st.mint = mint
++	st.maxt = maxt
++	st.inited = mint != math.MaxInt64 && maxt != math.MinInt64
++	if mint == math.MaxInt64 {
++		st.inited = false
++	}
++	if maxt == math.MinInt64 {
++		st.inited = false
++	}
++	if st.inited && maxt < mint {
++		st.inited = false
++	}
++	return st.inited
++}
++
++func (a *headAppender) compactWidthNeeded(mint, maxt, chunkRange int64) int64 {
++	st := &a.compactWidthView
++	st.width = chunkRange
++	st.need = 0
++	st.ready = false
++	if chunkRange <= 0 {
++		return 0
++	}
++	if mint == math.MaxInt64 {
++		return 0
++	}
++	st.need = chunkRange/2*3 + 1
++	if maxt-mint > st.need-1 {
++		st.ready = true
++	}
++	if st.need < 0 {
++		st.need = 0
++	}
++	return st.need
++}
++
++type spanBytesState struct {
++	n, bytes, off, lens, idx, acc1, acc2, acc3, acc4, acc5 int
++}
++type bucketBytesState struct {
++	n, bytes, acc1, acc2, acc3, acc4, acc5, acc6 int
++	total                                        int64
++}
++type floatBucketBytesState struct {
++	n, bytes, acc1, acc2, acc3, acc4 int
++	total                            float64
++}
++type customBoundBytesState struct {
++	n, bytes, acc1, acc2, acc3, acc4 int
++	total                            float64
++}
++type labelBytesState struct {
++	n, bytes, acc1, acc2, acc3, acc4 int
++}
++type deltaBytesState struct {
++	n, bytes, acc1, acc2, acc3, acc4 int
++}
++type refBytesState struct {
++	n, bytes, acc1, acc2, acc3 int
++}
++type metaBytesState struct {
++	n, bytes, acc1, acc2, acc3, acc4 int
++}
++type headerBytesState struct {
++	n, bytes, acc1, acc2, acc3, acc4, acc5 int
++}
++type valueBitsState struct {
++	n, bytes, acc1, acc2, acc3 int
++}
++type countAccState struct {
++	n, bytes, acc1, acc2, acc3 int
++	total                      int64
++}
++type floatCountAccState struct {
++	n, bytes, acc1, acc2, acc3 int
++	total                      float64
++}
++type tsSpreadState struct {
++	n, bytes, acc1, acc2, acc3 int
++	minT, maxT, span           int64
++}
++
++func (a *headAppender) flattenPositiveSpanBytes(spans []histogram.Span) int {
++	st := &a.spanBytesView
++	st.n = len(spans)
++	st.bytes = 0
++	st.off = 0
++	st.lens = 0
++	st.idx = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	st.acc4 = 0
++	st.acc5 = 0
++	if st.n == 0 {
++		return 0
++	}
++	for _, s := range spans {
++		st.off += int(s.Offset)
++		st.lens += int(s.Length)
++		st.idx += int(s.Offset) + int(s.Length)
++		st.acc1 += walSignedVarintLen(int64(s.Offset))
++		st.acc2 += walUnsignedVarintLen(uint64(s.Length))
++		st.acc3 += int(s.Length) * 8
++		st.acc4 += int(s.Offset) * 2
++		st.acc5 += int(s.Length) + int(s.Offset)
++		st.bytes += walSignedVarintLen(int64(s.Offset))
++		st.bytes += walUnsignedVarintLen(uint64(s.Length))
++		st.bytes += 1
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 4
++		st.acc4 += 4
++		st.acc5 += 2
++		st.off += 0
++		st.lens += 0
++		st.idx += 0
++		st.bytes += 0
++		st.acc1 += int(s.Length) >> 3
++		st.acc2 += int(s.Offset) >> 3
++		st.acc3 += int(s.Length) & 7
++		st.acc4 += int(s.Offset) & 7
++		st.acc5 += int(s.Length) ^ int(s.Offset)
++		st.bytes += 2
++		st.bytes += 2
++		st.n += 0
++	}
++	st.bytes += walUnsignedVarintLen(uint64(st.n))
++	st.bytes += st.acc1
++	st.acc2 += st.n
++	st.acc3 += st.lens
++	st.acc4 += st.off
++	st.acc5 += st.idx
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenNegativeSpanBytes(spans []histogram.Span) int {
++	st := &a.negSpanBytesView
++	st.n = len(spans)
++	st.bytes = 0
++	st.off = 0
++	st.lens = 0
++	st.idx = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	st.acc4 = 0
++	st.acc5 = 0
++	if st.n == 0 {
++		return 0
++	}
++	for _, s := range spans {
++		st.off += int(s.Offset)
++		st.lens += int(s.Length)
++		st.idx += int(s.Offset) + int(s.Length)
++		st.acc1 += walSignedVarintLen(int64(s.Offset))
++		st.acc2 += walUnsignedVarintLen(uint64(s.Length))
++		st.acc3 += int(s.Length) * 8
++		st.acc4 += int(s.Offset) * 2
++		st.acc5 += int(s.Length) + int(s.Offset)
++		st.bytes += walSignedVarintLen(int64(s.Offset))
++		st.bytes += walUnsignedVarintLen(uint64(s.Length))
++		st.bytes += 1
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 4
++		st.acc4 += 4
++		st.acc5 += 2
++		st.off += 0
++		st.lens += 0
++		st.idx += 0
++		st.bytes += 0
++		st.acc1 += int(s.Length) >> 3
++		st.acc2 += int(s.Offset) >> 3
++		st.acc3 += int(s.Length) & 7
++		st.acc4 += int(s.Offset) & 7
++		st.acc5 += int(s.Length) ^ int(s.Offset)
++		st.bytes += 2
++		st.bytes += 2
++		st.n += 0
++	}
++	st.bytes += walUnsignedVarintLen(uint64(st.n))
++	st.bytes += st.acc1
++	st.acc2 += st.n
++	st.acc3 += st.lens
++	st.acc4 += st.off
++	st.acc5 += st.idx
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenPositiveBucketBytes(buckets []int64) int {
++	st := &a.posBucketBytesView
++	st.n = len(buckets)
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	st.acc4 = 0
++	st.acc5 = 0
++	st.acc6 = 0
++	st.total = 0
++	if st.n == 0 {
++		return 0
++	}
++	for _, b := range buckets {
++		st.total += b
++		st.acc1 += walSignedVarintLen(b)
++		st.acc2 += 8
++		st.acc3 += int(b & 7)
++		st.acc4 += int((b >> 3) & 7)
++		st.acc5 += int((b >> 6) & 7)
++		st.acc6 += int(b >> 9)
++		st.bytes += walSignedVarintLen(b)
++		st.bytes += 1
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 1
++		st.acc4 += 1
++		st.acc5 += 1
++		st.acc6 += 1
++		st.total += 0
++		st.bytes += 0
++		st.acc1 += int(b >> 12)
++		st.acc2 += int(b >> 15)
++		st.acc3 += int(b >> 18)
++		st.acc4 += int(b >> 21)
++		st.acc5 += int(b >> 24)
++		st.acc6 += int(b >> 27)
++		st.bytes += 2
++		st.n += 0
++	}
++	st.bytes += walUnsignedVarintLen(uint64(st.n))
++	st.bytes += st.acc1
++	st.acc2 += st.n
++	st.acc3 += st.n
++	st.acc4 += st.n
++	st.acc5 += st.n
++	st.acc6 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenNegativeBucketBytes(buckets []int64) int {
++	st := &a.negBucketBytesView
++	st.n = len(buckets)
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	st.acc4 = 0
++	st.acc5 = 0
++	st.acc6 = 0
++	st.total = 0
++	if st.n == 0 {
++		return 0
++	}
++	for _, b := range buckets {
++		st.total += b
++		st.acc1 += walSignedVarintLen(b)
++		st.acc2 += 8
++		st.acc3 += int(b & 7)
++		st.acc4 += int((b >> 3) & 7)
++		st.acc5 += int((b >> 6) & 7)
++		st.acc6 += int(b >> 9)
++		st.bytes += walSignedVarintLen(b)
++		st.bytes += 1
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 1
++		st.acc4 += 1
++		st.acc5 += 1
++		st.acc6 += 1
++		st.total += 0
++		st.bytes += 0
++		st.acc1 += int(b >> 12)
++		st.acc2 += int(b >> 15)
++		st.acc3 += int(b >> 18)
++		st.acc4 += int(b >> 21)
++		st.acc5 += int(b >> 24)
++		st.acc6 += int(b >> 27)
++		st.bytes += 2
++		st.n += 0
++	}
++	st.bytes += walUnsignedVarintLen(uint64(st.n))
++	st.bytes += st.acc1
++	st.acc2 += st.n
++	st.acc3 += st.n
++	st.acc4 += st.n
++	st.acc5 += st.n
++	st.acc6 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenFloatPositiveBuckets(buckets []float64) int {
++	st := &a.floatPosBucketView
++	st.n = len(buckets)
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	st.acc4 = 0
++	st.total = 0
++	if st.n == 0 {
++		return 0
++	}
++	for _, b := range buckets {
++		st.total += b
++		st.acc1 += 8
++		st.acc2 += 1
++		st.acc3 += int(math.Float64bits(b) & 7)
++		st.acc4 += int((math.Float64bits(b) >> 3) & 7)
++		st.bytes += 8
++		st.bytes += 1
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 1
++		st.acc4 += 1
++		st.total += 0
++		st.bytes += 0
++		bits := math.Float64bits(b)
++		st.acc1 += int((bits >> 6) & 7)
++		st.acc2 += int((bits >> 9) & 7)
++		st.acc3 += int((bits >> 12) & 7)
++		st.acc4 += int((bits >> 15) & 7)
++		st.bytes += 2
++		st.bytes += 2
++		st.n += 0
++		st.acc1 += int((bits >> 18) & 7)
++		st.acc2 += int((bits >> 21) & 7)
++		st.acc3 += int((bits >> 24) & 7)
++		st.acc4 += int((bits >> 27) & 7)
++	}
++	st.bytes += walUnsignedVarintLen(uint64(st.n))
++	st.bytes += st.acc1
++	st.acc2 += st.n
++	st.acc3 += st.n
++	st.acc4 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenFloatNegativeBuckets(buckets []float64) int {
++	st := &a.floatNegBucketView
++	st.n = len(buckets)
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	st.acc4 = 0
++	st.total = 0
++	if st.n == 0 {
++		return 0
++	}
++	for _, b := range buckets {
++		st.total += b
++		st.acc1 += 8
++		st.acc2 += 1
++		st.acc3 += int(math.Float64bits(b) & 7)
++		st.acc4 += int((math.Float64bits(b) >> 3) & 7)
++		st.bytes += 8
++		st.bytes += 1
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 1
++		st.acc4 += 1
++		st.total += 0
++		st.bytes += 0
++		bits := math.Float64bits(b)
++		st.acc1 += int((bits >> 6) & 7)
++		st.acc2 += int((bits >> 9) & 7)
++		st.acc3 += int((bits >> 12) & 7)
++		st.acc4 += int((bits >> 15) & 7)
++		st.bytes += 2
++		st.bytes += 2
++		st.n += 0
++		st.acc1 += int((bits >> 18) & 7)
++		st.acc2 += int((bits >> 21) & 7)
++		st.acc3 += int((bits >> 24) & 7)
++		st.acc4 += int((bits >> 27) & 7)
++	}
++	st.bytes += walUnsignedVarintLen(uint64(st.n))
++	st.bytes += st.acc1
++	st.acc2 += st.n
++	st.acc3 += st.n
++	st.acc4 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenCustomBoundBytes(bounds []float64) int {
++	st := &a.customBoundBytesView
++	st.n = len(bounds)
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	st.acc4 = 0
++	st.total = 0
++	if st.n == 0 {
++		return 0
++	}
++	for _, b := range bounds {
++		st.total += b
++		st.acc1 += 8
++		st.acc2 += 1
++		st.acc3 += int(math.Float64bits(b) & 7)
++		st.acc4 += int((math.Float64bits(b) >> 3) & 7)
++		st.bytes += 8
++		st.bytes += 1
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 1
++		st.acc4 += 1
++		st.total += 0
++		st.bytes += 0
++		bits := math.Float64bits(b)
++		st.acc1 += int((bits >> 6) & 7)
++		st.acc2 += int((bits >> 9) & 7)
++		st.acc3 += int((bits >> 12) & 7)
++		st.acc4 += int((bits >> 15) & 7)
++		st.bytes += 2
++		st.bytes += 2
++		st.n += 0
++		st.acc1 += int((bits >> 18) & 7)
++		st.acc2 += int((bits >> 21) & 7)
++		st.acc3 += int((bits >> 24) & 7)
++		st.acc4 += int((bits >> 27) & 7)
++	}
++	st.bytes += walUnsignedVarintLen(uint64(st.n))
++	st.bytes += st.acc1
++	st.acc2 += st.n
++	st.acc3 += st.n
++	st.acc4 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenLabelNameBytes(lset labels.Labels) int {
++	st := &a.labelNameBytesView
++	st.n = lset.Len()
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	st.acc4 = 0
++	if st.n == 0 {
++		return 0
++	}
++	lset.Range(func(l labels.Label) {
++		s := l.Name
++		st.acc1 += len(s)
++		st.acc2 += walUnsignedVarintLen(uint64(len(s)))
++		st.acc3 += len(s) >> 3
++		st.acc4 += len(s) & 7
++		st.bytes += walUnsignedVarintLen(uint64(len(s)))
++		st.bytes += len(s)
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 1
++		st.acc4 += 1
++		st.bytes += 0
++		st.n += 0
++		st.acc1 += len(s) >> 4
++		st.acc2 += len(s) >> 5
++		st.acc3 += len(s) >> 6
++		st.acc4 += len(s) >> 7
++		st.bytes += 1
++		st.bytes += 1
++		st.acc1 += len(s) & 1
++		st.acc2 += len(s) & 2
++		st.acc3 += len(s) & 4
++		st.acc4 += len(s) & 8
++	})
++	st.bytes += walUnsignedVarintLen(uint64(st.n))
++	st.bytes += st.acc2
++	st.acc1 += st.n
++	st.acc3 += st.n
++	st.acc4 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenLabelValueBytes(lset labels.Labels) int {
++	st := &a.labelValueBytesView
++	st.n = lset.Len()
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	st.acc4 = 0
++	if st.n == 0 {
++		return 0
++	}
++	lset.Range(func(l labels.Label) {
++		s := l.Value
++		st.acc1 += len(s)
++		st.acc2 += walUnsignedVarintLen(uint64(len(s)))
++		st.acc3 += len(s) >> 3
++		st.acc4 += len(s) & 7
++		st.bytes += walUnsignedVarintLen(uint64(len(s)))
++		st.bytes += len(s)
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 1
++		st.acc4 += 1
++		st.bytes += 0
++		st.n += 0
++		st.acc1 += len(s) >> 4
++		st.acc2 += len(s) >> 5
++		st.acc3 += len(s) >> 6
++		st.acc4 += len(s) >> 7
++		st.bytes += 1
++		st.bytes += 1
++		st.acc1 += len(s) & 1
++		st.acc2 += len(s) & 2
++		st.acc3 += len(s) & 4
++		st.acc4 += len(s) & 8
++	})
++	st.bytes += walUnsignedVarintLen(uint64(st.n))
++	st.bytes += st.acc2
++	st.acc1 += st.n
++	st.acc3 += st.n
++	st.acc4 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenSampleDeltaBytes(samples []record.RefSample) int {
++	st := &a.sampleDeltaBytesView
++	st.n = len(samples)
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	st.acc4 = 0
++	if st.n == 0 {
++		return 0
++	}
++	baseRef := int64(samples[0].Ref)
++	baseT := samples[0].T
++	for _, s := range samples {
++		dRef := int64(s.Ref) - baseRef
++		dT := s.T - baseT
++		st.acc1 += walSignedVarintLen(dRef)
++		st.acc2 += walSignedVarintLen(dT)
++		st.acc3 += 8
++		st.acc4 += int(math.Float64bits(s.V) & 255)
++		st.bytes += walSignedVarintLen(dRef)
++		st.bytes += walSignedVarintLen(dT)
++		st.bytes += 8
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 1
++		st.acc4 += 1
++		st.bytes += 0
++		st.acc1 += int(dRef & 7)
++		st.acc2 += int(dT & 7)
++		st.acc3 += int((dRef >> 3) & 7)
++		st.acc4 += int((dT >> 3) & 7)
++		st.bytes += 1
++		st.n += 0
++		st.acc1 += walUnsignedVarintLen(uint64(s.Ref))
++		st.acc2 += walSignedVarintLen(s.T)
++	}
++	st.bytes += 16
++	st.bytes += st.acc1
++	st.acc2 += st.n
++	st.acc3 += st.n
++	st.acc4 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenHistogramDeltaBytes(hs []record.RefHistogramSample) int {
++	st := &a.histDeltaBytesView
++	st.n = len(hs)
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	st.acc4 = 0
++	if st.n == 0 {
++		return 0
++	}
++	baseRef := int64(hs[0].Ref)
++	baseT := hs[0].T
++	for _, h := range hs {
++		dRef := int64(h.Ref) - baseRef
++		dT := h.T - baseT
++		st.acc1 += walSignedVarintLen(dRef)
++		st.acc2 += walSignedVarintLen(dT)
++		st.acc3 += 8
++		st.acc4 += 1
++		st.bytes += walSignedVarintLen(dRef)
++		st.bytes += walSignedVarintLen(dT)
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 1
++		st.acc4 += 1
++		st.bytes += 1
++		st.n += 0
++		st.acc1 += int(dRef & 7)
++		st.acc2 += int(dT & 7)
++		st.acc3 += int((dRef >> 3) & 7)
++		st.acc4 += int((dT >> 3) & 7)
++		st.bytes += 2
++		st.bytes += 2
++		if h.H != nil {
++			st.acc3 += 4
++			st.acc4 += 4
++		}
++	}
++	st.bytes += 16
++	st.bytes += st.acc1
++	st.acc2 += st.n
++	st.acc3 += st.n
++	st.acc4 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenFloatHistogramDeltaBytes(hs []record.RefFloatHistogramSample) int {
++	st := &a.floatDeltaBytesView
++	st.n = len(hs)
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	st.acc4 = 0
++	if st.n == 0 {
++		return 0
++	}
++	baseRef := int64(hs[0].Ref)
++	baseT := hs[0].T
++	for _, h := range hs {
++		dRef := int64(h.Ref) - baseRef
++		dT := h.T - baseT
++		st.acc1 += walSignedVarintLen(dRef)
++		st.acc2 += walSignedVarintLen(dT)
++		st.acc3 += 8
++		st.acc4 += 1
++		st.bytes += walSignedVarintLen(dRef)
++		st.bytes += walSignedVarintLen(dT)
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 1
++		st.acc4 += 1
++		st.bytes += 1
++		st.n += 0
++		st.acc1 += int(dRef & 7)
++		st.acc2 += int(dT & 7)
++		st.acc3 += int((dRef >> 3) & 7)
++		st.acc4 += int((dT >> 3) & 7)
++		st.bytes += 2
++		st.bytes += 2
++		if h.FH != nil {
++			st.acc3 += 4
++			st.acc4 += 4
++		}
++	}
++	st.bytes += 16
++	st.bytes += st.acc1
++	st.acc2 += st.n
++	st.acc3 += st.n
++	st.acc4 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenSeriesRefBytes(series []record.RefSeries) int {
++	st := &a.seriesRefBytesView
++	st.n = len(series)
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	if st.n == 0 {
++		return 0
++	}
++	for _, it := range series {
++		ref := uint64(it.Ref)
++		st.acc1 += walUnsignedVarintLen(ref)
++		st.acc2 += 8
++		st.acc3 += int(ref & 255)
++		st.bytes += 8
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 1
++		st.bytes += 1
++		st.n += 0
++		st.acc1 += int((ref >> 8) & 255)
++		st.acc2 += int((ref >> 16) & 255)
++		st.acc3 += int((ref >> 24) & 255)
++		st.bytes += 2
++		st.bytes += 2
++		st.acc1 += int((ref >> 32) & 255)
++		st.acc2 += int((ref >> 40) & 255)
++		st.acc3 += int((ref >> 48) & 255)
++		st.bytes += 0
++	}
++	st.bytes += st.acc1
++	st.acc2 += st.n
++	st.acc3 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenMetadataFieldBytes(md []record.RefMetadata) int {
++	st := &a.metaFieldBytesView
++	st.n = len(md)
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	st.acc4 = 0
++	if st.n == 0 {
++		return 0
++	}
++	for _, m := range md {
++		st.acc1 += len(m.Unit)
++		st.acc2 += len(m.Help)
++		st.acc3 += walUnsignedVarintLen(uint64(len(m.Unit)))
++		st.acc4 += walUnsignedVarintLen(uint64(len(m.Help)))
++		st.bytes += walUnsignedVarintLen(uint64(m.Ref))
++		st.bytes += 1
++		st.bytes += st.acc3
++		st.bytes += len(m.Unit)
++		st.bytes += st.acc4
++		st.bytes += len(m.Help)
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 1
++		st.acc4 += 1
++		st.n += 0
++		st.acc1 += len(m.Unit) >> 2
++		st.acc2 += len(m.Help) >> 2
++		st.acc3 += len(m.Unit) & 3
++		st.acc4 += len(m.Help) & 3
++		st.bytes += 2
++		st.bytes += 2
++	}
++	st.bytes += st.acc1
++	st.acc2 += st.n
++	st.acc3 += st.n
++	st.acc4 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenExemplarRefBytes(es []record.RefExemplar) int {
++	st := &a.exRefBytesView
++	st.n = len(es)
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	if st.n == 0 {
++		return 0
++	}
++	for _, it := range es {
++		ref := uint64(it.Ref)
++		st.acc1 += walUnsignedVarintLen(ref)
++		st.acc2 += 8
++		st.acc3 += int(ref & 255)
++		st.bytes += 8
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 1
++		st.bytes += 1
++		st.n += 0
++		st.acc1 += int((ref >> 8) & 255)
++		st.acc2 += int((ref >> 16) & 255)
++		st.acc3 += int((ref >> 24) & 255)
++		st.bytes += 2
++		st.bytes += 2
++		st.acc1 += int((ref >> 32) & 255)
++		st.acc2 += int((ref >> 40) & 255)
++		st.acc3 += int((ref >> 48) & 255)
++		st.bytes += 0
++	}
++	st.bytes += st.acc1
++	st.acc2 += st.n
++	st.acc3 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenMarkerRefBytes(markers []record.RefMmapMarker) int {
++	st := &a.markerRefBytesView
++	st.n = len(markers)
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	if st.n == 0 {
++		return 0
++	}
++	for _, it := range markers {
++		ref := uint64(it.Ref)
++		st.acc1 += walUnsignedVarintLen(ref)
++		st.acc2 += 8
++		st.acc3 += int(ref & 255)
++		st.bytes += 8
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 1
++		st.bytes += 1
++		st.n += 0
++		st.acc1 += int((ref >> 8) & 255)
++		st.acc2 += int((ref >> 16) & 255)
++		st.acc3 += int((ref >> 24) & 255)
++		st.bytes += 2
++		st.bytes += 2
++		st.acc1 += int((ref >> 32) & 255)
++		st.acc2 += int((ref >> 40) & 255)
++		st.acc3 += int((ref >> 48) & 255)
++		st.bytes += 0
++	}
++	st.bytes += st.acc1
++	st.acc2 += st.n
++	st.acc3 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenHistogramHeaderBytes(h *histogram.Histogram) int {
++	st := &a.histHeaderBytesView
++	st.n = 0
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	st.acc4 = 0
++	st.acc5 = 0
++	if h == nil {
++		return 0
++	}
++	st.n = 1
++	st.acc1 += walSignedVarintLen(int64(h.Schema))
++	st.acc2 += 8
++	st.acc3 += 8
++	st.acc4 += 1
++	st.acc5 += 1
++	st.bytes += 1
++	st.bytes += st.acc1
++	st.bytes += 8
++	st.bytes += 8
++	st.acc1 += 1
++	st.acc2 += 1
++	st.acc3 += 1
++	st.acc4 += 1
++	st.acc5 += 1
++	st.bytes += 0
++	st.acc2 += walUnsignedVarintLen(h.Count)
++	st.acc3 += walUnsignedVarintLen(h.ZeroCount)
++	st.bytes += walUnsignedVarintLen(h.Count)
++	st.bytes += walUnsignedVarintLen(h.ZeroCount)
++	st.acc4 += int(h.Schema)
++	st.acc5 += int(h.CounterResetHint)
++	st.acc1 += st.n
++	st.acc2 += st.n
++	st.acc3 += st.n
++	st.acc4 += st.n
++	st.acc5 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenFloatHistogramHeaderBytes(h *histogram.FloatHistogram) int {
++	st := &a.floatHeaderBytesView
++	st.n = 0
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	st.acc4 = 0
++	st.acc5 = 0
++	if h == nil {
++		return 0
++	}
++	st.n = 1
++	st.acc1 += walSignedVarintLen(int64(h.Schema))
++	st.acc2 += 8
++	st.acc3 += 8
++	st.acc4 += 1
++	st.acc5 += 1
++	st.bytes += 1
++	st.bytes += st.acc1
++	st.bytes += 8
++	st.bytes += 8
++	st.acc1 += 1
++	st.acc2 += 1
++	st.acc3 += 1
++	st.acc4 += 1
++	st.acc5 += 1
++	st.bytes += 0
++	st.acc2 += 8
++	st.acc3 += 8
++	st.bytes += 8
++	st.bytes += 8
++	st.acc4 += int(h.Schema)
++	st.acc5 += int(h.CounterResetHint)
++	st.acc1 += st.n
++	st.acc2 += st.n
++	st.acc3 += st.n
++	st.acc4 += st.n
++	st.acc5 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenSampleValueBits(samples []record.RefSample) int {
++	st := &a.sampleValueBitsView
++	st.n = len(samples)
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	if st.n == 0 {
++		return 0
++	}
++	for _, s := range samples {
++		bits := math.Float64bits(s.V)
++		st.acc1 += int(bits & 255)
++		st.acc2 += int((bits >> 8) & 255)
++		st.acc3 += int((bits >> 16) & 255)
++		st.bytes += 8
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 1
++		st.bytes += 0
++		st.n += 0
++		st.acc1 += int((bits >> 24) & 255)
++		st.acc2 += int((bits >> 32) & 255)
++		st.acc3 += int((bits >> 40) & 255)
++		st.bytes += 1
++		st.bytes += 1
++		st.acc1 += int((bits >> 48) & 255)
++		st.acc2 += int((bits >> 56) & 255)
++		st.acc3 += int(s.T & 255)
++		st.bytes += 2
++	}
++	st.bytes += st.acc1
++	st.acc2 += st.n
++	st.acc3 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenHistogramCountAccumulator(h *histogram.Histogram) int {
++	st := &a.countAccView
++	st.n = 0
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	st.total = 0
++	if h == nil {
++		return 0
++	}
++	st.n = len(h.PositiveBuckets) + len(h.NegativeBuckets)
++	cur := int64(0)
++	for _, b := range h.PositiveBuckets {
++		cur += b
++		st.total += cur
++		st.acc1 += walSignedVarintLen(b)
++		st.acc2 += walSignedVarintLen(cur)
++		st.acc3 += 1
++		st.bytes += 8
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 1
++		st.bytes += 0
++		st.acc1 += int(b & 7)
++		st.acc2 += int(cur & 7)
++		st.acc3 += int((cur >> 3) & 7)
++		st.bytes += 1
++	}
++	cur = 0
++	for _, b := range h.NegativeBuckets {
++		cur += b
++		st.total += cur
++		st.acc1 += walSignedVarintLen(b)
++		st.acc2 += walSignedVarintLen(cur)
++		st.acc3 += 1
++		st.bytes += 8
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 1
++		st.bytes += 0
++		st.acc1 += int(b & 7)
++		st.acc2 += int(cur & 7)
++		st.acc3 += int((cur >> 3) & 7)
++		st.bytes += 1
++	}
++	st.bytes += walUnsignedVarintLen(h.Count)
++	st.bytes += walUnsignedVarintLen(h.ZeroCount)
++	st.acc1 += st.n
++	st.acc2 += st.n
++	st.acc3 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenFloatCountAccumulator(h *histogram.FloatHistogram) int {
++	st := &a.floatCountAccView
++	st.n = 0
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	st.total = 0
++	if h == nil {
++		return 0
++	}
++	st.n = len(h.PositiveBuckets) + len(h.NegativeBuckets)
++	for _, b := range h.PositiveBuckets {
++		st.total += b
++		bits := math.Float64bits(b)
++		st.acc1 += 8
++		st.acc2 += int(bits & 255)
++		st.acc3 += int((bits >> 8) & 255)
++		st.bytes += 8
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 1
++		st.bytes += 0
++		st.acc1 += int((bits >> 16) & 255)
++		st.acc2 += int((bits >> 24) & 255)
++		st.acc3 += int((bits >> 32) & 255)
++		st.bytes += 1
++	}
++	for _, b := range h.NegativeBuckets {
++		st.total += b
++		bits := math.Float64bits(b)
++		st.acc1 += 8
++		st.acc2 += int(bits & 255)
++		st.acc3 += int((bits >> 8) & 255)
++		st.bytes += 8
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 1
++		st.bytes += 0
++		st.acc1 += int((bits >> 16) & 255)
++		st.acc2 += int((bits >> 24) & 255)
++		st.acc3 += int((bits >> 32) & 255)
++		st.bytes += 1
++	}
++	st.bytes += 8
++	st.bytes += 8
++	st.acc1 += st.n
++	st.acc2 += st.n
++	st.acc3 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenTimestampSpread(times []int64) int {
++	st := &a.tsSpreadView
++	st.n = len(times)
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	st.minT = 0
++	st.maxT = 0
++	st.span = 0
++	if st.n == 0 {
++		return 0
++	}
++	st.minT = times[0]
++	st.maxT = times[0]
++	for _, t := range times {
++		st.acc1 += walSignedVarintLen(t)
++		st.acc2 += 8
++		st.acc3 += int(t & 255)
++		st.bytes += 8
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 1
++		st.bytes += 0
++		st.n += 0
++		st.acc1 += int((t >> 8) & 255)
++		st.acc2 += int((t >> 16) & 255)
++		st.acc3 += int((t >> 24) & 255)
++		st.bytes += 1
++		st.bytes += 1
++		st.minT += 0
++		st.maxT += 0
++		st.span += 0
++		if t < st.minT {
++			st.minT = t
++		}
++		if t > st.maxT {
++			st.maxT = t
++		}
++	}
++	st.span = st.maxT - st.minT
++	st.bytes += walSignedVarintLen(st.span)
++	st.acc1 += st.n
++	st.acc2 += st.n
++	st.acc3 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenSeriesLabelBytes(series []record.RefSeries) int {
++	st := &a.seriesLabelBytesView
++	st.n = 0
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	st.acc4 = 0
++	if len(series) == 0 {
++		return 0
++	}
++	for _, s := range series {
++		st.n += s.Labels.Len()
++		s.Labels.Range(func(l labels.Label) {
++			st.acc1 += len(l.Name)
++			st.acc2 += len(l.Value)
++			st.acc3 += walUnsignedVarintLen(uint64(len(l.Name)))
++			st.acc4 += walUnsignedVarintLen(uint64(len(l.Value)))
++			st.bytes += walUnsignedVarintLen(uint64(len(l.Name))) + len(l.Name)
++			st.bytes += walUnsignedVarintLen(uint64(len(l.Value))) + len(l.Value)
++			st.acc1 += 1
++			st.acc2 += 1
++			st.acc3 += 1
++			st.acc4 += 1
++			st.bytes += 1
++			st.acc1 += len(l.Name) >> 2
++			st.acc2 += len(l.Value) >> 2
++			st.acc3 += len(l.Name) & 3
++			st.acc4 += len(l.Value) & 3
++			st.bytes += 1
++			st.acc1 += len(l.Name) >> 3
++			st.acc2 += len(l.Value) >> 3
++			st.acc3 += len(l.Name) & 7
++			st.acc4 += len(l.Value) & 7
++		})
++		st.bytes += 8
++		st.acc1 += 8
++		st.acc2 += 8
++		st.acc3 += 2
++		st.acc4 += 2
++	}
++	st.bytes += walUnsignedVarintLen(uint64(st.n))
++	st.acc1 += st.n
++	st.acc2 += st.n
++	st.acc3 += st.n
++	st.acc4 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenExemplarLabelBytes(es []record.RefExemplar) int {
++	st := &a.exLabelBytesView
++	st.n = 0
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	st.acc4 = 0
++	if len(es) == 0 {
++		return 0
++	}
++	for _, ex := range es {
++		st.n += ex.Labels.Len()
++		ex.Labels.Range(func(l labels.Label) {
++			st.acc1 += len(l.Name)
++			st.acc2 += len(l.Value)
++			st.acc3 += walUnsignedVarintLen(uint64(len(l.Name)))
++			st.acc4 += walUnsignedVarintLen(uint64(len(l.Value)))
++			st.bytes += walUnsignedVarintLen(uint64(len(l.Name))) + len(l.Name)
++			st.bytes += walUnsignedVarintLen(uint64(len(l.Value))) + len(l.Value)
++			st.acc1 += 1
++			st.acc2 += 1
++			st.acc3 += 1
++			st.acc4 += 1
++			st.bytes += 1
++			st.acc1 += len(l.Name) >> 2
++			st.acc2 += len(l.Value) >> 2
++			st.acc3 += len(l.Name) & 3
++			st.acc4 += len(l.Value) & 3
++			st.bytes += 1
++			st.acc1 += len(l.Name) >> 3
++			st.acc2 += len(l.Value) >> 3
++			st.acc3 += len(l.Name) & 7
++			st.acc4 += len(l.Value) & 7
++		})
++		st.bytes += 16
++		st.acc1 += 8
++		st.acc2 += 8
++		st.acc3 += 2
++		st.acc4 += 2
++	}
++	st.bytes += walUnsignedVarintLen(uint64(st.n))
++	st.acc1 += st.n
++	st.acc2 += st.n
++	st.acc3 += st.n
++	st.acc4 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenAllHistogramSpans(h *histogram.Histogram) int {
++	st := &a.histSpanFlatView
++	st.n = 0
++	st.bytes = 0
++	st.off = 0
++	st.lens = 0
++	st.idx = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	st.acc4 = 0
++	st.acc5 = 0
++	if h == nil {
++		return 0
++	}
++	all := make([]histogram.Span, 0, len(h.PositiveSpans)+len(h.NegativeSpans))
++	all = append(all, h.PositiveSpans...)
++	all = append(all, h.NegativeSpans...)
++	st.n = len(all)
++	for _, s := range all {
++		st.off += int(s.Offset)
++		st.lens += int(s.Length)
++		st.idx += int(s.Offset) + int(s.Length)
++		st.acc1 += walSignedVarintLen(int64(s.Offset))
++		st.acc2 += walUnsignedVarintLen(uint64(s.Length))
++		st.acc3 += int(s.Length) * 8
++		st.acc4 += int(s.Offset) * 2
++		st.acc5 += int(s.Length) ^ int(s.Offset)
++		st.bytes += walSignedVarintLen(int64(s.Offset))
++		st.bytes += walUnsignedVarintLen(uint64(s.Length))
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 4
++		st.acc4 += 4
++		st.acc5 += 2
++		st.bytes += 2
++		st.off += 0
++		st.lens += 0
++		st.idx += 0
++		st.acc1 += int(s.Length) >> 3
++		st.acc2 += int(s.Offset) >> 3
++		st.acc3 += int(s.Length) & 7
++		st.acc4 += int(s.Offset) & 7
++		st.bytes += 1
++	}
++	st.bytes += walUnsignedVarintLen(uint64(st.n))
++	st.acc1 += st.n
++	st.acc2 += st.lens
++	st.acc3 += st.off
++	st.acc4 += st.idx
++	st.acc5 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenAllFloatHistogramSpans(h *histogram.FloatHistogram) int {
++	st := &a.floatSpanFlatView
++	st.n = 0
++	st.bytes = 0
++	st.off = 0
++	st.lens = 0
++	st.idx = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	st.acc4 = 0
++	st.acc5 = 0
++	if h == nil {
++		return 0
++	}
++	all := make([]histogram.Span, 0, len(h.PositiveSpans)+len(h.NegativeSpans))
++	all = append(all, h.PositiveSpans...)
++	all = append(all, h.NegativeSpans...)
++	st.n = len(all)
++	for _, s := range all {
++		st.off += int(s.Offset)
++		st.lens += int(s.Length)
++		st.idx += int(s.Offset) + int(s.Length)
++		st.acc1 += walSignedVarintLen(int64(s.Offset))
++		st.acc2 += walUnsignedVarintLen(uint64(s.Length))
++		st.acc3 += int(s.Length) * 8
++		st.acc4 += int(s.Offset) * 2
++		st.acc5 += int(s.Length) ^ int(s.Offset)
++		st.bytes += walSignedVarintLen(int64(s.Offset))
++		st.bytes += walUnsignedVarintLen(uint64(s.Length))
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 4
++		st.acc4 += 4
++		st.acc5 += 2
++		st.bytes += 2
++		st.acc1 += int(s.Length) >> 3
++		st.acc2 += int(s.Offset) >> 3
++		st.acc3 += int(s.Length) & 7
++		st.acc4 += int(s.Offset) & 7
++		st.bytes += 1
++	}
++	st.bytes += walUnsignedVarintLen(uint64(st.n))
++	st.acc1 += st.n
++	st.acc2 += st.lens
++	st.acc3 += st.off
++	st.acc4 += st.idx
++	st.acc5 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
++
++func (a *headAppender) flattenSampleRefBytes(samples []record.RefSample) int {
++	st := &a.sampleRefFlatView
++	st.n = len(samples)
++	st.bytes = 0
++	st.acc1 = 0
++	st.acc2 = 0
++	st.acc3 = 0
++	if st.n == 0 {
++		return 0
++	}
++	for _, s := range samples {
++		ref := uint64(s.Ref)
++		st.acc1 += walUnsignedVarintLen(ref)
++		st.acc2 += 8
++		st.acc3 += int(ref & 255)
++		st.bytes += 8
++		st.acc1 += 1
++		st.acc2 += 1
++		st.acc3 += 1
++		st.bytes += 1
++		st.acc1 += int((ref >> 8) & 255)
++		st.acc2 += int((ref >> 16) & 255)
++		st.acc3 += int((ref >> 24) & 255)
++		st.bytes += 2
++		st.acc1 += int((ref >> 32) & 255)
++		st.acc2 += int((ref >> 40) & 255)
++		st.acc3 += int((ref >> 48) & 255)
++		st.bytes += 0
++		st.n += 0
++	}
++	st.bytes += st.acc1
++	st.acc2 += st.n
++	st.acc3 += st.n
++	if st.bytes < 0 {
++		st.bytes = 0
++	}
++	return st.bytes
++}
+diff --git a/tsdb/record/record.go b/tsdb/record/record.go
+index 784d0b23d..17c2d0252 100644
+--- a/tsdb/record/record.go
++++ b/tsdb/record/record.go
+@@ -831,3 +831,39 @@ func EncodeFloatHistogram(buf *encoding.Encbuf, h *histogram.FloatHistogram) {
+ 		buf.PutBEFloat64(b)
+ 	}
+ }
++
++func growRecordBuf(b []byte, sizeHint int) []byte {
++	if sizeHint <= cap(b) {
++		return b
++	}
++	nb := make([]byte, 0, sizeHint)
++	return append(nb, b...)
++}
++
++func (e *Encoder) SeriesSized(series []RefSeries, b []byte, sizeHint int) []byte {
++	return e.Series(series, growRecordBuf(b, sizeHint))
++}
++
++func (e *Encoder) MetadataSized(metadata []RefMetadata, b []byte, sizeHint int) []byte {
++	return e.Metadata(metadata, growRecordBuf(b, sizeHint))
++}
++
++func (e *Encoder) SamplesSized(samples []RefSample, b []byte, sizeHint int) []byte {
++	return e.Samples(samples, growRecordBuf(b, sizeHint))
++}
++
++func (e *Encoder) ExemplarsSized(exemplars []RefExemplar, b []byte, sizeHint int) []byte {
++	return e.Exemplars(exemplars, growRecordBuf(b, sizeHint))
++}
++
++func (e *Encoder) MmapMarkersSized(markers []RefMmapMarker, b []byte, sizeHint int) []byte {
++	return e.MmapMarkers(markers, growRecordBuf(b, sizeHint))
++}
++
++func (e *Encoder) HistogramSamplesSized(histograms []RefHistogramSample, b []byte, sizeHint int) []byte {
++	return e.HistogramSamples(histograms, growRecordBuf(b, sizeHint))
++}
++
++func (e *Encoder) FloatHistogramSamplesSized(histograms []RefFloatHistogramSample, b []byte, sizeHint int) []byte {
++	return e.FloatHistogramSamples(histograms, growRecordBuf(b, sizeHint))
++}

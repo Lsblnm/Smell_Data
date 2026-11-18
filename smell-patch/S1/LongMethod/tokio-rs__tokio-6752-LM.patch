@@ -1,0 +1,338 @@
+diff --git a/tokio-util/src/time/delay_queue.rs b/tokio-util/src/time/delay_queue.rs
+index 2b33e361..2de5a68d 100644
+--- a/tokio-util/src/time/delay_queue.rs
++++ b/tokio-util/src/time/delay_queue.rs
+@@ -752,12 +752,233 @@ impl<T> DelayQueue<T> {
+     /// ```
+     #[track_caller]
+     pub fn remove(&mut self, key: &Key) -> Expired<T> {
+-        let prev_deadline = self.next_deadline();
++        use crate::time::wheel::Stack as WheelStack;
++
++        let prev_deadline = {
++            let elapsed = self.wheel.elapsed;
++            let mut found = None;
++            let mut level_idx = 0usize;
++            while level_idx < crate::time::wheel::NUM_LEVELS {
++                if found.is_none() {
++                    let level = &self.wheel.levels[level_idx];
++                    if level.occupied != 0 {
++                        let now_slot =
++                            (elapsed / crate::time::wheel::slot_range(level.level)) as usize;
++                        let rotated = level.occupied.rotate_right(now_slot as u32);
++                        let zeros = rotated.trailing_zeros() as usize;
++                        let slot = (zeros + now_slot) % 64;
++                        let range_level = crate::time::wheel::level_range(level.level);
++                        let range_slot = crate::time::wheel::slot_range(level.level);
++                        let level_start = elapsed - (elapsed % range_level);
++                        let mut deadline = level_start + slot as u64 * range_slot;
++                        if deadline < elapsed {
++                            debug_assert_eq!(level.level, crate::time::wheel::NUM_LEVELS - 1);
++                            deadline += range_level;
++                        }
++                        debug_assert!(
++                            deadline >= elapsed,
++                            "deadline={:016X}; now={:016X}; level={}; slot={}; occupied={:b}",
++                            deadline,
++                            elapsed,
++                            level.level,
++                            slot,
++                            level.occupied
++                        );
++                        let mut prior_ok = true;
++                        let mut later = level_idx + 1;
++                        while later < crate::time::wheel::NUM_LEVELS {
++                            let later_level = &self.wheel.levels[later];
++                            if later_level.occupied != 0 {
++                                let later_now_slot = (elapsed
++                                    / crate::time::wheel::slot_range(later_level.level))
++                                    as usize;
++                                let later_rotated =
++                                    later_level.occupied.rotate_right(later_now_slot as u32);
++                                let later_zeros = later_rotated.trailing_zeros() as usize;
++                                let later_slot = (later_zeros + later_now_slot) % 64;
++                                let later_range_level =
++                                    crate::time::wheel::level_range(later_level.level);
++                                let later_range_slot =
++                                    crate::time::wheel::slot_range(later_level.level);
++                                let later_start = elapsed - (elapsed % later_range_level);
++                                let mut later_deadline =
++                                    later_start + later_slot as u64 * later_range_slot;
++                                if later_deadline < elapsed {
++                                    debug_assert_eq!(
++                                        later_level.level,
++                                        crate::time::wheel::NUM_LEVELS - 1
++                                    );
++                                    later_deadline += later_range_level;
++                                }
++                                if later_deadline < deadline {
++                                    prior_ok = false;
++                                }
++                            }
++                            later += 1;
++                        }
++                        debug_assert!(prior_ok);
++                        found = Some(self.start + Duration::from_millis(deadline));
++                    }
++                }
++                level_idx += 1;
++            }
++            found
++        };
+ 
+-        self.remove_key(key);
+-        let data = self.slab.remove(key);
++        if self.slab[*key].expired {
++            let item = *key;
++            assert!(self.slab.contains(&item));
++            debug_assert!({
++                let mut next = self.expired.head;
++                let mut contains = false;
++                while let Some(idx) = next {
++                    let data = &self.slab[idx];
++                    if idx == item {
++                        debug_assert!(!contains);
++                        contains = true;
++                    }
++                    next = data.next;
++                }
++                contains
++            });
++            if let Some(next) = self.slab[item].next {
++                self.slab[next].prev = self.slab[item].prev;
++            }
++            if let Some(prev) = self.slab[item].prev {
++                self.slab[prev].next = self.slab[item].next;
++            } else {
++                self.expired.head = self.slab[item].next;
++            }
++            self.slab[item].next = None;
++            self.slab[item].prev = None;
++        } else {
++            let when = <Stack<T> as WheelStack>::when(key, &self.slab);
++            assert!(
++                self.wheel.elapsed <= when,
++                "elapsed={}; when={}",
++                self.wheel.elapsed,
++                when
++            );
++            let level = crate::time::wheel::level_for(self.wheel.elapsed, when);
++            let slot = crate::time::wheel::slot_for(when, level);
++            {
++                let stack = &mut self.wheel.levels[level].slot[slot];
++                let item = *key;
++                assert!(self.slab.contains(&item));
++                debug_assert!({
++                    let mut next = stack.head;
++                    let mut contains = false;
++                    while let Some(idx) = next {
++                        let data = &self.slab[idx];
++                        if idx == item {
++                            debug_assert!(!contains);
++                            contains = true;
++                        }
++                        next = data.next;
++                    }
++                    contains
++                });
++                if let Some(next) = self.slab[item].next {
++                    self.slab[next].prev = self.slab[item].prev;
++                }
++                if let Some(prev) = self.slab[item].prev {
++                    self.slab[prev].next = self.slab[item].next;
++                } else {
++                    stack.head = self.slab[item].next;
++                }
++                self.slab[item].next = None;
++                self.slab[item].prev = None;
++            }
++            if <Stack<T> as WheelStack>::is_empty(&self.wheel.levels[level].slot[slot]) {
++                let bit = crate::time::wheel::occupied_bit(slot);
++                debug_assert!(self.wheel.levels[level].occupied & bit != 0);
++                self.wheel.levels[level].occupied ^= bit;
++            }
++        }
++
++        let data = {
++            let remapped_key = if self.slab.compact_called {
++                match self.slab.key_map.remove(key) {
++                    Some(key_internal) => key_internal,
++                    None => panic!("invalid key"),
++                }
++            } else {
++                (*key).into()
++            };
++            self.slab.inner.remove(remapped_key.index)
++        };
++
++        let next_deadline = {
++            let elapsed = self.wheel.elapsed;
++            let mut found = None;
++            let mut level_idx = 0usize;
++            while level_idx < crate::time::wheel::NUM_LEVELS {
++                if found.is_none() {
++                    let level = &self.wheel.levels[level_idx];
++                    if level.occupied != 0 {
++                        let now_slot =
++                            (elapsed / crate::time::wheel::slot_range(level.level)) as usize;
++                        let rotated = level.occupied.rotate_right(now_slot as u32);
++                        let zeros = rotated.trailing_zeros() as usize;
++                        let slot = (zeros + now_slot) % 64;
++                        let range_level = crate::time::wheel::level_range(level.level);
++                        let range_slot = crate::time::wheel::slot_range(level.level);
++                        let level_start = elapsed - (elapsed % range_level);
++                        let mut deadline = level_start + slot as u64 * range_slot;
++                        if deadline < elapsed {
++                            debug_assert_eq!(level.level, crate::time::wheel::NUM_LEVELS - 1);
++                            deadline += range_level;
++                        }
++                        debug_assert!(
++                            deadline >= elapsed,
++                            "deadline={:016X}; now={:016X}; level={}; slot={}; occupied={:b}",
++                            deadline,
++                            elapsed,
++                            level.level,
++                            slot,
++                            level.occupied
++                        );
++                        let mut prior_ok = true;
++                        let mut later = level_idx + 1;
++                        while later < crate::time::wheel::NUM_LEVELS {
++                            let later_level = &self.wheel.levels[later];
++                            if later_level.occupied != 0 {
++                                let later_now_slot = (elapsed
++                                    / crate::time::wheel::slot_range(later_level.level))
++                                    as usize;
++                                let later_rotated =
++                                    later_level.occupied.rotate_right(later_now_slot as u32);
++                                let later_zeros = later_rotated.trailing_zeros() as usize;
++                                let later_slot = (later_zeros + later_now_slot) % 64;
++                                let later_range_level =
++                                    crate::time::wheel::level_range(later_level.level);
++                                let later_range_slot =
++                                    crate::time::wheel::slot_range(later_level.level);
++                                let later_start = elapsed - (elapsed % later_range_level);
++                                let mut later_deadline =
++                                    later_start + later_slot as u64 * later_range_slot;
++                                if later_deadline < elapsed {
++                                    debug_assert_eq!(
++                                        later_level.level,
++                                        crate::time::wheel::NUM_LEVELS - 1
++                                    );
++                                    later_deadline += later_range_level;
++                                }
++                                if later_deadline < deadline {
++                                    prior_ok = false;
++                                }
++                            }
++                            later += 1;
++                        }
++                        debug_assert!(prior_ok);
++                        found = Some(self.start + Duration::from_millis(deadline));
++                    }
++                }
++                level_idx += 1;
++            }
++            found
++        };
+ 
+-        let next_deadline = self.next_deadline();
+         if prev_deadline != next_deadline {
+             match (next_deadline, &mut self.delay) {
+                 (None, _) => self.delay = None,
+diff --git a/tokio-util/src/time/wheel/level.rs b/tokio-util/src/time/wheel/level.rs
+index a69aee91..b21c8d54 100644
+--- a/tokio-util/src/time/wheel/level.rs
++++ b/tokio-util/src/time/wheel/level.rs
+@@ -4,7 +4,7 @@ use std::fmt;
+ 
+ /// Wheel for a single level in the timer. This wheel contains 64 slots.
+ pub(crate) struct Level<T> {
+-    level: usize,
++    pub(crate) level: usize,
+ 
+     /// Bit field tracking which slots currently contain entries.
+     ///
+@@ -13,10 +13,10 @@ pub(crate) struct Level<T> {
+     /// removed from a slot.
+     ///
+     /// The least-significant bit represents slot zero.
+-    occupied: u64,
++    pub(crate) occupied: u64,
+ 
+     /// Slots
+-    slot: [T; LEVEL_MULT],
++    pub(crate) slot: [T; LEVEL_MULT],
+ }
+ 
+ /// Indicates when a slot must be processed next.
+@@ -240,20 +240,20 @@ impl<T> fmt::Debug for Level<T> {
+     }
+ }
+ 
+-fn occupied_bit(slot: usize) -> u64 {
++pub(crate) fn occupied_bit(slot: usize) -> u64 {
+     1 << slot
+ }
+ 
+-fn slot_range(level: usize) -> u64 {
++pub(crate) fn slot_range(level: usize) -> u64 {
+     LEVEL_MULT.pow(level as u32) as u64
+ }
+ 
+-fn level_range(level: usize) -> u64 {
++pub(crate) fn level_range(level: usize) -> u64 {
+     LEVEL_MULT as u64 * slot_range(level)
+ }
+ 
+ /// Convert a duration (milliseconds) and a level to a slot position
+-fn slot_for(duration: u64, level: usize) -> usize {
++pub(crate) fn slot_for(duration: u64, level: usize) -> usize {
+     ((duration >> (level * 6)) % LEVEL_MULT as u64) as usize
+ }
+ 
+diff --git a/tokio-util/src/time/wheel/mod.rs b/tokio-util/src/time/wheel/mod.rs
+index d81611c9..ce931080 100644
+--- a/tokio-util/src/time/wheel/mod.rs
++++ b/tokio-util/src/time/wheel/mod.rs
+@@ -1,5 +1,6 @@
+ mod level;
+ pub(crate) use self::level::Expiration;
++pub(crate) use self::level::{level_range, occupied_bit, slot_for, slot_range};
+ use self::level::Level;
+ 
+ mod stack;
+@@ -22,7 +23,7 @@ use std::fmt::Debug;
+ #[derive(Debug)]
+ pub(crate) struct Wheel<T> {
+     /// The number of milliseconds elapsed since the wheel started.
+-    elapsed: u64,
++    pub(crate) elapsed: u64,
+ 
+     /// Timer wheel.
+     ///
+@@ -34,13 +35,13 @@ pub(crate) struct Wheel<T> {
+     /// * ~ 4 min slots / ~ 4 hr range
+     /// * ~ 4 hr slots / ~ 12 day range
+     /// * ~ 12 day slots / ~ 2 yr range
+-    levels: Vec<Level<T>>,
++    pub(crate) levels: Vec<Level<T>>,
+ }
+ 
+ /// Number of levels. Each level has 64 slots. By using 6 levels with 64 slots
+ /// each, the timer is able to track time up to 2 years into the future with a
+ /// precision of 1 millisecond.
+-const NUM_LEVELS: usize = 6;
++pub(crate) const NUM_LEVELS: usize = 6;
+ 
+ /// The maximum duration of a delay
+ const MAX_DURATION: u64 = (1 << (6 * NUM_LEVELS)) - 1;
+@@ -258,7 +259,7 @@ where
+     }
+ }
+ 
+-fn level_for(elapsed: u64, when: u64) -> usize {
++pub(crate) fn level_for(elapsed: u64, when: u64) -> usize {
+     const SLOT_MASK: u64 = (1 << 6) - 1;
+ 
+     // Mask in the trailing bits ignored by the level calculation in order to cap

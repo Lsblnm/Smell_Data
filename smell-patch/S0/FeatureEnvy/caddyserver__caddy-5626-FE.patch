@@ -1,0 +1,427 @@
+diff --git a/caddyconfig/caddyfile/dispenser.go b/caddyconfig/caddyfile/dispenser.go
+index 580de4a9..3c5343bd 100644
+--- a/caddyconfig/caddyfile/dispenser.go
++++ b/caddyconfig/caddyfile/dispenser.go
+@@ -19,8 +19,12 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"log"
++	"path/filepath"
+ 	"strconv"
+ 	"strings"
++
++	"github.com/caddyserver/caddy/v2"
++	"go.uber.org/zap"
+ )
+ 
+ // Dispenser is a type that dispenses tokens, similarly to a lexer,
+@@ -502,3 +506,183 @@ func (d *Dispenser) isNextOnNewLine() bool {
+ 	// then the next token is on a new line
+ 	return curr.Line+curr.NumLineBreaks() < next.Line
+ }
++
++// doImport swaps out the import directive and its argument
++// (a total of 2 tokens) with the tokens in the specified file
++// or globbing pattern. When the function returns, the cursor
++// is on the token before where the import directive was. In
++// other words, call Next() to access the first token that was
++// imported.
++func (d *Dispenser) doImport(p *parser, nesting int) error {
++	// syntax checks
++	if !d.NextArg() {
++		return d.ArgErr()
++	}
++	importPattern := d.Val()
++	if importPattern == "" {
++		return d.Err("Import requires a non-empty filepath")
++	}
++
++	// grab remaining args as placeholder replacements
++	args := d.RemainingArgs()
++
++	// set up a replacer for non-variadic args replacement
++	repl := makeArgsReplacer(args)
++
++	// splice out the import directive and its arguments
++	// (2 tokens, plus the length of args)
++	tokensBefore := d.tokens[:d.cursor-1-len(args)]
++	tokensAfter := d.tokens[d.cursor+1:]
++	var importedTokens []Token
++	var nodes []string
++
++	// first check snippets. That is a simple, non-recursive replacement
++	if p.definedSnippets != nil && p.definedSnippets[importPattern] != nil {
++		importedTokens = p.definedSnippets[importPattern]
++		if len(importedTokens) > 0 {
++			// just grab the first one
++			nodes = append(nodes, fmt.Sprintf("%s:%s", importedTokens[0].File, importedTokens[0].snippetName))
++		}
++	} else {
++		// make path relative to the file of the _token_ being processed rather
++		// than current working directory (issue #867) and then use glob to get
++		// list of matching filenames
++		absFile, err := filepath.Abs(d.File())
++		if err != nil {
++			return d.Errf("Failed to get absolute path of file: %s: %v", d.File(), err)
++		}
++
++		var matches []string
++		var globPattern string
++		if !filepath.IsAbs(importPattern) {
++			globPattern = filepath.Join(filepath.Dir(absFile), importPattern)
++		} else {
++			globPattern = importPattern
++		}
++		if strings.Count(globPattern, "*") > 1 || strings.Count(globPattern, "?") > 1 ||
++			(strings.Contains(globPattern, "[") && strings.Contains(globPattern, "]")) {
++			// See issue #2096 - a pattern with many glob expansions can hang for too long
++			return d.Errf("Glob pattern may only contain one wildcard (*), but has others: %s", globPattern)
++		}
++		matches, err = filepath.Glob(globPattern)
++
++		if err != nil {
++			return d.Errf("Failed to use import pattern %s: %v", importPattern, err)
++		}
++		if len(matches) == 0 {
++			if strings.ContainsAny(globPattern, "*?[]") {
++				caddy.Log().Warn("No files matching import glob pattern", zap.String("pattern", importPattern))
++			} else {
++				return d.Errf("File to import not found: %s", importPattern)
++			}
++		} else {
++			// See issue #5295 - should skip any files that start with a . when iterating over them.
++			sep := string(filepath.Separator)
++			segGlobPattern := strings.Split(globPattern, sep)
++			if strings.HasPrefix(segGlobPattern[len(segGlobPattern)-1], "*") {
++				var tmpMatches []string
++				for _, m := range matches {
++					seg := strings.Split(m, sep)
++					if !strings.HasPrefix(seg[len(seg)-1], ".") {
++						tmpMatches = append(tmpMatches, m)
++					}
++				}
++				matches = tmpMatches
++			}
++		}
++
++		// collect all the imported tokens
++		for _, importFile := range matches {
++			newTokens, err := p.doSingleImport(importFile)
++			if err != nil {
++				return err
++			}
++			importedTokens = append(importedTokens, newTokens...)
++		}
++		nodes = matches
++	}
++
++	nodeName := d.File()
++	if d.Token().snippetName != "" {
++		nodeName += fmt.Sprintf(":%s", d.Token().snippetName)
++	}
++	p.importGraph.addNode(nodeName)
++	p.importGraph.addNodes(nodes)
++	if err := p.importGraph.addEdges(nodeName, nodes); err != nil {
++		p.importGraph.removeNodes(nodes)
++		return err
++	}
++
++	// copy the tokens so we don't overwrite p.definedSnippets
++	tokensCopy := make([]Token, 0, len(importedTokens))
++
++	var (
++		maybeSnippet   bool
++		maybeSnippetId bool
++		index          int
++	)
++
++	// run the argument replacer on the tokens
++	// golang for range slice return a copy of value
++	// similarly, append also copy value
++	for i, token := range importedTokens {
++		// update the token's imports to refer to import directive filename, line number and snippet name if there is one
++		if token.snippetName != "" {
++			token.imports = append(token.imports, fmt.Sprintf("%s:%d (import %s)", d.File(), d.Line(), token.snippetName))
++		} else {
++			token.imports = append(token.imports, fmt.Sprintf("%s:%d (import)", d.File(), d.Line()))
++		}
++
++		// naive way of determine snippets, as snippets definition can only follow name + block
++		// format, won't check for nesting correctness or any other error, that's what parser does.
++		if !maybeSnippet && nesting == 0 {
++			// first of the line
++			if i == 0 || importedTokens[i-1].File != token.File || importedTokens[i-1].Line+importedTokens[i-1].NumLineBreaks() < token.Line {
++				index = 0
++			} else {
++				index++
++			}
++
++			if index == 0 && len(token.Text) >= 3 && strings.HasPrefix(token.Text, "(") && strings.HasSuffix(token.Text, ")") {
++				maybeSnippetId = true
++			}
++		}
++
++		switch token.Text {
++		case "{":
++			nesting++
++			if index == 1 && maybeSnippetId && nesting == 1 {
++				maybeSnippet = true
++				maybeSnippetId = false
++			}
++		case "}":
++			nesting--
++			if nesting == 0 && maybeSnippet {
++				maybeSnippet = false
++			}
++		}
++
++		if maybeSnippet {
++			tokensCopy = append(tokensCopy, token)
++			continue
++		}
++
++		foundVariadic, startIndex, endIndex := parseVariadic(token, len(args))
++		if foundVariadic {
++			for _, arg := range args[startIndex:endIndex] {
++				token.Text = arg
++				tokensCopy = append(tokensCopy, token)
++			}
++		} else {
++			token.Text = repl.ReplaceKnown(token.Text, "")
++			tokensCopy = append(tokensCopy, token)
++		}
++	}
++
++	// splice the imported tokens in the place of the import statement
++	// and rewind cursor so Next() will land on first imported token
++	d.tokens = append(tokensBefore, append(tokensCopy, tokensAfter...)...)
++	d.cursor -= len(args) + 1
++
++	return nil
++}
+diff --git a/caddyconfig/caddyfile/parse.go b/caddyconfig/caddyfile/parse.go
+index 81181a47..4c8cbf77 100644
+--- a/caddyconfig/caddyfile/parse.go
++++ b/caddyconfig/caddyfile/parse.go
+@@ -16,7 +16,6 @@ package caddyfile
+ 
+ import (
+ 	"bytes"
+-	"fmt"
+ 	"io"
+ 	"os"
+ 	"path/filepath"
+@@ -214,7 +213,7 @@ func (p *parser) addresses() error {
+ 
+ 		// special case: import directive replaces tokens during parse-time
+ 		if tkn == "import" && p.isNewLine() {
+-			err := p.doImport(0)
++			err := p.doImport(p, 0)
+ 			if err != nil {
+ 				return err
+ 			}
+@@ -314,7 +313,7 @@ func (p *parser) directives() error {
+ 
+ 		// special case: import directive replaces tokens during parse-time
+ 		if p.Val() == "import" {
+-			err := p.doImport(1)
++			err := p.doImport(p, 1)
+ 			if err != nil {
+ 				return err
+ 			}
+@@ -334,186 +333,6 @@ func (p *parser) directives() error {
+ 	return nil
+ }
+ 
+-// doImport swaps out the import directive and its argument
+-// (a total of 2 tokens) with the tokens in the specified file
+-// or globbing pattern. When the function returns, the cursor
+-// is on the token before where the import directive was. In
+-// other words, call Next() to access the first token that was
+-// imported.
+-func (p *parser) doImport(nesting int) error {
+-	// syntax checks
+-	if !p.NextArg() {
+-		return p.ArgErr()
+-	}
+-	importPattern := p.Val()
+-	if importPattern == "" {
+-		return p.Err("Import requires a non-empty filepath")
+-	}
+-
+-	// grab remaining args as placeholder replacements
+-	args := p.RemainingArgs()
+-
+-	// set up a replacer for non-variadic args replacement
+-	repl := makeArgsReplacer(args)
+-
+-	// splice out the import directive and its arguments
+-	// (2 tokens, plus the length of args)
+-	tokensBefore := p.tokens[:p.cursor-1-len(args)]
+-	tokensAfter := p.tokens[p.cursor+1:]
+-	var importedTokens []Token
+-	var nodes []string
+-
+-	// first check snippets. That is a simple, non-recursive replacement
+-	if p.definedSnippets != nil && p.definedSnippets[importPattern] != nil {
+-		importedTokens = p.definedSnippets[importPattern]
+-		if len(importedTokens) > 0 {
+-			// just grab the first one
+-			nodes = append(nodes, fmt.Sprintf("%s:%s", importedTokens[0].File, importedTokens[0].snippetName))
+-		}
+-	} else {
+-		// make path relative to the file of the _token_ being processed rather
+-		// than current working directory (issue #867) and then use glob to get
+-		// list of matching filenames
+-		absFile, err := filepath.Abs(p.Dispenser.File())
+-		if err != nil {
+-			return p.Errf("Failed to get absolute path of file: %s: %v", p.Dispenser.File(), err)
+-		}
+-
+-		var matches []string
+-		var globPattern string
+-		if !filepath.IsAbs(importPattern) {
+-			globPattern = filepath.Join(filepath.Dir(absFile), importPattern)
+-		} else {
+-			globPattern = importPattern
+-		}
+-		if strings.Count(globPattern, "*") > 1 || strings.Count(globPattern, "?") > 1 ||
+-			(strings.Contains(globPattern, "[") && strings.Contains(globPattern, "]")) {
+-			// See issue #2096 - a pattern with many glob expansions can hang for too long
+-			return p.Errf("Glob pattern may only contain one wildcard (*), but has others: %s", globPattern)
+-		}
+-		matches, err = filepath.Glob(globPattern)
+-
+-		if err != nil {
+-			return p.Errf("Failed to use import pattern %s: %v", importPattern, err)
+-		}
+-		if len(matches) == 0 {
+-			if strings.ContainsAny(globPattern, "*?[]") {
+-				caddy.Log().Warn("No files matching import glob pattern", zap.String("pattern", importPattern))
+-			} else {
+-				return p.Errf("File to import not found: %s", importPattern)
+-			}
+-		} else {
+-			// See issue #5295 - should skip any files that start with a . when iterating over them.
+-			sep := string(filepath.Separator)
+-			segGlobPattern := strings.Split(globPattern, sep)
+-			if strings.HasPrefix(segGlobPattern[len(segGlobPattern)-1], "*") {
+-				var tmpMatches []string
+-				for _, m := range matches {
+-					seg := strings.Split(m, sep)
+-					if !strings.HasPrefix(seg[len(seg)-1], ".") {
+-						tmpMatches = append(tmpMatches, m)
+-					}
+-				}
+-				matches = tmpMatches
+-			}
+-		}
+-
+-		// collect all the imported tokens
+-		for _, importFile := range matches {
+-			newTokens, err := p.doSingleImport(importFile)
+-			if err != nil {
+-				return err
+-			}
+-			importedTokens = append(importedTokens, newTokens...)
+-		}
+-		nodes = matches
+-	}
+-
+-	nodeName := p.File()
+-	if p.Token().snippetName != "" {
+-		nodeName += fmt.Sprintf(":%s", p.Token().snippetName)
+-	}
+-	p.importGraph.addNode(nodeName)
+-	p.importGraph.addNodes(nodes)
+-	if err := p.importGraph.addEdges(nodeName, nodes); err != nil {
+-		p.importGraph.removeNodes(nodes)
+-		return err
+-	}
+-
+-	// copy the tokens so we don't overwrite p.definedSnippets
+-	tokensCopy := make([]Token, 0, len(importedTokens))
+-
+-	var (
+-		maybeSnippet   bool
+-		maybeSnippetId bool
+-		index          int
+-	)
+-
+-	// run the argument replacer on the tokens
+-	// golang for range slice return a copy of value
+-	// similarly, append also copy value
+-	for i, token := range importedTokens {
+-		// update the token's imports to refer to import directive filename, line number and snippet name if there is one
+-		if token.snippetName != "" {
+-			token.imports = append(token.imports, fmt.Sprintf("%s:%d (import %s)", p.File(), p.Line(), token.snippetName))
+-		} else {
+-			token.imports = append(token.imports, fmt.Sprintf("%s:%d (import)", p.File(), p.Line()))
+-		}
+-
+-		// naive way of determine snippets, as snippets definition can only follow name + block
+-		// format, won't check for nesting correctness or any other error, that's what parser does.
+-		if !maybeSnippet && nesting == 0 {
+-			// first of the line
+-			if i == 0 || importedTokens[i-1].File != token.File || importedTokens[i-1].Line+importedTokens[i-1].NumLineBreaks() < token.Line {
+-				index = 0
+-			} else {
+-				index++
+-			}
+-
+-			if index == 0 && len(token.Text) >= 3 && strings.HasPrefix(token.Text, "(") && strings.HasSuffix(token.Text, ")") {
+-				maybeSnippetId = true
+-			}
+-		}
+-
+-		switch token.Text {
+-		case "{":
+-			nesting++
+-			if index == 1 && maybeSnippetId && nesting == 1 {
+-				maybeSnippet = true
+-				maybeSnippetId = false
+-			}
+-		case "}":
+-			nesting--
+-			if nesting == 0 && maybeSnippet {
+-				maybeSnippet = false
+-			}
+-		}
+-
+-		if maybeSnippet {
+-			tokensCopy = append(tokensCopy, token)
+-			continue
+-		}
+-
+-		foundVariadic, startIndex, endIndex := parseVariadic(token, len(args))
+-		if foundVariadic {
+-			for _, arg := range args[startIndex:endIndex] {
+-				token.Text = arg
+-				tokensCopy = append(tokensCopy, token)
+-			}
+-		} else {
+-			token.Text = repl.ReplaceKnown(token.Text, "")
+-			tokensCopy = append(tokensCopy, token)
+-		}
+-	}
+-
+-	// splice the imported tokens in the place of the import statement
+-	// and rewind cursor so Next() will land on first imported token
+-	p.tokens = append(tokensBefore, append(tokensCopy, tokensAfter...)...)
+-	p.cursor -= len(args) + 1
+-
+-	return nil
+-}
+-
+ // doSingleImport lexes the individual file at importFile and returns
+ // its tokens or an error, if any.
+ func (p *parser) doSingleImport(importFile string) ([]Token, error) {
+@@ -593,7 +412,7 @@ func (p *parser) directive() error {
+ 		} else if p.Val() == "}" && p.nesting == 0 {
+ 			return p.Err("Unexpected '}' because no matching opening brace")
+ 		} else if p.Val() == "import" && p.isNewLine() {
+-			if err := p.doImport(1); err != nil {
++			if err := p.doImport(p, 1); err != nil {
+ 				return err
+ 			}
+ 			p.cursor-- // cursor is advanced when we continue, so roll back one more

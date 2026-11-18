@@ -1,0 +1,312 @@
+diff --git a/src/functions.c b/src/functions.c
+index f51aa62d0..9996ff521 100644
+--- a/src/functions.c
++++ b/src/functions.c
+@@ -622,30 +622,263 @@ static void fcallCommandGeneric(client *c, int ro) {
+         addReplyError(c, "Function not found");
+         return;
+     }
+-    engine *engine = fi->li->ei->engine;
+ 
+-    long long numkeys;
+-    /* Get the number of arguments that are keys */
+-    if (getLongLongFromObject(c->argv[2], &numkeys) != C_OK) {
+-        addReplyError(c, "Bad number of keys provided");
+-        return;
++    functionLibInfo *li = fi->li;
++    engineInfo *ei = li->ei;
++    engine *engine = ei->engine;
++    client *engine_client = ei->c;
++    client *caller = c;
++    uint64_t script_flags = fi->f_flags;
++    long long numkeys = 0;
++    int parsed_numkeys = 0;
++    robj *numkeys_obj = c->argv[2];
++    int has_no_writes = 0;
++    int has_allow_oom = 0;
++    int has_allow_stale = 0;
++    int has_no_cluster = 0;
++    int has_allow_cross_slot = 0;
++    int has_eval_compat = 0;
++    int client_allow_oom = 0;
++    int running_stale = 0;
++    int obey_client = 0;
++    int prepared = 0;
++    int write_blocked = 0;
++    int deny_write_type = DISK_ERROR_TYPE_NONE;
++    int replicas_ok = 1;
++    int aof_bio_fsync_status = C_OK;
++    scriptRunCtx run_ctx;
++    client *script_client;
++    client *curr_client;
++    client *timeout_client;
++    robj **keys;
++    robj **args;
++    size_t nkeys;
++    size_t nargs;
++    int dbid;
++    void *compiled_function;
++    void *engine_ctx;
++    sds funcname;
++    int pending_replies;
++    int replica_lag_window;
++    long long replica_needed;
++    long long replica_good;
++
++    if (script_flags & SCRIPT_FLAG_NO_WRITES) {
++        has_no_writes = 1;
+     }
+-    if (numkeys > (c->argc - 3)) {
+-        addReplyError(c, "Number of keys can't be greater than number of args");
+-        return;
+-    } else if (numkeys < 0) {
+-        addReplyError(c, "Number of keys can't be negative");
+-        return;
++    if (script_flags & SCRIPT_FLAG_ALLOW_OOM) {
++        has_allow_oom = 1;
++    }
++    if (script_flags & SCRIPT_FLAG_ALLOW_STALE) {
++        has_allow_stale = 1;
++    }
++    if (script_flags & SCRIPT_FLAG_NO_CLUSTER) {
++        has_no_cluster = 1;
++    }
++    if (script_flags & SCRIPT_FLAG_ALLOW_CROSS_SLOT) {
++        has_allow_cross_slot = 1;
++    }
++    if (script_flags & SCRIPT_FLAG_EVAL_COMPAT_MODE) {
++        has_eval_compat = 1;
++    }
++    if (caller->flags & CLIENT_ALLOW_OOM) {
++        client_allow_oom = 1;
++    }
++    if (caller->id == CLIENT_ID_AOF) {
++        obey_client = 1;
++    } else if (caller->flags & CLIENT_MASTER) {
++        obey_client = 1;
++    }
++    if (server.masterhost) {
++        if (server.repl_state != REPL_STATE_CONNECTED) {
++            if (server.repl_serve_stale_data == 0) {
++                running_stale = 1;
++            }
++        }
+     }
+ 
+-    scriptRunCtx run_ctx;
++    if (numkeys_obj == NULL) {
++        numkeys = 0;
++        parsed_numkeys = 1;
++    } else {
++        serverAssertWithInfo(NULL, numkeys_obj, numkeys_obj->type == OBJ_STRING);
++        if (sdsEncodedObject(numkeys_obj)) {
++            if (string2ll(numkeys_obj->ptr, sdslen(numkeys_obj->ptr), &numkeys) == 0) {
++                addReplyError(c, "Bad number of keys provided");
++            } else {
++                parsed_numkeys = 1;
++            }
++        } else if (numkeys_obj->encoding == OBJ_ENCODING_INT) {
++            numkeys = (long)numkeys_obj->ptr;
++            parsed_numkeys = 1;
++        } else {
++            serverPanic("Unknown string encoding");
++        }
++    }
+ 
+-    if (scriptPrepareForRun(&run_ctx, fi->li->ei->c, c, fi->name, fi->f_flags, ro) != C_OK)
+-        return;
++    if (parsed_numkeys) {
++        if (numkeys > (c->argc - 3)) {
++            addReplyError(c, "Number of keys can't be greater than number of args");
++        } else if (numkeys < 0) {
++            addReplyError(c, "Number of keys can't be negative");
++        } else {
++            serverAssert(!curr_run_ctx);
++            if (!has_eval_compat) {
++                if (has_no_cluster && server.cluster_enabled) {
++                    addReplyError(caller, "Can not run script on cluster, 'no-cluster' flag is set.");
++                } else if (running_stale && !has_allow_stale) {
++                    addReplyError(caller, "-MASTERDOWN Link with MASTER is down, "
++                                     "replica-serve-stale-data is set to 'no' "
++                                     "and 'allow-stale' flag is not set on the script.");
++                } else {
++                    if (!has_no_writes) {
++                        if (server.masterhost && server.repl_slave_ro && !obey_client) {
++                            addReplyError(caller, "-READONLY Can not run script with write flag on readonly replica");
++                            write_blocked = 1;
++                        } else {
++                            if (server.stop_writes_on_bgsave_err &&
++                                server.saveparamslen > 0 &&
++                                server.lastbgsave_status == C_ERR)
++                            {
++                                deny_write_type = DISK_ERROR_TYPE_RDB;
++                            }
++                                            if (deny_write_type == DISK_ERROR_TYPE_NONE && server.aof_state != AOF_OFF) {
++                                atomicGet(server.aof_bio_fsync_status, aof_bio_fsync_status);
++                                if (server.aof_last_write_status == C_ERR) {
++                                    deny_write_type = DISK_ERROR_TYPE_AOF;
++                                } else if (aof_bio_fsync_status == C_ERR) {
++                                    atomicGet(server.aof_bio_fsync_errno, server.aof_last_write_errno);
++                                    deny_write_type = DISK_ERROR_TYPE_AOF;
++                                }
++                            }
++                            if (deny_write_type != DISK_ERROR_TYPE_NONE && !obey_client) {
++                                write_blocked = 1;
++                                if (deny_write_type == DISK_ERROR_TYPE_RDB) {
++                                    addReplyError(caller, "-MISCONF Redis is configured to save RDB snapshots, "
++                                                     "but it's currently unable to persist to disk. "
++                                                     "Writable scripts are blocked. Use 'no-writes' flag for read only scripts.");
++                                } else {
++                                    addReplyErrorFormat(caller, "-MISCONF Redis is configured to persist data to AOF, "
++                                                           "but it's currently unable to persist to disk. "
++                                                           "Writable scripts are blocked. Use 'no-writes' flag for read only scripts. "
++                                                           "AOF error: %s", strerror(server.aof_last_write_errno));
++                                }
++                            } else if (ro) {
++                                addReplyError(caller, "Can not execute a script with write flag using *_ro command.");
++                                write_blocked = 1;
++                            } else {
++                                replica_lag_window = server.repl_min_slaves_max_lag;
++                                replica_needed = server.repl_min_slaves_to_write;
++                                replica_good = server.repl_good_slaves_count;
++                                if (server.masterhost) {
++                                    replicas_ok = 1;
++                                } else if (!replica_lag_window) {
++                                    replicas_ok = 1;
++                                } else if (!replica_needed) {
++                                    replicas_ok = 1;
++                                } else if (replica_good >= replica_needed) {
++                                    replicas_ok = 1;
++                                } else {
++                                    replicas_ok = 0;
++                                }
++                                if (!replicas_ok) {
++                                    addReplyErrorObject(caller, shared.noreplicaserr);
++                                    write_blocked = 1;
++                                }
++                            }
++                        }
++                    }
++                    if (!write_blocked) {
++                        if (!client_allow_oom && server.pre_command_oom_state && server.maxmemory &&
++                            !(has_allow_oom || has_no_writes))
++                        {
++                            addReplyError(caller, "-OOM allow-oom flag is not set on the script, "
++                                                  "can not run it when used memory > 'maxmemory'");
++                        } else {
++                            prepared = 1;
++                        }
++                    }
++                }
++            } else {
++                if (running_stale) {
++                    addReplyErrorObject(caller, shared.masterdownerr);
++                } else {
++                    prepared = 1;
++                }
++            }
+ 
+-    engine->call(&run_ctx, engine->engine_ctx, fi->function, c->argv + 3, numkeys,
+-                 c->argv + 3 + numkeys, c->argc - 3 - numkeys);
+-    scriptResetRun(&run_ctx);
++            if (prepared) {
++                funcname = fi->name;
++                compiled_function = fi->function;
++                engine_ctx = engine->engine_ctx;
++                run_ctx.c = engine_client;
++                run_ctx.original_client = caller;
++                run_ctx.funcname = funcname;
++                script_client = run_ctx.c;
++                curr_client = run_ctx.original_client;
++                server.script_caller = curr_client;
++                dbid = curr_client->db->id;
++                if (dbid >= 0 && dbid < server.dbnum) {
++                    script_client->db = &server.db[dbid];
++                }
++                script_client->resp = 2;
++                if (curr_client->flags & CLIENT_MULTI) {
++                    script_client->flags |= CLIENT_MULTI;
++                }
++                run_ctx.start_time = getMonotonicUs();
++                run_ctx.snapshot_time = mstime();
++                run_ctx.flags = 0;
++                run_ctx.repl_flags = PROPAGATE_AOF | PROPAGATE_REPL;
++                if (ro) {
++                    run_ctx.flags |= SCRIPT_READ_ONLY;
++                } else if (!has_eval_compat && has_no_writes) {
++                    run_ctx.flags |= SCRIPT_READ_ONLY;
++                }
++                if (client_allow_oom) {
++                    run_ctx.flags |= SCRIPT_ALLOW_OOM;
++                } else if (!has_eval_compat && has_allow_oom) {
++                    run_ctx.flags |= SCRIPT_ALLOW_OOM;
++                }
++                if (has_eval_compat) {
++                    run_ctx.flags |= SCRIPT_ALLOW_CROSS_SLOT;
++                } else if (has_allow_cross_slot) {
++                    run_ctx.flags |= SCRIPT_ALLOW_CROSS_SLOT;
++                }
++                curr_run_ctx = &run_ctx;
++                keys = c->argv + 3;
++                nkeys = (size_t) numkeys;
++                args = c->argv + 3 + numkeys;
++                nargs = (size_t) (c->argc - 3 - numkeys);
++                engine->call(&run_ctx, engine_ctx, compiled_function, keys, nkeys, args, nargs);
++                serverAssert(curr_run_ctx);
++                run_ctx.c->flags &= ~CLIENT_MULTI;
++                server.script_caller = NULL;
++                if (curr_run_ctx && (curr_run_ctx->flags & SCRIPT_TIMEDOUT)) {
++                    serverAssert(curr_run_ctx == &run_ctx);
++                    run_ctx.flags &= ~SCRIPT_TIMEDOUT;
++                    blockingOperationEnds();
++                    if (server.masterhost) {
++                        if (server.master) {
++                            queueClientForReprocessing(server.master);
++                        }
++                    }
++                    timeout_client = run_ctx.original_client;
++                    if (timeout_client->flags & CLIENT_PROTECTED) {
++                        timeout_client->flags &= ~CLIENT_PROTECTED;
++                        if (timeout_client->conn) {
++                            connSetReadHandler(timeout_client->conn, readQueryFromClient);
++                            pending_replies = clientHasPendingReplies(timeout_client);
++                            if (pending_replies) {
++                                putClientInPendingWriteQueue(timeout_client);
++                            }
++                        }
++                    }
++                }
++                preventCommandPropagation(run_ctx.original_client);
++                curr_run_ctx = NULL;
++            }
++        }
++    }
+ }
+ 
+ /*
+diff --git a/src/script.c b/src/script.c
+index 57fa7eeba..45852034a 100644
+--- a/src/script.c
++++ b/src/script.c
+@@ -41,7 +41,7 @@ scriptFlag scripts_flags_def[] = {
+ };
+ 
+ /* On script invocation, holding the current run context */
+-static scriptRunCtx *curr_run_ctx = NULL;
++scriptRunCtx *curr_run_ctx = NULL;
+ 
+ static void exitScriptTimedoutMode(scriptRunCtx *run_ctx) {
+     serverAssert(run_ctx == curr_run_ctx);
+diff --git a/src/script.h b/src/script.h
+index b601342c5..5c0abf872 100644
+--- a/src/script.h
++++ b/src/script.h
+@@ -93,6 +93,8 @@ typedef struct scriptFlag {
+ 
+ extern scriptFlag scripts_flags_def[];
+ 
++extern scriptRunCtx *curr_run_ctx;
++
+ uint64_t scriptFlagsToCmdFlags(uint64_t cmd_flags, uint64_t script_flags);
+ int scriptPrepareForRun(scriptRunCtx *r_ctx, client *engine_client, client *caller, const char *funcname, uint64_t script_flags, int ro);
+ void scriptResetRun(scriptRunCtx *r_ctx);

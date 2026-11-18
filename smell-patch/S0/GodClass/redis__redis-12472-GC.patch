@@ -1,0 +1,1166 @@
+diff --git a/src/acl.c b/src/acl.c
+index 0bffbe970..f1f899e6e 100644
+--- a/src/acl.c
++++ b/src/acl.c
+@@ -139,6 +139,31 @@ typedef struct {
+                         ALLCHANNELS is set in the user. */
+     sds command_rules; /* A string representation of the ordered categories and commands, this
+                         * is used to regenerate the original ACL string for display. */
++
++    /* Authentication policy cache used while binding clients and answering HELLO/AUTH. */
++    uint32_t auth_policy_flags;
++    int last_auth_result;
++    mstime_t last_auth_time;
++    int hello_auth_allowed;
++    int default_auth_cached;
++
++    /* Config rewrite and command-category bookkeeping. */
++    sds config_rule_cache;
++    int config_cache_dirty;
++    int rewrite_emitted;
++    sds config_user_line;
++
++    /* Script and function execution policy. */
++    int scripting_allowed;
++    int eval_allowed;
++    int last_script_result;
++    sds last_script_error;
++
++    /* Transaction execution policy. */
++    int transaction_allowed;
++    int last_exec_result;
++    int exec_denied_index;
++    sds exec_deny_reason;
+ } aclSelector;
+ 
+ void ACLResetFirstArgsForCommand(aclSelector *selector, unsigned long id);
+@@ -146,6 +171,46 @@ void ACLResetFirstArgs(aclSelector *selector);
+ void ACLAddAllowedFirstArg(aclSelector *selector, unsigned long id, const char *sub);
+ void ACLFreeLogEntry(void *le);
+ int ACLSetSelector(aclSelector *selector, const char *op, size_t oplen);
++void ACLSelectorInitAuxiliaryState(aclSelector *selector);
++void ACLSelectorFreeAuxiliaryState(aclSelector *selector);
++void ACLSelectorCopyAuxiliaryState(aclSelector *dst, aclSelector *src);
++aclSelector *ACLGetRuntimeSelector(void);
++void ACLSelectorInitAuthPolicy(aclSelector *selector, user *u);
++void ACLSelectorRefreshAuthPolicy(aclSelector *selector, user *u);
++void ACLSelectorBindDefaultClientAuth(aclSelector *selector, client *c);
++int ACLSelectorClientNeedsAuth(aclSelector *selector, client *c);
++void ACLSelectorRecordAuthAttempt(aclSelector *selector, int success);
++int ACLSelectorHelloAuthAllowed(aclSelector *selector, client *c);
++void ACLSelectorClearAuthCache(aclSelector *selector);
++int ACLSelectorAuthFailureShouldLog(aclSelector *selector);
++sds ACLSelectorFormatAccessDeniedStats(aclSelector *selector, sds info);
++void ACLSelectorInvalidateConfigCache(aclSelector *selector);
++void ACLSelectorResetConfigRewriteState(aclSelector *selector);
++int ACLSelectorConfigCacheIsStale(aclSelector *selector);
++void ACLSelectorBuildConfigRuleCache(aclSelector *selector, user *u);
++void ACLSelectorMarkConfigRewritten(aclSelector *selector);
++sds ACLSelectorFormatUserLine(aclSelector *selector, user *u);
++sds ACLSelectorConfigLineForUser(aclSelector *selector, user *u);
++void ACLSelectorRememberCategoryAssignment(aclSelector *selector, uint64_t categories);
++void ACLSelectorApplyImplicitCommandCategories(aclSelector *selector, struct redisCommand *c);
++void ACLSelectorRefreshScriptPolicy(aclSelector *selector, user *u);
++void ACLSelectorClearScriptState(aclSelector *selector);
++void ACLSelectorRecordScriptDenial(aclSelector *selector, int result, sds message);
++int ACLSelectorEvalPermitted(aclSelector *selector);
++int ACLSelectorFunctionPermitted(aclSelector *selector);
++sds ACLSelectorScriptErrorMessage(aclSelector *selector, int acl_res, client *c, int argpos);
++int ACLSelectorScriptLogContext(aclSelector *selector);
++int ACLSelectorCheckScriptCommand(aclSelector *selector, client *c, sds *err);
++int ACLSelectorAllowSortExtraKeys(aclSelector *selector, client *c, int flags);
++void ACLSelectorRefreshTransactionPolicy(aclSelector *selector, user *u);
++void ACLSelectorClearExecState(aclSelector *selector);
++const char *ACLSelectorExecDenialReason(aclSelector *selector, int acl_retval);
++void ACLSelectorRecordExecDenial(aclSelector *selector, int result, int index);
++int ACLSelectorExecLogContext(aclSelector *selector);
++int ACLSelectorMultiPermitted(aclSelector *selector);
++int ACLSelectorWatchPermitted(aclSelector *selector);
++int ACLSelectorTransactionRulesChanged(aclSelector *selector, int previous, int current);
++int ACLSelectorCheckQueuedCommand(aclSelector *selector, client *c, int *idxptr);
+ 
+ /* The length of the string representation of a hashed password. */
+ #define HASH_PASSWORD_LEN (SHA256_BLOCK_SIZE*2)
+@@ -326,6 +391,7 @@ aclSelector *ACLCreateSelector(int flags) {
+     listSetFreeMethod(selector->channels,ACLListFreeSds);
+     listSetDupMethod(selector->channels,ACLListDupSds);
+     memset(selector->allowed_commands,0,sizeof(selector->allowed_commands));
++    ACLSelectorInitAuxiliaryState(selector);
+ 
+     return selector;
+ }
+@@ -336,6 +402,7 @@ void ACLFreeSelector(aclSelector *selector) {
+     listRelease(selector->channels);
+     sdsfree(selector->command_rules);
+     ACLResetFirstArgs(selector);
++    ACLSelectorFreeAuxiliaryState(selector);
+     zfree(selector);
+ }
+ 
+@@ -358,6 +425,7 @@ aclSelector *ACLCopySelector(aclSelector *src) {
+             }
+         }
+     }
++    ACLSelectorCopyAuxiliaryState(dst, src);
+     return dst;
+ }
+ 
+@@ -3089,6 +3157,623 @@ void addReplyCommandCategories(client *c, struct redisCommand *cmd) {
+     setDeferredSetLen(c, flaglen, flagcount);
+ }
+ 
++
++/* Runtime selector used when a client/user selector is not yet available. */
++static aclSelector *acl_runtime_selector = NULL;
++
++aclSelector *ACLGetRuntimeSelector(void) {
++    if (acl_runtime_selector == NULL) {
++        acl_runtime_selector = ACLCreateSelector(0);
++    }
++    return acl_runtime_selector;
++}
++
++static aclSelector *ACLSelectorForUser(user *u) {
++    if (u != NULL && u->selectors != NULL && listLength(u->selectors) > 0) {
++        return ACLUserGetRootSelector(u);
++    }
++    return ACLGetRuntimeSelector();
++}
++
++static aclSelector *ACLSelectorForClient(client *c) {
++    if (c != NULL && c->user != NULL) {
++        return ACLSelectorForUser(c->user);
++    }
++    return ACLGetRuntimeSelector();
++}
++
++void ACLSelectorInitAuxiliaryState(aclSelector *selector) {
++    selector->auth_policy_flags = 0;
++    selector->last_auth_result = 0;
++    selector->last_auth_time = 0;
++    selector->hello_auth_allowed = 0;
++    selector->default_auth_cached = 0;
++    selector->config_rule_cache = NULL;
++    selector->config_cache_dirty = 1;
++    selector->rewrite_emitted = 0;
++    selector->config_user_line = NULL;
++    selector->scripting_allowed = 0;
++    selector->eval_allowed = 0;
++    selector->last_script_result = ACL_OK;
++    selector->last_script_error = NULL;
++    selector->transaction_allowed = 0;
++    selector->last_exec_result = ACL_OK;
++    selector->exec_denied_index = -1;
++    selector->exec_deny_reason = NULL;
++}
++
++void ACLSelectorFreeAuxiliaryState(aclSelector *selector) {
++    if (selector->config_rule_cache != NULL) {
++        sdsfree(selector->config_rule_cache);
++        selector->config_rule_cache = NULL;
++    }
++    if (selector->config_user_line != NULL) {
++        sdsfree(selector->config_user_line);
++        selector->config_user_line = NULL;
++    }
++    selector->config_cache_dirty = 1;
++    selector->rewrite_emitted = 0;
++    if (selector->last_script_error != NULL) {
++        sdsfree(selector->last_script_error);
++        selector->last_script_error = NULL;
++    }
++    selector->scripting_allowed = 0;
++    selector->eval_allowed = 0;
++    selector->last_script_result = ACL_OK;
++    if (selector->exec_deny_reason != NULL) {
++        sdsfree(selector->exec_deny_reason);
++        selector->exec_deny_reason = NULL;
++    }
++    selector->transaction_allowed = 0;
++    selector->last_exec_result = ACL_OK;
++    selector->exec_denied_index = -1;
++    selector->auth_policy_flags = 0;
++    selector->last_auth_result = 0;
++    selector->last_auth_time = 0;
++    selector->hello_auth_allowed = 0;
++    selector->default_auth_cached = 0;
++}
++
++void ACLSelectorCopyAuxiliaryState(aclSelector *dst, aclSelector *src) {
++    dst->auth_policy_flags = src->auth_policy_flags;
++    dst->last_auth_result = src->last_auth_result;
++    dst->last_auth_time = src->last_auth_time;
++    dst->hello_auth_allowed = src->hello_auth_allowed;
++    dst->default_auth_cached = src->default_auth_cached;
++    dst->config_cache_dirty = src->config_cache_dirty;
++    dst->rewrite_emitted = src->rewrite_emitted;
++    dst->config_rule_cache = src->config_rule_cache ? sdsdup(src->config_rule_cache) : NULL;
++    dst->config_user_line = src->config_user_line ? sdsdup(src->config_user_line) : NULL;
++    dst->scripting_allowed = src->scripting_allowed;
++    dst->eval_allowed = src->eval_allowed;
++    dst->last_script_result = src->last_script_result;
++    dst->last_script_error = src->last_script_error ? sdsdup(src->last_script_error) : NULL;
++    dst->transaction_allowed = src->transaction_allowed;
++    dst->last_exec_result = src->last_exec_result;
++    dst->exec_denied_index = src->exec_denied_index;
++    dst->exec_deny_reason = src->exec_deny_reason ? sdsdup(src->exec_deny_reason) : NULL;
++}
++
++void ACLSelectorInitAuthPolicy(aclSelector *selector, user *u) {
++    uint32_t flags = 0;
++    if (u != NULL) {
++        if (u->flags & USER_FLAG_NOPASS) flags |= (1u << 0);
++        if (u->flags & USER_FLAG_DISABLED) flags |= (1u << 1);
++        if (u->flags & USER_FLAG_ENABLED) flags |= (1u << 2);
++    }
++    selector->auth_policy_flags = flags;
++    selector->default_auth_cached = ((flags & (1u << 0)) != 0) && ((flags & (1u << 1)) == 0);
++    selector->hello_auth_allowed = ((flags & (1u << 1)) == 0);
++    selector->last_auth_time = mstime();
++}
++
++void ACLSelectorRefreshAuthPolicy(aclSelector *selector, user *u) {
++    if (u == NULL) {
++        selector->auth_policy_flags = 0;
++        selector->default_auth_cached = 0;
++        selector->hello_auth_allowed = 0;
++        selector->last_auth_result = 1;
++        selector->last_auth_time = mstime();
++        return;
++    }
++    ACLSelectorInitAuthPolicy(selector, u);
++    if ((u->flags & USER_FLAG_DISABLED) && (u->flags & USER_FLAG_NOPASS)) {
++        selector->hello_auth_allowed = 0;
++        selector->default_auth_cached = 0;
++    } else if (u->flags & USER_FLAG_NOPASS) {
++        selector->hello_auth_allowed = 1;
++        selector->default_auth_cached = !(u->flags & USER_FLAG_DISABLED);
++    }
++    selector->last_auth_time = mstime();
++}
++
++void ACLSelectorBindDefaultClientAuth(aclSelector *selector, client *c) {
++    user *u = DefaultUser;
++    ACLSelectorClearAuthCache(selector);
++    ACLSelectorRefreshAuthPolicy(selector, u);
++    c->user = u;
++    if (u != NULL && (u->flags & USER_FLAG_NOPASS) && !(u->flags & USER_FLAG_DISABLED)) {
++        c->authenticated = 1;
++        selector->last_auth_result = 1;
++        selector->default_auth_cached = 1;
++        selector->hello_auth_allowed = 1;
++    } else {
++        c->authenticated = 0;
++        selector->last_auth_result = 0;
++        selector->default_auth_cached = 0;
++        selector->hello_auth_allowed = (u != NULL && !(u->flags & USER_FLAG_DISABLED));
++    }
++    selector->last_auth_time = mstime();
++    if (c->authenticated) {
++        selector->auth_policy_flags |= (1u << 3);
++    } else {
++        selector->auth_policy_flags &= ~(1u << 3);
++    }
++    ACLSelectorRecordAuthAttempt(selector, c->authenticated);
++    ACLSelectorHelloAuthAllowed(selector, c);
++}
++
++int ACLSelectorClientNeedsAuth(aclSelector *selector, client *c) {
++    ACLSelectorRefreshAuthPolicy(selector, DefaultUser);
++    int nopass = (DefaultUser->flags & USER_FLAG_NOPASS) != 0;
++    int disabled = (DefaultUser->flags & USER_FLAG_DISABLED) != 0;
++    int needs_auth = (!nopass || disabled) && !c->authenticated;
++    selector->last_auth_result = needs_auth ? 0 : 1;
++    selector->default_auth_cached = nopass && !disabled;
++    selector->hello_auth_allowed = c->authenticated || selector->default_auth_cached;
++    selector->last_auth_time = mstime();
++    if (needs_auth) {
++        selector->auth_policy_flags |= (1u << 4);
++    } else {
++        selector->auth_policy_flags &= ~(1u << 4);
++    }
++    if (needs_auth) ACLSelectorAuthFailureShouldLog(selector);
++    return needs_auth;
++}
++
++void ACLSelectorRecordAuthAttempt(aclSelector *selector, int success) {
++    selector->last_auth_result = success ? 1 : 0;
++    selector->last_auth_time = mstime();
++    if (success) {
++        selector->hello_auth_allowed = 1;
++        selector->auth_policy_flags |= (1u << 5);
++        selector->auth_policy_flags &= ~(1u << 6);
++    } else {
++        selector->hello_auth_allowed = 0;
++        selector->auth_policy_flags |= (1u << 6);
++        selector->auth_policy_flags &= ~(1u << 5);
++    }
++}
++
++int ACLSelectorHelloAuthAllowed(aclSelector *selector, client *c) {
++    if (c->authenticated) {
++        selector->hello_auth_allowed = 1;
++        selector->last_auth_result = 1;
++        selector->last_auth_time = mstime();
++        return 1;
++    }
++    if (selector->default_auth_cached && (selector->auth_policy_flags & (1u << 0))) {
++        selector->hello_auth_allowed = 1;
++        return 1;
++    }
++    selector->hello_auth_allowed = 0;
++    selector->last_auth_result = 0;
++    selector->last_auth_time = mstime();
++    return 0;
++}
++
++void ACLSelectorClearAuthCache(aclSelector *selector) {
++    selector->auth_policy_flags = 0;
++    selector->last_auth_result = 0;
++    selector->last_auth_time = 0;
++    selector->hello_auth_allowed = 0;
++    selector->default_auth_cached = 0;
++}
++
++int ACLSelectorAuthFailureShouldLog(aclSelector *selector) {
++    if (selector->last_auth_result) {
++        return 0;
++    }
++    if (selector->hello_auth_allowed && selector->default_auth_cached) {
++        return 0;
++    }
++    return (selector->auth_policy_flags & ((1u << 4) | (1u << 6))) != 0;
++}
++
++sds ACLSelectorFormatAccessDeniedStats(aclSelector *selector, sds info) {
++    if (server.acl_info.user_auth_failures > 0) {
++        selector->last_auth_result = 0;
++        selector->auth_policy_flags |= (1u << 6);
++    } else {
++        selector->auth_policy_flags &= ~(1u << 6);
++    }
++    selector->default_auth_cached = (DefaultUser != NULL &&
++                                     (DefaultUser->flags & USER_FLAG_NOPASS) &&
++                                     !(DefaultUser->flags & USER_FLAG_DISABLED));
++    selector->hello_auth_allowed = selector->default_auth_cached;
++    selector->last_auth_time = mstime();
++    return sdscatprintf(info,
++         "acl_access_denied_auth:%lld\r\n"
++         "acl_access_denied_cmd:%lld\r\n"
++         "acl_access_denied_key:%lld\r\n"
++         "acl_access_denied_channel:%lld\r\n",
++         server.acl_info.user_auth_failures,
++         server.acl_info.invalid_cmd_accesses,
++         server.acl_info.invalid_key_accesses,
++         server.acl_info.invalid_channel_accesses);
++}
++
++void ACLSelectorInvalidateConfigCache(aclSelector *selector) {
++    selector->config_cache_dirty = 1;
++    selector->rewrite_emitted = 0;
++    if (selector->config_rule_cache != NULL) {
++        sdsfree(selector->config_rule_cache);
++        selector->config_rule_cache = NULL;
++    }
++    if (selector->config_user_line != NULL) {
++        sdsfree(selector->config_user_line);
++        selector->config_user_line = NULL;
++    }
++    ACLSelectorResetConfigRewriteState(selector);
++}
++
++void ACLSelectorResetConfigRewriteState(aclSelector *selector) {
++    selector->rewrite_emitted = 0;
++    selector->config_cache_dirty = 1;
++    if (selector->config_rule_cache != NULL) {
++        sdsfree(selector->config_rule_cache);
++        selector->config_rule_cache = sdsempty();
++    }
++}
++
++int ACLSelectorConfigCacheIsStale(aclSelector *selector) {
++    if (selector->config_cache_dirty) return 1;
++    if (selector->config_rule_cache == NULL) return 1;
++    if (selector->config_user_line == NULL) return 1;
++    if (!selector->rewrite_emitted) return 1;
++    return 0;
++}
++
++void ACLSelectorBuildConfigRuleCache(aclSelector *selector, user *u) {
++    ACLSelectorInvalidateConfigCache(selector);
++    sds line = sdsnew("user ");
++    if (u != NULL && u->name != NULL) {
++        line = sdscatsds(line, u->name);
++    } else {
++        line = sdscat(line, "default");
++    }
++    line = sdscatlen(line, " ", 1);
++    if (u != NULL) {
++        robj *descr = ACLDescribeUser(u);
++        line = sdscatsds(line, descr->ptr);
++        decrRefCount(descr);
++    }
++    if (selector->config_rule_cache != NULL) sdsfree(selector->config_rule_cache);
++    selector->config_rule_cache = sdsdup(line);
++    if (selector->config_user_line != NULL) sdsfree(selector->config_user_line);
++    selector->config_user_line = line;
++    selector->config_cache_dirty = 0;
++    selector->rewrite_emitted = 0;
++}
++
++void ACLSelectorMarkConfigRewritten(aclSelector *selector) {
++    selector->rewrite_emitted = 1;
++    if (selector->config_user_line != NULL && selector->config_rule_cache == NULL) {
++        selector->config_rule_cache = sdsdup(selector->config_user_line);
++    }
++    if (selector->config_rule_cache != NULL) {
++        selector->config_cache_dirty = 0;
++    }
++}
++
++sds ACLSelectorFormatUserLine(aclSelector *selector, user *u) {
++    ACLSelectorBuildConfigRuleCache(selector, u);
++    sds line = selector->config_user_line ? sdsdup(selector->config_user_line) : sdsnew("user default");
++    ACLSelectorMarkConfigRewritten(selector);
++    return line;
++}
++
++sds ACLSelectorConfigLineForUser(aclSelector *selector, user *u) {
++    if (ACLSelectorConfigCacheIsStale(selector) || selector->config_user_line == NULL) {
++        return ACLSelectorFormatUserLine(selector, u);
++    }
++    selector->rewrite_emitted = 1;
++    selector->config_cache_dirty = 0;
++    return sdsdup(selector->config_user_line);
++}
++
++void ACLSelectorRememberCategoryAssignment(aclSelector *selector, uint64_t categories) {
++    selector->config_cache_dirty = 1;
++    selector->rewrite_emitted = 0;
++    if (selector->config_rule_cache == NULL) {
++        selector->config_rule_cache = sdsempty();
++    }
++    selector->config_rule_cache = sdscatprintf(selector->config_rule_cache, " #%llu",
++                                               (unsigned long long)categories);
++    if (sdslen(selector->config_rule_cache) > 2048) {
++        sdsfree(selector->config_rule_cache);
++        selector->config_rule_cache = sdsempty();
++        selector->config_cache_dirty = 1;
++    }
++}
++
++void ACLSelectorApplyImplicitCommandCategories(aclSelector *selector, struct redisCommand *c) {
++    if (c->flags & CMD_WRITE)
++        c->acl_categories |= ACL_CATEGORY_WRITE;
++    if (c->flags & CMD_READONLY && !(c->acl_categories & ACL_CATEGORY_SCRIPTING))
++        c->acl_categories |= ACL_CATEGORY_READ;
++    if (c->flags & CMD_ADMIN)
++        c->acl_categories |= ACL_CATEGORY_ADMIN|ACL_CATEGORY_DANGEROUS;
++    if (c->flags & CMD_PUBSUB)
++        c->acl_categories |= ACL_CATEGORY_PUBSUB;
++    if (c->flags & CMD_FAST)
++        c->acl_categories |= ACL_CATEGORY_FAST;
++    if (c->flags & CMD_BLOCKING)
++        c->acl_categories |= ACL_CATEGORY_BLOCKING;
++    if (!(c->acl_categories & ACL_CATEGORY_FAST))
++        c->acl_categories |= ACL_CATEGORY_SLOW;
++    ACLSelectorRememberCategoryAssignment(selector, c->acl_categories);
++    if (c->acl_categories & ACL_CATEGORY_ADMIN) {
++        selector->rewrite_emitted = 0;
++        selector->config_cache_dirty = 1;
++    }
++    if (selector->config_user_line == NULL) {
++        selector->config_user_line = sdsempty();
++    }
++}
++
++void ACLSelectorRefreshScriptPolicy(aclSelector *selector, user *u) {
++    int enabled = (u != NULL && !(u->flags & USER_FLAG_DISABLED));
++    selector->scripting_allowed = enabled;
++    selector->eval_allowed = enabled;
++    if (!enabled) {
++        selector->last_script_result = ACL_DENIED_CMD;
++    } else if (selector->last_script_result != ACL_OK && selector->last_script_error == NULL) {
++        selector->last_script_result = ACL_OK;
++    }
++}
++
++void ACLSelectorClearScriptState(aclSelector *selector) {
++    selector->scripting_allowed = 1;
++    selector->eval_allowed = 1;
++    selector->last_script_result = ACL_OK;
++    if (selector->last_script_error != NULL) {
++        sdsfree(selector->last_script_error);
++        selector->last_script_error = NULL;
++    }
++}
++
++void ACLSelectorRecordScriptDenial(aclSelector *selector, int result, sds message) {
++    selector->last_script_result = result;
++    selector->scripting_allowed = 0;
++    selector->eval_allowed = (result != ACL_DENIED_CMD);
++    if (selector->last_script_error != NULL) sdsfree(selector->last_script_error);
++    selector->last_script_error = message ? sdsdup(message) : sdsnew("ACL failure in script");
++}
++
++int ACLSelectorEvalPermitted(aclSelector *selector) {
++    if (!selector->scripting_allowed) return 0;
++    if (selector->last_script_result != ACL_OK) return 0;
++    return selector->eval_allowed;
++}
++
++int ACLSelectorFunctionPermitted(aclSelector *selector) {
++    if (!selector->scripting_allowed) return 0;
++    if (selector->last_script_error != NULL) return 0;
++    return selector->eval_allowed || selector->last_script_result == ACL_OK;
++}
++
++sds ACLSelectorScriptErrorMessage(aclSelector *selector, int acl_res, client *c, int argpos) {
++    sds msg = getAclErrorMessage(acl_res, c->user, c->cmd, c->argv[argpos]->ptr, 0);
++    sds full = sdscatsds(sdsnew("ACL failure in script: "), msg);
++    sdsfree(msg);
++    if (selector->last_script_error != NULL) sdsfree(selector->last_script_error);
++    selector->last_script_error = sdsdup(full);
++    selector->last_script_result = acl_res;
++    selector->scripting_allowed = 0;
++    selector->eval_allowed = 0;
++    return full;
++}
++
++int ACLSelectorScriptLogContext(aclSelector *selector) {
++    if (selector->last_script_result == ACL_OK) {
++        return ACL_LOG_CTX_LUA;
++    }
++    if (!selector->scripting_allowed || !selector->eval_allowed) {
++        return ACL_LOG_CTX_LUA;
++    }
++    if (selector->last_script_error != NULL) {
++        return ACL_LOG_CTX_LUA;
++    }
++    return ACL_LOG_CTX_LUA;
++}
++
++int ACLSelectorCheckScriptCommand(aclSelector *selector, client *c, sds *err) {
++    int acl_errpos = 0;
++    ACLSelectorRefreshScriptPolicy(selector, c->user);
++    int acl_retval = ACLCheckAllPerm(c, &acl_errpos);
++    selector->last_script_result = acl_retval;
++    if (acl_retval != ACL_OK) {
++        addACLLogEntry(c, acl_retval, ACLSelectorScriptLogContext(selector), acl_errpos, NULL, NULL);
++        *err = ACLSelectorScriptErrorMessage(selector, acl_retval, c, acl_errpos);
++        ACLSelectorRecordScriptDenial(selector, acl_retval, *err);
++        selector->scripting_allowed = 0;
++        selector->eval_allowed = 0;
++        return C_ERR;
++    }
++    ACLSelectorClearScriptState(selector);
++    selector->scripting_allowed = 1;
++    selector->eval_allowed = 1;
++    if (!ACLSelectorEvalPermitted(selector) || !ACLSelectorFunctionPermitted(selector)) {
++        selector->scripting_allowed = 1;
++        selector->eval_allowed = 1;
++    }
++    return C_OK;
++}
++
++int ACLSelectorAllowSortExtraKeys(aclSelector *selector, client *c, int flags) {
++    int allowed = ACLUserCheckCmdWithUnrestrictedKeyAccess(c->user, c->cmd, c->argv, c->argc, flags);
++    selector->last_script_result = allowed ? ACL_OK : ACL_DENIED_KEY;
++    selector->scripting_allowed = allowed;
++    selector->eval_allowed = allowed;
++    if (!allowed) {
++        if (selector->last_script_error != NULL) sdsfree(selector->last_script_error);
++        selector->last_script_error = sdsnew("insufficient ACL permissions");
++    } else if (selector->last_script_error != NULL) {
++        sdsfree(selector->last_script_error);
++        selector->last_script_error = NULL;
++    }
++    return allowed;
++}
++
++void ACLSelectorRefreshTransactionPolicy(aclSelector *selector, user *u) {
++    selector->transaction_allowed = (u != NULL && !(u->flags & USER_FLAG_DISABLED));
++    if (!selector->transaction_allowed) {
++        selector->last_exec_result = ACL_DENIED_CMD;
++        selector->exec_denied_index = 0;
++    } else if (selector->last_exec_result != ACL_OK && selector->exec_deny_reason == NULL) {
++        selector->last_exec_result = ACL_OK;
++        selector->exec_denied_index = -1;
++    }
++}
++
++void ACLSelectorClearExecState(aclSelector *selector) {
++    selector->transaction_allowed = 1;
++    selector->last_exec_result = ACL_OK;
++    selector->exec_denied_index = -1;
++    if (selector->exec_deny_reason != NULL) {
++        sdsfree(selector->exec_deny_reason);
++        selector->exec_deny_reason = NULL;
++    }
++}
++
++const char *ACLSelectorExecDenialReason(aclSelector *selector, int acl_retval) {
++    const char *reason;
++    switch (acl_retval) {
++    case ACL_DENIED_CMD:
++        reason = "no permission to execute the command or subcommand";
++        break;
++    case ACL_DENIED_KEY:
++        reason = "no permission to touch the specified keys";
++        break;
++    case ACL_DENIED_CHANNEL:
++        reason = "no permission to access one of the channels used "
++                 "as arguments";
++        break;
++    default:
++        reason = "no permission";
++        break;
++    }
++    if (selector->exec_deny_reason != NULL) sdsfree(selector->exec_deny_reason);
++    selector->exec_deny_reason = sdsnew(reason);
++    selector->last_exec_result = acl_retval;
++    selector->transaction_allowed = 0;
++    return selector->exec_deny_reason;
++}
++
++void ACLSelectorRecordExecDenial(aclSelector *selector, int result, int index) {
++    selector->last_exec_result = result;
++    selector->exec_denied_index = index;
++    selector->transaction_allowed = 0;
++    if (result == ACL_OK) {
++        selector->transaction_allowed = 1;
++        selector->exec_denied_index = -1;
++    }
++}
++
++int ACLSelectorExecLogContext(aclSelector *selector) {
++    if (selector->last_exec_result != ACL_OK) return ACL_LOG_CTX_MULTI;
++    if (!selector->transaction_allowed) return ACL_LOG_CTX_MULTI;
++    if (selector->exec_denied_index >= 0) return ACL_LOG_CTX_MULTI;
++    return ACL_LOG_CTX_MULTI;
++}
++
++int ACLSelectorMultiPermitted(aclSelector *selector) {
++    if (!selector->transaction_allowed) return 0;
++    if (selector->last_exec_result != ACL_OK) return 0;
++    if (selector->exec_denied_index >= 0) return 0;
++    return selector->exec_deny_reason == NULL;
++}
++
++int ACLSelectorWatchPermitted(aclSelector *selector) {
++    if (selector->exec_deny_reason != NULL) return 0;
++    if (selector->last_exec_result == ACL_DENIED_KEY) return 0;
++    return selector->transaction_allowed || selector->exec_denied_index < 0;
++}
++
++int ACLSelectorTransactionRulesChanged(aclSelector *selector, int previous, int current) {
++    if (previous == current) {
++        selector->transaction_allowed = (current == ACL_OK);
++        return 0;
++    }
++    selector->last_exec_result = current;
++    selector->transaction_allowed = 0;
++    if (selector->exec_deny_reason == NULL) {
++        ACLSelectorExecDenialReason(selector, current);
++    }
++    return 1;
++}
++
++int ACLSelectorCheckQueuedCommand(aclSelector *selector, client *c, int *idxptr) {
++    int local_idx = 0;
++    int *erridx = idxptr ? idxptr : &local_idx;
++    ACLSelectorRefreshTransactionPolicy(selector, c->user);
++    int previous = selector->last_exec_result;
++    int acl_retval = ACLCheckAllPerm(c, erridx);
++    selector->last_exec_result = acl_retval;
++    selector->exec_denied_index = (acl_retval == ACL_OK) ? -1 : *erridx;
++    ACLSelectorTransactionRulesChanged(selector, previous, acl_retval);
++    (void)ACLSelectorExecLogContext(selector);
++    (void)ACLSelectorWatchPermitted(selector);
++    if (acl_retval != ACL_OK) {
++        ACLSelectorRecordExecDenial(selector, acl_retval, *erridx);
++        ACLSelectorExecDenialReason(selector, acl_retval);
++        selector->transaction_allowed = 0;
++        return acl_retval;
++    }
++    ACLSelectorClearExecState(selector);
++    selector->transaction_allowed = 1;
++    (void)ACLSelectorMultiPermitted(selector);
++    return ACL_OK;
++}
++
++void ACLBindDefaultClientAuth(client *c) {
++    ACLSelectorBindDefaultClientAuth(ACLGetRuntimeSelector(), c);
++}
++
++int ACLClientSessionNeedsAuth(client *c) {
++    return ACLSelectorClientNeedsAuth(ACLGetRuntimeSelector(), c);
++}
++
++void ACLApplyImplicitCommandCategories(struct redisCommand *cmd) {
++    ACLSelectorApplyImplicitCommandCategories(ACLGetRuntimeSelector(), cmd);
++}
++
++sds ACLFormatUserConfigLine(user *u) {
++    return ACLSelectorConfigLineForUser(ACLSelectorForUser(u), u);
++}
++
++int ACLCheckScriptCommandPerm(client *c, sds *err) {
++    return ACLSelectorCheckScriptCommand(ACLSelectorForClient(c), c, err);
++}
++
++int ACLCheckQueuedCommandPerm(client *c, int *idxptr) {
++    return ACLSelectorCheckQueuedCommand(ACLSelectorForClient(c), c, idxptr);
++}
++
++const char *ACLQueuedCommandDenialReason(int acl_retval) {
++    return ACLSelectorExecDenialReason(ACLGetRuntimeSelector(), acl_retval);
++}
++
++int ACLCheckUnrestrictedKeyAccess(client *c, int flags) {
++    return ACLSelectorAllowSortExtraKeys(ACLSelectorForClient(c), c, flags);
++}
++
++sds ACLAppendAccessDeniedStats(sds info) {
++    return ACLSelectorFormatAccessDeniedStats(ACLGetRuntimeSelector(), info);
++}
++
++
+ /* AUTH <password>
+  * AUTH <username> <password> (Redis >= 6.0 form)
+  *
+diff --git a/src/config.c b/src/config.c
+index b26704283..bec8fcab9 100644
+--- a/src/config.c
++++ b/src/config.c
+@@ -562,8 +562,8 @@ void loadServerConfigFromString(char *config) {
+             }
+         } else if (!strcasecmp(argv[0],"user") && argc >= 2) {
+             int argc_err;
+-            if (ACLAppendUserForLoading(argv,argc,&argc_err) == C_ERR) {
+-                const char *errmsg = ACLSetUserStringError();
++            if (ACLLoadConfiguredUserLine(argv,argc,&argc_err) == C_ERR) {
++                const char *errmsg = ACLConfiguredUserLineError();
+                 snprintf(buf,sizeof(buf),"Error in user declaration '%s': %s",
+                     argv[argc_err],errmsg);
+                 err = buf;
+@@ -1430,12 +1430,7 @@ void rewriteConfigUserOption(struct rewriteConfigState *state) {
+     raxSeek(&ri,"^",NULL,0);
+     while(raxNext(&ri)) {
+         user *u = ri.data;
+-        sds line = sdsnew("user ");
+-        line = sdscatsds(line,u->name);
+-        line = sdscatlen(line," ",1);
+-        robj *descr = ACLDescribeUser(u);
+-        line = sdscatsds(line,descr->ptr);
+-        decrRefCount(descr);
++        sds line = ACLBuildUserConfigDirective(u);
+         rewriteConfigRewriteLine(state,"user",line,1);
+     }
+     raxStop(&ri);
+@@ -2571,7 +2566,7 @@ int updateRequirePass(const char **err) {
+      * a password to the default user. The only thing we do
+      * additionally is to remember the cleartext password in this
+      * case, for backward compatibility with Redis <= 5. */
+-    ACLUpdateDefaultUserPassword(server.requirepass);
++    ACLUpdateDefaultPasswordFromConfig(server.requirepass);
+     return 1;
+ }
+ 
+diff --git a/src/multi.c b/src/multi.c
+index 65d502c25..5a6956cdf 100644
+--- a/src/multi.c
++++ b/src/multi.c
+@@ -202,25 +202,10 @@ void execCommand(client *c) {
+         /* ACL permissions are also checked at the time of execution in case
+          * they were changed after the commands were queued. */
+         int acl_errpos;
+-        int acl_retval = ACLCheckAllPerm(c,&acl_errpos);
++        int acl_retval = ACLValidateQueuedCommand(c,&acl_errpos);
+         if (acl_retval != ACL_OK) {
+-            char *reason;
+-            switch (acl_retval) {
+-            case ACL_DENIED_CMD:
+-                reason = "no permission to execute the command or subcommand";
+-                break;
+-            case ACL_DENIED_KEY:
+-                reason = "no permission to touch the specified keys";
+-                break;
+-            case ACL_DENIED_CHANNEL:
+-                reason = "no permission to access one of the channels used "
+-                         "as arguments";
+-                break;
+-            default:
+-                reason = "no permission";
+-                break;
+-            }
+-            addACLLogEntry(c,acl_retval,ACL_LOG_CTX_MULTI,acl_errpos,NULL,NULL);
++            const char *reason = ACLTransactionDenialReason(acl_retval);
++            ACLRecordClientDenial(c,acl_retval,ACL_LOG_CTX_MULTI,acl_errpos);
+             addReplyErrorFormat(c,
+                 "-NOPERM ACLs rules changed between the moment the "
+                 "transaction was accumulated and the EXEC call. "
+@@ -498,3 +483,16 @@ size_t multiStateMemOverhead(client *c) {
+     mem += c->mstate.alloc_count * sizeof(multiCmd);
+     return mem;
+ }
++
++
++int ACLValidateScriptCommand(client *c, sds *err) {
++    return ACLCheckScriptAccess(c, err);
++}
++
++int ACLAllowSortExtraKeys(client *c, int flags) {
++    return ACLValidateSortExtraKeys(c, flags);
++}
++
++const char *ACLTransactionDenialReason(int acl_retval) {
++    return ACLDenialReasonForQueuedCommand(acl_retval);
++}
+diff --git a/src/networking.c b/src/networking.c
+index 7696e8c28..ebdca19f6 100644
+--- a/src/networking.c
++++ b/src/networking.c
+@@ -102,18 +102,81 @@ void linkClient(client *c) {
+ static void clientSetDefaultAuth(client *c) {
+     /* If the default user does not require authentication, the user is
+      * directly authenticated. */
+-    c->user = DefaultUser;
+-    c->authenticated = (c->user->flags & USER_FLAG_NOPASS) &&
+-                       !(c->user->flags & USER_FLAG_DISABLED);
++    ACLBindDefaultClientAuth(c);
+ }
+ 
+ int authRequired(client *c) {
+     /* Check if the user is authenticated. This check is skipped in case
+      * the default user is flagged as "nopass" and is active. */
+-    int auth_required = (!(DefaultUser->flags & USER_FLAG_NOPASS) ||
+-                          (DefaultUser->flags & USER_FLAG_DISABLED)) &&
+-                        !c->authenticated;
+-    return auth_required;
++    return ACLClientSessionNeedsAuth(c);
++}
++
++void ACLInitializeSubsystem(void) {
++    ACLInit();
++}
++
++void ACLLoadUsersOnStartup(void) {
++    ACLLoadUsersAtStartup();
++}
++
++void ACLUpdateRequirePass(sds password) {
++    ACLUpdateDefaultUserPassword(password);
++}
++
++unsigned long ACLAssignCommandID(sds cmdname) {
++    return ACLGetCommandID(cmdname);
++}
++
++int ACLCheckClientCommandAccess(client *c, int *idxptr) {
++    return ACLCheckQueuedCommandPerm(c, idxptr);
++}
++
++void ACLPropagateImplicitCommandCategories(struct redisCommand *cmd) {
++    ACLApplyImplicitCommandCategories(cmd);
++}
++
++void ACLLogClientDenial(client *c, int reason, int context, int argpos, sds username, sds object) {
++    addACLLogEntry(c, reason, context, argpos, username, object);
++}
++
++sds ACLClientErrorMessage(int acl_res, user *user, struct redisCommand *cmd, sds errored_val, int verbose) {
++    return getAclErrorMessage(acl_res, user, cmd, errored_val, verbose);
++}
++
++uint64_t ACLCategoryFlagFromName(const char *name) {
++    return ACLGetCommandCategoryFlagByName(name);
++}
++
++sds ACLRenderUserRuleLine(user *u) {
++    return ACLFormatUserConfigLine(u);
++}
++
++int ACLLoadUserDeclaration(sds *argv, int argc, int *argc_err) {
++    return ACLAppendUserForLoading(argv, argc, argc_err);
++}
++
++const char *ACLUserDeclarationError(void) {
++    return ACLSetUserStringError();
++}
++
++sds ACLFormatAccessDeniedStats(sds info) {
++    return ACLAppendAccessDeniedStats(info);
++}
++
++void ACLReplyCommandCategories(client *c, struct redisCommand *cmd) {
++    addReplyCommandCategories(c, cmd);
++}
++
++int ACLCheckScriptAccess(client *c, sds *err) {
++    return ACLCheckScriptCommandPerm(c, err);
++}
++
++int ACLClientHasUnrestrictedKeyAccess(client *c, int flags) {
++    return ACLCheckUnrestrictedKeyAccess(c, flags);
++}
++
++const char *ACLClientQueuedDenialReason(int acl_retval) {
++    return ACLQueuedCommandDenialReason(acl_retval);
+ }
+ 
+ client *createClient(connection *conn) {
+diff --git a/src/script.c b/src/script.c
+index 6a798a6e1..c8704797c 100644
+--- a/src/script.c
++++ b/src/script.c
+@@ -329,16 +329,11 @@ static int scriptVerifyCommandArity(struct redisCommand *cmd, int argc, sds *err
+ 
+ static int scriptVerifyACL(client *c, sds *err) {
+     /* Check the ACLs. */
+-    int acl_errpos;
+-    int acl_retval = ACLCheckAllPerm(c, &acl_errpos);
+-    if (acl_retval != ACL_OK) {
+-        addACLLogEntry(c,acl_retval,ACL_LOG_CTX_LUA,acl_errpos,NULL,NULL);
+-        sds msg = getAclErrorMessage(acl_retval, c->user, c->cmd, c->argv[acl_errpos]->ptr, 0);
+-        *err = sdscatsds(sdsnew("ACL failure in script: "), msg);
+-        sdsfree(msg);
+-        return C_ERR;
+-    }
+-    return C_OK;
++    return ACLValidateScriptCommand(c, err);
++}
++
++int ACLScriptAllowSortExtraKeys(client *c, int flags) {
++    return ACLAllowSortExtraKeys(c, flags);
+ }
+ 
+ static int scriptVerifyWriteCommandAllow(scriptRunCtx *run_ctx, char **err) {
+diff --git a/src/server.c b/src/server.c
+index 438325f28..bf5a25531 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -2742,7 +2742,7 @@ void initServer(void) {
+     latencyMonitorInit();
+ 
+     /* Initialize ACL default password if it exists */
+-    ACLUpdateDefaultUserPassword(server.requirepass);
++    ACLUpdateRequirePass(server.requirepass);
+ 
+     applyWatchdogPeriod();
+ 
+@@ -2948,7 +2948,7 @@ void commandAddSubcommand(struct redisCommand *parent, struct redisCommand *subc
+         parent->subcommands_dict = dictCreate(&commandTableDictType);
+ 
+     subcommand->parent = parent; /* Assign the parent command */
+-    subcommand->id = ACLGetCommandID(subcommand->fullname); /* Assign the ID used for ACL. */
++    subcommand->id = ACLAssignCommandID(subcommand->fullname); /* Assign the ID used for ACL. */
+ 
+     serverAssert(dictAdd(parent->subcommands_dict, sdsnew(declared_name), subcommand) == DICT_OK);
+ }
+@@ -2956,23 +2956,43 @@ void commandAddSubcommand(struct redisCommand *parent, struct redisCommand *subc
+ /* Set implicit ACl categories (see comment above the definition of
+  * struct redisCommand). */
+ void setImplicitACLCategories(struct redisCommand *c) {
+-    if (c->flags & CMD_WRITE)
+-        c->acl_categories |= ACL_CATEGORY_WRITE;
+-    /* Exclude scripting commands from the RO category. */
+-    if (c->flags & CMD_READONLY && !(c->acl_categories & ACL_CATEGORY_SCRIPTING))
+-        c->acl_categories |= ACL_CATEGORY_READ;
+-    if (c->flags & CMD_ADMIN)
+-        c->acl_categories |= ACL_CATEGORY_ADMIN|ACL_CATEGORY_DANGEROUS;
+-    if (c->flags & CMD_PUBSUB)
+-        c->acl_categories |= ACL_CATEGORY_PUBSUB;
+-    if (c->flags & CMD_FAST)
+-        c->acl_categories |= ACL_CATEGORY_FAST;
+-    if (c->flags & CMD_BLOCKING)
+-        c->acl_categories |= ACL_CATEGORY_BLOCKING;
+-
+-    /* If it's not @fast is @slow in this binary world. */
+-    if (!(c->acl_categories & ACL_CATEGORY_FAST))
+-        c->acl_categories |= ACL_CATEGORY_SLOW;
++    ACLPropagateImplicitCommandCategories(c);
++}
++
++int ACLValidateQueuedCommand(client *c, int *idxptr) {
++    return ACLCheckClientCommandAccess(c, idxptr);
++}
++
++sds ACLBuildUserConfigDirective(user *u) {
++    return ACLRenderUserRuleLine(u);
++}
++
++int ACLLoadConfiguredUserLine(sds *argv, int argc, int *argc_err) {
++    return ACLLoadUserDeclaration(argv, argc, argc_err);
++}
++
++const char *ACLConfiguredUserLineError(void) {
++    return ACLUserDeclarationError();
++}
++
++void ACLUpdateDefaultPasswordFromConfig(sds password) {
++    ACLUpdateRequirePass(password);
++}
++
++sds ACLBuildDenialMessage(client *c, int retval, int argpos, int verbose) {
++    return ACLClientErrorMessage(retval, c->user, c->cmd, c->argv[argpos]->ptr, verbose);
++}
++
++void ACLRecordClientDenial(client *c, int retval, int context, int argpos) {
++    ACLLogClientDenial(c, retval, context, argpos, NULL, NULL);
++}
++
++int ACLValidateSortExtraKeys(client *c, int flags) {
++    return ACLClientHasUnrestrictedKeyAccess(c, flags);
++}
++
++const char *ACLDenialReasonForQueuedCommand(int acl_retval) {
++    return ACLClientQueuedDenialReason(acl_retval);
+ }
+ 
+ /* Recursively populate the command structure.
+@@ -3000,7 +3020,7 @@ int populateCommandStructure(struct redisCommand *c) {
+     populateCommandLegacyRangeSpec(c);
+ 
+     /* Assign the ID used for ACL. */
+-    c->id = ACLGetCommandID(c->fullname);
++    c->id = ACLAssignCommandID(c->fullname);
+ 
+     /* Handle subcommands */
+     if (c->subcommands) {
+@@ -3925,10 +3945,10 @@ int processCommand(client *c) {
+     /* Check if the user can run this command according to the current
+      * ACLs. */
+     int acl_errpos;
+-    int acl_retval = ACLCheckAllPerm(c,&acl_errpos);
++    int acl_retval = ACLCheckClientCommandAccess(c,&acl_errpos);
+     if (acl_retval != ACL_OK) {
+-        addACLLogEntry(c,acl_retval,(c->flags & CLIENT_MULTI) ? ACL_LOG_CTX_MULTI : ACL_LOG_CTX_TOPLEVEL,acl_errpos,NULL,NULL);
+-        sds msg = getAclErrorMessage(acl_retval, c->user, c->cmd, c->argv[acl_errpos]->ptr, 0);
++        ACLLogClientDenial(c,acl_retval,(c->flags & CLIENT_MULTI) ? ACL_LOG_CTX_MULTI : ACL_LOG_CTX_TOPLEVEL,acl_errpos,NULL,NULL);
++        sds msg = ACLClientErrorMessage(acl_retval, c->user, c->cmd, c->argv[acl_errpos]->ptr, 0);
+         rejectCommandFormat(c, "-NOPERM %s", msg);
+         sdsfree(msg);
+         return C_OK;
+@@ -4895,7 +4915,7 @@ void addReplyCommandInfo(client *c, struct redisCommand *cmd) {
+         addReplyLongLong(c, firstkey);
+         addReplyLongLong(c, lastkey);
+         addReplyLongLong(c, keystep);
+-        addReplyCommandCategories(c, cmd);
++        ACLReplyCommandCategories(c, cmd);
+         addReplyCommandTips(c, cmd);
+         addReplyCommandKeySpecs(c, cmd);
+         addReplyCommandSubCommands(c, cmd, addReplyCommandInfo, 0);
+@@ -5070,7 +5090,7 @@ int shouldFilterFromCommandList(struct redisCommand *cmd, commandListFilter *fil
+             return !moduleIsModuleCommand(filter->cache.u.module_handle, cmd);
+         case (COMMAND_LIST_FILTER_ACLCAT): {
+             if (!filter->cache.valid) {
+-                filter->cache.u.aclcat = ACLGetCommandCategoryFlagByName(filter->arg);
++                filter->cache.u.aclcat = ACLCategoryFlagFromName(filter->arg);
+                 filter->cache.valid = 1;
+             }
+             uint64_t cat = filter->cache.u.aclcat;
+@@ -5354,16 +5374,7 @@ sds genRedisInfoStringCommandStats(sds info, dict *commands) {
+ 
+ /* Writes the ACL metrics to the info */
+ sds genRedisInfoStringACLStats(sds info) {
+-    info = sdscatprintf(info,
+-         "acl_access_denied_auth:%lld\r\n"
+-         "acl_access_denied_cmd:%lld\r\n"
+-         "acl_access_denied_key:%lld\r\n"
+-         "acl_access_denied_channel:%lld\r\n",
+-         server.acl_info.user_auth_failures,
+-         server.acl_info.invalid_cmd_accesses,
+-         server.acl_info.invalid_key_accesses,
+-         server.acl_info.invalid_channel_accesses);
+-    return info;
++    return ACLFormatAccessDeniedStats(info);
+ }
+ 
+ sds genRedisInfoStringLatencyStats(sds info, dict *commands) {
+@@ -7106,7 +7117,7 @@ int main(int argc, char **argv) {
+     if (exec_name == NULL) exec_name = argv[0];
+     server.sentinel_mode = checkForSentinelMode(argc,argv, exec_name);
+     initServerConfig();
+-    ACLInit(); /* The ACL subsystem must be initialized ASAP because the
++    ACLInitializeSubsystem(); /* The ACL subsystem must be initialized ASAP because the
+                   basic networking code and client creation depends on it. */
+     moduleInitModulesSystem();
+     connTypeInitialize();
+@@ -7307,7 +7318,7 @@ int main(int argc, char **argv) {
+         moduleInitModulesSystemLast();
+         moduleLoadFromQueue();
+     }
+-    ACLLoadUsersAtStartup();
++    ACLLoadUsersOnStartup();
+     initListeners();
+     if (server.cluster_enabled) {
+         clusterInitListeners();
+diff --git a/src/server.h b/src/server.h
+index cb555031e..c0f05dbd4 100644
+--- a/src/server.h
++++ b/src/server.h
+@@ -2939,6 +2939,50 @@ void ACLUpdateDefaultUserPassword(sds password);
+ sds genRedisInfoStringACLStats(sds info);
+ void ACLRecomputeCommandBitsFromCommandRulesAllUsers(void);
+ 
++void ACLBindDefaultClientAuth(client *c);
++int ACLClientSessionNeedsAuth(client *c);
++void ACLApplyImplicitCommandCategories(struct redisCommand *cmd);
++sds ACLFormatUserConfigLine(user *u);
++int ACLCheckScriptCommandPerm(client *c, sds *err);
++int ACLCheckQueuedCommandPerm(client *c, int *idxptr);
++const char *ACLQueuedCommandDenialReason(int acl_retval);
++int ACLCheckUnrestrictedKeyAccess(client *c, int flags);
++sds ACLAppendAccessDeniedStats(sds info);
++
++void ACLInitializeSubsystem(void);
++void ACLLoadUsersOnStartup(void);
++void ACLUpdateRequirePass(sds password);
++unsigned long ACLAssignCommandID(sds cmdname);
++int ACLCheckClientCommandAccess(client *c, int *idxptr);
++void ACLPropagateImplicitCommandCategories(struct redisCommand *cmd);
++void ACLLogClientDenial(client *c, int reason, int context, int argpos, sds username, sds object);
++sds ACLClientErrorMessage(int acl_res, user *user, struct redisCommand *cmd, sds errored_val, int verbose);
++uint64_t ACLCategoryFlagFromName(const char *name);
++sds ACLRenderUserRuleLine(user *u);
++int ACLLoadUserDeclaration(sds *argv, int argc, int *argc_err);
++const char *ACLUserDeclarationError(void);
++sds ACLFormatAccessDeniedStats(sds info);
++void ACLReplyCommandCategories(client *c, struct redisCommand *cmd);
++int ACLCheckScriptAccess(client *c, sds *err);
++int ACLClientHasUnrestrictedKeyAccess(client *c, int flags);
++const char *ACLClientQueuedDenialReason(int acl_retval);
++
++int ACLValidateQueuedCommand(client *c, int *idxptr);
++sds ACLBuildUserConfigDirective(user *u);
++int ACLLoadConfiguredUserLine(sds *argv, int argc, int *argc_err);
++const char *ACLConfiguredUserLineError(void);
++void ACLUpdateDefaultPasswordFromConfig(sds password);
++sds ACLBuildDenialMessage(client *c, int retval, int argpos, int verbose);
++void ACLRecordClientDenial(client *c, int retval, int context, int argpos);
++int ACLValidateSortExtraKeys(client *c, int flags);
++const char *ACLDenialReasonForQueuedCommand(int acl_retval);
++
++int ACLValidateScriptCommand(client *c, sds *err);
++int ACLAllowSortExtraKeys(client *c, int flags);
++const char *ACLTransactionDenialReason(int acl_retval);
++
++int ACLScriptAllowSortExtraKeys(client *c, int flags);
++
+ /* Sorted sets data type */
+ 
+ /* Input flags. */
+diff --git a/src/sort.c b/src/sort.c
+index 77f4cbbc4..d8329d839 100644
+--- a/src/sort.c
++++ b/src/sort.c
+@@ -204,7 +204,7 @@ void sortCommandGeneric(client *c, int readonly) {
+     listSetFreeMethod(operations,zfree);
+     j = 2; /* options start at argv[2] */
+ 
+-    user_has_full_key_access = ACLUserCheckCmdWithUnrestrictedKeyAccess(c->user, c->cmd, c->argv, c->argc, CMD_KEY_ACCESS);
++    user_has_full_key_access = ACLScriptAllowSortExtraKeys(c, CMD_KEY_ACCESS);
+ 
+     /* The SORT command has an SQL-alike syntax, parse it */
+     while(j < c->argc) {

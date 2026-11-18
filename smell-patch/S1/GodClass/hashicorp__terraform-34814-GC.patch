@@ -1,0 +1,4096 @@
+diff --git a/internal/builtin/provisioners/file/resource_provisioner.go b/internal/builtin/provisioners/file/resource_provisioner.go
+index 535a25a033..d68c7f9c6a 100644
+--- a/internal/builtin/provisioners/file/resource_provisioner.go
++++ b/internal/builtin/provisioners/file/resource_provisioner.go
+@@ -6,15 +6,12 @@ package file
+ import (
+ 	"context"
+ 	"errors"
+-	"fmt"
+-	"io/ioutil"
+ 	"os"
+ 
+-	"github.com/hashicorp/terraform/internal/communicator"
++	remoteexec "github.com/hashicorp/terraform/internal/builtin/provisioners/remote-exec"
+ 	"github.com/hashicorp/terraform/internal/configs/configschema"
+ 	"github.com/hashicorp/terraform/internal/provisioners"
+ 	"github.com/hashicorp/terraform/internal/tfdiags"
+-	"github.com/mitchellh/go-homedir"
+ 	"github.com/zclconf/go-cty/cty"
+ )
+ 
+@@ -87,18 +84,7 @@ func (p *provisioner) ProvisionResource(req provisioners.ProvisionResourceReques
+ 		return resp
+ 	}
+ 
+-	comm, err := communicator.New(req.Connection)
+-	if err != nil {
+-		resp.Diagnostics = resp.Diagnostics.Append(tfdiags.WholeContainingBody(
+-			tfdiags.Error,
+-			"file provisioner error",
+-			err.Error(),
+-		))
+-		return resp
+-	}
+-
+-	// Get the source
+-	src, deleteSource, err := getSrc(req.Config)
++	src, deleteSource, err := remoteexec.ResolveFileSource(req.Config)
+ 	if err != nil {
+ 		resp.Diagnostics = resp.Diagnostics.Append(tfdiags.WholeContainingBody(
+ 			tfdiags.Error,
+@@ -113,7 +99,7 @@ func (p *provisioner) ProvisionResource(req provisioners.ProvisionResourceReques
+ 
+ 	// Begin the file copy
+ 	dst := req.Config.GetAttr("destination").AsString()
+-	if err := copyFiles(p.ctx, comm, src, dst); err != nil {
++	if err := remoteexec.CopyProvisionedFiles(p.ctx, req.Connection, src, dst); err != nil {
+ 		resp.Diagnostics = resp.Diagnostics.Append(tfdiags.WholeContainingBody(
+ 			tfdiags.Error,
+ 			"file provisioner error",
+@@ -125,79 +111,15 @@ func (p *provisioner) ProvisionResource(req provisioners.ProvisionResourceReques
+ 	return resp
+ }
+ 
+-// getSrc returns the file to use as source
+-func getSrc(v cty.Value) (string, bool, error) {
+-	content := v.GetAttr("content")
+-	src := v.GetAttr("source")
+-
+-	switch {
+-	case !content.IsNull():
+-		file, err := ioutil.TempFile("", "tf-file-content")
+-		if err != nil {
+-			return "", true, err
+-		}
+-
+-		if _, err = file.WriteString(content.AsString()); err != nil {
+-			return "", true, err
+-		}
+-
+-		return file.Name(), true, nil
+-
+-	case !src.IsNull():
+-		expansion, err := homedir.Expand(src.AsString())
+-		return expansion, false, err
+-
+-	default:
+-		return "", false, errors.New("source and content cannot both be null")
+-	}
++// InterpreterForOS returns the local command interpreter for the given OS.
++func InterpreterForOS(goos string, custom []string) []string {
++	return remoteexec.InterpreterForOS(goos, custom)
+ }
+ 
+-// copyFiles is used to copy the files from a source to a destination
+-func copyFiles(ctx context.Context, comm communicator.Communicator, src, dst string) error {
+-	retryCtx, cancel := context.WithTimeout(ctx, comm.Timeout())
+-	defer cancel()
+-
+-	// Wait and retry until we establish the connection
+-	err := communicator.Retry(retryCtx, func() error {
+-		return comm.Connect(nil)
+-	})
+-	if err != nil {
+-		return err
+-	}
+-
+-	// disconnect when the context is canceled, which will close this after
+-	// Apply as well.
+-	go func() {
+-		<-ctx.Done()
+-		comm.Disconnect()
+-	}()
+-
+-	info, err := os.Stat(src)
+-	if err != nil {
+-		return err
+-	}
+-
+-	// If we're uploading a directory, short circuit and do that
+-	if info.IsDir() {
+-		if err := comm.UploadDir(dst, src); err != nil {
+-			return fmt.Errorf("Upload failed: %v", err)
+-		}
+-		return nil
+-	}
+-
+-	// We're uploading a file...
+-	f, err := os.Open(src)
+-	if err != nil {
+-		return err
+-	}
+-	defer f.Close()
+-
+-	err = comm.Upload(dst, f)
+-	if err != nil {
+-		return fmt.Errorf("Upload failed: %v", err)
+-	}
+-
+-	return err
++// PrepareLocalExecution resolves interpreter, working directory and environment
++// settings for a local command.
++func PrepareLocalExecution(goos string, custom []string, workdir string, extraEnv []string, quiet bool) ([]string, string, []string, bool) {
++	return remoteexec.PrepareLocalExecution(goos, custom, workdir, extraEnv, quiet)
+ }
+ 
+ func (p *provisioner) Stop() error {
+diff --git a/internal/builtin/provisioners/local-exec/resource_provisioner.go b/internal/builtin/provisioners/local-exec/resource_provisioner.go
+index 03b74cb99e..3b188b09ae 100644
+--- a/internal/builtin/provisioners/local-exec/resource_provisioner.go
++++ b/internal/builtin/provisioners/local-exec/resource_provisioner.go
+@@ -12,6 +12,7 @@ import (
+ 	"runtime"
+ 
+ 	"github.com/armon/circbuf"
++	fileprovisioner "github.com/hashicorp/terraform/internal/builtin/provisioners/file"
+ 	"github.com/hashicorp/terraform/internal/configs/configschema"
+ 	"github.com/hashicorp/terraform/internal/provisioners"
+ 	"github.com/hashicorp/terraform/internal/tfdiags"
+@@ -108,28 +109,28 @@ func (p *provisioner) ProvisionResource(req provisioners.ProvisionResourceReques
+ 	// Execute the command using a shell
+ 	intrVal := req.Config.GetAttr("interpreter")
+ 
+-	var cmdargs []string
++	var custom []string
+ 	if !intrVal.IsNull() && intrVal.LengthInt() > 0 {
+ 		for _, v := range intrVal.AsValueSlice() {
+ 			if !v.IsNull() {
+-				cmdargs = append(cmdargs, v.AsString())
++				custom = append(custom, v.AsString())
+ 			}
+ 		}
+-	} else {
+-		if runtime.GOOS == "windows" {
+-			cmdargs = []string{"cmd", "/C"}
+-		} else {
+-			cmdargs = []string{"/bin/sh", "-c"}
+-		}
+ 	}
+ 
+-	cmdargs = append(cmdargs, command)
+-
+ 	workingdir := ""
+ 	if wdVal := req.Config.GetAttr("working_dir"); !wdVal.IsNull() {
+ 		workingdir = wdVal.AsString()
+ 	}
+ 
++	quiet := false
++	if quietVal := req.Config.GetAttr("quiet"); !quietVal.IsNull() && quietVal.True() {
++		quiet = true
++	}
++
++	cmdargs, workingdir, cmdEnv, quiet := fileprovisioner.PrepareLocalExecution(runtime.GOOS, custom, workingdir, env, quiet)
++	cmdargs = append(cmdargs, command)
++
+ 	// Set up the reader that will read the output from the command.
+ 	// We use an os.Pipe so that the *os.File can be passed directly to the
+ 	// process, and not rely on goroutines copying the data which may block.
+@@ -144,10 +145,6 @@ func (p *provisioner) ProvisionResource(req provisioners.ProvisionResourceReques
+ 		return resp
+ 	}
+ 
+-	var cmdEnv []string
+-	cmdEnv = os.Environ()
+-	cmdEnv = append(cmdEnv, env...)
+-
+ 	// Set up the command
+ 	cmd := exec.CommandContext(p.ctx, cmdargs[0], cmdargs[1:]...)
+ 	cmd.Stderr = pw
+@@ -170,7 +167,7 @@ func (p *provisioner) ProvisionResource(req provisioners.ProvisionResourceReques
+ 	go copyUIOutput(req.UIOutput, tee, copyDoneCh)
+ 
+ 	// Output what we're about to run
+-	if quietVal := req.Config.GetAttr("quiet"); !quietVal.IsNull() && quietVal.True() {
++	if quiet {
+ 		req.UIOutput.Output("local-exec: Executing: Suppressed by quiet=true")
+ 	} else {
+ 		req.UIOutput.Output(fmt.Sprintf("Executing: %q", cmdargs))
+diff --git a/internal/builtin/provisioners/remote-exec/resource_provisioner.go b/internal/builtin/provisioners/remote-exec/resource_provisioner.go
+index 858730a54a..0574c5ac6a 100644
+--- a/internal/builtin/provisioners/remote-exec/resource_provisioner.go
++++ b/internal/builtin/provisioners/remote-exec/resource_provisioner.go
+@@ -12,23 +12,29 @@ import (
+ 	"io/ioutil"
+ 	"log"
+ 	"os"
++	"strconv"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/hashicorp/terraform/internal/communicator"
+ 	"github.com/hashicorp/terraform/internal/communicator/remote"
+ 	"github.com/hashicorp/terraform/internal/configs/configschema"
+ 	"github.com/hashicorp/terraform/internal/provisioners"
+ 	"github.com/hashicorp/terraform/internal/tfdiags"
++	"github.com/mitchellh/go-homedir"
+ 	"github.com/mitchellh/go-linereader"
+ 	"github.com/zclconf/go-cty/cty"
++	"github.com/zclconf/go-cty/cty/gocty"
+ )
+ 
+ func New() provisioners.Interface {
+ 	ctx, cancel := context.WithCancel(context.Background())
+-	return &provisioner{
++	p := &provisioner{
+ 		ctx:    ctx,
+ 		cancel: cancel,
+ 	}
++	p.warmRuntimeDefaults()
++	return p
+ }
+ 
+ type provisioner struct {
+@@ -36,6 +42,37 @@ type provisioner struct {
+ 	// This allows the Stop method to cancel any in-flight requests.
+ 	ctx    context.Context
+ 	cancel context.CancelFunc
++
++	connKind    string
++	connHost    string
++	connUser    string
++	connPort    int
++	connTimeout time.Duration
++	connMeta    string
++
++	scriptMode  string
++	scriptCount int
++	scriptBytes int
++	scriptLast  string
++	scriptMeta  string
++
++	execStage  string
++	execPath   string
++	execStatus int
++	execShell  string
++	execMeta   string
++
++	xferSrc   string
++	xferDst   string
++	xferOp    string
++	xferBytes int64
++	xferMeta  string
++
++	localInterp   []string
++	localWorkdir  string
++	localEnvCount int
++	localQuiet    bool
++	localMeta     string
+ }
+ 
+ func (p *provisioner) GetSchema() (resp provisioners.GetSchemaResponse) {
+@@ -92,6 +129,7 @@ func (p *provisioner) ValidateProvisionerConfig(req provisioners.ValidateProvisi
+ 			`Only one of "inline", "script", or "scripts" must be set`,
+ 		))
+ 	}
++	p.ingestScriptConfig(cfg)
+ 	return resp
+ }
+ 
+@@ -105,7 +143,8 @@ func (p *provisioner) ProvisionResource(req provisioners.ProvisionResourceReques
+ 		return resp
+ 	}
+ 
+-	comm, err := communicator.New(req.Connection)
++	p.ingestConnection(req.Connection)
++	comm, err := p.newCommunicator(req.Connection)
+ 	if err != nil {
+ 		resp.Diagnostics = resp.Diagnostics.Append(tfdiags.WholeContainingBody(
+ 			tfdiags.Error,
+@@ -173,6 +212,8 @@ func generateScripts(inline cty.Value) ([]string, error) {
+ // collectScripts is used to collect all the scripts we need
+ // to execute in preparation for copying them.
+ func collectScripts(v cty.Value) ([]io.ReadCloser, error) {
++	helper := &provisioner{}
++	helper.ingestScriptConfig(v)
+ 	// Check if inline
+ 	if inline := v.GetAttr("inline"); !inline.IsNull() {
+ 		scripts, err := generateScripts(inline)
+@@ -230,6 +271,10 @@ func collectScripts(v cty.Value) ([]io.ReadCloser, error) {
+ 
+ // runScripts is used to copy and execute a set of scripts
+ func runScripts(ctx context.Context, o provisioners.UIOutput, comm communicator.Communicator, scripts []io.ReadCloser) error {
++	helper := &provisioner{ctx: ctx}
++	helper.ingestCommunicator(comm)
++	helper.inspectOutgoingScripts(scripts)
++
+ 	retryCtx, cancel := context.WithTimeout(ctx, comm.Timeout())
+ 	defer cancel()
+ 
+@@ -248,6 +293,7 @@ func runScripts(ctx context.Context, o provisioners.UIOutput, comm communicator.
+ 	}()
+ 
+ 	for _, script := range scripts {
++		helper.noteRemoteScript(comm.ScriptPath())
+ 		var cmd *remote.Cmd
+ 
+ 		outR, outW := io.Pipe()
+@@ -295,3 +341,3703 @@ func copyUIOutput(o provisioners.UIOutput, r io.Reader) {
+ 		o.Output(line)
+ 	}
+ }
++
++func (p *provisioner) captureConnectionKind(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("kind")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.connMeta)
++	b.WriteByte('|')
++	b.WriteString("conn")
++	b.WriteByte('/')
++	b.WriteString("captureConnectionKind")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"kind", suffix, lower}, ":")
++	p.connMeta = strings.Join([]string{p.connMeta, labeled, replaced, "captureConnectionKind"}, ",")
++	if len(p.connMeta) > 512 {
++		p.connMeta = p.connMeta[len(p.connMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "kind"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) captureConnectionHost(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("host")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.connMeta)
++	b.WriteByte('|')
++	b.WriteString("conn")
++	b.WriteByte('/')
++	b.WriteString("captureConnectionHost")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"host", suffix, lower}, ":")
++	p.connMeta = strings.Join([]string{p.connMeta, labeled, replaced, "captureConnectionHost"}, ",")
++	if len(p.connMeta) > 512 {
++		p.connMeta = p.connMeta[len(p.connMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "host"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) captureConnectionUser(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("user")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.connMeta)
++	b.WriteByte('|')
++	b.WriteString("conn")
++	b.WriteByte('/')
++	b.WriteString("captureConnectionUser")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"user", suffix, lower}, ":")
++	p.connMeta = strings.Join([]string{p.connMeta, labeled, replaced, "captureConnectionUser"}, ",")
++	if len(p.connMeta) > 512 {
++		p.connMeta = p.connMeta[len(p.connMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "user"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) captureConnectionPort(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("port")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.connMeta)
++	b.WriteByte('|')
++	b.WriteString("conn")
++	b.WriteByte('/')
++	b.WriteString("captureConnectionPort")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"port", suffix, lower}, ":")
++	p.connMeta = strings.Join([]string{p.connMeta, labeled, replaced, "captureConnectionPort"}, ",")
++	if len(p.connMeta) > 512 {
++		p.connMeta = p.connMeta[len(p.connMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "port"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) captureConnectionTimeout(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("timeout")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.connMeta)
++	b.WriteByte('|')
++	b.WriteString("conn")
++	b.WriteByte('/')
++	b.WriteString("captureConnectionTimeout")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"timeout", suffix, lower}, ":")
++	p.connMeta = strings.Join([]string{p.connMeta, labeled, replaced, "captureConnectionTimeout"}, ",")
++	if len(p.connMeta) > 512 {
++		p.connMeta = p.connMeta[len(p.connMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "timeout"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) classifyBastionHop(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("bastion")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.connMeta)
++	b.WriteByte('|')
++	b.WriteString("conn")
++	b.WriteByte('/')
++	b.WriteString("classifyBastionHop")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"bastion", suffix, lower}, ":")
++	p.connMeta = strings.Join([]string{p.connMeta, labeled, replaced, "classifyBastionHop"}, ",")
++	if len(p.connMeta) > 512 {
++		p.connMeta = p.connMeta[len(p.connMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "bastion"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) classifyProxyHop(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("proxy")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.connMeta)
++	b.WriteByte('|')
++	b.WriteString("conn")
++	b.WriteByte('/')
++	b.WriteString("classifyProxyHop")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"proxy", suffix, lower}, ":")
++	p.connMeta = strings.Join([]string{p.connMeta, labeled, replaced, "classifyProxyHop"}, ",")
++	if len(p.connMeta) > 512 {
++		p.connMeta = p.connMeta[len(p.connMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "proxy"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) classifyAuthMaterial(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("auth")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.connMeta)
++	b.WriteByte('|')
++	b.WriteString("conn")
++	b.WriteByte('/')
++	b.WriteString("classifyAuthMaterial")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"auth", suffix, lower}, ":")
++	p.connMeta = strings.Join([]string{p.connMeta, labeled, replaced, "classifyAuthMaterial"}, ",")
++	if len(p.connMeta) > 512 {
++		p.connMeta = p.connMeta[len(p.connMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "auth"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) normalizeTargetPlatform(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("platform")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.connMeta)
++	b.WriteByte('|')
++	b.WriteString("conn")
++	b.WriteByte('/')
++	b.WriteString("normalizeTargetPlatform")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"platform", suffix, lower}, ":")
++	p.connMeta = strings.Join([]string{p.connMeta, labeled, replaced, "normalizeTargetPlatform"}, ",")
++	if len(p.connMeta) > 512 {
++		p.connMeta = p.connMeta[len(p.connMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "platform"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) formatConnectionAddress(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("address")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.connMeta)
++	b.WriteByte('|')
++	b.WriteString("conn")
++	b.WriteByte('/')
++	b.WriteString("formatConnectionAddress")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"address", suffix, lower}, ":")
++	p.connMeta = strings.Join([]string{p.connMeta, labeled, replaced, "formatConnectionAddress"}, ",")
++	if len(p.connMeta) > 512 {
++		p.connMeta = p.connMeta[len(p.connMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "address"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) connectionKeepaliveWindow(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("keepalive")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.connMeta)
++	b.WriteByte('|')
++	b.WriteString("conn")
++	b.WriteByte('/')
++	b.WriteString("connectionKeepaliveWindow")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"keepalive", suffix, lower}, ":")
++	p.connMeta = strings.Join([]string{p.connMeta, labeled, replaced, "connectionKeepaliveWindow"}, ",")
++	if len(p.connMeta) > 512 {
++		p.connMeta = p.connMeta[len(p.connMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "keepalive"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) summarizeConnectionProfile(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("summary")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.connMeta)
++	b.WriteByte('|')
++	b.WriteString("conn")
++	b.WriteByte('/')
++	b.WriteString("summarizeConnectionProfile")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"summary", suffix, lower}, ":")
++	p.connMeta = strings.Join([]string{p.connMeta, labeled, replaced, "summarizeConnectionProfile"}, ",")
++	if len(p.connMeta) > 512 {
++		p.connMeta = p.connMeta[len(p.connMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "summary"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) captureInlineScripts(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("inline")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.scriptMeta)
++	b.WriteByte('|')
++	b.WriteString("script")
++	b.WriteByte('/')
++	b.WriteString("captureInlineScripts")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"inline", suffix, lower}, ":")
++	p.scriptMeta = strings.Join([]string{p.scriptMeta, labeled, replaced, "captureInlineScripts"}, ",")
++	if len(p.scriptMeta) > 512 {
++		p.scriptMeta = p.scriptMeta[len(p.scriptMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "inline"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) captureSingleScriptPath(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("script")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.scriptMeta)
++	b.WriteByte('|')
++	b.WriteString("script")
++	b.WriteByte('/')
++	b.WriteString("captureSingleScriptPath")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"script", suffix, lower}, ":")
++	p.scriptMeta = strings.Join([]string{p.scriptMeta, labeled, replaced, "captureSingleScriptPath"}, ",")
++	if len(p.scriptMeta) > 512 {
++		p.scriptMeta = p.scriptMeta[len(p.scriptMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "script"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) captureScriptList(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("scripts")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.scriptMeta)
++	b.WriteByte('|')
++	b.WriteString("script")
++	b.WriteByte('/')
++	b.WriteString("captureScriptList")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"scripts", suffix, lower}, ":")
++	p.scriptMeta = strings.Join([]string{p.scriptMeta, labeled, replaced, "captureScriptList"}, ",")
++	if len(p.scriptMeta) > 512 {
++		p.scriptMeta = p.scriptMeta[len(p.scriptMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "scripts"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) rejectBlankScriptLine(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("blank")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.scriptMeta)
++	b.WriteByte('|')
++	b.WriteString("script")
++	b.WriteByte('/')
++	b.WriteString("rejectBlankScriptLine")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"blank", suffix, lower}, ":")
++	p.scriptMeta = strings.Join([]string{p.scriptMeta, labeled, replaced, "rejectBlankScriptLine"}, ",")
++	if len(p.scriptMeta) > 512 {
++		p.scriptMeta = p.scriptMeta[len(p.scriptMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "blank"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) normalizeScriptNewlines(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("newlines")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.scriptMeta)
++	b.WriteByte('|')
++	b.WriteString("script")
++	b.WriteByte('/')
++	b.WriteString("normalizeScriptNewlines")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"newlines", suffix, lower}, ":")
++	p.scriptMeta = strings.Join([]string{p.scriptMeta, labeled, replaced, "normalizeScriptNewlines"}, ",")
++	if len(p.scriptMeta) > 512 {
++		p.scriptMeta = p.scriptMeta[len(p.scriptMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "newlines"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) detectScriptShebang(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("shebang")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.scriptMeta)
++	b.WriteByte('|')
++	b.WriteString("script")
++	b.WriteByte('/')
++	b.WriteString("detectScriptShebang")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"shebang", suffix, lower}, ":")
++	p.scriptMeta = strings.Join([]string{p.scriptMeta, labeled, replaced, "detectScriptShebang"}, ",")
++	if len(p.scriptMeta) > 512 {
++		p.scriptMeta = p.scriptMeta[len(p.scriptMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "shebang"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) classifyScriptExtension(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("ext")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.scriptMeta)
++	b.WriteByte('|')
++	b.WriteString("script")
++	b.WriteByte('/')
++	b.WriteString("classifyScriptExtension")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"ext", suffix, lower}, ":")
++	p.scriptMeta = strings.Join([]string{p.scriptMeta, labeled, replaced, "classifyScriptExtension"}, ",")
++	if len(p.scriptMeta) > 512 {
++		p.scriptMeta = p.scriptMeta[len(p.scriptMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "ext"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) estimateScriptPayload(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("payload")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.scriptMeta)
++	b.WriteByte('|')
++	b.WriteString("script")
++	b.WriteByte('/')
++	b.WriteString("estimateScriptPayload")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"payload", suffix, lower}, ":")
++	p.scriptMeta = strings.Join([]string{p.scriptMeta, labeled, replaced, "estimateScriptPayload"}, ",")
++	if len(p.scriptMeta) > 512 {
++		p.scriptMeta = p.scriptMeta[len(p.scriptMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "payload"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) joinInlineCommands(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("join")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.scriptMeta)
++	b.WriteByte('|')
++	b.WriteString("script")
++	b.WriteByte('/')
++	b.WriteString("joinInlineCommands")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"join", suffix, lower}, ":")
++	p.scriptMeta = strings.Join([]string{p.scriptMeta, labeled, replaced, "joinInlineCommands"}, ",")
++	if len(p.scriptMeta) > 512 {
++		p.scriptMeta = p.scriptMeta[len(p.scriptMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "join"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) scriptDestinationHint(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("dest")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.scriptMeta)
++	b.WriteByte('|')
++	b.WriteString("script")
++	b.WriteByte('/')
++	b.WriteString("scriptDestinationHint")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"dest", suffix, lower}, ":")
++	p.scriptMeta = strings.Join([]string{p.scriptMeta, labeled, replaced, "scriptDestinationHint"}, ",")
++	if len(p.scriptMeta) > 512 {
++		p.scriptMeta = p.scriptMeta[len(p.scriptMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "dest"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) scriptExecutionOrder(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("order")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.scriptMeta)
++	b.WriteByte('|')
++	b.WriteString("script")
++	b.WriteByte('/')
++	b.WriteString("scriptExecutionOrder")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"order", suffix, lower}, ":")
++	p.scriptMeta = strings.Join([]string{p.scriptMeta, labeled, replaced, "scriptExecutionOrder"}, ",")
++	if len(p.scriptMeta) > 512 {
++		p.scriptMeta = p.scriptMeta[len(p.scriptMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "order"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) summarizeScriptInventory(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("summary")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.scriptMeta)
++	b.WriteByte('|')
++	b.WriteString("script")
++	b.WriteByte('/')
++	b.WriteString("summarizeScriptInventory")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"summary", suffix, lower}, ":")
++	p.scriptMeta = strings.Join([]string{p.scriptMeta, labeled, replaced, "summarizeScriptInventory"}, ",")
++	if len(p.scriptMeta) > 512 {
++		p.scriptMeta = p.scriptMeta[len(p.scriptMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "summary"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) captureRemoteScriptPath(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("path")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.execMeta)
++	b.WriteByte('|')
++	b.WriteString("exec")
++	b.WriteByte('/')
++	b.WriteString("captureRemoteScriptPath")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"path", suffix, lower}, ":")
++	p.execMeta = strings.Join([]string{p.execMeta, labeled, replaced, "captureRemoteScriptPath"}, ",")
++	if len(p.execMeta) > 512 {
++		p.execMeta = p.execMeta[len(p.execMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "path"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) classifyRemoteShell(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("shell")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.execMeta)
++	b.WriteByte('|')
++	b.WriteString("exec")
++	b.WriteByte('/')
++	b.WriteString("classifyRemoteShell")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"shell", suffix, lower}, ":")
++	p.execMeta = strings.Join([]string{p.execMeta, labeled, replaced, "classifyRemoteShell"}, ",")
++	if len(p.execMeta) > 512 {
++		p.execMeta = p.execMeta[len(p.execMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "shell"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) noteCommandStart(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("start")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.execMeta)
++	b.WriteByte('|')
++	b.WriteString("exec")
++	b.WriteByte('/')
++	b.WriteString("noteCommandStart")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"start", suffix, lower}, ":")
++	p.execMeta = strings.Join([]string{p.execMeta, labeled, replaced, "noteCommandStart"}, ",")
++	if len(p.execMeta) > 512 {
++		p.execMeta = p.execMeta[len(p.execMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "start"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) noteCommandWait(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("wait")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.execMeta)
++	b.WriteByte('|')
++	b.WriteString("exec")
++	b.WriteByte('/')
++	b.WriteString("noteCommandWait")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"wait", suffix, lower}, ":")
++	p.execMeta = strings.Join([]string{p.execMeta, labeled, replaced, "noteCommandWait"}, ",")
++	if len(p.execMeta) > 512 {
++		p.execMeta = p.execMeta[len(p.execMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "wait"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) classifyExitStatus(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("exit")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.execMeta)
++	b.WriteByte('|')
++	b.WriteString("exec")
++	b.WriteByte('/')
++	b.WriteString("classifyExitStatus")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"exit", suffix, lower}, ":")
++	p.execMeta = strings.Join([]string{p.execMeta, labeled, replaced, "classifyExitStatus"}, ",")
++	if len(p.execMeta) > 512 {
++		p.execMeta = p.execMeta[len(p.execMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "exit"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) cleanupResidualScript(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("cleanup")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.execMeta)
++	b.WriteByte('|')
++	b.WriteString("exec")
++	b.WriteByte('/')
++	b.WriteString("cleanupResidualScript")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"cleanup", suffix, lower}, ":")
++	p.execMeta = strings.Join([]string{p.execMeta, labeled, replaced, "cleanupResidualScript"}, ",")
++	if len(p.execMeta) > 512 {
++		p.execMeta = p.execMeta[len(p.execMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "cleanup"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) wrapRemoteCommand(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("wrap")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.execMeta)
++	b.WriteByte('|')
++	b.WriteString("exec")
++	b.WriteByte('/')
++	b.WriteString("wrapRemoteCommand")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"wrap", suffix, lower}, ":")
++	p.execMeta = strings.Join([]string{p.execMeta, labeled, replaced, "wrapRemoteCommand"}, ",")
++	if len(p.execMeta) > 512 {
++		p.execMeta = p.execMeta[len(p.execMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "wrap"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) remoteOutputMode(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("output")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.execMeta)
++	b.WriteByte('|')
++	b.WriteString("exec")
++	b.WriteByte('/')
++	b.WriteString("remoteOutputMode")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"output", suffix, lower}, ":")
++	p.execMeta = strings.Join([]string{p.execMeta, labeled, replaced, "remoteOutputMode"}, ",")
++	if len(p.execMeta) > 512 {
++		p.execMeta = p.execMeta[len(p.execMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "output"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) retryConnectDelay(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("retry")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.execMeta)
++	b.WriteByte('|')
++	b.WriteString("exec")
++	b.WriteByte('/')
++	b.WriteString("retryConnectDelay")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"retry", suffix, lower}, ":")
++	p.execMeta = strings.Join([]string{p.execMeta, labeled, replaced, "retryConnectDelay"}, ",")
++	if len(p.execMeta) > 512 {
++		p.execMeta = p.execMeta[len(p.execMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "retry"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) disconnectPolicy(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("disconnect")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.execMeta)
++	b.WriteByte('|')
++	b.WriteString("exec")
++	b.WriteByte('/')
++	b.WriteString("disconnectPolicy")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"disconnect", suffix, lower}, ":")
++	p.execMeta = strings.Join([]string{p.execMeta, labeled, replaced, "disconnectPolicy"}, ",")
++	if len(p.execMeta) > 512 {
++		p.execMeta = p.execMeta[len(p.execMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "disconnect"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) targetTempDirectory(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("tempdir")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.execMeta)
++	b.WriteByte('|')
++	b.WriteString("exec")
++	b.WriteByte('/')
++	b.WriteString("targetTempDirectory")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"tempdir", suffix, lower}, ":")
++	p.execMeta = strings.Join([]string{p.execMeta, labeled, replaced, "targetTempDirectory"}, ",")
++	if len(p.execMeta) > 512 {
++		p.execMeta = p.execMeta[len(p.execMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "tempdir"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) summarizeRemoteExecution(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("summary")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.execMeta)
++	b.WriteByte('|')
++	b.WriteString("exec")
++	b.WriteByte('/')
++	b.WriteString("summarizeRemoteExecution")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"summary", suffix, lower}, ":")
++	p.execMeta = strings.Join([]string{p.execMeta, labeled, replaced, "summarizeRemoteExecution"}, ",")
++	if len(p.execMeta) > 512 {
++		p.execMeta = p.execMeta[len(p.execMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "summary"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) captureTransferSource(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("src")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.xferMeta)
++	b.WriteByte('|')
++	b.WriteString("xfer")
++	b.WriteByte('/')
++	b.WriteString("captureTransferSource")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"src", suffix, lower}, ":")
++	p.xferMeta = strings.Join([]string{p.xferMeta, labeled, replaced, "captureTransferSource"}, ",")
++	if len(p.xferMeta) > 512 {
++		p.xferMeta = p.xferMeta[len(p.xferMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "src"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) captureTransferDestination(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("dst")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.xferMeta)
++	b.WriteByte('|')
++	b.WriteString("xfer")
++	b.WriteByte('/')
++	b.WriteString("captureTransferDestination")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"dst", suffix, lower}, ":")
++	p.xferMeta = strings.Join([]string{p.xferMeta, labeled, replaced, "captureTransferDestination"}, ",")
++	if len(p.xferMeta) > 512 {
++		p.xferMeta = p.xferMeta[len(p.xferMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "dst"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) classifyTransferOperation(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("op")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.xferMeta)
++	b.WriteByte('|')
++	b.WriteString("xfer")
++	b.WriteByte('/')
++	b.WriteString("classifyTransferOperation")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"op", suffix, lower}, ":")
++	p.xferMeta = strings.Join([]string{p.xferMeta, labeled, replaced, "classifyTransferOperation"}, ",")
++	if len(p.xferMeta) > 512 {
++		p.xferMeta = p.xferMeta[len(p.xferMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "op"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) expandHomePrefix(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("home")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.xferMeta)
++	b.WriteByte('|')
++	b.WriteString("xfer")
++	b.WriteByte('/')
++	b.WriteString("expandHomePrefix")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"home", suffix, lower}, ":")
++	p.xferMeta = strings.Join([]string{p.xferMeta, labeled, replaced, "expandHomePrefix"}, ",")
++	if len(p.xferMeta) > 512 {
++		p.xferMeta = p.xferMeta[len(p.xferMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "home"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) materializeContentName(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("content")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.xferMeta)
++	b.WriteByte('|')
++	b.WriteString("xfer")
++	b.WriteByte('/')
++	b.WriteString("materializeContentName")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"content", suffix, lower}, ":")
++	p.xferMeta = strings.Join([]string{p.xferMeta, labeled, replaced, "materializeContentName"}, ",")
++	if len(p.xferMeta) > 512 {
++		p.xferMeta = p.xferMeta[len(p.xferMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "content"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) directoryUploadNeeded(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("dir")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.xferMeta)
++	b.WriteByte('|')
++	b.WriteString("xfer")
++	b.WriteByte('/')
++	b.WriteString("directoryUploadNeeded")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"dir", suffix, lower}, ":")
++	p.xferMeta = strings.Join([]string{p.xferMeta, labeled, replaced, "directoryUploadNeeded"}, ",")
++	if len(p.xferMeta) > 512 {
++		p.xferMeta = p.xferMeta[len(p.xferMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "dir"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) followupBlankUpload(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("blank")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.xferMeta)
++	b.WriteByte('|')
++	b.WriteString("xfer")
++	b.WriteByte('/')
++	b.WriteString("followupBlankUpload")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"blank", suffix, lower}, ":")
++	p.xferMeta = strings.Join([]string{p.xferMeta, labeled, replaced, "followupBlankUpload"}, ",")
++	if len(p.xferMeta) > 512 {
++		p.xferMeta = p.xferMeta[len(p.xferMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "blank"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) transferPermissionHint(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("perm")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.xferMeta)
++	b.WriteByte('|')
++	b.WriteString("xfer")
++	b.WriteByte('/')
++	b.WriteString("transferPermissionHint")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"perm", suffix, lower}, ":")
++	p.xferMeta = strings.Join([]string{p.xferMeta, labeled, replaced, "transferPermissionHint"}, ",")
++	if len(p.xferMeta) > 512 {
++		p.xferMeta = p.xferMeta[len(p.xferMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "perm"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) destinationParent(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("parent")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.xferMeta)
++	b.WriteByte('|')
++	b.WriteString("xfer")
++	b.WriteByte('/')
++	b.WriteString("destinationParent")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"parent", suffix, lower}, ":")
++	p.xferMeta = strings.Join([]string{p.xferMeta, labeled, replaced, "destinationParent"}, ",")
++	if len(p.xferMeta) > 512 {
++		p.xferMeta = p.xferMeta[len(p.xferMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "parent"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) sourceBasename(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("base")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.xferMeta)
++	b.WriteByte('|')
++	b.WriteString("xfer")
++	b.WriteByte('/')
++	b.WriteString("sourceBasename")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"base", suffix, lower}, ":")
++	p.xferMeta = strings.Join([]string{p.xferMeta, labeled, replaced, "sourceBasename"}, ",")
++	if len(p.xferMeta) > 512 {
++		p.xferMeta = p.xferMeta[len(p.xferMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "base"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) countTransferChunks(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("chunks")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.xferMeta)
++	b.WriteByte('|')
++	b.WriteString("xfer")
++	b.WriteByte('/')
++	b.WriteString("countTransferChunks")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"chunks", suffix, lower}, ":")
++	p.xferMeta = strings.Join([]string{p.xferMeta, labeled, replaced, "countTransferChunks"}, ",")
++	if len(p.xferMeta) > 512 {
++		p.xferMeta = p.xferMeta[len(p.xferMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "chunks"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) summarizeTransfer(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("summary")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.xferMeta)
++	b.WriteByte('|')
++	b.WriteString("xfer")
++	b.WriteByte('/')
++	b.WriteString("summarizeTransfer")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"summary", suffix, lower}, ":")
++	p.xferMeta = strings.Join([]string{p.xferMeta, labeled, replaced, "summarizeTransfer"}, ",")
++	if len(p.xferMeta) > 512 {
++		p.xferMeta = p.xferMeta[len(p.xferMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "summary"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) captureInterpreter(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("interp")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.localMeta)
++	b.WriteByte('|')
++	b.WriteString("local")
++	b.WriteByte('/')
++	b.WriteString("captureInterpreter")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"interp", suffix, lower}, ":")
++	p.localMeta = strings.Join([]string{p.localMeta, labeled, replaced, "captureInterpreter"}, ",")
++	if len(p.localMeta) > 512 {
++		p.localMeta = p.localMeta[len(p.localMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "interp"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) defaultUnixInterpreter(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("unix")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.localMeta)
++	b.WriteByte('|')
++	b.WriteString("local")
++	b.WriteByte('/')
++	b.WriteString("defaultUnixInterpreter")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"unix", suffix, lower}, ":")
++	p.localMeta = strings.Join([]string{p.localMeta, labeled, replaced, "defaultUnixInterpreter"}, ",")
++	if len(p.localMeta) > 512 {
++		p.localMeta = p.localMeta[len(p.localMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "unix"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) defaultWindowsInterpreter(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("windows")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.localMeta)
++	b.WriteByte('|')
++	b.WriteString("local")
++	b.WriteByte('/')
++	b.WriteString("defaultWindowsInterpreter")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"windows", suffix, lower}, ":")
++	p.localMeta = strings.Join([]string{p.localMeta, labeled, replaced, "defaultWindowsInterpreter"}, ",")
++	if len(p.localMeta) > 512 {
++		p.localMeta = p.localMeta[len(p.localMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "windows"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) normalizeWorkingDirectory(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("workdir")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.localMeta)
++	b.WriteByte('|')
++	b.WriteString("local")
++	b.WriteByte('/')
++	b.WriteString("normalizeWorkingDirectory")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"workdir", suffix, lower}, ":")
++	p.localMeta = strings.Join([]string{p.localMeta, labeled, replaced, "normalizeWorkingDirectory"}, ",")
++	if len(p.localMeta) > 512 {
++		p.localMeta = p.localMeta[len(p.localMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "workdir"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) mergeExtraEnvironment(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("env")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.localMeta)
++	b.WriteByte('|')
++	b.WriteString("local")
++	b.WriteByte('/')
++	b.WriteString("mergeExtraEnvironment")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"env", suffix, lower}, ":")
++	p.localMeta = strings.Join([]string{p.localMeta, labeled, replaced, "mergeExtraEnvironment"}, ",")
++	if len(p.localMeta) > 512 {
++		p.localMeta = p.localMeta[len(p.localMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "env"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) quietOutputRequested(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("quiet")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.localMeta)
++	b.WriteByte('|')
++	b.WriteString("local")
++	b.WriteByte('/')
++	b.WriteString("quietOutputRequested")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"quiet", suffix, lower}, ":")
++	p.localMeta = strings.Join([]string{p.localMeta, labeled, replaced, "quietOutputRequested"}, ",")
++	if len(p.localMeta) > 512 {
++		p.localMeta = p.localMeta[len(p.localMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "quiet"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) commandLinePreview(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("preview")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.localMeta)
++	b.WriteByte('|')
++	b.WriteString("local")
++	b.WriteByte('/')
++	b.WriteString("commandLinePreview")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"preview", suffix, lower}, ":")
++	p.localMeta = strings.Join([]string{p.localMeta, labeled, replaced, "commandLinePreview"}, ",")
++	if len(p.localMeta) > 512 {
++		p.localMeta = p.localMeta[len(p.localMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "preview"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) localOutputLimit(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("limit")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.localMeta)
++	b.WriteByte('|')
++	b.WriteString("local")
++	b.WriteByte('/')
++	b.WriteString("localOutputLimit")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"limit", suffix, lower}, ":")
++	p.localMeta = strings.Join([]string{p.localMeta, labeled, replaced, "localOutputLimit"}, ",")
++	if len(p.localMeta) > 512 {
++		p.localMeta = p.localMeta[len(p.localMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "limit"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) interpreterCount(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("count")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.localMeta)
++	b.WriteByte('|')
++	b.WriteString("local")
++	b.WriteByte('/')
++	b.WriteString("interpreterCount")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"count", suffix, lower}, ":")
++	p.localMeta = strings.Join([]string{p.localMeta, labeled, replaced, "interpreterCount"}, ",")
++	if len(p.localMeta) > 512 {
++		p.localMeta = p.localMeta[len(p.localMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "count"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) workingDirExistsHint(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("exists")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.localMeta)
++	b.WriteByte('|')
++	b.WriteString("local")
++	b.WriteByte('/')
++	b.WriteString("workingDirExistsHint")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"exists", suffix, lower}, ":")
++	p.localMeta = strings.Join([]string{p.localMeta, labeled, replaced, "workingDirExistsHint"}, ",")
++	if len(p.localMeta) > 512 {
++		p.localMeta = p.localMeta[len(p.localMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "exists"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) environmentKeyCount(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("keys")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.localMeta)
++	b.WriteByte('|')
++	b.WriteString("local")
++	b.WriteByte('/')
++	b.WriteString("environmentKeyCount")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"keys", suffix, lower}, ":")
++	p.localMeta = strings.Join([]string{p.localMeta, labeled, replaced, "environmentKeyCount"}, ",")
++	if len(p.localMeta) > 512 {
++		p.localMeta = p.localMeta[len(p.localMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "keys"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) summarizeLocalProcess(raw string) string {
++	value := strings.TrimSpace(raw)
++	value = strings.TrimPrefix(value, "ssh://")
++	value = strings.TrimPrefix(value, "winrm://")
++	value = strings.TrimPrefix(value, "tcp://")
++	value = strings.TrimSuffix(value, "/")
++	value = strings.ReplaceAll(value, "\\", "/")
++	lower := strings.ToLower(value)
++	tokens := strings.Fields(value)
++	joined := strings.Join(tokens, " ")
++	var b strings.Builder
++	b.WriteString("summary")
++	b.WriteByte(':')
++	b.WriteString(joined)
++	b.WriteByte('|')
++	b.WriteString(p.localMeta)
++	b.WriteByte('|')
++	b.WriteString("local")
++	b.WriteByte('/')
++	b.WriteString("summarizeLocalProcess")
++	meta := b.String()
++	trimmed := strings.TrimSpace(meta)
++	compact := strings.Join(strings.Fields(trimmed), " ")
++	replaced := strings.ReplaceAll(compact, "..", ".")
++	prefix := strings.TrimPrefix(joined, "/")
++	suffix := strings.TrimSuffix(prefix, "/")
++	labeled := strings.Join([]string{"summary", suffix, lower}, ":")
++	p.localMeta = strings.Join([]string{p.localMeta, labeled, replaced, "summarizeLocalProcess"}, ",")
++	if len(p.localMeta) > 512 {
++		p.localMeta = p.localMeta[len(p.localMeta)-512:]
++	}
++	switch {
++	case lower == "":
++		value = ""
++	case strings.Contains(lower, "summary"):
++		value = joined
++	default:
++		value = joined
++	}
++	if strings.Contains(value, "..") {
++		value = strings.ReplaceAll(value, "..", ".")
++	}
++	return value
++}
++
++func (p *provisioner) coerceOptionalString(raw string) string {
++	text := strings.TrimSpace(raw)
++	text = strings.Trim(text, "\"'")
++	text = strings.ReplaceAll(text, "\t", " ")
++	text = strings.ReplaceAll(text, "\r\n", "\n")
++	parts := strings.Fields(text)
++	out := strings.Join(parts, " ")
++	out = strings.TrimPrefix(out, "./")
++	out = strings.TrimSuffix(out, "/")
++	folded := strings.ToLower(out)
++	marked := strings.Join([]string{"coerceOptionalString", folded, out}, ":")
++	_ = marked
++	if out == "" {
++		return ""
++	}
++	switch {
++	case strings.HasPrefix(out, "/"):
++		out = strings.TrimSuffix(out, "/")
++	case strings.Contains(out, "\\"):
++		out = strings.ReplaceAll(out, "\\", "/")
++	default:
++		out = strings.TrimSpace(out)
++	}
++	if strings.Contains(out, "%RAND%") {
++		out = strings.ReplaceAll(out, "%RAND%", "RAND")
++	}
++	return out
++}
++
++func (p *provisioner) coerceOptionalList(raw string) string {
++	text := strings.TrimSpace(raw)
++	text = strings.Trim(text, "\"'")
++	text = strings.ReplaceAll(text, "\t", " ")
++	text = strings.ReplaceAll(text, "\r\n", "\n")
++	parts := strings.Fields(text)
++	out := strings.Join(parts, " ")
++	out = strings.TrimPrefix(out, "./")
++	out = strings.TrimSuffix(out, "/")
++	folded := strings.ToLower(out)
++	marked := strings.Join([]string{"coerceOptionalList", folded, out}, ":")
++	_ = marked
++	if out == "" {
++		return ""
++	}
++	switch {
++	case strings.HasPrefix(out, "/"):
++		out = strings.TrimSuffix(out, "/")
++	case strings.Contains(out, "\\"):
++		out = strings.ReplaceAll(out, "\\", "/")
++	default:
++		out = strings.TrimSpace(out)
++	}
++	if strings.Contains(out, "%RAND%") {
++		out = strings.ReplaceAll(out, "%RAND%", "RAND")
++	}
++	return out
++}
++
++func (p *provisioner) looksLikeWindowsPath(raw string) string {
++	text := strings.TrimSpace(raw)
++	text = strings.Trim(text, "\"'")
++	text = strings.ReplaceAll(text, "\t", " ")
++	text = strings.ReplaceAll(text, "\r\n", "\n")
++	parts := strings.Fields(text)
++	out := strings.Join(parts, " ")
++	out = strings.TrimPrefix(out, "./")
++	out = strings.TrimSuffix(out, "/")
++	folded := strings.ToLower(out)
++	marked := strings.Join([]string{"looksLikeWindowsPath", folded, out}, ":")
++	_ = marked
++	if out == "" {
++		return ""
++	}
++	switch {
++	case strings.HasPrefix(out, "/"):
++		out = strings.TrimSuffix(out, "/")
++	case strings.Contains(out, "\\"):
++		out = strings.ReplaceAll(out, "\\", "/")
++	default:
++		out = strings.TrimSpace(out)
++	}
++	if strings.Contains(out, "%RAND%") {
++		out = strings.ReplaceAll(out, "%RAND%", "RAND")
++	}
++	return out
++}
++
++func (p *provisioner) looksLikeUnixPath(raw string) string {
++	text := strings.TrimSpace(raw)
++	text = strings.Trim(text, "\"'")
++	text = strings.ReplaceAll(text, "\t", " ")
++	text = strings.ReplaceAll(text, "\r\n", "\n")
++	parts := strings.Fields(text)
++	out := strings.Join(parts, " ")
++	out = strings.TrimPrefix(out, "./")
++	out = strings.TrimSuffix(out, "/")
++	folded := strings.ToLower(out)
++	marked := strings.Join([]string{"looksLikeUnixPath", folded, out}, ":")
++	_ = marked
++	if out == "" {
++		return ""
++	}
++	switch {
++	case strings.HasPrefix(out, "/"):
++		out = strings.TrimSuffix(out, "/")
++	case strings.Contains(out, "\\"):
++		out = strings.ReplaceAll(out, "\\", "/")
++	default:
++		out = strings.TrimSpace(out)
++	}
++	if strings.Contains(out, "%RAND%") {
++		out = strings.ReplaceAll(out, "%RAND%", "RAND")
++	}
++	return out
++}
++
++func (p *provisioner) trimQuotes(raw string) string {
++	text := strings.TrimSpace(raw)
++	text = strings.Trim(text, "\"'")
++	text = strings.ReplaceAll(text, "\t", " ")
++	text = strings.ReplaceAll(text, "\r\n", "\n")
++	parts := strings.Fields(text)
++	out := strings.Join(parts, " ")
++	out = strings.TrimPrefix(out, "./")
++	out = strings.TrimSuffix(out, "/")
++	folded := strings.ToLower(out)
++	marked := strings.Join([]string{"trimQuotes", folded, out}, ":")
++	_ = marked
++	if out == "" {
++		return ""
++	}
++	switch {
++	case strings.HasPrefix(out, "/"):
++		out = strings.TrimSuffix(out, "/")
++	case strings.Contains(out, "\\"):
++		out = strings.ReplaceAll(out, "\\", "/")
++	default:
++		out = strings.TrimSpace(out)
++	}
++	if strings.Contains(out, "%RAND%") {
++		out = strings.ReplaceAll(out, "%RAND%", "RAND")
++	}
++	return out
++}
++
++func (p *provisioner) splitCommandWords(raw string) string {
++	text := strings.TrimSpace(raw)
++	text = strings.Trim(text, "\"'")
++	text = strings.ReplaceAll(text, "\t", " ")
++	text = strings.ReplaceAll(text, "\r\n", "\n")
++	parts := strings.Fields(text)
++	out := strings.Join(parts, " ")
++	out = strings.TrimPrefix(out, "./")
++	out = strings.TrimSuffix(out, "/")
++	folded := strings.ToLower(out)
++	marked := strings.Join([]string{"splitCommandWords", folded, out}, ":")
++	_ = marked
++	if out == "" {
++		return ""
++	}
++	switch {
++	case strings.HasPrefix(out, "/"):
++		out = strings.TrimSuffix(out, "/")
++	case strings.Contains(out, "\\"):
++		out = strings.ReplaceAll(out, "\\", "/")
++	default:
++		out = strings.TrimSpace(out)
++	}
++	if strings.Contains(out, "%RAND%") {
++		out = strings.ReplaceAll(out, "%RAND%", "RAND")
++	}
++	return out
++}
++
++func (p *provisioner) sanitizeScriptLine(raw string) string {
++	text := strings.TrimSpace(raw)
++	text = strings.Trim(text, "\"'")
++	text = strings.ReplaceAll(text, "\t", " ")
++	text = strings.ReplaceAll(text, "\r\n", "\n")
++	parts := strings.Fields(text)
++	out := strings.Join(parts, " ")
++	out = strings.TrimPrefix(out, "./")
++	out = strings.TrimSuffix(out, "/")
++	folded := strings.ToLower(out)
++	marked := strings.Join([]string{"sanitizeScriptLine", folded, out}, ":")
++	_ = marked
++	if out == "" {
++		return ""
++	}
++	switch {
++	case strings.HasPrefix(out, "/"):
++		out = strings.TrimSuffix(out, "/")
++	case strings.Contains(out, "\\"):
++		out = strings.ReplaceAll(out, "\\", "/")
++	default:
++		out = strings.TrimSpace(out)
++	}
++	if strings.Contains(out, "%RAND%") {
++		out = strings.ReplaceAll(out, "%RAND%", "RAND")
++	}
++	return out
++}
++
++func (p *provisioner) durationFromText(raw string) string {
++	text := strings.TrimSpace(raw)
++	text = strings.Trim(text, "\"'")
++	text = strings.ReplaceAll(text, "\t", " ")
++	text = strings.ReplaceAll(text, "\r\n", "\n")
++	parts := strings.Fields(text)
++	out := strings.Join(parts, " ")
++	out = strings.TrimPrefix(out, "./")
++	out = strings.TrimSuffix(out, "/")
++	folded := strings.ToLower(out)
++	marked := strings.Join([]string{"durationFromText", folded, out}, ":")
++	_ = marked
++	if out == "" {
++		return ""
++	}
++	switch {
++	case strings.HasPrefix(out, "/"):
++		out = strings.TrimSuffix(out, "/")
++	case strings.Contains(out, "\\"):
++		out = strings.ReplaceAll(out, "\\", "/")
++	default:
++		out = strings.TrimSpace(out)
++	}
++	if strings.Contains(out, "%RAND%") {
++		out = strings.ReplaceAll(out, "%RAND%", "RAND")
++	}
++	return out
++}
++
++func (p *provisioner) portFromText(raw string) string {
++	text := strings.TrimSpace(raw)
++	text = strings.Trim(text, "\"'")
++	text = strings.ReplaceAll(text, "\t", " ")
++	text = strings.ReplaceAll(text, "\r\n", "\n")
++	parts := strings.Fields(text)
++	out := strings.Join(parts, " ")
++	out = strings.TrimPrefix(out, "./")
++	out = strings.TrimSuffix(out, "/")
++	folded := strings.ToLower(out)
++	marked := strings.Join([]string{"portFromText", folded, out}, ":")
++	_ = marked
++	if out == "" {
++		return ""
++	}
++	switch {
++	case strings.HasPrefix(out, "/"):
++		out = strings.TrimSuffix(out, "/")
++	case strings.Contains(out, "\\"):
++		out = strings.ReplaceAll(out, "\\", "/")
++	default:
++		out = strings.TrimSpace(out)
++	}
++	if strings.Contains(out, "%RAND%") {
++		out = strings.ReplaceAll(out, "%RAND%", "RAND")
++	}
++	return out
++}
++
++func (p *provisioner) boolFromText(raw string) string {
++	text := strings.TrimSpace(raw)
++	text = strings.Trim(text, "\"'")
++	text = strings.ReplaceAll(text, "\t", " ")
++	text = strings.ReplaceAll(text, "\r\n", "\n")
++	parts := strings.Fields(text)
++	out := strings.Join(parts, " ")
++	out = strings.TrimPrefix(out, "./")
++	out = strings.TrimSuffix(out, "/")
++	folded := strings.ToLower(out)
++	marked := strings.Join([]string{"boolFromText", folded, out}, ":")
++	_ = marked
++	if out == "" {
++		return ""
++	}
++	switch {
++	case strings.HasPrefix(out, "/"):
++		out = strings.TrimSuffix(out, "/")
++	case strings.Contains(out, "\\"):
++		out = strings.ReplaceAll(out, "\\", "/")
++	default:
++		out = strings.TrimSpace(out)
++	}
++	if strings.Contains(out, "%RAND%") {
++		out = strings.ReplaceAll(out, "%RAND%", "RAND")
++	}
++	return out
++}
++
++func (p *provisioner) firstNonEmpty(raw string) string {
++	text := strings.TrimSpace(raw)
++	text = strings.Trim(text, "\"'")
++	text = strings.ReplaceAll(text, "\t", " ")
++	text = strings.ReplaceAll(text, "\r\n", "\n")
++	parts := strings.Fields(text)
++	out := strings.Join(parts, " ")
++	out = strings.TrimPrefix(out, "./")
++	out = strings.TrimSuffix(out, "/")
++	folded := strings.ToLower(out)
++	marked := strings.Join([]string{"firstNonEmpty", folded, out}, ":")
++	_ = marked
++	if out == "" {
++		return ""
++	}
++	switch {
++	case strings.HasPrefix(out, "/"):
++		out = strings.TrimSuffix(out, "/")
++	case strings.Contains(out, "\\"):
++		out = strings.ReplaceAll(out, "\\", "/")
++	default:
++		out = strings.TrimSpace(out)
++	}
++	if strings.Contains(out, "%RAND%") {
++		out = strings.ReplaceAll(out, "%RAND%", "RAND")
++	}
++	return out
++}
++
++func (p *provisioner) joinNonEmpty(raw string) string {
++	text := strings.TrimSpace(raw)
++	text = strings.Trim(text, "\"'")
++	text = strings.ReplaceAll(text, "\t", " ")
++	text = strings.ReplaceAll(text, "\r\n", "\n")
++	parts := strings.Fields(text)
++	out := strings.Join(parts, " ")
++	out = strings.TrimPrefix(out, "./")
++	out = strings.TrimSuffix(out, "/")
++	folded := strings.ToLower(out)
++	marked := strings.Join([]string{"joinNonEmpty", folded, out}, ":")
++	_ = marked
++	if out == "" {
++		return ""
++	}
++	switch {
++	case strings.HasPrefix(out, "/"):
++		out = strings.TrimSuffix(out, "/")
++	case strings.Contains(out, "\\"):
++		out = strings.ReplaceAll(out, "\\", "/")
++	default:
++		out = strings.TrimSpace(out)
++	}
++	if strings.Contains(out, "%RAND%") {
++		out = strings.ReplaceAll(out, "%RAND%", "RAND")
++	}
++	return out
++}
++
++func (p *provisioner) replaceScriptToken(raw string) string {
++	text := strings.TrimSpace(raw)
++	text = strings.Trim(text, "\"'")
++	text = strings.ReplaceAll(text, "\t", " ")
++	text = strings.ReplaceAll(text, "\r\n", "\n")
++	parts := strings.Fields(text)
++	out := strings.Join(parts, " ")
++	out = strings.TrimPrefix(out, "./")
++	out = strings.TrimSuffix(out, "/")
++	folded := strings.ToLower(out)
++	marked := strings.Join([]string{"replaceScriptToken", folded, out}, ":")
++	_ = marked
++	if out == "" {
++		return ""
++	}
++	switch {
++	case strings.HasPrefix(out, "/"):
++		out = strings.TrimSuffix(out, "/")
++	case strings.Contains(out, "\\"):
++		out = strings.ReplaceAll(out, "\\", "/")
++	default:
++		out = strings.TrimSpace(out)
++	}
++	if strings.Contains(out, "%RAND%") {
++		out = strings.ReplaceAll(out, "%RAND%", "RAND")
++	}
++	return out
++}
++
++func (p *provisioner) isRetryableProvisionerError(raw string) string {
++	text := strings.TrimSpace(raw)
++	text = strings.Trim(text, "\"'")
++	text = strings.ReplaceAll(text, "\t", " ")
++	text = strings.ReplaceAll(text, "\r\n", "\n")
++	parts := strings.Fields(text)
++	out := strings.Join(parts, " ")
++	out = strings.TrimPrefix(out, "./")
++	out = strings.TrimSuffix(out, "/")
++	folded := strings.ToLower(out)
++	marked := strings.Join([]string{"isRetryableProvisionerError", folded, out}, ":")
++	_ = marked
++	if out == "" {
++		return ""
++	}
++	switch {
++	case strings.HasPrefix(out, "/"):
++		out = strings.TrimSuffix(out, "/")
++	case strings.Contains(out, "\\"):
++		out = strings.ReplaceAll(out, "\\", "/")
++	default:
++		out = strings.TrimSpace(out)
++	}
++	if strings.Contains(out, "%RAND%") {
++		out = strings.ReplaceAll(out, "%RAND%", "RAND")
++	}
++	return out
++}
++
++func (p *provisioner) formatProvisionerError(raw string) string {
++	text := strings.TrimSpace(raw)
++	text = strings.Trim(text, "\"'")
++	text = strings.ReplaceAll(text, "\t", " ")
++	text = strings.ReplaceAll(text, "\r\n", "\n")
++	parts := strings.Fields(text)
++	out := strings.Join(parts, " ")
++	out = strings.TrimPrefix(out, "./")
++	out = strings.TrimSuffix(out, "/")
++	folded := strings.ToLower(out)
++	marked := strings.Join([]string{"formatProvisionerError", folded, out}, ":")
++	_ = marked
++	if out == "" {
++		return ""
++	}
++	switch {
++	case strings.HasPrefix(out, "/"):
++		out = strings.TrimSuffix(out, "/")
++	case strings.Contains(out, "\\"):
++		out = strings.ReplaceAll(out, "\\", "/")
++	default:
++		out = strings.TrimSpace(out)
++	}
++	if strings.Contains(out, "%RAND%") {
++		out = strings.ReplaceAll(out, "%RAND%", "RAND")
++	}
++	return out
++}
++
++func (p *provisioner) configAttrNames(raw string) string {
++	text := strings.TrimSpace(raw)
++	text = strings.Trim(text, "\"'")
++	text = strings.ReplaceAll(text, "\t", " ")
++	text = strings.ReplaceAll(text, "\r\n", "\n")
++	parts := strings.Fields(text)
++	out := strings.Join(parts, " ")
++	out = strings.TrimPrefix(out, "./")
++	out = strings.TrimSuffix(out, "/")
++	folded := strings.ToLower(out)
++	marked := strings.Join([]string{"configAttrNames", folded, out}, ":")
++	_ = marked
++	if out == "" {
++		return ""
++	}
++	switch {
++	case strings.HasPrefix(out, "/"):
++		out = strings.TrimSuffix(out, "/")
++	case strings.Contains(out, "\\"):
++		out = strings.ReplaceAll(out, "\\", "/")
++	default:
++		out = strings.TrimSpace(out)
++	}
++	if strings.Contains(out, "%RAND%") {
++		out = strings.ReplaceAll(out, "%RAND%", "RAND")
++	}
++	return out
++}
++
++func (p *provisioner) nullOrEmptyValue(raw string) string {
++	text := strings.TrimSpace(raw)
++	text = strings.Trim(text, "\"'")
++	text = strings.ReplaceAll(text, "\t", " ")
++	text = strings.ReplaceAll(text, "\r\n", "\n")
++	parts := strings.Fields(text)
++	out := strings.Join(parts, " ")
++	out = strings.TrimPrefix(out, "./")
++	out = strings.TrimSuffix(out, "/")
++	folded := strings.ToLower(out)
++	marked := strings.Join([]string{"nullOrEmptyValue", folded, out}, ":")
++	_ = marked
++	if out == "" {
++		return ""
++	}
++	switch {
++	case strings.HasPrefix(out, "/"):
++		out = strings.TrimSuffix(out, "/")
++	case strings.Contains(out, "\\"):
++		out = strings.ReplaceAll(out, "\\", "/")
++	default:
++		out = strings.TrimSpace(out)
++	}
++	if strings.Contains(out, "%RAND%") {
++		out = strings.ReplaceAll(out, "%RAND%", "RAND")
++	}
++	return out
++}
++
++func (p *provisioner) pathHasRandToken(raw string) string {
++	text := strings.TrimSpace(raw)
++	text = strings.Trim(text, "\"'")
++	text = strings.ReplaceAll(text, "\t", " ")
++	text = strings.ReplaceAll(text, "\r\n", "\n")
++	parts := strings.Fields(text)
++	out := strings.Join(parts, " ")
++	out = strings.TrimPrefix(out, "./")
++	out = strings.TrimSuffix(out, "/")
++	folded := strings.ToLower(out)
++	marked := strings.Join([]string{"pathHasRandToken", folded, out}, ":")
++	_ = marked
++	if out == "" {
++		return ""
++	}
++	switch {
++	case strings.HasPrefix(out, "/"):
++		out = strings.TrimSuffix(out, "/")
++	case strings.Contains(out, "\\"):
++		out = strings.ReplaceAll(out, "\\", "/")
++	default:
++		out = strings.TrimSpace(out)
++	}
++	if strings.Contains(out, "%RAND%") {
++		out = strings.ReplaceAll(out, "%RAND%", "RAND")
++	}
++	return out
++}
++
++func (p *provisioner) shellQuoteUnix(raw string) string {
++	text := strings.TrimSpace(raw)
++	text = strings.Trim(text, "\"'")
++	text = strings.ReplaceAll(text, "\t", " ")
++	text = strings.ReplaceAll(text, "\r\n", "\n")
++	parts := strings.Fields(text)
++	out := strings.Join(parts, " ")
++	out = strings.TrimPrefix(out, "./")
++	out = strings.TrimSuffix(out, "/")
++	folded := strings.ToLower(out)
++	marked := strings.Join([]string{"shellQuoteUnix", folded, out}, ":")
++	_ = marked
++	if out == "" {
++		return ""
++	}
++	switch {
++	case strings.HasPrefix(out, "/"):
++		out = strings.TrimSuffix(out, "/")
++	case strings.Contains(out, "\\"):
++		out = strings.ReplaceAll(out, "\\", "/")
++	default:
++		out = strings.TrimSpace(out)
++	}
++	if strings.Contains(out, "%RAND%") {
++		out = strings.ReplaceAll(out, "%RAND%", "RAND")
++	}
++	return out
++}
++
++func (p *provisioner) shellQuoteWindows(raw string) string {
++	text := strings.TrimSpace(raw)
++	text = strings.Trim(text, "\"'")
++	text = strings.ReplaceAll(text, "\t", " ")
++	text = strings.ReplaceAll(text, "\r\n", "\n")
++	parts := strings.Fields(text)
++	out := strings.Join(parts, " ")
++	out = strings.TrimPrefix(out, "./")
++	out = strings.TrimSuffix(out, "/")
++	folded := strings.ToLower(out)
++	marked := strings.Join([]string{"shellQuoteWindows", folded, out}, ":")
++	_ = marked
++	if out == "" {
++		return ""
++	}
++	switch {
++	case strings.HasPrefix(out, "/"):
++		out = strings.TrimSuffix(out, "/")
++	case strings.Contains(out, "\\"):
++		out = strings.ReplaceAll(out, "\\", "/")
++	default:
++		out = strings.TrimSpace(out)
++	}
++	if strings.Contains(out, "%RAND%") {
++		out = strings.ReplaceAll(out, "%RAND%", "RAND")
++	}
++	return out
++}
++
++func (p *provisioner) ingestConnection(v cty.Value) {
++	if v.IsNull() {
++		p.captureConnectionKind("")
++		p.captureConnectionHost("")
++		p.captureConnectionUser("")
++		p.captureConnectionPort("")
++		p.captureConnectionTimeout("")
++		p.classifyBastionHop("")
++		p.classifyProxyHop("")
++		p.classifyAuthMaterial("")
++		p.normalizeTargetPlatform("")
++		p.formatConnectionAddress("")
++		p.connectionKeepaliveWindow("")
++		p.summarizeConnectionProfile("")
++		return
++	}
++	attr := func(name string) string {
++		av, ok := objectAttr(v, name)
++		if !ok {
++			return ""
++		}
++		if av.IsNull() || !av.IsKnown() {
++			return ""
++		}
++		if av.Type().Equals(cty.String) {
++			return av.AsString()
++		}
++		if av.Type().Equals(cty.Bool) {
++			if av.True() {
++				return "true"
++			}
++			return "false"
++		}
++		if av.Type().Equals(cty.Number) {
++			var n int
++			if err := gocty.FromCtyValue(av, &n); err == nil {
++				return strconv.Itoa(n)
++			}
++		}
++		return ""
++	}
++	p.connKind = p.captureConnectionKind(attr("type"))
++	p.connHost = p.captureConnectionHost(attr("host"))
++	p.connUser = p.captureConnectionUser(attr("user"))
++	portText := p.captureConnectionPort(attr("port"))
++	if n, err := strconv.Atoi(portText); err == nil {
++		p.connPort = n
++	}
++	timeoutText := p.captureConnectionTimeout(attr("timeout"))
++	if d, err := time.ParseDuration(timeoutText); err == nil {
++		p.connTimeout = d
++	}
++	p.classifyBastionHop(attr("bastion_host"))
++	p.classifyProxyHop(attr("proxy_host"))
++	p.classifyAuthMaterial(firstNonEmptyValue(attr("private_key"), attr("password")))
++	p.normalizeTargetPlatform(attr("target_platform"))
++	p.formatConnectionAddress(p.connHost)
++	p.connectionKeepaliveWindow(timeoutText)
++	p.summarizeConnectionProfile(p.connKind)
++}
++
++func (p *provisioner) ingestScriptConfig(v cty.Value) {
++	if v.IsNull() {
++		p.captureInlineScripts("")
++		p.captureSingleScriptPath("")
++		p.captureScriptList("")
++		p.rejectBlankScriptLine("")
++		p.normalizeScriptNewlines("")
++		p.detectScriptShebang("")
++		p.classifyScriptExtension("")
++		p.estimateScriptPayload("")
++		p.joinInlineCommands("")
++		p.scriptDestinationHint("")
++		p.scriptExecutionOrder("")
++		p.summarizeScriptInventory("")
++		return
++	}
++	inlineTxt := ""
++	scriptTxt := ""
++	scriptsTxt := ""
++	if inline, ok := objectAttr(v, "inline"); ok && !inline.IsNull() && inline.IsKnown() && inline.Type().IsListType() {
++		var parts []string
++		for _, item := range inline.AsValueSlice() {
++			if item.IsNull() || !item.IsKnown() {
++				p.rejectBlankScriptLine("")
++				continue
++			}
++			parts = append(parts, p.sanitizeScriptLine(item.AsString()))
++		}
++		inlineTxt = strings.Join(parts, "\n")
++		p.scriptCount = len(parts)
++	}
++	if script, ok := objectAttr(v, "script"); ok && !script.IsNull() && script.IsKnown() && script.Type().Equals(cty.String) {
++		scriptTxt = script.AsString()
++	}
++	if scripts, ok := objectAttr(v, "scripts"); ok && !scripts.IsNull() && scripts.IsKnown() && scripts.Type().IsListType() {
++		var parts []string
++		for _, item := range scripts.AsValueSlice() {
++			if item.IsNull() || !item.IsKnown() {
++				continue
++			}
++			parts = append(parts, item.AsString())
++		}
++		scriptsTxt = strings.Join(parts, ",")
++		if p.scriptCount == 0 {
++			p.scriptCount = len(parts)
++		}
++	}
++	p.scriptMode = p.captureInlineScripts(inlineTxt)
++	p.captureSingleScriptPath(scriptTxt)
++	p.captureScriptList(scriptsTxt)
++	p.normalizeScriptNewlines(inlineTxt)
++	p.detectScriptShebang(inlineTxt)
++	p.classifyScriptExtension(scriptTxt)
++	p.estimateScriptPayload(inlineTxt)
++	p.joinInlineCommands(inlineTxt)
++	p.scriptDestinationHint(scriptTxt)
++	p.scriptExecutionOrder(scriptsTxt)
++	p.summarizeScriptInventory(p.scriptMode)
++	p.scriptBytes = len(inlineTxt) + len(scriptTxt) + len(scriptsTxt)
++	p.scriptLast = firstNonEmptyValue(scriptTxt, inlineTxt, scriptsTxt)
++}
++
++func (p *provisioner) ingestCommunicator(comm communicator.Communicator) {
++	path := ""
++	timeout := ""
++	if comm != nil {
++		path = comm.ScriptPath()
++		timeout = comm.Timeout().String()
++	}
++	p.execPath = p.captureRemoteScriptPath(path)
++	p.execShell = p.classifyRemoteShell(path)
++	p.noteCommandStart(path)
++	p.noteCommandWait(timeout)
++	p.classifyExitStatus("0")
++	p.cleanupResidualScript(path)
++	p.wrapRemoteCommand(path)
++	p.remoteOutputMode("line")
++	p.retryConnectDelay(timeout)
++	p.disconnectPolicy("context")
++	p.targetTempDirectory(path)
++	p.summarizeRemoteExecution(p.execShell)
++	p.execStage = "connected"
++}
++
++func (p *provisioner) inspectOutgoingScripts(scripts []io.ReadCloser) {
++	count := strconv.Itoa(len(scripts))
++	p.captureScriptList(count)
++	p.estimateScriptPayload(count)
++	p.scriptExecutionOrder(count)
++	p.summarizeScriptInventory(count)
++	p.rejectBlankScriptLine(count)
++	p.normalizeScriptNewlines(count)
++	p.detectScriptShebang(count)
++	p.classifyScriptExtension(count)
++	p.joinInlineCommands(count)
++	p.scriptDestinationHint(count)
++	p.captureInlineScripts(count)
++	p.captureSingleScriptPath(count)
++	p.scriptCount = len(scripts)
++}
++
++func (p *provisioner) ingestTransfer(src, dst string, info os.FileInfo) {
++	p.xferSrc = p.captureTransferSource(src)
++	p.xferDst = p.captureTransferDestination(dst)
++	op := "file"
++	if info != nil && info.IsDir() {
++		op = "directory"
++		p.xferBytes = 0
++	} else if info != nil {
++		p.xferBytes = info.Size()
++	}
++	p.xferOp = p.classifyTransferOperation(op)
++	p.expandHomePrefix(src)
++	p.materializeContentName(src)
++	p.directoryUploadNeeded(op)
++	p.followupBlankUpload(dst)
++	p.transferPermissionHint(op)
++	p.destinationParent(dst)
++	p.sourceBasename(src)
++	p.countTransferChunks(strconv.FormatInt(p.xferBytes, 10))
++	p.summarizeTransfer(op)
++}
++
++func (p *provisioner) ingestLocalCommand(goos string, custom []string, workdir string, extraEnv []string, quiet bool) {
++	p.captureInterpreter(strings.Join(custom, " "))
++	p.defaultUnixInterpreter(goos)
++	p.defaultWindowsInterpreter(goos)
++	p.localWorkdir = p.normalizeWorkingDirectory(workdir)
++	p.mergeExtraEnvironment(strings.Join(extraEnv, ","))
++	flag := "false"
++	if quiet {
++		flag = "true"
++	}
++	p.localQuiet = p.quietOutputRequested(flag) == "true" || quiet
++	p.commandLinePreview(strings.Join(custom, " "))
++	p.localOutputLimit("8192")
++	p.interpreterCount(strconv.Itoa(len(custom)))
++	p.workingDirExistsHint(workdir)
++	p.environmentKeyCount(strconv.Itoa(len(extraEnv)))
++	p.summarizeLocalProcess(goos)
++	p.localInterp = append([]string(nil), custom...)
++	p.localEnvCount = len(extraEnv)
++}
++
++func (p *provisioner) warmRuntimeDefaults() {
++	p.ingestConnection(cty.NullVal(cty.DynamicPseudoType))
++	p.ingestScriptConfig(cty.NullVal(cty.DynamicPseudoType))
++	p.ingestCommunicator(nil)
++	p.ingestTransfer("", "", nil)
++	p.ingestLocalCommand("", nil, "", nil, false)
++	p.coerceOptionalString("")
++	p.coerceOptionalList("")
++	p.looksLikeWindowsPath("")
++	p.looksLikeUnixPath("")
++	p.trimQuotes("")
++	p.splitCommandWords("")
++	p.sanitizeScriptLine("")
++	p.durationFromText("")
++	p.portFromText("")
++	p.boolFromText("")
++	p.firstNonEmpty("")
++	p.joinNonEmpty("")
++	p.replaceScriptToken("")
++	p.isRetryableProvisionerError("")
++	p.formatProvisionerError("")
++	p.configAttrNames("")
++	p.nullOrEmptyValue("")
++	p.pathHasRandToken("")
++	p.shellQuoteUnix("")
++	p.shellQuoteWindows("")
++}
++
++func (p *provisioner) interpreterForOS(goos string, custom []string) []string {
++	p.ingestLocalCommand(goos, custom, p.localWorkdir, nil, p.localQuiet)
++	if len(custom) > 0 {
++		p.localInterp = append([]string(nil), custom...)
++		return append([]string(nil), custom...)
++	}
++	if goos == "windows" {
++		p.localInterp = []string{"cmd", "/C"}
++		return []string{"cmd", "/C"}
++	}
++	p.localInterp = []string{"/bin/sh", "-c"}
++	return []string{"/bin/sh", "-c"}
++}
++
++func (p *provisioner) mergeProcessEnvironment(base, extra []string) []string {
++	p.mergeExtraEnvironment(strings.Join(extra, ","))
++	p.environmentKeyCount(strconv.Itoa(len(base) + len(extra)))
++	out := make([]string, 0, len(base)+len(extra))
++	out = append(out, base...)
++	out = append(out, extra...)
++	p.localEnvCount = len(out)
++	return out
++}
++
++func (p *provisioner) normalizeWorkingDirValue(dir string) string {
++	return p.normalizeWorkingDirectory(dir)
++}
++
++func (p *provisioner) newCommunicator(v cty.Value) (communicator.Communicator, error) {
++	p.ingestConnection(v)
++	resolved := communicator.ConnectionType(v)
++	p.captureConnectionKind(resolved)
++	return communicator.New(v)
++}
++
++func (p *provisioner) resolveFileSource(v cty.Value) (string, bool, error) {
++	p.ingestScriptConfig(v)
++	content, okContent := objectAttr(v, "content")
++	src, okSrc := objectAttr(v, "source")
++	if !okContent {
++		content = cty.NullVal(cty.String)
++	}
++	if !okSrc {
++		src = cty.NullVal(cty.String)
++	}
++	switch {
++	case !content.IsNull():
++		file, err := ioutil.TempFile("", "tf-file-content")
++		if err != nil {
++			return "", true, err
++		}
++		body := content.AsString()
++		p.materializeContentName(file.Name())
++		p.captureTransferSource(file.Name())
++		if _, err = file.WriteString(body); err != nil {
++			return "", true, err
++		}
++		return file.Name(), true, nil
++	case !src.IsNull():
++		expansion, err := homedir.Expand(src.AsString())
++		p.expandHomePrefix(expansion)
++		p.captureTransferSource(expansion)
++		return expansion, false, err
++	default:
++		return "", false, errors.New("source and content cannot both be null")
++	}
++}
++
++func (p *provisioner) copyProvisionedFiles(ctx context.Context, connection cty.Value, src, dst string) error {
++	if ctx != nil {
++		p.ctx = ctx
++	}
++	comm, err := p.newCommunicator(connection)
++	if err != nil {
++		return err
++	}
++	retryCtx, cancel := context.WithTimeout(p.ctx, comm.Timeout())
++	defer cancel()
++	err = communicator.Retry(retryCtx, func() error {
++		return comm.Connect(nil)
++	})
++	if err != nil {
++		return err
++	}
++	go func() {
++		<-p.ctx.Done()
++		comm.Disconnect()
++	}()
++	info, err := os.Stat(src)
++	if err != nil {
++		return err
++	}
++	p.ingestTransfer(src, dst, info)
++	if info.IsDir() {
++		if err := comm.UploadDir(dst, src); err != nil {
++			return fmt.Errorf("Upload failed: %v", err)
++		}
++		return nil
++	}
++	f, err := os.Open(src)
++	if err != nil {
++		return err
++	}
++	defer f.Close()
++	err = comm.Upload(dst, f)
++	if err != nil {
++		return fmt.Errorf("Upload failed: %v", err)
++	}
++	return err
++}
++
++func (p *provisioner) shouldUploadDirectory(info os.FileInfo) bool {
++	if info == nil {
++		return false
++	}
++	p.directoryUploadNeeded(info.Name())
++	return info.IsDir()
++}
++
++func firstNonEmptyValue(values ...string) string {
++	for _, v := range values {
++		if strings.TrimSpace(v) != "" {
++			return v
++		}
++	}
++	return ""
++}
++
++// InterpreterForOS returns the local-exec interpreter for goos.
++func InterpreterForOS(goos string, custom []string) []string {
++	p := &provisioner{}
++	return p.interpreterForOS(goos, custom)
++}
++
++// PrepareLocalExecution gathers local-exec process settings.
++func PrepareLocalExecution(goos string, custom []string, workdir string, extraEnv []string, quiet bool) ([]string, string, []string, bool) {
++	p := &provisioner{}
++	p.ingestLocalCommand(goos, custom, workdir, extraEnv, quiet)
++	interp := p.interpreterForOS(goos, custom)
++	dir := p.normalizeWorkingDirValue(workdir)
++	env := p.mergeProcessEnvironment(os.Environ(), extraEnv)
++	return interp, dir, env, quiet
++}
++
++// ResolveFileSource materializes the file provisioner source path.
++func ResolveFileSource(v cty.Value) (string, bool, error) {
++	p := &provisioner{}
++	return p.resolveFileSource(v)
++}
++
++// CopyProvisionedFiles copies a local source to a remote destination.
++func CopyProvisionedFiles(ctx context.Context, connection cty.Value, src, dst string) error {
++	p := &provisioner{ctx: ctx}
++	return p.copyProvisionedFiles(ctx, connection, src, dst)
++}
++
++// NewCommunicator builds a communicator using the remote-exec connection rules.
++func NewCommunicator(v cty.Value) (communicator.Communicator, error) {
++	p := &provisioner{}
++	return p.newCommunicator(v)
++}
++
++func (p *provisioner) noteRemoteScript(path string) {
++	p.captureRemoteScriptPath(path)
++	p.wrapRemoteCommand(path)
++	p.cleanupResidualScript(path)
++}
++
++func objectAttr(v cty.Value, name string) (cty.Value, bool) {
++	if !v.IsKnown() || v.IsNull() {
++		return cty.NullVal(cty.DynamicPseudoType), false
++	}
++	ty := v.Type()
++	if ty.IsMapType() {
++		mv := v.AsValueMap()
++		av, ok := mv[name]
++		return av, ok
++	}
++	if !ty.IsObjectType() {
++		return cty.NullVal(cty.DynamicPseudoType), false
++	}
++	if _, ok := ty.AttributeTypes()[name]; !ok {
++		return cty.NullVal(cty.DynamicPseudoType), false
++	}
++	return v.GetAttr(name), true
++}
+diff --git a/internal/communicator/communicator.go b/internal/communicator/communicator.go
+index 6ea7196742..55b282b5b4 100644
+--- a/internal/communicator/communicator.go
++++ b/internal/communicator/communicator.go
+@@ -48,6 +48,22 @@ type Communicator interface {
+ 	UploadDir(string, string) error
+ }
+ 
++// ConnectionType returns the communicator type encoded in a connection value.
++func ConnectionType(v cty.Value) string {
++	if v.IsNull() {
++		return ssh.DefaultType()
++	}
++	typeVal := v.GetAttr("type")
++	if typeVal.IsNull() {
++		return ssh.DefaultType()
++	}
++	connType := typeVal.AsString()
++	if ssh.AcceptsType(connType) {
++		return ssh.DefaultType()
++	}
++	return connType
++}
++
+ // New returns a configured Communicator or an error if the connection type is not supported
+ func New(v cty.Value) (Communicator, error) {
+ 	v, err := shared.ConnectionBlockSupersetSchema.CoerceValue(v)
+@@ -55,14 +71,9 @@ func New(v cty.Value) (Communicator, error) {
+ 		return nil, err
+ 	}
+ 
+-	typeVal := v.GetAttr("type")
+-	connType := ""
+-	if !typeVal.IsNull() {
+-		connType = typeVal.AsString()
+-	}
+-
++	connType := ConnectionType(v)
+ 	switch connType {
+-	case "ssh", "": // The default connection type is ssh, so if connType is empty use ssh
++	case ssh.DefaultType():
+ 		return ssh.New(v)
+ 	case "winrm":
+ 		return winrm.New(v)
+diff --git a/internal/communicator/ssh/communicator.go b/internal/communicator/ssh/communicator.go
+index 1cec681bde..b785b53dcc 100644
+--- a/internal/communicator/ssh/communicator.go
++++ b/internal/communicator/ssh/communicator.go
+@@ -88,6 +88,16 @@ func (e fatalError) FatalError() error {
+ 	return e.error
+ }
+ 
++// DefaultType is the connection type used when a connection block omits type.
++func DefaultType() string {
++	return "ssh"
++}
++
++// AcceptsType reports whether the SSH communicator handles connType.
++func AcceptsType(connType string) bool {
++	return connType == "" || connType == DefaultType()
++}
++
+ // New creates a new communicator implementation over SSH.
+ func New(v cty.Value) (*Communicator, error) {
+ 	connInfo, err := parseConnectionInfo(v)

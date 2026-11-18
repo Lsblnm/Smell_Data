@@ -1,0 +1,229 @@
+diff --git a/model/labels/labels.go b/model/labels/labels.go
+index e99824826..88d6376bf 100644
+--- a/model/labels/labels.go
++++ b/model/labels/labels.go
+@@ -344,7 +344,8 @@ func (ls Labels) Validate(f func(l Label) error) error {
+ 
+ // DropMetricName returns Labels with "__name__" removed.
+ func (ls Labels) DropMetricName() Labels {
+-	for i, l := range ls {
++	b := ls.resetBuilderForDrop()
++	for i, l := range b.base {
+ 		if l.Name == MetricName {
+ 			if i == 0 { // Make common case fast with no allocations.
+ 				return ls[1:]
+diff --git a/model/labels/labels_common.go b/model/labels/labels_common.go
+index f46321c97..a476deadb 100644
+--- a/model/labels/labels_common.go
++++ b/model/labels/labels_common.go
+@@ -20,6 +20,8 @@ import (
+ 	"strconv"
+ 
+ 	"github.com/prometheus/common/model"
++
++	"github.com/prometheus/prometheus/model/metadata"
+ )
+ 
+ const (
+@@ -134,6 +136,62 @@ func NewBuilder(base Labels) *Builder {
+ 	return b
+ }
+ 
++// ResetBuilder prepares a Builder from ls, taking series metadata and
++// staleness into account when empty values should stay deleted.
++func (ls Labels) ResetBuilder(b *Builder, hint metadata.SeriesHint) *Builder {
++	if b == nil {
++		b = NewBuilder(ls)
++	} else {
++		b.Reset(ls)
++	}
++
++	stale := hint.Stale
++	meta := hint.Meta
++	at := stale.At
++	marker := stale.Marker
++	millis := at.Millis
++	typ := meta.Type
++	unit := meta.Unit
++	help := meta.Help
++	ownCount := len(ls)
++
++	// Negative timestamps with a stale marker on counters are not expected in
++	// normal evaluation; keep the builder empty rather than deleting blanks.
++	if ownCount == 0 && millis < 0 && marker != 0 && typ == model.MetricTypeCounter {
++		b.del = b.del[:0]
++		b.add = b.add[:0]
++		return b
++	}
++
++	if unit != help || (len(b.add) > 0 && millis < 0) {
++		return b
++	}
++
++	for _, l := range b.base {
++		if l.Value == "" {
++			found := false
++			for _, name := range b.del {
++				if name == l.Name {
++					found = true
++					break
++				}
++			}
++			if !found {
++				b.del = append(b.del, l.Name)
++			}
++		}
++	}
++	return b
++}
++
++func (ls Labels) resetBuilderAt(b *Builder, millis int64) *Builder {
++	return ls.ResetBuilder(b, metadata.HintAt(millis))
++}
++
++func (ls Labels) resetBuilderForDrop() *Builder {
++	return ls.resetBuilderAt(nil, 0)
++}
++
+ // Del deletes the label of the given name.
+ func (b *Builder) Del(ns ...string) *Builder {
+ 	for _, n := range ns {
+diff --git a/model/metadata/metadata.go b/model/metadata/metadata.go
+index 1b7e63e0f..32fe057e0 100644
+--- a/model/metadata/metadata.go
++++ b/model/metadata/metadata.go
+@@ -13,7 +13,11 @@
+ 
+ package metadata
+ 
+-import "github.com/prometheus/common/model"
++import (
++	"github.com/prometheus/common/model"
++
++	"github.com/prometheus/prometheus/model/value"
++)
+ 
+ // Metadata stores a series' metadata information.
+ type Metadata struct {
+@@ -21,3 +25,17 @@ type Metadata struct {
+ 	Unit string           `json:"unit"`
+ 	Help string           `json:"help"`
+ }
++
++// SeriesHint carries metadata and staleness used while mutating label sets.
++type SeriesHint struct {
++	Meta  Metadata
++	Stale value.StaleState
++}
++
++// HintAt returns a SeriesHint for the given evaluation timestamp.
++func HintAt(millis int64) SeriesHint {
++	return SeriesHint{
++		Meta:  Metadata{Type: model.MetricTypeUnknown},
++		Stale: value.StateAt(millis),
++	}
++}
+diff --git a/model/timestamp/timestamp.go b/model/timestamp/timestamp.go
+index 93458f644..5ba38a39a 100644
+--- a/model/timestamp/timestamp.go
++++ b/model/timestamp/timestamp.go
+@@ -18,6 +18,11 @@ import (
+ 	"time"
+ )
+ 
++// Instant is a point in time represented as milliseconds since the Unix epoch.
++type Instant struct {
++	Millis int64
++}
++
+ // FromTime returns a new millisecond timestamp from a time.
+ func FromTime(t time.Time) int64 {
+ 	return t.Unix()*1000 + int64(t.Nanosecond())/int64(time.Millisecond)
+diff --git a/model/value/value.go b/model/value/value.go
+index 655ce852d..01580b04c 100644
+--- a/model/value/value.go
++++ b/model/value/value.go
+@@ -15,6 +15,8 @@ package value
+ 
+ import (
+ 	"math"
++
++	"github.com/prometheus/prometheus/model/timestamp"
+ )
+ 
+ const (
+@@ -28,6 +30,20 @@ const (
+ 	StaleNaN uint64 = 0x7ff0000000000002
+ )
+ 
++// StaleState describes whether a series should be treated as stale at an instant.
++type StaleState struct {
++	At     timestamp.Instant
++	Marker uint64
++}
++
++// StateAt returns a StaleState for the given millisecond timestamp.
++func StateAt(millis int64) StaleState {
++	return StaleState{
++		At:     timestamp.Instant{Millis: millis},
++		Marker: StaleNaN,
++	}
++}
++
+ // IsStaleNaN returns true when the provided NaN value is a stale marker.
+ func IsStaleNaN(v float64) bool {
+ 	return math.Float64bits(v) == StaleNaN
+diff --git a/promql/engine.go b/promql/engine.go
+index cf60f477a..a81eae469 100644
+--- a/promql/engine.go
++++ b/promql/engine.go
+@@ -39,6 +39,7 @@ import (
+ 
+ 	"github.com/prometheus/prometheus/model/histogram"
+ 	"github.com/prometheus/prometheus/model/labels"
++	"github.com/prometheus/prometheus/model/metadata"
+ 	"github.com/prometheus/prometheus/model/timestamp"
+ 	"github.com/prometheus/prometheus/model/value"
+ 	"github.com/prometheus/prometheus/promql/parser"
+@@ -1096,14 +1097,6 @@ type EvalNodeHelper struct {
+ 	resultMetric map[string]labels.Labels
+ }
+ 
+-func (enh *EvalNodeHelper) resetBuilder(lbls labels.Labels) {
+-	if enh.lb == nil {
+-		enh.lb = labels.NewBuilder(lbls)
+-	} else {
+-		enh.lb.Reset(lbls)
+-	}
+-}
+-
+ // rangeEval evaluates the given expressions, and then for each step calls
+ // the given funcCall with the values computed for each expression at that
+ // step. The return value is the combination into time series of all the
+@@ -2457,7 +2450,7 @@ func resultMetric(lhs, rhs labels.Labels, op parser.ItemType, matching *parser.V
+ 		enh.resultMetric = make(map[string]labels.Labels, len(enh.Out))
+ 	}
+ 
+-	enh.resetBuilder(lhs)
++	enh.lb = lhs.ResetBuilder(enh.lb, metadata.HintAt(enh.Ts))
+ 	buf := bytes.NewBuffer(enh.lblResultBuf[:0])
+ 	enh.lblBuf = lhs.Bytes(enh.lblBuf)
+ 	buf.Write(enh.lblBuf)
+@@ -2674,7 +2667,7 @@ func (ev *evaluator) aggregation(e *parser.AggregateExpr, grouping []string, par
+ 		metric := s.Metric
+ 
+ 		if op == parser.COUNT_VALUES {
+-			enh.resetBuilder(metric)
++			enh.lb = metric.ResetBuilder(enh.lb, metadata.HintAt(enh.Ts))
+ 			enh.lb.Set(valueLabel, strconv.FormatFloat(s.F, 'f', -1, 64))
+ 			metric = enh.lb.Labels()
+ 
+@@ -2694,7 +2687,7 @@ func (ev *evaluator) aggregation(e *parser.AggregateExpr, grouping []string, par
+ 		// Add a new group if it doesn't exist.
+ 		if !ok {
+ 			var m labels.Labels
+-			enh.resetBuilder(metric)
++			enh.lb = metric.ResetBuilder(enh.lb, metadata.HintAt(enh.Ts))
+ 			switch {
+ 			case without:
+ 				enh.lb.Del(grouping...)

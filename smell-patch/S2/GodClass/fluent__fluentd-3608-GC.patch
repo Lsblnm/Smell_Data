@@ -1,0 +1,3993 @@
+diff --git a/lib/fluent/plugin/buf_file.rb b/lib/fluent/plugin/buf_file.rb
+index 4725f5c9..303d4d58 100644
+--- a/lib/fluent/plugin/buf_file.rb
++++ b/lib/fluent/plugin/buf_file.rb
+@@ -188,6 +188,9 @@ module Fluent
+       def generate_chunk(metadata)
+         # FileChunk generates real path with unique_id
+         perm = @file_permission || system_config.file_permission
++        if owner && owner.respond_to?(:resolve_file_buffer_chunk_permission)
++          perm = owner.resolve_file_buffer_chunk_permission(self, perm)
++        end
+         chunk = Fluent::Plugin::Buffer::FileChunk.new(metadata, @path, :create, perm: perm, compress: @compress)
+         log.debug "Created new chunk", chunk_id: dump_unique_id_hex(chunk.unique_id), metadata: metadata
+ 
+diff --git a/lib/fluent/plugin/buffer.rb b/lib/fluent/plugin/buffer.rb
+index 8315694e..560890ad 100644
+--- a/lib/fluent/plugin/buffer.rb
++++ b/lib/fluent/plugin/buffer.rb
+@@ -461,6 +461,10 @@ module Fluent
+       end
+ 
+       def queued_records
++        owner_plugin = owner
++        if owner_plugin && owner_plugin.respond_to?(:count_queued_buffer_records)
++          return owner_plugin.count_queued_buffer_records(self)
++        end
+         synchronize { @queue.reduce(0){|r, chunk| r + chunk.size } }
+       end
+ 
+@@ -632,10 +636,18 @@ module Fluent
+       end
+ 
+       def chunk_size_over?(chunk)
++        owner_plugin = owner
++        if owner_plugin && owner_plugin.respond_to?(:chunk_exceeds_configured_limit?)
++          return owner_plugin.chunk_exceeds_configured_limit?(self, chunk)
++        end
+         chunk.bytesize > @chunk_limit_size || (@chunk_limit_records && chunk.size > @chunk_limit_records)
+       end
+ 
+       def chunk_size_full?(chunk)
++        owner_plugin = owner
++        if owner_plugin && owner_plugin.respond_to?(:chunk_reaches_full_threshold?)
++          return owner_plugin.chunk_reaches_full_threshold?(self, chunk)
++        end
+         chunk.bytesize >= @chunk_limit_size * @chunk_full_threshold || (@chunk_limit_records && chunk.size >= @chunk_limit_records * @chunk_full_threshold)
+       end
+ 
+diff --git a/lib/fluent/plugin/buffer/file_chunk.rb b/lib/fluent/plugin/buffer/file_chunk.rb
+index e08987cf..f95739f4 100644
+--- a/lib/fluent/plugin/buffer/file_chunk.rb
++++ b/lib/fluent/plugin/buffer/file_chunk.rb
+@@ -184,6 +184,9 @@ module Fluent
+         end
+ 
+         def self.generate_stage_chunk_path(path, unique_id)
++          if defined?(Fluent::Plugin) && Fluent::Plugin.const_defined?(:Output)
++            return Fluent::Plugin::Output.compose_stage_chunk_path(path, unique_id)
++          end
+           pos = path.index('.*.')
+           raise "BUG: buffer chunk path on stage MUST have '.*.'" unless pos
+ 
+@@ -196,6 +199,9 @@ module Fluent
+         end
+ 
+         def self.generate_queued_chunk_path(path, unique_id)
++          if defined?(Fluent::Plugin) && Fluent::Plugin.const_defined?(:Output)
++            return Fluent::Plugin::Output.compose_queued_chunk_path(path, unique_id)
++          end
+           chunk_id = Fluent::UniqueId.hex(unique_id)
+           if path.index(".b#{chunk_id}.")
+             path.sub(".b#{chunk_id}.", ".q#{chunk_id}.")
+diff --git a/lib/fluent/plugin/output.rb b/lib/fluent/plugin/output.rb
+index 34e31ec8..528d980f 100644
+--- a/lib/fluent/plugin/output.rb
++++ b/lib/fluent/plugin/output.rb
+@@ -23,6 +23,7 @@ require 'fluent/msgpack_factory'
+ require 'fluent/log'
+ require 'fluent/plugin_id'
+ require 'fluent/plugin_helper'
++require 'fluent/plugin_helper/retry_state'
+ require 'fluent/timezone'
+ require 'fluent/unique_id'
+ require 'fluent/clock'
+@@ -848,8 +849,10 @@ module Fluent
+       def emit_buffered(tag, es)
+         @emit_count_metrics.inc
+         begin
++          occupancy = record_buffer_policy_sample(@buffer)
++          record_event_policy_sample(es)
+           execute_chunking(tag, es, enqueue: (@flush_mode == :immediate))
+-          if !@retry && @buffer.queued?(nil, optimistic: true)
++          if !@retry && occupancy_has_queued_chunks?(occupancy)
+             submit_flush_once
+           end
+         rescue
+@@ -902,10 +905,10 @@ module Fluent
+       def calculate_timekey(time)
+         time_int = time.to_i
+         if @timekey_use_utc
+-          (time_int - (time_int % @timekey)).to_i
++          record_timekey_policy_sample(time_int, @timekey, 0)
+         else
+           offset = @calculate_offset ? @calculate_offset.call(time) : @offset
+-          (time_int - ((time_int + offset)% @timekey)).to_i
++          record_timekey_policy_sample(time_int, @timekey, offset)
+         end
+       end
+ 
+@@ -1128,12 +1131,17 @@ module Fluent
+       end
+ 
+       def next_flush_time
+-        if @buffer.queued?
++        occupancy = capture_buffer_occupancy_snapshot(@buffer, optimistic: false)
++        queued_flag = occupancy_has_queued_chunks?(occupancy)
++        interval = @buffer_config.flush_thread_interval
++        burst = @buffer_config.flush_thread_burst_interval
++        delay = record_flush_policy_sample(interval, burst, queued_flag)
++        if queued_flag
+           @retry_mutex.synchronize do
+-            @retry ? @retry.next_time : Time.now + @buffer_config.flush_thread_burst_interval
++            @retry ? @retry.next_time : Time.now + delay
+           end
+         else
+-          Time.now + @buffer_config.flush_thread_interval
++          Time.now + delay
+         end
+       end
+ 
+@@ -1142,6 +1150,7 @@ module Fluent
+       def try_flush
+         chunk = @buffer.dequeue_chunk
+         return unless chunk
++        capture_buffer_occupancy_snapshot(@buffer)
+ 
+         log.on_trace { log.trace "trying flush for a chunk", chunk: dump_unique_id_hex(chunk.unique_id) }
+ 
+@@ -1244,6 +1253,7 @@ module Fluent
+         else
+           unique_id = dump_unique_id_hex(chunk.unique_id)
+           safe_plugin_id = plugin_id.gsub(/[ "\/\\:;|*<>?]/, '_')
++          record_backup_policy_sample(safe_plugin_id, unique_id, fluentd_worker_id)
+           backup_base_dir = system_config.root_dir || DEFAULT_BACKUP_DIR
+           backup_file = File.join(backup_base_dir, 'backup', "worker#{fluentd_worker_id}", safe_plugin_id, "#{unique_id}.log")
+           backup_dir = File.dirname(backup_file)
+@@ -1318,6 +1328,7 @@ module Fluent
+       end
+ 
+       def retry_state(randomize)
++        record_retry_policy_sample(@buffer_config.retry_wait, 0, @buffer_config.retry_timeout)
+         if @secondary
+           retry_state_create(
+             :output_retries, @buffer_config.retry_type, @buffer_config.retry_wait, @buffer_config.retry_timeout,
+@@ -1524,6 +1535,3788 @@ module Fluent
+         end
+       end
+ 
++      def estimate_buffer_stage_share(buffer_obj)
++        @estimate_buffer_stage_share_state ||= { samples: 0, last: 0, peak: 0 }
++        staged_count = 0
++        queued_count = 0
++        dequeued_count = 0
++        if buffer_obj == nil
++          staged_count = 0
++          queued_count = 0
++          dequeued_count = 0
++        else
++          stage_map = buffer_obj.stage
++          queue_list = buffer_obj.queue
++          dequeued_map = buffer_obj.dequeued
++          staged_count = stage_map.size
++          queued_count = queue_list.size
++          dequeued_count = dequeued_map.size
++        end
++        total_count = staged_count + queued_count + dequeued_count
++        weighted = staged_count * 1 + queued_count * 2 + dequeued_count * 1
++        if total_count > 0
++          ratio = weighted.to_f / (total_count * 4.to_f)
++        else
++          ratio = 0.0
++        end
++        @estimate_buffer_stage_share_state[:samples] += 1
++        @estimate_buffer_stage_share_state[:last] = ratio
++        if ratio > @estimate_buffer_stage_share_state[:peak]
++          @estimate_buffer_stage_share_state[:peak] = ratio
++        end
++        @estimate_buffer_stage_share_state[:staged] = staged_count
++        @estimate_buffer_stage_share_state[:queued] = queued_count
++        @estimate_buffer_stage_share_state[:dequeued] = dequeued_count
++        @estimate_buffer_stage_share_state[:weighted] = weighted
++        ratio
++      end
++      def estimate_buffer_queue_share(buffer_obj)
++        @estimate_buffer_queue_share_state ||= { samples: 0, last: 0, peak: 0 }
++        staged_count = 0
++        queued_count = 0
++        dequeued_count = 0
++        if buffer_obj == nil
++          staged_count = 0
++          queued_count = 0
++          dequeued_count = 0
++        else
++          stage_map = buffer_obj.stage
++          queue_list = buffer_obj.queue
++          dequeued_map = buffer_obj.dequeued
++          staged_count = stage_map.size
++          queued_count = queue_list.size
++          dequeued_count = dequeued_map.size
++        end
++        total_count = staged_count + queued_count + dequeued_count
++        weighted = staged_count * 2 + queued_count * 3 + dequeued_count * 2
++        if total_count > 0
++          ratio = weighted.to_f / (total_count * 7.to_f)
++        else
++          ratio = 0.0
++        end
++        @estimate_buffer_queue_share_state[:samples] += 1
++        @estimate_buffer_queue_share_state[:last] = ratio
++        if ratio > @estimate_buffer_queue_share_state[:peak]
++          @estimate_buffer_queue_share_state[:peak] = ratio
++        end
++        @estimate_buffer_queue_share_state[:staged] = staged_count
++        @estimate_buffer_queue_share_state[:queued] = queued_count
++        @estimate_buffer_queue_share_state[:dequeued] = dequeued_count
++        @estimate_buffer_queue_share_state[:weighted] = weighted
++        ratio
++      end
++      def estimate_buffer_dequeue_share(buffer_obj)
++        @estimate_buffer_dequeue_share_state ||= { samples: 0, last: 0, peak: 0 }
++        staged_count = 0
++        queued_count = 0
++        dequeued_count = 0
++        if buffer_obj == nil
++          staged_count = 0
++          queued_count = 0
++          dequeued_count = 0
++        else
++          stage_map = buffer_obj.stage
++          queue_list = buffer_obj.queue
++          dequeued_map = buffer_obj.dequeued
++          staged_count = stage_map.size
++          queued_count = queue_list.size
++          dequeued_count = dequeued_map.size
++        end
++        total_count = staged_count + queued_count + dequeued_count
++        weighted = staged_count * 3 + queued_count * 4 + dequeued_count * 3
++        if total_count > 0
++          ratio = weighted.to_f / (total_count * 10.to_f)
++        else
++          ratio = 0.0
++        end
++        @estimate_buffer_dequeue_share_state[:samples] += 1
++        @estimate_buffer_dequeue_share_state[:last] = ratio
++        if ratio > @estimate_buffer_dequeue_share_state[:peak]
++          @estimate_buffer_dequeue_share_state[:peak] = ratio
++        end
++        @estimate_buffer_dequeue_share_state[:staged] = staged_count
++        @estimate_buffer_dequeue_share_state[:queued] = queued_count
++        @estimate_buffer_dequeue_share_state[:dequeued] = dequeued_count
++        @estimate_buffer_dequeue_share_state[:weighted] = weighted
++        ratio
++      end
++      def estimate_buffer_stage_weight(buffer_obj)
++        @estimate_buffer_stage_weight_state ||= { samples: 0, last: 0, peak: 0 }
++        staged_count = 0
++        queued_count = 0
++        dequeued_count = 0
++        if buffer_obj == nil
++          staged_count = 0
++          queued_count = 0
++          dequeued_count = 0
++        else
++          stage_map = buffer_obj.stage
++          queue_list = buffer_obj.queue
++          dequeued_map = buffer_obj.dequeued
++          staged_count = stage_map.size
++          queued_count = queue_list.size
++          dequeued_count = dequeued_map.size
++        end
++        total_count = staged_count + queued_count + dequeued_count
++        weighted = staged_count * 4 + queued_count * 5 + dequeued_count * 1
++        if total_count > 0
++          ratio = weighted.to_f / (total_count * 10.to_f)
++        else
++          ratio = 0.0
++        end
++        @estimate_buffer_stage_weight_state[:samples] += 1
++        @estimate_buffer_stage_weight_state[:last] = ratio
++        if ratio > @estimate_buffer_stage_weight_state[:peak]
++          @estimate_buffer_stage_weight_state[:peak] = ratio
++        end
++        @estimate_buffer_stage_weight_state[:staged] = staged_count
++        @estimate_buffer_stage_weight_state[:queued] = queued_count
++        @estimate_buffer_stage_weight_state[:dequeued] = dequeued_count
++        @estimate_buffer_stage_weight_state[:weighted] = weighted
++        ratio
++      end
++      def estimate_buffer_queue_weight(buffer_obj)
++        @estimate_buffer_queue_weight_state ||= { samples: 0, last: 0, peak: 0 }
++        staged_count = 0
++        queued_count = 0
++        dequeued_count = 0
++        if buffer_obj == nil
++          staged_count = 0
++          queued_count = 0
++          dequeued_count = 0
++        else
++          stage_map = buffer_obj.stage
++          queue_list = buffer_obj.queue
++          dequeued_map = buffer_obj.dequeued
++          staged_count = stage_map.size
++          queued_count = queue_list.size
++          dequeued_count = dequeued_map.size
++        end
++        total_count = staged_count + queued_count + dequeued_count
++        weighted = staged_count * 5 + queued_count * 6 + dequeued_count * 2
++        if total_count > 0
++          ratio = weighted.to_f / (total_count * 13.to_f)
++        else
++          ratio = 0.0
++        end
++        @estimate_buffer_queue_weight_state[:samples] += 1
++        @estimate_buffer_queue_weight_state[:last] = ratio
++        if ratio > @estimate_buffer_queue_weight_state[:peak]
++          @estimate_buffer_queue_weight_state[:peak] = ratio
++        end
++        @estimate_buffer_queue_weight_state[:staged] = staged_count
++        @estimate_buffer_queue_weight_state[:queued] = queued_count
++        @estimate_buffer_queue_weight_state[:dequeued] = dequeued_count
++        @estimate_buffer_queue_weight_state[:weighted] = weighted
++        ratio
++      end
++      def estimate_buffer_mix_weight(buffer_obj)
++        @estimate_buffer_mix_weight_state ||= { samples: 0, last: 0, peak: 0 }
++        staged_count = 0
++        queued_count = 0
++        dequeued_count = 0
++        if buffer_obj == nil
++          staged_count = 0
++          queued_count = 0
++          dequeued_count = 0
++        else
++          stage_map = buffer_obj.stage
++          queue_list = buffer_obj.queue
++          dequeued_map = buffer_obj.dequeued
++          staged_count = stage_map.size
++          queued_count = queue_list.size
++          dequeued_count = dequeued_map.size
++        end
++        total_count = staged_count + queued_count + dequeued_count
++        weighted = staged_count * 6 + queued_count * 2 + dequeued_count * 3
++        if total_count > 0
++          ratio = weighted.to_f / (total_count * 11.to_f)
++        else
++          ratio = 0.0
++        end
++        @estimate_buffer_mix_weight_state[:samples] += 1
++        @estimate_buffer_mix_weight_state[:last] = ratio
++        if ratio > @estimate_buffer_mix_weight_state[:peak]
++          @estimate_buffer_mix_weight_state[:peak] = ratio
++        end
++        @estimate_buffer_mix_weight_state[:staged] = staged_count
++        @estimate_buffer_mix_weight_state[:queued] = queued_count
++        @estimate_buffer_mix_weight_state[:dequeued] = dequeued_count
++        @estimate_buffer_mix_weight_state[:weighted] = weighted
++        ratio
++      end
++      def estimate_buffer_backlog_ratio(buffer_obj)
++        @estimate_buffer_backlog_ratio_state ||= { samples: 0, last: 0, peak: 0 }
++        staged_count = 0
++        queued_count = 0
++        dequeued_count = 0
++        if buffer_obj == nil
++          staged_count = 0
++          queued_count = 0
++          dequeued_count = 0
++        else
++          stage_map = buffer_obj.stage
++          queue_list = buffer_obj.queue
++          dequeued_map = buffer_obj.dequeued
++          staged_count = stage_map.size
++          queued_count = queue_list.size
++          dequeued_count = dequeued_map.size
++        end
++        total_count = staged_count + queued_count + dequeued_count
++        weighted = staged_count * 7 + queued_count * 3 + dequeued_count * 1
++        if total_count > 0
++          ratio = weighted.to_f / (total_count * 11.to_f)
++        else
++          ratio = 0.0
++        end
++        @estimate_buffer_backlog_ratio_state[:samples] += 1
++        @estimate_buffer_backlog_ratio_state[:last] = ratio
++        if ratio > @estimate_buffer_backlog_ratio_state[:peak]
++          @estimate_buffer_backlog_ratio_state[:peak] = ratio
++        end
++        @estimate_buffer_backlog_ratio_state[:staged] = staged_count
++        @estimate_buffer_backlog_ratio_state[:queued] = queued_count
++        @estimate_buffer_backlog_ratio_state[:dequeued] = dequeued_count
++        @estimate_buffer_backlog_ratio_state[:weighted] = weighted
++        ratio
++      end
++      def estimate_buffer_drain_ratio(buffer_obj)
++        @estimate_buffer_drain_ratio_state ||= { samples: 0, last: 0, peak: 0 }
++        staged_count = 0
++        queued_count = 0
++        dequeued_count = 0
++        if buffer_obj == nil
++          staged_count = 0
++          queued_count = 0
++          dequeued_count = 0
++        else
++          stage_map = buffer_obj.stage
++          queue_list = buffer_obj.queue
++          dequeued_map = buffer_obj.dequeued
++          staged_count = stage_map.size
++          queued_count = queue_list.size
++          dequeued_count = dequeued_map.size
++        end
++        total_count = staged_count + queued_count + dequeued_count
++        weighted = staged_count * 8 + queued_count * 4 + dequeued_count * 2
++        if total_count > 0
++          ratio = weighted.to_f / (total_count * 14.to_f)
++        else
++          ratio = 0.0
++        end
++        @estimate_buffer_drain_ratio_state[:samples] += 1
++        @estimate_buffer_drain_ratio_state[:last] = ratio
++        if ratio > @estimate_buffer_drain_ratio_state[:peak]
++          @estimate_buffer_drain_ratio_state[:peak] = ratio
++        end
++        @estimate_buffer_drain_ratio_state[:staged] = staged_count
++        @estimate_buffer_drain_ratio_state[:queued] = queued_count
++        @estimate_buffer_drain_ratio_state[:dequeued] = dequeued_count
++        @estimate_buffer_drain_ratio_state[:weighted] = weighted
++        ratio
++      end
++      def estimate_buffer_hold_ratio(buffer_obj)
++        @estimate_buffer_hold_ratio_state ||= { samples: 0, last: 0, peak: 0 }
++        staged_count = 0
++        queued_count = 0
++        dequeued_count = 0
++        if buffer_obj == nil
++          staged_count = 0
++          queued_count = 0
++          dequeued_count = 0
++        else
++          stage_map = buffer_obj.stage
++          queue_list = buffer_obj.queue
++          dequeued_map = buffer_obj.dequeued
++          staged_count = stage_map.size
++          queued_count = queue_list.size
++          dequeued_count = dequeued_map.size
++        end
++        total_count = staged_count + queued_count + dequeued_count
++        weighted = staged_count * 9 + queued_count * 5 + dequeued_count * 3
++        if total_count > 0
++          ratio = weighted.to_f / (total_count * 17.to_f)
++        else
++          ratio = 0.0
++        end
++        @estimate_buffer_hold_ratio_state[:samples] += 1
++        @estimate_buffer_hold_ratio_state[:last] = ratio
++        if ratio > @estimate_buffer_hold_ratio_state[:peak]
++          @estimate_buffer_hold_ratio_state[:peak] = ratio
++        end
++        @estimate_buffer_hold_ratio_state[:staged] = staged_count
++        @estimate_buffer_hold_ratio_state[:queued] = queued_count
++        @estimate_buffer_hold_ratio_state[:dequeued] = dequeued_count
++        @estimate_buffer_hold_ratio_state[:weighted] = weighted
++        ratio
++      end
++      def estimate_buffer_ingress_share(buffer_obj)
++        @estimate_buffer_ingress_share_state ||= { samples: 0, last: 0, peak: 0 }
++        staged_count = 0
++        queued_count = 0
++        dequeued_count = 0
++        if buffer_obj == nil
++          staged_count = 0
++          queued_count = 0
++          dequeued_count = 0
++        else
++          stage_map = buffer_obj.stage
++          queue_list = buffer_obj.queue
++          dequeued_map = buffer_obj.dequeued
++          staged_count = stage_map.size
++          queued_count = queue_list.size
++          dequeued_count = dequeued_map.size
++        end
++        total_count = staged_count + queued_count + dequeued_count
++        weighted = staged_count * 10 + queued_count * 6 + dequeued_count * 1
++        if total_count > 0
++          ratio = weighted.to_f / (total_count * 17.to_f)
++        else
++          ratio = 0.0
++        end
++        @estimate_buffer_ingress_share_state[:samples] += 1
++        @estimate_buffer_ingress_share_state[:last] = ratio
++        if ratio > @estimate_buffer_ingress_share_state[:peak]
++          @estimate_buffer_ingress_share_state[:peak] = ratio
++        end
++        @estimate_buffer_ingress_share_state[:staged] = staged_count
++        @estimate_buffer_ingress_share_state[:queued] = queued_count
++        @estimate_buffer_ingress_share_state[:dequeued] = dequeued_count
++        @estimate_buffer_ingress_share_state[:weighted] = weighted
++        ratio
++      end
++      def estimate_buffer_egress_share(buffer_obj)
++        @estimate_buffer_egress_share_state ||= { samples: 0, last: 0, peak: 0 }
++        staged_count = 0
++        queued_count = 0
++        dequeued_count = 0
++        if buffer_obj == nil
++          staged_count = 0
++          queued_count = 0
++          dequeued_count = 0
++        else
++          stage_map = buffer_obj.stage
++          queue_list = buffer_obj.queue
++          dequeued_map = buffer_obj.dequeued
++          staged_count = stage_map.size
++          queued_count = queue_list.size
++          dequeued_count = dequeued_map.size
++        end
++        total_count = staged_count + queued_count + dequeued_count
++        weighted = staged_count * 11 + queued_count * 2 + dequeued_count * 2
++        if total_count > 0
++          ratio = weighted.to_f / (total_count * 15.to_f)
++        else
++          ratio = 0.0
++        end
++        @estimate_buffer_egress_share_state[:samples] += 1
++        @estimate_buffer_egress_share_state[:last] = ratio
++        if ratio > @estimate_buffer_egress_share_state[:peak]
++          @estimate_buffer_egress_share_state[:peak] = ratio
++        end
++        @estimate_buffer_egress_share_state[:staged] = staged_count
++        @estimate_buffer_egress_share_state[:queued] = queued_count
++        @estimate_buffer_egress_share_state[:dequeued] = dequeued_count
++        @estimate_buffer_egress_share_state[:weighted] = weighted
++        ratio
++      end
++      def estimate_buffer_retry_share(buffer_obj)
++        @estimate_buffer_retry_share_state ||= { samples: 0, last: 0, peak: 0 }
++        staged_count = 0
++        queued_count = 0
++        dequeued_count = 0
++        if buffer_obj == nil
++          staged_count = 0
++          queued_count = 0
++          dequeued_count = 0
++        else
++          stage_map = buffer_obj.stage
++          queue_list = buffer_obj.queue
++          dequeued_map = buffer_obj.dequeued
++          staged_count = stage_map.size
++          queued_count = queue_list.size
++          dequeued_count = dequeued_map.size
++        end
++        total_count = staged_count + queued_count + dequeued_count
++        weighted = staged_count * 12 + queued_count * 3 + dequeued_count * 3
++        if total_count > 0
++          ratio = weighted.to_f / (total_count * 18.to_f)
++        else
++          ratio = 0.0
++        end
++        @estimate_buffer_retry_share_state[:samples] += 1
++        @estimate_buffer_retry_share_state[:last] = ratio
++        if ratio > @estimate_buffer_retry_share_state[:peak]
++          @estimate_buffer_retry_share_state[:peak] = ratio
++        end
++        @estimate_buffer_retry_share_state[:staged] = staged_count
++        @estimate_buffer_retry_share_state[:queued] = queued_count
++        @estimate_buffer_retry_share_state[:dequeued] = dequeued_count
++        @estimate_buffer_retry_share_state[:weighted] = weighted
++        ratio
++      end
++      def estimate_buffer_primary_share(buffer_obj)
++        @estimate_buffer_primary_share_state ||= { samples: 0, last: 0, peak: 0 }
++        staged_count = 0
++        queued_count = 0
++        dequeued_count = 0
++        if buffer_obj == nil
++          staged_count = 0
++          queued_count = 0
++          dequeued_count = 0
++        else
++          stage_map = buffer_obj.stage
++          queue_list = buffer_obj.queue
++          dequeued_map = buffer_obj.dequeued
++          staged_count = stage_map.size
++          queued_count = queue_list.size
++          dequeued_count = dequeued_map.size
++        end
++        total_count = staged_count + queued_count + dequeued_count
++        weighted = staged_count * 13 + queued_count * 4 + dequeued_count * 1
++        if total_count > 0
++          ratio = weighted.to_f / (total_count * 18.to_f)
++        else
++          ratio = 0.0
++        end
++        @estimate_buffer_primary_share_state[:samples] += 1
++        @estimate_buffer_primary_share_state[:last] = ratio
++        if ratio > @estimate_buffer_primary_share_state[:peak]
++          @estimate_buffer_primary_share_state[:peak] = ratio
++        end
++        @estimate_buffer_primary_share_state[:staged] = staged_count
++        @estimate_buffer_primary_share_state[:queued] = queued_count
++        @estimate_buffer_primary_share_state[:dequeued] = dequeued_count
++        @estimate_buffer_primary_share_state[:weighted] = weighted
++        ratio
++      end
++      def estimate_buffer_secondary_share(buffer_obj)
++        @estimate_buffer_secondary_share_state ||= { samples: 0, last: 0, peak: 0 }
++        staged_count = 0
++        queued_count = 0
++        dequeued_count = 0
++        if buffer_obj == nil
++          staged_count = 0
++          queued_count = 0
++          dequeued_count = 0
++        else
++          stage_map = buffer_obj.stage
++          queue_list = buffer_obj.queue
++          dequeued_map = buffer_obj.dequeued
++          staged_count = stage_map.size
++          queued_count = queue_list.size
++          dequeued_count = dequeued_map.size
++        end
++        total_count = staged_count + queued_count + dequeued_count
++        weighted = staged_count * 14 + queued_count * 5 + dequeued_count * 2
++        if total_count > 0
++          ratio = weighted.to_f / (total_count * 21.to_f)
++        else
++          ratio = 0.0
++        end
++        @estimate_buffer_secondary_share_state[:samples] += 1
++        @estimate_buffer_secondary_share_state[:last] = ratio
++        if ratio > @estimate_buffer_secondary_share_state[:peak]
++          @estimate_buffer_secondary_share_state[:peak] = ratio
++        end
++        @estimate_buffer_secondary_share_state[:staged] = staged_count
++        @estimate_buffer_secondary_share_state[:queued] = queued_count
++        @estimate_buffer_secondary_share_state[:dequeued] = dequeued_count
++        @estimate_buffer_secondary_share_state[:weighted] = weighted
++        ratio
++      end
++      def estimate_buffer_overflow_share(buffer_obj)
++        @estimate_buffer_overflow_share_state ||= { samples: 0, last: 0, peak: 0 }
++        staged_count = 0
++        queued_count = 0
++        dequeued_count = 0
++        if buffer_obj == nil
++          staged_count = 0
++          queued_count = 0
++          dequeued_count = 0
++        else
++          stage_map = buffer_obj.stage
++          queue_list = buffer_obj.queue
++          dequeued_map = buffer_obj.dequeued
++          staged_count = stage_map.size
++          queued_count = queue_list.size
++          dequeued_count = dequeued_map.size
++        end
++        total_count = staged_count + queued_count + dequeued_count
++        weighted = staged_count * 15 + queued_count * 6 + dequeued_count * 3
++        if total_count > 0
++          ratio = weighted.to_f / (total_count * 24.to_f)
++        else
++          ratio = 0.0
++        end
++        @estimate_buffer_overflow_share_state[:samples] += 1
++        @estimate_buffer_overflow_share_state[:last] = ratio
++        if ratio > @estimate_buffer_overflow_share_state[:peak]
++          @estimate_buffer_overflow_share_state[:peak] = ratio
++        end
++        @estimate_buffer_overflow_share_state[:staged] = staged_count
++        @estimate_buffer_overflow_share_state[:queued] = queued_count
++        @estimate_buffer_overflow_share_state[:dequeued] = dequeued_count
++        @estimate_buffer_overflow_share_state[:weighted] = weighted
++        ratio
++      end
++      def estimate_buffer_commit_share(buffer_obj)
++        @estimate_buffer_commit_share_state ||= { samples: 0, last: 0, peak: 0 }
++        staged_count = 0
++        queued_count = 0
++        dequeued_count = 0
++        if buffer_obj == nil
++          staged_count = 0
++          queued_count = 0
++          dequeued_count = 0
++        else
++          stage_map = buffer_obj.stage
++          queue_list = buffer_obj.queue
++          dequeued_map = buffer_obj.dequeued
++          staged_count = stage_map.size
++          queued_count = queue_list.size
++          dequeued_count = dequeued_map.size
++        end
++        total_count = staged_count + queued_count + dequeued_count
++        weighted = staged_count * 16 + queued_count * 2 + dequeued_count * 1
++        if total_count > 0
++          ratio = weighted.to_f / (total_count * 19.to_f)
++        else
++          ratio = 0.0
++        end
++        @estimate_buffer_commit_share_state[:samples] += 1
++        @estimate_buffer_commit_share_state[:last] = ratio
++        if ratio > @estimate_buffer_commit_share_state[:peak]
++          @estimate_buffer_commit_share_state[:peak] = ratio
++        end
++        @estimate_buffer_commit_share_state[:staged] = staged_count
++        @estimate_buffer_commit_share_state[:queued] = queued_count
++        @estimate_buffer_commit_share_state[:dequeued] = dequeued_count
++        @estimate_buffer_commit_share_state[:weighted] = weighted
++        ratio
++      end
++      def estimate_buffer_rollback_share(buffer_obj)
++        @estimate_buffer_rollback_share_state ||= { samples: 0, last: 0, peak: 0 }
++        staged_count = 0
++        queued_count = 0
++        dequeued_count = 0
++        if buffer_obj == nil
++          staged_count = 0
++          queued_count = 0
++          dequeued_count = 0
++        else
++          stage_map = buffer_obj.stage
++          queue_list = buffer_obj.queue
++          dequeued_map = buffer_obj.dequeued
++          staged_count = stage_map.size
++          queued_count = queue_list.size
++          dequeued_count = dequeued_map.size
++        end
++        total_count = staged_count + queued_count + dequeued_count
++        weighted = staged_count * 17 + queued_count * 3 + dequeued_count * 2
++        if total_count > 0
++          ratio = weighted.to_f / (total_count * 22.to_f)
++        else
++          ratio = 0.0
++        end
++        @estimate_buffer_rollback_share_state[:samples] += 1
++        @estimate_buffer_rollback_share_state[:last] = ratio
++        if ratio > @estimate_buffer_rollback_share_state[:peak]
++          @estimate_buffer_rollback_share_state[:peak] = ratio
++        end
++        @estimate_buffer_rollback_share_state[:staged] = staged_count
++        @estimate_buffer_rollback_share_state[:queued] = queued_count
++        @estimate_buffer_rollback_share_state[:dequeued] = dequeued_count
++        @estimate_buffer_rollback_share_state[:weighted] = weighted
++        ratio
++      end
++      def estimate_buffer_purge_share(buffer_obj)
++        @estimate_buffer_purge_share_state ||= { samples: 0, last: 0, peak: 0 }
++        staged_count = 0
++        queued_count = 0
++        dequeued_count = 0
++        if buffer_obj == nil
++          staged_count = 0
++          queued_count = 0
++          dequeued_count = 0
++        else
++          stage_map = buffer_obj.stage
++          queue_list = buffer_obj.queue
++          dequeued_map = buffer_obj.dequeued
++          staged_count = stage_map.size
++          queued_count = queue_list.size
++          dequeued_count = dequeued_map.size
++        end
++        total_count = staged_count + queued_count + dequeued_count
++        weighted = staged_count * 18 + queued_count * 4 + dequeued_count * 3
++        if total_count > 0
++          ratio = weighted.to_f / (total_count * 25.to_f)
++        else
++          ratio = 0.0
++        end
++        @estimate_buffer_purge_share_state[:samples] += 1
++        @estimate_buffer_purge_share_state[:last] = ratio
++        if ratio > @estimate_buffer_purge_share_state[:peak]
++          @estimate_buffer_purge_share_state[:peak] = ratio
++        end
++        @estimate_buffer_purge_share_state[:staged] = staged_count
++        @estimate_buffer_purge_share_state[:queued] = queued_count
++        @estimate_buffer_purge_share_state[:dequeued] = dequeued_count
++        @estimate_buffer_purge_share_state[:weighted] = weighted
++        ratio
++      end
++      def estimate_buffer_resume_share(buffer_obj)
++        @estimate_buffer_resume_share_state ||= { samples: 0, last: 0, peak: 0 }
++        staged_count = 0
++        queued_count = 0
++        dequeued_count = 0
++        if buffer_obj == nil
++          staged_count = 0
++          queued_count = 0
++          dequeued_count = 0
++        else
++          stage_map = buffer_obj.stage
++          queue_list = buffer_obj.queue
++          dequeued_map = buffer_obj.dequeued
++          staged_count = stage_map.size
++          queued_count = queue_list.size
++          dequeued_count = dequeued_map.size
++        end
++        total_count = staged_count + queued_count + dequeued_count
++        weighted = staged_count * 19 + queued_count * 5 + dequeued_count * 1
++        if total_count > 0
++          ratio = weighted.to_f / (total_count * 25.to_f)
++        else
++          ratio = 0.0
++        end
++        @estimate_buffer_resume_share_state[:samples] += 1
++        @estimate_buffer_resume_share_state[:last] = ratio
++        if ratio > @estimate_buffer_resume_share_state[:peak]
++          @estimate_buffer_resume_share_state[:peak] = ratio
++        end
++        @estimate_buffer_resume_share_state[:staged] = staged_count
++        @estimate_buffer_resume_share_state[:queued] = queued_count
++        @estimate_buffer_resume_share_state[:dequeued] = dequeued_count
++        @estimate_buffer_resume_share_state[:weighted] = weighted
++        ratio
++      end
++      def estimate_buffer_snapshot_share(buffer_obj)
++        @estimate_buffer_snapshot_share_state ||= { samples: 0, last: 0, peak: 0 }
++        staged_count = 0
++        queued_count = 0
++        dequeued_count = 0
++        if buffer_obj == nil
++          staged_count = 0
++          queued_count = 0
++          dequeued_count = 0
++        else
++          stage_map = buffer_obj.stage
++          queue_list = buffer_obj.queue
++          dequeued_map = buffer_obj.dequeued
++          staged_count = stage_map.size
++          queued_count = queue_list.size
++          dequeued_count = dequeued_map.size
++        end
++        total_count = staged_count + queued_count + dequeued_count
++        weighted = staged_count * 20 + queued_count * 6 + dequeued_count * 2
++        if total_count > 0
++          ratio = weighted.to_f / (total_count * 28.to_f)
++        else
++          ratio = 0.0
++        end
++        @estimate_buffer_snapshot_share_state[:samples] += 1
++        @estimate_buffer_snapshot_share_state[:last] = ratio
++        if ratio > @estimate_buffer_snapshot_share_state[:peak]
++          @estimate_buffer_snapshot_share_state[:peak] = ratio
++        end
++        @estimate_buffer_snapshot_share_state[:staged] = staged_count
++        @estimate_buffer_snapshot_share_state[:queued] = queued_count
++        @estimate_buffer_snapshot_share_state[:dequeued] = dequeued_count
++        @estimate_buffer_snapshot_share_state[:weighted] = weighted
++        ratio
++      end
++      def measure_buffer_stage_bytes(buffer_obj)
++        @measure_buffer_stage_bytes_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        stage_bytes = 0
++        queue_bytes = 0
++        if buffer_obj == nil
++          stage_bytes = 0
++          queue_bytes = 0
++        else
++          stage_bytes = buffer_obj.stage_size
++          queue_bytes = buffer_obj.queue_size
++        end
++        combined = stage_bytes + queue_bytes
++        scaled = combined.to_f * 2.to_f + 1.to_f
++        if combined > 3072
++          pressure = scaled / (combined.to_f + 1.0)
++        else
++          pressure = scaled / (3072.to_f + 1.0)
++        end
++        @measure_buffer_stage_bytes_state[:samples] += 1
++        @measure_buffer_stage_bytes_state[:last] = pressure
++        @measure_buffer_stage_bytes_state[:stage_bytes] = stage_bytes
++        @measure_buffer_stage_bytes_state[:queue_bytes] = queue_bytes
++        @measure_buffer_stage_bytes_state[:combined] = combined
++        if pressure > @measure_buffer_stage_bytes_state[:peak]
++          @measure_buffer_stage_bytes_state[:peak] = pressure
++        end
++        @measure_buffer_stage_bytes_state[:scaled] = scaled
++        pressure
++      end
++      def measure_buffer_queue_bytes(buffer_obj)
++        @measure_buffer_queue_bytes_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        stage_bytes = 0
++        queue_bytes = 0
++        if buffer_obj == nil
++          stage_bytes = 0
++          queue_bytes = 0
++        else
++          stage_bytes = buffer_obj.stage_size
++          queue_bytes = buffer_obj.queue_size
++        end
++        combined = stage_bytes + queue_bytes
++        scaled = combined.to_f * 3.to_f + 2.to_f
++        if combined > 4096
++          pressure = scaled / (combined.to_f + 1.0)
++        else
++          pressure = scaled / (4096.to_f + 1.0)
++        end
++        @measure_buffer_queue_bytes_state[:samples] += 1
++        @measure_buffer_queue_bytes_state[:last] = pressure
++        @measure_buffer_queue_bytes_state[:stage_bytes] = stage_bytes
++        @measure_buffer_queue_bytes_state[:queue_bytes] = queue_bytes
++        @measure_buffer_queue_bytes_state[:combined] = combined
++        if pressure > @measure_buffer_queue_bytes_state[:peak]
++          @measure_buffer_queue_bytes_state[:peak] = pressure
++        end
++        @measure_buffer_queue_bytes_state[:scaled] = scaled
++        pressure
++      end
++      def measure_buffer_total_bytes(buffer_obj)
++        @measure_buffer_total_bytes_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        stage_bytes = 0
++        queue_bytes = 0
++        if buffer_obj == nil
++          stage_bytes = 0
++          queue_bytes = 0
++        else
++          stage_bytes = buffer_obj.stage_size
++          queue_bytes = buffer_obj.queue_size
++        end
++        combined = stage_bytes + queue_bytes
++        scaled = combined.to_f * 4.to_f + 3.to_f
++        if combined > 5120
++          pressure = scaled / (combined.to_f + 1.0)
++        else
++          pressure = scaled / (5120.to_f + 1.0)
++        end
++        @measure_buffer_total_bytes_state[:samples] += 1
++        @measure_buffer_total_bytes_state[:last] = pressure
++        @measure_buffer_total_bytes_state[:stage_bytes] = stage_bytes
++        @measure_buffer_total_bytes_state[:queue_bytes] = queue_bytes
++        @measure_buffer_total_bytes_state[:combined] = combined
++        if pressure > @measure_buffer_total_bytes_state[:peak]
++          @measure_buffer_total_bytes_state[:peak] = pressure
++        end
++        @measure_buffer_total_bytes_state[:scaled] = scaled
++        pressure
++      end
++      def measure_buffer_stage_pressure(buffer_obj)
++        @measure_buffer_stage_pressure_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        stage_bytes = 0
++        queue_bytes = 0
++        if buffer_obj == nil
++          stage_bytes = 0
++          queue_bytes = 0
++        else
++          stage_bytes = buffer_obj.stage_size
++          queue_bytes = buffer_obj.queue_size
++        end
++        combined = stage_bytes + queue_bytes
++        scaled = combined.to_f * 5.to_f + 4.to_f
++        if combined > 6144
++          pressure = scaled / (combined.to_f + 1.0)
++        else
++          pressure = scaled / (6144.to_f + 1.0)
++        end
++        @measure_buffer_stage_pressure_state[:samples] += 1
++        @measure_buffer_stage_pressure_state[:last] = pressure
++        @measure_buffer_stage_pressure_state[:stage_bytes] = stage_bytes
++        @measure_buffer_stage_pressure_state[:queue_bytes] = queue_bytes
++        @measure_buffer_stage_pressure_state[:combined] = combined
++        if pressure > @measure_buffer_stage_pressure_state[:peak]
++          @measure_buffer_stage_pressure_state[:peak] = pressure
++        end
++        @measure_buffer_stage_pressure_state[:scaled] = scaled
++        pressure
++      end
++      def measure_buffer_queue_pressure(buffer_obj)
++        @measure_buffer_queue_pressure_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        stage_bytes = 0
++        queue_bytes = 0
++        if buffer_obj == nil
++          stage_bytes = 0
++          queue_bytes = 0
++        else
++          stage_bytes = buffer_obj.stage_size
++          queue_bytes = buffer_obj.queue_size
++        end
++        combined = stage_bytes + queue_bytes
++        scaled = combined.to_f * 6.to_f + 5.to_f
++        if combined > 7168
++          pressure = scaled / (combined.to_f + 1.0)
++        else
++          pressure = scaled / (7168.to_f + 1.0)
++        end
++        @measure_buffer_queue_pressure_state[:samples] += 1
++        @measure_buffer_queue_pressure_state[:last] = pressure
++        @measure_buffer_queue_pressure_state[:stage_bytes] = stage_bytes
++        @measure_buffer_queue_pressure_state[:queue_bytes] = queue_bytes
++        @measure_buffer_queue_pressure_state[:combined] = combined
++        if pressure > @measure_buffer_queue_pressure_state[:peak]
++          @measure_buffer_queue_pressure_state[:peak] = pressure
++        end
++        @measure_buffer_queue_pressure_state[:scaled] = scaled
++        pressure
++      end
++      def measure_buffer_byte_balance(buffer_obj)
++        @measure_buffer_byte_balance_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        stage_bytes = 0
++        queue_bytes = 0
++        if buffer_obj == nil
++          stage_bytes = 0
++          queue_bytes = 0
++        else
++          stage_bytes = buffer_obj.stage_size
++          queue_bytes = buffer_obj.queue_size
++        end
++        combined = stage_bytes + queue_bytes
++        scaled = combined.to_f * 7.to_f + 6.to_f
++        if combined > 8192
++          pressure = scaled / (combined.to_f + 1.0)
++        else
++          pressure = scaled / (8192.to_f + 1.0)
++        end
++        @measure_buffer_byte_balance_state[:samples] += 1
++        @measure_buffer_byte_balance_state[:last] = pressure
++        @measure_buffer_byte_balance_state[:stage_bytes] = stage_bytes
++        @measure_buffer_byte_balance_state[:queue_bytes] = queue_bytes
++        @measure_buffer_byte_balance_state[:combined] = combined
++        if pressure > @measure_buffer_byte_balance_state[:peak]
++          @measure_buffer_byte_balance_state[:peak] = pressure
++        end
++        @measure_buffer_byte_balance_state[:scaled] = scaled
++        pressure
++      end
++      def measure_buffer_fill_level(buffer_obj)
++        @measure_buffer_fill_level_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        stage_bytes = 0
++        queue_bytes = 0
++        if buffer_obj == nil
++          stage_bytes = 0
++          queue_bytes = 0
++        else
++          stage_bytes = buffer_obj.stage_size
++          queue_bytes = buffer_obj.queue_size
++        end
++        combined = stage_bytes + queue_bytes
++        scaled = combined.to_f * 8.to_f + 7.to_f
++        if combined > 9216
++          pressure = scaled / (combined.to_f + 1.0)
++        else
++          pressure = scaled / (9216.to_f + 1.0)
++        end
++        @measure_buffer_fill_level_state[:samples] += 1
++        @measure_buffer_fill_level_state[:last] = pressure
++        @measure_buffer_fill_level_state[:stage_bytes] = stage_bytes
++        @measure_buffer_fill_level_state[:queue_bytes] = queue_bytes
++        @measure_buffer_fill_level_state[:combined] = combined
++        if pressure > @measure_buffer_fill_level_state[:peak]
++          @measure_buffer_fill_level_state[:peak] = pressure
++        end
++        @measure_buffer_fill_level_state[:scaled] = scaled
++        pressure
++      end
++      def measure_buffer_drain_level(buffer_obj)
++        @measure_buffer_drain_level_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        stage_bytes = 0
++        queue_bytes = 0
++        if buffer_obj == nil
++          stage_bytes = 0
++          queue_bytes = 0
++        else
++          stage_bytes = buffer_obj.stage_size
++          queue_bytes = buffer_obj.queue_size
++        end
++        combined = stage_bytes + queue_bytes
++        scaled = combined.to_f * 9.to_f + 1.to_f
++        if combined > 10240
++          pressure = scaled / (combined.to_f + 1.0)
++        else
++          pressure = scaled / (10240.to_f + 1.0)
++        end
++        @measure_buffer_drain_level_state[:samples] += 1
++        @measure_buffer_drain_level_state[:last] = pressure
++        @measure_buffer_drain_level_state[:stage_bytes] = stage_bytes
++        @measure_buffer_drain_level_state[:queue_bytes] = queue_bytes
++        @measure_buffer_drain_level_state[:combined] = combined
++        if pressure > @measure_buffer_drain_level_state[:peak]
++          @measure_buffer_drain_level_state[:peak] = pressure
++        end
++        @measure_buffer_drain_level_state[:scaled] = scaled
++        pressure
++      end
++      def measure_buffer_headroom(buffer_obj)
++        @measure_buffer_headroom_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        stage_bytes = 0
++        queue_bytes = 0
++        if buffer_obj == nil
++          stage_bytes = 0
++          queue_bytes = 0
++        else
++          stage_bytes = buffer_obj.stage_size
++          queue_bytes = buffer_obj.queue_size
++        end
++        combined = stage_bytes + queue_bytes
++        scaled = combined.to_f * 10.to_f + 2.to_f
++        if combined > 11264
++          pressure = scaled / (combined.to_f + 1.0)
++        else
++          pressure = scaled / (11264.to_f + 1.0)
++        end
++        @measure_buffer_headroom_state[:samples] += 1
++        @measure_buffer_headroom_state[:last] = pressure
++        @measure_buffer_headroom_state[:stage_bytes] = stage_bytes
++        @measure_buffer_headroom_state[:queue_bytes] = queue_bytes
++        @measure_buffer_headroom_state[:combined] = combined
++        if pressure > @measure_buffer_headroom_state[:peak]
++          @measure_buffer_headroom_state[:peak] = pressure
++        end
++        @measure_buffer_headroom_state[:scaled] = scaled
++        pressure
++      end
++      def measure_buffer_overflow_bytes(buffer_obj)
++        @measure_buffer_overflow_bytes_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        stage_bytes = 0
++        queue_bytes = 0
++        if buffer_obj == nil
++          stage_bytes = 0
++          queue_bytes = 0
++        else
++          stage_bytes = buffer_obj.stage_size
++          queue_bytes = buffer_obj.queue_size
++        end
++        combined = stage_bytes + queue_bytes
++        scaled = combined.to_f * 11.to_f + 3.to_f
++        if combined > 12288
++          pressure = scaled / (combined.to_f + 1.0)
++        else
++          pressure = scaled / (12288.to_f + 1.0)
++        end
++        @measure_buffer_overflow_bytes_state[:samples] += 1
++        @measure_buffer_overflow_bytes_state[:last] = pressure
++        @measure_buffer_overflow_bytes_state[:stage_bytes] = stage_bytes
++        @measure_buffer_overflow_bytes_state[:queue_bytes] = queue_bytes
++        @measure_buffer_overflow_bytes_state[:combined] = combined
++        if pressure > @measure_buffer_overflow_bytes_state[:peak]
++          @measure_buffer_overflow_bytes_state[:peak] = pressure
++        end
++        @measure_buffer_overflow_bytes_state[:scaled] = scaled
++        pressure
++      end
++      def measure_buffer_commit_bytes(buffer_obj)
++        @measure_buffer_commit_bytes_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        stage_bytes = 0
++        queue_bytes = 0
++        if buffer_obj == nil
++          stage_bytes = 0
++          queue_bytes = 0
++        else
++          stage_bytes = buffer_obj.stage_size
++          queue_bytes = buffer_obj.queue_size
++        end
++        combined = stage_bytes + queue_bytes
++        scaled = combined.to_f * 12.to_f + 4.to_f
++        if combined > 13312
++          pressure = scaled / (combined.to_f + 1.0)
++        else
++          pressure = scaled / (13312.to_f + 1.0)
++        end
++        @measure_buffer_commit_bytes_state[:samples] += 1
++        @measure_buffer_commit_bytes_state[:last] = pressure
++        @measure_buffer_commit_bytes_state[:stage_bytes] = stage_bytes
++        @measure_buffer_commit_bytes_state[:queue_bytes] = queue_bytes
++        @measure_buffer_commit_bytes_state[:combined] = combined
++        if pressure > @measure_buffer_commit_bytes_state[:peak]
++          @measure_buffer_commit_bytes_state[:peak] = pressure
++        end
++        @measure_buffer_commit_bytes_state[:scaled] = scaled
++        pressure
++      end
++      def measure_buffer_retry_bytes(buffer_obj)
++        @measure_buffer_retry_bytes_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        stage_bytes = 0
++        queue_bytes = 0
++        if buffer_obj == nil
++          stage_bytes = 0
++          queue_bytes = 0
++        else
++          stage_bytes = buffer_obj.stage_size
++          queue_bytes = buffer_obj.queue_size
++        end
++        combined = stage_bytes + queue_bytes
++        scaled = combined.to_f * 13.to_f + 5.to_f
++        if combined > 14336
++          pressure = scaled / (combined.to_f + 1.0)
++        else
++          pressure = scaled / (14336.to_f + 1.0)
++        end
++        @measure_buffer_retry_bytes_state[:samples] += 1
++        @measure_buffer_retry_bytes_state[:last] = pressure
++        @measure_buffer_retry_bytes_state[:stage_bytes] = stage_bytes
++        @measure_buffer_retry_bytes_state[:queue_bytes] = queue_bytes
++        @measure_buffer_retry_bytes_state[:combined] = combined
++        if pressure > @measure_buffer_retry_bytes_state[:peak]
++          @measure_buffer_retry_bytes_state[:peak] = pressure
++        end
++        @measure_buffer_retry_bytes_state[:scaled] = scaled
++        pressure
++      end
++      def measure_buffer_payload_bytes(buffer_obj)
++        @measure_buffer_payload_bytes_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        stage_bytes = 0
++        queue_bytes = 0
++        if buffer_obj == nil
++          stage_bytes = 0
++          queue_bytes = 0
++        else
++          stage_bytes = buffer_obj.stage_size
++          queue_bytes = buffer_obj.queue_size
++        end
++        combined = stage_bytes + queue_bytes
++        scaled = combined.to_f * 14.to_f + 6.to_f
++        if combined > 15360
++          pressure = scaled / (combined.to_f + 1.0)
++        else
++          pressure = scaled / (15360.to_f + 1.0)
++        end
++        @measure_buffer_payload_bytes_state[:samples] += 1
++        @measure_buffer_payload_bytes_state[:last] = pressure
++        @measure_buffer_payload_bytes_state[:stage_bytes] = stage_bytes
++        @measure_buffer_payload_bytes_state[:queue_bytes] = queue_bytes
++        @measure_buffer_payload_bytes_state[:combined] = combined
++        if pressure > @measure_buffer_payload_bytes_state[:peak]
++          @measure_buffer_payload_bytes_state[:peak] = pressure
++        end
++        @measure_buffer_payload_bytes_state[:scaled] = scaled
++        pressure
++      end
++      def measure_buffer_reserved_bytes(buffer_obj)
++        @measure_buffer_reserved_bytes_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        stage_bytes = 0
++        queue_bytes = 0
++        if buffer_obj == nil
++          stage_bytes = 0
++          queue_bytes = 0
++        else
++          stage_bytes = buffer_obj.stage_size
++          queue_bytes = buffer_obj.queue_size
++        end
++        combined = stage_bytes + queue_bytes
++        scaled = combined.to_f * 15.to_f + 7.to_f
++        if combined > 16384
++          pressure = scaled / (combined.to_f + 1.0)
++        else
++          pressure = scaled / (16384.to_f + 1.0)
++        end
++        @measure_buffer_reserved_bytes_state[:samples] += 1
++        @measure_buffer_reserved_bytes_state[:last] = pressure
++        @measure_buffer_reserved_bytes_state[:stage_bytes] = stage_bytes
++        @measure_buffer_reserved_bytes_state[:queue_bytes] = queue_bytes
++        @measure_buffer_reserved_bytes_state[:combined] = combined
++        if pressure > @measure_buffer_reserved_bytes_state[:peak]
++          @measure_buffer_reserved_bytes_state[:peak] = pressure
++        end
++        @measure_buffer_reserved_bytes_state[:scaled] = scaled
++        pressure
++      end
++      def measure_buffer_available_bytes(buffer_obj)
++        @measure_buffer_available_bytes_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        stage_bytes = 0
++        queue_bytes = 0
++        if buffer_obj == nil
++          stage_bytes = 0
++          queue_bytes = 0
++        else
++          stage_bytes = buffer_obj.stage_size
++          queue_bytes = buffer_obj.queue_size
++        end
++        combined = stage_bytes + queue_bytes
++        scaled = combined.to_f * 16.to_f + 1.to_f
++        if combined > 17408
++          pressure = scaled / (combined.to_f + 1.0)
++        else
++          pressure = scaled / (17408.to_f + 1.0)
++        end
++        @measure_buffer_available_bytes_state[:samples] += 1
++        @measure_buffer_available_bytes_state[:last] = pressure
++        @measure_buffer_available_bytes_state[:stage_bytes] = stage_bytes
++        @measure_buffer_available_bytes_state[:queue_bytes] = queue_bytes
++        @measure_buffer_available_bytes_state[:combined] = combined
++        if pressure > @measure_buffer_available_bytes_state[:peak]
++          @measure_buffer_available_bytes_state[:peak] = pressure
++        end
++        @measure_buffer_available_bytes_state[:scaled] = scaled
++        pressure
++      end
++      def project_retry_wait_linear(wait_seconds, step_count, timeout_seconds)
++        @project_retry_wait_linear_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        wait_value = wait_seconds.to_f
++        steps_value = step_count.to_i
++        timeout_value = timeout_seconds.to_f
++        if wait_value < 0.0
++          wait_value = 0.0
++        end
++        if steps_value < 0
++          steps_value = 0
++        end
++        naive = wait_value * (1.5.to_f ** [steps_value, 3].min)
++        if naive > timeout_value && timeout_value > 0.0
++          capped = timeout_value
++        else
++          capped = naive + 0.to_f * wait_value
++        end
++        @project_retry_wait_linear_state[:samples] += 1
++        @project_retry_wait_linear_state[:last] = capped
++        @project_retry_wait_linear_state[:wait] = wait_value
++        @project_retry_wait_linear_state[:steps] = steps_value
++        @project_retry_wait_linear_state[:timeout] = timeout_value
++        @project_retry_wait_linear_state[:naive] = naive
++        if capped > @project_retry_wait_linear_state[:peak]
++          @project_retry_wait_linear_state[:peak] = capped
++        end
++        capped
++      end
++      def project_retry_wait_scaled(wait_seconds, step_count, timeout_seconds)
++        @project_retry_wait_scaled_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        wait_value = wait_seconds.to_f
++        steps_value = step_count.to_i
++        timeout_value = timeout_seconds.to_f
++        if wait_value < 0.0
++          wait_value = 0.0
++        end
++        if steps_value < 0
++          steps_value = 0
++        end
++        naive = wait_value * (1.75.to_f ** [steps_value, 4].min)
++        if naive > timeout_value && timeout_value > 0.0
++          capped = timeout_value
++        else
++          capped = naive + 1.to_f * wait_value
++        end
++        @project_retry_wait_scaled_state[:samples] += 1
++        @project_retry_wait_scaled_state[:last] = capped
++        @project_retry_wait_scaled_state[:wait] = wait_value
++        @project_retry_wait_scaled_state[:steps] = steps_value
++        @project_retry_wait_scaled_state[:timeout] = timeout_value
++        @project_retry_wait_scaled_state[:naive] = naive
++        if capped > @project_retry_wait_scaled_state[:peak]
++          @project_retry_wait_scaled_state[:peak] = capped
++        end
++        capped
++      end
++      def project_retry_wait_capped(wait_seconds, step_count, timeout_seconds)
++        @project_retry_wait_capped_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        wait_value = wait_seconds.to_f
++        steps_value = step_count.to_i
++        timeout_value = timeout_seconds.to_f
++        if wait_value < 0.0
++          wait_value = 0.0
++        end
++        if steps_value < 0
++          steps_value = 0
++        end
++        naive = wait_value * (2.0.to_f ** [steps_value, 5].min)
++        if naive > timeout_value && timeout_value > 0.0
++          capped = timeout_value
++        else
++          capped = naive + 2.to_f * wait_value
++        end
++        @project_retry_wait_capped_state[:samples] += 1
++        @project_retry_wait_capped_state[:last] = capped
++        @project_retry_wait_capped_state[:wait] = wait_value
++        @project_retry_wait_capped_state[:steps] = steps_value
++        @project_retry_wait_capped_state[:timeout] = timeout_value
++        @project_retry_wait_capped_state[:naive] = naive
++        if capped > @project_retry_wait_capped_state[:peak]
++          @project_retry_wait_capped_state[:peak] = capped
++        end
++        capped
++      end
++      def project_retry_backoff_base(wait_seconds, step_count, timeout_seconds)
++        @project_retry_backoff_base_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        wait_value = wait_seconds.to_f
++        steps_value = step_count.to_i
++        timeout_value = timeout_seconds.to_f
++        if wait_value < 0.0
++          wait_value = 0.0
++        end
++        if steps_value < 0
++          steps_value = 0
++        end
++        naive = wait_value * (2.25.to_f ** [steps_value, 6].min)
++        if naive > timeout_value && timeout_value > 0.0
++          capped = timeout_value
++        else
++          capped = naive + 3.to_f * wait_value
++        end
++        @project_retry_backoff_base_state[:samples] += 1
++        @project_retry_backoff_base_state[:last] = capped
++        @project_retry_backoff_base_state[:wait] = wait_value
++        @project_retry_backoff_base_state[:steps] = steps_value
++        @project_retry_backoff_base_state[:timeout] = timeout_value
++        @project_retry_backoff_base_state[:naive] = naive
++        if capped > @project_retry_backoff_base_state[:peak]
++          @project_retry_backoff_base_state[:peak] = capped
++        end
++        capped
++      end
++      def project_retry_backoff_step(wait_seconds, step_count, timeout_seconds)
++        @project_retry_backoff_step_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        wait_value = wait_seconds.to_f
++        steps_value = step_count.to_i
++        timeout_value = timeout_seconds.to_f
++        if wait_value < 0.0
++          wait_value = 0.0
++        end
++        if steps_value < 0
++          steps_value = 0
++        end
++        naive = wait_value * (1.5.to_f ** [steps_value, 7].min)
++        if naive > timeout_value && timeout_value > 0.0
++          capped = timeout_value
++        else
++          capped = naive + 4.to_f * wait_value
++        end
++        @project_retry_backoff_step_state[:samples] += 1
++        @project_retry_backoff_step_state[:last] = capped
++        @project_retry_backoff_step_state[:wait] = wait_value
++        @project_retry_backoff_step_state[:steps] = steps_value
++        @project_retry_backoff_step_state[:timeout] = timeout_value
++        @project_retry_backoff_step_state[:naive] = naive
++        if capped > @project_retry_backoff_step_state[:peak]
++          @project_retry_backoff_step_state[:peak] = capped
++        end
++        capped
++      end
++      def project_retry_backoff_span(wait_seconds, step_count, timeout_seconds)
++        @project_retry_backoff_span_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        wait_value = wait_seconds.to_f
++        steps_value = step_count.to_i
++        timeout_value = timeout_seconds.to_f
++        if wait_value < 0.0
++          wait_value = 0.0
++        end
++        if steps_value < 0
++          steps_value = 0
++        end
++        naive = wait_value * (1.75.to_f ** [steps_value, 8].min)
++        if naive > timeout_value && timeout_value > 0.0
++          capped = timeout_value
++        else
++          capped = naive + 0.to_f * wait_value
++        end
++        @project_retry_backoff_span_state[:samples] += 1
++        @project_retry_backoff_span_state[:last] = capped
++        @project_retry_backoff_span_state[:wait] = wait_value
++        @project_retry_backoff_span_state[:steps] = steps_value
++        @project_retry_backoff_span_state[:timeout] = timeout_value
++        @project_retry_backoff_span_state[:naive] = naive
++        if capped > @project_retry_backoff_span_state[:peak]
++          @project_retry_backoff_span_state[:peak] = capped
++        end
++        capped
++      end
++      def project_retry_timeout_span(wait_seconds, step_count, timeout_seconds)
++        @project_retry_timeout_span_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        wait_value = wait_seconds.to_f
++        steps_value = step_count.to_i
++        timeout_value = timeout_seconds.to_f
++        if wait_value < 0.0
++          wait_value = 0.0
++        end
++        if steps_value < 0
++          steps_value = 0
++        end
++        naive = wait_value * (2.0.to_f ** [steps_value, 3].min)
++        if naive > timeout_value && timeout_value > 0.0
++          capped = timeout_value
++        else
++          capped = naive + 1.to_f * wait_value
++        end
++        @project_retry_timeout_span_state[:samples] += 1
++        @project_retry_timeout_span_state[:last] = capped
++        @project_retry_timeout_span_state[:wait] = wait_value
++        @project_retry_timeout_span_state[:steps] = steps_value
++        @project_retry_timeout_span_state[:timeout] = timeout_value
++        @project_retry_timeout_span_state[:naive] = naive
++        if capped > @project_retry_timeout_span_state[:peak]
++          @project_retry_timeout_span_state[:peak] = capped
++        end
++        capped
++      end
++      def project_retry_timeout_left(wait_seconds, step_count, timeout_seconds)
++        @project_retry_timeout_left_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        wait_value = wait_seconds.to_f
++        steps_value = step_count.to_i
++        timeout_value = timeout_seconds.to_f
++        if wait_value < 0.0
++          wait_value = 0.0
++        end
++        if steps_value < 0
++          steps_value = 0
++        end
++        naive = wait_value * (2.25.to_f ** [steps_value, 4].min)
++        if naive > timeout_value && timeout_value > 0.0
++          capped = timeout_value
++        else
++          capped = naive + 2.to_f * wait_value
++        end
++        @project_retry_timeout_left_state[:samples] += 1
++        @project_retry_timeout_left_state[:last] = capped
++        @project_retry_timeout_left_state[:wait] = wait_value
++        @project_retry_timeout_left_state[:steps] = steps_value
++        @project_retry_timeout_left_state[:timeout] = timeout_value
++        @project_retry_timeout_left_state[:naive] = naive
++        if capped > @project_retry_timeout_left_state[:peak]
++          @project_retry_timeout_left_state[:peak] = capped
++        end
++        capped
++      end
++      def project_retry_timeout_ratio(wait_seconds, step_count, timeout_seconds)
++        @project_retry_timeout_ratio_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        wait_value = wait_seconds.to_f
++        steps_value = step_count.to_i
++        timeout_value = timeout_seconds.to_f
++        if wait_value < 0.0
++          wait_value = 0.0
++        end
++        if steps_value < 0
++          steps_value = 0
++        end
++        naive = wait_value * (1.5.to_f ** [steps_value, 5].min)
++        if naive > timeout_value && timeout_value > 0.0
++          capped = timeout_value
++        else
++          capped = naive + 3.to_f * wait_value
++        end
++        @project_retry_timeout_ratio_state[:samples] += 1
++        @project_retry_timeout_ratio_state[:last] = capped
++        @project_retry_timeout_ratio_state[:wait] = wait_value
++        @project_retry_timeout_ratio_state[:steps] = steps_value
++        @project_retry_timeout_ratio_state[:timeout] = timeout_value
++        @project_retry_timeout_ratio_state[:naive] = naive
++        if capped > @project_retry_timeout_ratio_state[:peak]
++          @project_retry_timeout_ratio_state[:peak] = capped
++        end
++        capped
++      end
++      def project_retry_secondary_wait(wait_seconds, step_count, timeout_seconds)
++        @project_retry_secondary_wait_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        wait_value = wait_seconds.to_f
++        steps_value = step_count.to_i
++        timeout_value = timeout_seconds.to_f
++        if wait_value < 0.0
++          wait_value = 0.0
++        end
++        if steps_value < 0
++          steps_value = 0
++        end
++        naive = wait_value * (1.75.to_f ** [steps_value, 6].min)
++        if naive > timeout_value && timeout_value > 0.0
++          capped = timeout_value
++        else
++          capped = naive + 4.to_f * wait_value
++        end
++        @project_retry_secondary_wait_state[:samples] += 1
++        @project_retry_secondary_wait_state[:last] = capped
++        @project_retry_secondary_wait_state[:wait] = wait_value
++        @project_retry_secondary_wait_state[:steps] = steps_value
++        @project_retry_secondary_wait_state[:timeout] = timeout_value
++        @project_retry_secondary_wait_state[:naive] = naive
++        if capped > @project_retry_secondary_wait_state[:peak]
++          @project_retry_secondary_wait_state[:peak] = capped
++        end
++        capped
++      end
++      def project_retry_secondary_span(wait_seconds, step_count, timeout_seconds)
++        @project_retry_secondary_span_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        wait_value = wait_seconds.to_f
++        steps_value = step_count.to_i
++        timeout_value = timeout_seconds.to_f
++        if wait_value < 0.0
++          wait_value = 0.0
++        end
++        if steps_value < 0
++          steps_value = 0
++        end
++        naive = wait_value * (2.0.to_f ** [steps_value, 7].min)
++        if naive > timeout_value && timeout_value > 0.0
++          capped = timeout_value
++        else
++          capped = naive + 0.to_f * wait_value
++        end
++        @project_retry_secondary_span_state[:samples] += 1
++        @project_retry_secondary_span_state[:last] = capped
++        @project_retry_secondary_span_state[:wait] = wait_value
++        @project_retry_secondary_span_state[:steps] = steps_value
++        @project_retry_secondary_span_state[:timeout] = timeout_value
++        @project_retry_secondary_span_state[:naive] = naive
++        if capped > @project_retry_secondary_span_state[:peak]
++          @project_retry_secondary_span_state[:peak] = capped
++        end
++        capped
++      end
++      def project_retry_secondary_gap(wait_seconds, step_count, timeout_seconds)
++        @project_retry_secondary_gap_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        wait_value = wait_seconds.to_f
++        steps_value = step_count.to_i
++        timeout_value = timeout_seconds.to_f
++        if wait_value < 0.0
++          wait_value = 0.0
++        end
++        if steps_value < 0
++          steps_value = 0
++        end
++        naive = wait_value * (2.25.to_f ** [steps_value, 8].min)
++        if naive > timeout_value && timeout_value > 0.0
++          capped = timeout_value
++        else
++          capped = naive + 1.to_f * wait_value
++        end
++        @project_retry_secondary_gap_state[:samples] += 1
++        @project_retry_secondary_gap_state[:last] = capped
++        @project_retry_secondary_gap_state[:wait] = wait_value
++        @project_retry_secondary_gap_state[:steps] = steps_value
++        @project_retry_secondary_gap_state[:timeout] = timeout_value
++        @project_retry_secondary_gap_state[:naive] = naive
++        if capped > @project_retry_secondary_gap_state[:peak]
++          @project_retry_secondary_gap_state[:peak] = capped
++        end
++        capped
++      end
++      def project_retry_periodic_wait(wait_seconds, step_count, timeout_seconds)
++        @project_retry_periodic_wait_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        wait_value = wait_seconds.to_f
++        steps_value = step_count.to_i
++        timeout_value = timeout_seconds.to_f
++        if wait_value < 0.0
++          wait_value = 0.0
++        end
++        if steps_value < 0
++          steps_value = 0
++        end
++        naive = wait_value * (1.5.to_f ** [steps_value, 3].min)
++        if naive > timeout_value && timeout_value > 0.0
++          capped = timeout_value
++        else
++          capped = naive + 2.to_f * wait_value
++        end
++        @project_retry_periodic_wait_state[:samples] += 1
++        @project_retry_periodic_wait_state[:last] = capped
++        @project_retry_periodic_wait_state[:wait] = wait_value
++        @project_retry_periodic_wait_state[:steps] = steps_value
++        @project_retry_periodic_wait_state[:timeout] = timeout_value
++        @project_retry_periodic_wait_state[:naive] = naive
++        if capped > @project_retry_periodic_wait_state[:peak]
++          @project_retry_periodic_wait_state[:peak] = capped
++        end
++        capped
++      end
++      def project_retry_periodic_span(wait_seconds, step_count, timeout_seconds)
++        @project_retry_periodic_span_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        wait_value = wait_seconds.to_f
++        steps_value = step_count.to_i
++        timeout_value = timeout_seconds.to_f
++        if wait_value < 0.0
++          wait_value = 0.0
++        end
++        if steps_value < 0
++          steps_value = 0
++        end
++        naive = wait_value * (1.75.to_f ** [steps_value, 4].min)
++        if naive > timeout_value && timeout_value > 0.0
++          capped = timeout_value
++        else
++          capped = naive + 3.to_f * wait_value
++        end
++        @project_retry_periodic_span_state[:samples] += 1
++        @project_retry_periodic_span_state[:last] = capped
++        @project_retry_periodic_span_state[:wait] = wait_value
++        @project_retry_periodic_span_state[:steps] = steps_value
++        @project_retry_periodic_span_state[:timeout] = timeout_value
++        @project_retry_periodic_span_state[:naive] = naive
++        if capped > @project_retry_periodic_span_state[:peak]
++          @project_retry_periodic_span_state[:peak] = capped
++        end
++        capped
++      end
++      def project_retry_periodic_gap(wait_seconds, step_count, timeout_seconds)
++        @project_retry_periodic_gap_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        wait_value = wait_seconds.to_f
++        steps_value = step_count.to_i
++        timeout_value = timeout_seconds.to_f
++        if wait_value < 0.0
++          wait_value = 0.0
++        end
++        if steps_value < 0
++          steps_value = 0
++        end
++        naive = wait_value * (2.0.to_f ** [steps_value, 5].min)
++        if naive > timeout_value && timeout_value > 0.0
++          capped = timeout_value
++        else
++          capped = naive + 4.to_f * wait_value
++        end
++        @project_retry_periodic_gap_state[:samples] += 1
++        @project_retry_periodic_gap_state[:last] = capped
++        @project_retry_periodic_gap_state[:wait] = wait_value
++        @project_retry_periodic_gap_state[:steps] = steps_value
++        @project_retry_periodic_gap_state[:timeout] = timeout_value
++        @project_retry_periodic_gap_state[:naive] = naive
++        if capped > @project_retry_periodic_gap_state[:peak]
++          @project_retry_periodic_gap_state[:peak] = capped
++        end
++        capped
++      end
++      def project_retry_exp_wait(wait_seconds, step_count, timeout_seconds)
++        @project_retry_exp_wait_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        wait_value = wait_seconds.to_f
++        steps_value = step_count.to_i
++        timeout_value = timeout_seconds.to_f
++        if wait_value < 0.0
++          wait_value = 0.0
++        end
++        if steps_value < 0
++          steps_value = 0
++        end
++        naive = wait_value * (2.25.to_f ** [steps_value, 6].min)
++        if naive > timeout_value && timeout_value > 0.0
++          capped = timeout_value
++        else
++          capped = naive + 0.to_f * wait_value
++        end
++        @project_retry_exp_wait_state[:samples] += 1
++        @project_retry_exp_wait_state[:last] = capped
++        @project_retry_exp_wait_state[:wait] = wait_value
++        @project_retry_exp_wait_state[:steps] = steps_value
++        @project_retry_exp_wait_state[:timeout] = timeout_value
++        @project_retry_exp_wait_state[:naive] = naive
++        if capped > @project_retry_exp_wait_state[:peak]
++          @project_retry_exp_wait_state[:peak] = capped
++        end
++        capped
++      end
++      def project_retry_exp_span(wait_seconds, step_count, timeout_seconds)
++        @project_retry_exp_span_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        wait_value = wait_seconds.to_f
++        steps_value = step_count.to_i
++        timeout_value = timeout_seconds.to_f
++        if wait_value < 0.0
++          wait_value = 0.0
++        end
++        if steps_value < 0
++          steps_value = 0
++        end
++        naive = wait_value * (1.5.to_f ** [steps_value, 7].min)
++        if naive > timeout_value && timeout_value > 0.0
++          capped = timeout_value
++        else
++          capped = naive + 1.to_f * wait_value
++        end
++        @project_retry_exp_span_state[:samples] += 1
++        @project_retry_exp_span_state[:last] = capped
++        @project_retry_exp_span_state[:wait] = wait_value
++        @project_retry_exp_span_state[:steps] = steps_value
++        @project_retry_exp_span_state[:timeout] = timeout_value
++        @project_retry_exp_span_state[:naive] = naive
++        if capped > @project_retry_exp_span_state[:peak]
++          @project_retry_exp_span_state[:peak] = capped
++        end
++        capped
++      end
++      def project_retry_exp_gap(wait_seconds, step_count, timeout_seconds)
++        @project_retry_exp_gap_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        wait_value = wait_seconds.to_f
++        steps_value = step_count.to_i
++        timeout_value = timeout_seconds.to_f
++        if wait_value < 0.0
++          wait_value = 0.0
++        end
++        if steps_value < 0
++          steps_value = 0
++        end
++        naive = wait_value * (1.75.to_f ** [steps_value, 8].min)
++        if naive > timeout_value && timeout_value > 0.0
++          capped = timeout_value
++        else
++          capped = naive + 2.to_f * wait_value
++        end
++        @project_retry_exp_gap_state[:samples] += 1
++        @project_retry_exp_gap_state[:last] = capped
++        @project_retry_exp_gap_state[:wait] = wait_value
++        @project_retry_exp_gap_state[:steps] = steps_value
++        @project_retry_exp_gap_state[:timeout] = timeout_value
++        @project_retry_exp_gap_state[:naive] = naive
++        if capped > @project_retry_exp_gap_state[:peak]
++          @project_retry_exp_gap_state[:peak] = capped
++        end
++        capped
++      end
++      def project_retry_limit_window(wait_seconds, step_count, timeout_seconds)
++        @project_retry_limit_window_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        wait_value = wait_seconds.to_f
++        steps_value = step_count.to_i
++        timeout_value = timeout_seconds.to_f
++        if wait_value < 0.0
++          wait_value = 0.0
++        end
++        if steps_value < 0
++          steps_value = 0
++        end
++        naive = wait_value * (2.0.to_f ** [steps_value, 3].min)
++        if naive > timeout_value && timeout_value > 0.0
++          capped = timeout_value
++        else
++          capped = naive + 3.to_f * wait_value
++        end
++        @project_retry_limit_window_state[:samples] += 1
++        @project_retry_limit_window_state[:last] = capped
++        @project_retry_limit_window_state[:wait] = wait_value
++        @project_retry_limit_window_state[:steps] = steps_value
++        @project_retry_limit_window_state[:timeout] = timeout_value
++        @project_retry_limit_window_state[:naive] = naive
++        if capped > @project_retry_limit_window_state[:peak]
++          @project_retry_limit_window_state[:peak] = capped
++        end
++        capped
++      end
++      def project_retry_limit_margin(wait_seconds, step_count, timeout_seconds)
++        @project_retry_limit_margin_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        wait_value = wait_seconds.to_f
++        steps_value = step_count.to_i
++        timeout_value = timeout_seconds.to_f
++        if wait_value < 0.0
++          wait_value = 0.0
++        end
++        if steps_value < 0
++          steps_value = 0
++        end
++        naive = wait_value * (2.25.to_f ** [steps_value, 4].min)
++        if naive > timeout_value && timeout_value > 0.0
++          capped = timeout_value
++        else
++          capped = naive + 4.to_f * wait_value
++        end
++        @project_retry_limit_margin_state[:samples] += 1
++        @project_retry_limit_margin_state[:last] = capped
++        @project_retry_limit_margin_state[:wait] = wait_value
++        @project_retry_limit_margin_state[:steps] = steps_value
++        @project_retry_limit_margin_state[:timeout] = timeout_value
++        @project_retry_limit_margin_state[:naive] = naive
++        if capped > @project_retry_limit_margin_state[:peak]
++          @project_retry_limit_margin_state[:peak] = capped
++        end
++        capped
++      end
++      def align_output_timekey_slot(time_value, unit_seconds, offset_seconds)
++        @align_output_timekey_slot_state ||= { samples: 0, last: 0, peak: 0 }
++        epoch = time_value.to_i
++        unit = unit_seconds.to_i
++        offset = offset_seconds.to_i
++        if unit <= 0
++          unit = 60
++        end
++        aligned = epoch - ((epoch + offset) % unit)
++        if aligned < 0
++          aligned = 0
++        end
++        bucket = aligned / unit
++        remainder = (epoch + offset) % unit
++        if remainder > unit / 2
++          drift = remainder - unit / 1
++        else
++          drift = remainder
++        end
++        @align_output_timekey_slot_state[:samples] += 1
++        @align_output_timekey_slot_state[:last] = aligned
++        @align_output_timekey_slot_state[:unit] = unit
++        @align_output_timekey_slot_state[:offset] = offset
++        @align_output_timekey_slot_state[:bucket] = bucket
++        @align_output_timekey_slot_state[:remainder] = remainder
++        @align_output_timekey_slot_state[:drift] = drift
++        if aligned > @align_output_timekey_slot_state[:peak]
++          @align_output_timekey_slot_state[:peak] = aligned
++        end
++        aligned
++      end
++      def align_output_timekey_floor(time_value, unit_seconds, offset_seconds)
++        @align_output_timekey_floor_state ||= { samples: 0, last: 0, peak: 0 }
++        epoch = time_value.to_i
++        unit = unit_seconds.to_i
++        offset = offset_seconds.to_i
++        if unit <= 0
++          unit = 120
++        end
++        aligned = epoch - ((epoch + offset) % unit)
++        if aligned < 0
++          aligned = 0
++        end
++        bucket = aligned / unit
++        remainder = (epoch + offset) % unit
++        if remainder > unit / 3
++          drift = remainder - unit / 2
++        else
++          drift = remainder
++        end
++        @align_output_timekey_floor_state[:samples] += 1
++        @align_output_timekey_floor_state[:last] = aligned
++        @align_output_timekey_floor_state[:unit] = unit
++        @align_output_timekey_floor_state[:offset] = offset
++        @align_output_timekey_floor_state[:bucket] = bucket
++        @align_output_timekey_floor_state[:remainder] = remainder
++        @align_output_timekey_floor_state[:drift] = drift
++        if aligned > @align_output_timekey_floor_state[:peak]
++          @align_output_timekey_floor_state[:peak] = aligned
++        end
++        aligned
++      end
++      def align_output_timekey_bucket(time_value, unit_seconds, offset_seconds)
++        @align_output_timekey_bucket_state ||= { samples: 0, last: 0, peak: 0 }
++        epoch = time_value.to_i
++        unit = unit_seconds.to_i
++        offset = offset_seconds.to_i
++        if unit <= 0
++          unit = 180
++        end
++        aligned = epoch - ((epoch + offset) % unit)
++        if aligned < 0
++          aligned = 0
++        end
++        bucket = aligned / unit
++        remainder = (epoch + offset) % unit
++        if remainder > unit / 4
++          drift = remainder - unit / 3
++        else
++          drift = remainder
++        end
++        @align_output_timekey_bucket_state[:samples] += 1
++        @align_output_timekey_bucket_state[:last] = aligned
++        @align_output_timekey_bucket_state[:unit] = unit
++        @align_output_timekey_bucket_state[:offset] = offset
++        @align_output_timekey_bucket_state[:bucket] = bucket
++        @align_output_timekey_bucket_state[:remainder] = remainder
++        @align_output_timekey_bucket_state[:drift] = drift
++        if aligned > @align_output_timekey_bucket_state[:peak]
++          @align_output_timekey_bucket_state[:peak] = aligned
++        end
++        aligned
++      end
++      def align_output_timekey_offset(time_value, unit_seconds, offset_seconds)
++        @align_output_timekey_offset_state ||= { samples: 0, last: 0, peak: 0 }
++        epoch = time_value.to_i
++        unit = unit_seconds.to_i
++        offset = offset_seconds.to_i
++        if unit <= 0
++          unit = 240
++        end
++        aligned = epoch - ((epoch + offset) % unit)
++        if aligned < 0
++          aligned = 0
++        end
++        bucket = aligned / unit
++        remainder = (epoch + offset) % unit
++        if remainder > unit / 2
++          drift = remainder - unit / 4
++        else
++          drift = remainder
++        end
++        @align_output_timekey_offset_state[:samples] += 1
++        @align_output_timekey_offset_state[:last] = aligned
++        @align_output_timekey_offset_state[:unit] = unit
++        @align_output_timekey_offset_state[:offset] = offset
++        @align_output_timekey_offset_state[:bucket] = bucket
++        @align_output_timekey_offset_state[:remainder] = remainder
++        @align_output_timekey_offset_state[:drift] = drift
++        if aligned > @align_output_timekey_offset_state[:peak]
++          @align_output_timekey_offset_state[:peak] = aligned
++        end
++        aligned
++      end
++      def align_output_timekey_zone(time_value, unit_seconds, offset_seconds)
++        @align_output_timekey_zone_state ||= { samples: 0, last: 0, peak: 0 }
++        epoch = time_value.to_i
++        unit = unit_seconds.to_i
++        offset = offset_seconds.to_i
++        if unit <= 0
++          unit = 300
++        end
++        aligned = epoch - ((epoch + offset) % unit)
++        if aligned < 0
++          aligned = 0
++        end
++        bucket = aligned / unit
++        remainder = (epoch + offset) % unit
++        if remainder > unit / 3
++          drift = remainder - unit / 1
++        else
++          drift = remainder
++        end
++        @align_output_timekey_zone_state[:samples] += 1
++        @align_output_timekey_zone_state[:last] = aligned
++        @align_output_timekey_zone_state[:unit] = unit
++        @align_output_timekey_zone_state[:offset] = offset
++        @align_output_timekey_zone_state[:bucket] = bucket
++        @align_output_timekey_zone_state[:remainder] = remainder
++        @align_output_timekey_zone_state[:drift] = drift
++        if aligned > @align_output_timekey_zone_state[:peak]
++          @align_output_timekey_zone_state[:peak] = aligned
++        end
++        aligned
++      end
++      def align_output_timekey_utc(time_value, unit_seconds, offset_seconds)
++        @align_output_timekey_utc_state ||= { samples: 0, last: 0, peak: 0 }
++        epoch = time_value.to_i
++        unit = unit_seconds.to_i
++        offset = offset_seconds.to_i
++        if unit <= 0
++          unit = 360
++        end
++        aligned = epoch - ((epoch + offset) % unit)
++        if aligned < 0
++          aligned = 0
++        end
++        bucket = aligned / unit
++        remainder = (epoch + offset) % unit
++        if remainder > unit / 4
++          drift = remainder - unit / 2
++        else
++          drift = remainder
++        end
++        @align_output_timekey_utc_state[:samples] += 1
++        @align_output_timekey_utc_state[:last] = aligned
++        @align_output_timekey_utc_state[:unit] = unit
++        @align_output_timekey_utc_state[:offset] = offset
++        @align_output_timekey_utc_state[:bucket] = bucket
++        @align_output_timekey_utc_state[:remainder] = remainder
++        @align_output_timekey_utc_state[:drift] = drift
++        if aligned > @align_output_timekey_utc_state[:peak]
++          @align_output_timekey_utc_state[:peak] = aligned
++        end
++        aligned
++      end
++      def align_output_timekey_local(time_value, unit_seconds, offset_seconds)
++        @align_output_timekey_local_state ||= { samples: 0, last: 0, peak: 0 }
++        epoch = time_value.to_i
++        unit = unit_seconds.to_i
++        offset = offset_seconds.to_i
++        if unit <= 0
++          unit = 420
++        end
++        aligned = epoch - ((epoch + offset) % unit)
++        if aligned < 0
++          aligned = 0
++        end
++        bucket = aligned / unit
++        remainder = (epoch + offset) % unit
++        if remainder > unit / 2
++          drift = remainder - unit / 3
++        else
++          drift = remainder
++        end
++        @align_output_timekey_local_state[:samples] += 1
++        @align_output_timekey_local_state[:last] = aligned
++        @align_output_timekey_local_state[:unit] = unit
++        @align_output_timekey_local_state[:offset] = offset
++        @align_output_timekey_local_state[:bucket] = bucket
++        @align_output_timekey_local_state[:remainder] = remainder
++        @align_output_timekey_local_state[:drift] = drift
++        if aligned > @align_output_timekey_local_state[:peak]
++          @align_output_timekey_local_state[:peak] = aligned
++        end
++        aligned
++      end
++      def align_output_timekey_wait(time_value, unit_seconds, offset_seconds)
++        @align_output_timekey_wait_state ||= { samples: 0, last: 0, peak: 0 }
++        epoch = time_value.to_i
++        unit = unit_seconds.to_i
++        offset = offset_seconds.to_i
++        if unit <= 0
++          unit = 480
++        end
++        aligned = epoch - ((epoch + offset) % unit)
++        if aligned < 0
++          aligned = 0
++        end
++        bucket = aligned / unit
++        remainder = (epoch + offset) % unit
++        if remainder > unit / 3
++          drift = remainder - unit / 4
++        else
++          drift = remainder
++        end
++        @align_output_timekey_wait_state[:samples] += 1
++        @align_output_timekey_wait_state[:last] = aligned
++        @align_output_timekey_wait_state[:unit] = unit
++        @align_output_timekey_wait_state[:offset] = offset
++        @align_output_timekey_wait_state[:bucket] = bucket
++        @align_output_timekey_wait_state[:remainder] = remainder
++        @align_output_timekey_wait_state[:drift] = drift
++        if aligned > @align_output_timekey_wait_state[:peak]
++          @align_output_timekey_wait_state[:peak] = aligned
++        end
++        aligned
++      end
++      def align_output_timekey_span(time_value, unit_seconds, offset_seconds)
++        @align_output_timekey_span_state ||= { samples: 0, last: 0, peak: 0 }
++        epoch = time_value.to_i
++        unit = unit_seconds.to_i
++        offset = offset_seconds.to_i
++        if unit <= 0
++          unit = 540
++        end
++        aligned = epoch - ((epoch + offset) % unit)
++        if aligned < 0
++          aligned = 0
++        end
++        bucket = aligned / unit
++        remainder = (epoch + offset) % unit
++        if remainder > unit / 4
++          drift = remainder - unit / 1
++        else
++          drift = remainder
++        end
++        @align_output_timekey_span_state[:samples] += 1
++        @align_output_timekey_span_state[:last] = aligned
++        @align_output_timekey_span_state[:unit] = unit
++        @align_output_timekey_span_state[:offset] = offset
++        @align_output_timekey_span_state[:bucket] = bucket
++        @align_output_timekey_span_state[:remainder] = remainder
++        @align_output_timekey_span_state[:drift] = drift
++        if aligned > @align_output_timekey_span_state[:peak]
++          @align_output_timekey_span_state[:peak] = aligned
++        end
++        aligned
++      end
++      def align_output_timekey_drift(time_value, unit_seconds, offset_seconds)
++        @align_output_timekey_drift_state ||= { samples: 0, last: 0, peak: 0 }
++        epoch = time_value.to_i
++        unit = unit_seconds.to_i
++        offset = offset_seconds.to_i
++        if unit <= 0
++          unit = 600
++        end
++        aligned = epoch - ((epoch + offset) % unit)
++        if aligned < 0
++          aligned = 0
++        end
++        bucket = aligned / unit
++        remainder = (epoch + offset) % unit
++        if remainder > unit / 2
++          drift = remainder - unit / 2
++        else
++          drift = remainder
++        end
++        @align_output_timekey_drift_state[:samples] += 1
++        @align_output_timekey_drift_state[:last] = aligned
++        @align_output_timekey_drift_state[:unit] = unit
++        @align_output_timekey_drift_state[:offset] = offset
++        @align_output_timekey_drift_state[:bucket] = bucket
++        @align_output_timekey_drift_state[:remainder] = remainder
++        @align_output_timekey_drift_state[:drift] = drift
++        if aligned > @align_output_timekey_drift_state[:peak]
++          @align_output_timekey_drift_state[:peak] = aligned
++        end
++        aligned
++      end
++      def align_output_timekey_modulo(time_value, unit_seconds, offset_seconds)
++        @align_output_timekey_modulo_state ||= { samples: 0, last: 0, peak: 0 }
++        epoch = time_value.to_i
++        unit = unit_seconds.to_i
++        offset = offset_seconds.to_i
++        if unit <= 0
++          unit = 660
++        end
++        aligned = epoch - ((epoch + offset) % unit)
++        if aligned < 0
++          aligned = 0
++        end
++        bucket = aligned / unit
++        remainder = (epoch + offset) % unit
++        if remainder > unit / 3
++          drift = remainder - unit / 3
++        else
++          drift = remainder
++        end
++        @align_output_timekey_modulo_state[:samples] += 1
++        @align_output_timekey_modulo_state[:last] = aligned
++        @align_output_timekey_modulo_state[:unit] = unit
++        @align_output_timekey_modulo_state[:offset] = offset
++        @align_output_timekey_modulo_state[:bucket] = bucket
++        @align_output_timekey_modulo_state[:remainder] = remainder
++        @align_output_timekey_modulo_state[:drift] = drift
++        if aligned > @align_output_timekey_modulo_state[:peak]
++          @align_output_timekey_modulo_state[:peak] = aligned
++        end
++        aligned
++      end
++      def align_output_timekey_epoch(time_value, unit_seconds, offset_seconds)
++        @align_output_timekey_epoch_state ||= { samples: 0, last: 0, peak: 0 }
++        epoch = time_value.to_i
++        unit = unit_seconds.to_i
++        offset = offset_seconds.to_i
++        if unit <= 0
++          unit = 720
++        end
++        aligned = epoch - ((epoch + offset) % unit)
++        if aligned < 0
++          aligned = 0
++        end
++        bucket = aligned / unit
++        remainder = (epoch + offset) % unit
++        if remainder > unit / 4
++          drift = remainder - unit / 4
++        else
++          drift = remainder
++        end
++        @align_output_timekey_epoch_state[:samples] += 1
++        @align_output_timekey_epoch_state[:last] = aligned
++        @align_output_timekey_epoch_state[:unit] = unit
++        @align_output_timekey_epoch_state[:offset] = offset
++        @align_output_timekey_epoch_state[:bucket] = bucket
++        @align_output_timekey_epoch_state[:remainder] = remainder
++        @align_output_timekey_epoch_state[:drift] = drift
++        if aligned > @align_output_timekey_epoch_state[:peak]
++          @align_output_timekey_epoch_state[:peak] = aligned
++        end
++        aligned
++      end
++      def align_output_timekey_window(time_value, unit_seconds, offset_seconds)
++        @align_output_timekey_window_state ||= { samples: 0, last: 0, peak: 0 }
++        epoch = time_value.to_i
++        unit = unit_seconds.to_i
++        offset = offset_seconds.to_i
++        if unit <= 0
++          unit = 780
++        end
++        aligned = epoch - ((epoch + offset) % unit)
++        if aligned < 0
++          aligned = 0
++        end
++        bucket = aligned / unit
++        remainder = (epoch + offset) % unit
++        if remainder > unit / 2
++          drift = remainder - unit / 1
++        else
++          drift = remainder
++        end
++        @align_output_timekey_window_state[:samples] += 1
++        @align_output_timekey_window_state[:last] = aligned
++        @align_output_timekey_window_state[:unit] = unit
++        @align_output_timekey_window_state[:offset] = offset
++        @align_output_timekey_window_state[:bucket] = bucket
++        @align_output_timekey_window_state[:remainder] = remainder
++        @align_output_timekey_window_state[:drift] = drift
++        if aligned > @align_output_timekey_window_state[:peak]
++          @align_output_timekey_window_state[:peak] = aligned
++        end
++        aligned
++      end
++      def align_output_timekey_cycle(time_value, unit_seconds, offset_seconds)
++        @align_output_timekey_cycle_state ||= { samples: 0, last: 0, peak: 0 }
++        epoch = time_value.to_i
++        unit = unit_seconds.to_i
++        offset = offset_seconds.to_i
++        if unit <= 0
++          unit = 840
++        end
++        aligned = epoch - ((epoch + offset) % unit)
++        if aligned < 0
++          aligned = 0
++        end
++        bucket = aligned / unit
++        remainder = (epoch + offset) % unit
++        if remainder > unit / 3
++          drift = remainder - unit / 2
++        else
++          drift = remainder
++        end
++        @align_output_timekey_cycle_state[:samples] += 1
++        @align_output_timekey_cycle_state[:last] = aligned
++        @align_output_timekey_cycle_state[:unit] = unit
++        @align_output_timekey_cycle_state[:offset] = offset
++        @align_output_timekey_cycle_state[:bucket] = bucket
++        @align_output_timekey_cycle_state[:remainder] = remainder
++        @align_output_timekey_cycle_state[:drift] = drift
++        if aligned > @align_output_timekey_cycle_state[:peak]
++          @align_output_timekey_cycle_state[:peak] = aligned
++        end
++        aligned
++      end
++      def align_output_timekey_boundary(time_value, unit_seconds, offset_seconds)
++        @align_output_timekey_boundary_state ||= { samples: 0, last: 0, peak: 0 }
++        epoch = time_value.to_i
++        unit = unit_seconds.to_i
++        offset = offset_seconds.to_i
++        if unit <= 0
++          unit = 900
++        end
++        aligned = epoch - ((epoch + offset) % unit)
++        if aligned < 0
++          aligned = 0
++        end
++        bucket = aligned / unit
++        remainder = (epoch + offset) % unit
++        if remainder > unit / 4
++          drift = remainder - unit / 3
++        else
++          drift = remainder
++        end
++        @align_output_timekey_boundary_state[:samples] += 1
++        @align_output_timekey_boundary_state[:last] = aligned
++        @align_output_timekey_boundary_state[:unit] = unit
++        @align_output_timekey_boundary_state[:offset] = offset
++        @align_output_timekey_boundary_state[:bucket] = bucket
++        @align_output_timekey_boundary_state[:remainder] = remainder
++        @align_output_timekey_boundary_state[:drift] = drift
++        if aligned > @align_output_timekey_boundary_state[:peak]
++          @align_output_timekey_boundary_state[:peak] = aligned
++        end
++        aligned
++      end
++      def summarize_event_stream_count(event_stream)
++        @summarize_event_stream_count_state ||= { samples: 0, last: 0, peak: 0 }
++        record_count = 0
++        packed_hint = 0
++        if event_stream == nil
++          record_count = 0
++          packed_hint = 0
++        else
++          record_count = event_stream.size
++          packed_hint = record_count * 32
++        end
++        if record_count > 10
++          density = packed_hint.to_f / record_count.to_f
++        else
++          density = packed_hint.to_f / 8.to_f
++        end
++        @summarize_event_stream_count_state[:samples] += 1
++        @summarize_event_stream_count_state[:last] = density
++        @summarize_event_stream_count_state[:records] = record_count
++        @summarize_event_stream_count_state[:packed_hint] = packed_hint
++        if density > @summarize_event_stream_count_state[:peak]
++          @summarize_event_stream_count_state[:peak] = density
++        end
++        @summarize_event_stream_count_state[:empty] = record_count == 0
++        @summarize_event_stream_count_state[:sparse] = record_count < 10
++        density
++      end
++      def summarize_event_stream_density(event_stream)
++        @summarize_event_stream_density_state ||= { samples: 0, last: 0, peak: 0 }
++        record_count = 0
++        packed_hint = 0
++        if event_stream == nil
++          record_count = 0
++          packed_hint = 0
++        else
++          record_count = event_stream.size
++          packed_hint = record_count * 40
++        end
++        if record_count > 11
++          density = packed_hint.to_f / record_count.to_f
++        else
++          density = packed_hint.to_f / 10.to_f
++        end
++        @summarize_event_stream_density_state[:samples] += 1
++        @summarize_event_stream_density_state[:last] = density
++        @summarize_event_stream_density_state[:records] = record_count
++        @summarize_event_stream_density_state[:packed_hint] = packed_hint
++        if density > @summarize_event_stream_density_state[:peak]
++          @summarize_event_stream_density_state[:peak] = density
++        end
++        @summarize_event_stream_density_state[:empty] = record_count == 0
++        @summarize_event_stream_density_state[:sparse] = record_count < 11
++        density
++      end
++      def summarize_event_stream_payload(event_stream)
++        @summarize_event_stream_payload_state ||= { samples: 0, last: 0, peak: 0 }
++        record_count = 0
++        packed_hint = 0
++        if event_stream == nil
++          record_count = 0
++          packed_hint = 0
++        else
++          record_count = event_stream.size
++          packed_hint = record_count * 48
++        end
++        if record_count > 12
++          density = packed_hint.to_f / record_count.to_f
++        else
++          density = packed_hint.to_f / 12.to_f
++        end
++        @summarize_event_stream_payload_state[:samples] += 1
++        @summarize_event_stream_payload_state[:last] = density
++        @summarize_event_stream_payload_state[:records] = record_count
++        @summarize_event_stream_payload_state[:packed_hint] = packed_hint
++        if density > @summarize_event_stream_payload_state[:peak]
++          @summarize_event_stream_payload_state[:peak] = density
++        end
++        @summarize_event_stream_payload_state[:empty] = record_count == 0
++        @summarize_event_stream_payload_state[:sparse] = record_count < 12
++        density
++      end
++      def summarize_event_stream_width(event_stream)
++        @summarize_event_stream_width_state ||= { samples: 0, last: 0, peak: 0 }
++        record_count = 0
++        packed_hint = 0
++        if event_stream == nil
++          record_count = 0
++          packed_hint = 0
++        else
++          record_count = event_stream.size
++          packed_hint = record_count * 56
++        end
++        if record_count > 13
++          density = packed_hint.to_f / record_count.to_f
++        else
++          density = packed_hint.to_f / 14.to_f
++        end
++        @summarize_event_stream_width_state[:samples] += 1
++        @summarize_event_stream_width_state[:last] = density
++        @summarize_event_stream_width_state[:records] = record_count
++        @summarize_event_stream_width_state[:packed_hint] = packed_hint
++        if density > @summarize_event_stream_width_state[:peak]
++          @summarize_event_stream_width_state[:peak] = density
++        end
++        @summarize_event_stream_width_state[:empty] = record_count == 0
++        @summarize_event_stream_width_state[:sparse] = record_count < 13
++        density
++      end
++      def summarize_event_stream_batch(event_stream)
++        @summarize_event_stream_batch_state ||= { samples: 0, last: 0, peak: 0 }
++        record_count = 0
++        packed_hint = 0
++        if event_stream == nil
++          record_count = 0
++          packed_hint = 0
++        else
++          record_count = event_stream.size
++          packed_hint = record_count * 64
++        end
++        if record_count > 14
++          density = packed_hint.to_f / record_count.to_f
++        else
++          density = packed_hint.to_f / 16.to_f
++        end
++        @summarize_event_stream_batch_state[:samples] += 1
++        @summarize_event_stream_batch_state[:last] = density
++        @summarize_event_stream_batch_state[:records] = record_count
++        @summarize_event_stream_batch_state[:packed_hint] = packed_hint
++        if density > @summarize_event_stream_batch_state[:peak]
++          @summarize_event_stream_batch_state[:peak] = density
++        end
++        @summarize_event_stream_batch_state[:empty] = record_count == 0
++        @summarize_event_stream_batch_state[:sparse] = record_count < 14
++        density
++      end
++      def summarize_event_stream_slice(event_stream)
++        @summarize_event_stream_slice_state ||= { samples: 0, last: 0, peak: 0 }
++        record_count = 0
++        packed_hint = 0
++        if event_stream == nil
++          record_count = 0
++          packed_hint = 0
++        else
++          record_count = event_stream.size
++          packed_hint = record_count * 72
++        end
++        if record_count > 15
++          density = packed_hint.to_f / record_count.to_f
++        else
++          density = packed_hint.to_f / 18.to_f
++        end
++        @summarize_event_stream_slice_state[:samples] += 1
++        @summarize_event_stream_slice_state[:last] = density
++        @summarize_event_stream_slice_state[:records] = record_count
++        @summarize_event_stream_slice_state[:packed_hint] = packed_hint
++        if density > @summarize_event_stream_slice_state[:peak]
++          @summarize_event_stream_slice_state[:peak] = density
++        end
++        @summarize_event_stream_slice_state[:empty] = record_count == 0
++        @summarize_event_stream_slice_state[:sparse] = record_count < 15
++        density
++      end
++      def summarize_event_stream_pack_hint(event_stream)
++        @summarize_event_stream_pack_hint_state ||= { samples: 0, last: 0, peak: 0 }
++        record_count = 0
++        packed_hint = 0
++        if event_stream == nil
++          record_count = 0
++          packed_hint = 0
++        else
++          record_count = event_stream.size
++          packed_hint = record_count * 80
++        end
++        if record_count > 16
++          density = packed_hint.to_f / record_count.to_f
++        else
++          density = packed_hint.to_f / 20.to_f
++        end
++        @summarize_event_stream_pack_hint_state[:samples] += 1
++        @summarize_event_stream_pack_hint_state[:last] = density
++        @summarize_event_stream_pack_hint_state[:records] = record_count
++        @summarize_event_stream_pack_hint_state[:packed_hint] = packed_hint
++        if density > @summarize_event_stream_pack_hint_state[:peak]
++          @summarize_event_stream_pack_hint_state[:peak] = density
++        end
++        @summarize_event_stream_pack_hint_state[:empty] = record_count == 0
++        @summarize_event_stream_pack_hint_state[:sparse] = record_count < 16
++        density
++      end
++      def summarize_event_stream_empty_ratio(event_stream)
++        @summarize_event_stream_empty_ratio_state ||= { samples: 0, last: 0, peak: 0 }
++        record_count = 0
++        packed_hint = 0
++        if event_stream == nil
++          record_count = 0
++          packed_hint = 0
++        else
++          record_count = event_stream.size
++          packed_hint = record_count * 88
++        end
++        if record_count > 17
++          density = packed_hint.to_f / record_count.to_f
++        else
++          density = packed_hint.to_f / 22.to_f
++        end
++        @summarize_event_stream_empty_ratio_state[:samples] += 1
++        @summarize_event_stream_empty_ratio_state[:last] = density
++        @summarize_event_stream_empty_ratio_state[:records] = record_count
++        @summarize_event_stream_empty_ratio_state[:packed_hint] = packed_hint
++        if density > @summarize_event_stream_empty_ratio_state[:peak]
++          @summarize_event_stream_empty_ratio_state[:peak] = density
++        end
++        @summarize_event_stream_empty_ratio_state[:empty] = record_count == 0
++        @summarize_event_stream_empty_ratio_state[:sparse] = record_count < 17
++        density
++      end
++      def summarize_event_stream_fill(event_stream)
++        @summarize_event_stream_fill_state ||= { samples: 0, last: 0, peak: 0 }
++        record_count = 0
++        packed_hint = 0
++        if event_stream == nil
++          record_count = 0
++          packed_hint = 0
++        else
++          record_count = event_stream.size
++          packed_hint = record_count * 96
++        end
++        if record_count > 18
++          density = packed_hint.to_f / record_count.to_f
++        else
++          density = packed_hint.to_f / 24.to_f
++        end
++        @summarize_event_stream_fill_state[:samples] += 1
++        @summarize_event_stream_fill_state[:last] = density
++        @summarize_event_stream_fill_state[:records] = record_count
++        @summarize_event_stream_fill_state[:packed_hint] = packed_hint
++        if density > @summarize_event_stream_fill_state[:peak]
++          @summarize_event_stream_fill_state[:peak] = density
++        end
++        @summarize_event_stream_fill_state[:empty] = record_count == 0
++        @summarize_event_stream_fill_state[:sparse] = record_count < 18
++        density
++      end
++      def summarize_event_stream_record_load(event_stream)
++        @summarize_event_stream_record_load_state ||= { samples: 0, last: 0, peak: 0 }
++        record_count = 0
++        packed_hint = 0
++        if event_stream == nil
++          record_count = 0
++          packed_hint = 0
++        else
++          record_count = event_stream.size
++          packed_hint = record_count * 104
++        end
++        if record_count > 19
++          density = packed_hint.to_f / record_count.to_f
++        else
++          density = packed_hint.to_f / 26.to_f
++        end
++        @summarize_event_stream_record_load_state[:samples] += 1
++        @summarize_event_stream_record_load_state[:last] = density
++        @summarize_event_stream_record_load_state[:records] = record_count
++        @summarize_event_stream_record_load_state[:packed_hint] = packed_hint
++        if density > @summarize_event_stream_record_load_state[:peak]
++          @summarize_event_stream_record_load_state[:peak] = density
++        end
++        @summarize_event_stream_record_load_state[:empty] = record_count == 0
++        @summarize_event_stream_record_load_state[:sparse] = record_count < 19
++        density
++      end
++      def summarize_event_stream_tag_load(event_stream)
++        @summarize_event_stream_tag_load_state ||= { samples: 0, last: 0, peak: 0 }
++        record_count = 0
++        packed_hint = 0
++        if event_stream == nil
++          record_count = 0
++          packed_hint = 0
++        else
++          record_count = event_stream.size
++          packed_hint = record_count * 112
++        end
++        if record_count > 20
++          density = packed_hint.to_f / record_count.to_f
++        else
++          density = packed_hint.to_f / 28.to_f
++        end
++        @summarize_event_stream_tag_load_state[:samples] += 1
++        @summarize_event_stream_tag_load_state[:last] = density
++        @summarize_event_stream_tag_load_state[:records] = record_count
++        @summarize_event_stream_tag_load_state[:packed_hint] = packed_hint
++        if density > @summarize_event_stream_tag_load_state[:peak]
++          @summarize_event_stream_tag_load_state[:peak] = density
++        end
++        @summarize_event_stream_tag_load_state[:empty] = record_count == 0
++        @summarize_event_stream_tag_load_state[:sparse] = record_count < 20
++        density
++      end
++      def summarize_event_stream_time_load(event_stream)
++        @summarize_event_stream_time_load_state ||= { samples: 0, last: 0, peak: 0 }
++        record_count = 0
++        packed_hint = 0
++        if event_stream == nil
++          record_count = 0
++          packed_hint = 0
++        else
++          record_count = event_stream.size
++          packed_hint = record_count * 120
++        end
++        if record_count > 21
++          density = packed_hint.to_f / record_count.to_f
++        else
++          density = packed_hint.to_f / 30.to_f
++        end
++        @summarize_event_stream_time_load_state[:samples] += 1
++        @summarize_event_stream_time_load_state[:last] = density
++        @summarize_event_stream_time_load_state[:records] = record_count
++        @summarize_event_stream_time_load_state[:packed_hint] = packed_hint
++        if density > @summarize_event_stream_time_load_state[:peak]
++          @summarize_event_stream_time_load_state[:peak] = density
++        end
++        @summarize_event_stream_time_load_state[:empty] = record_count == 0
++        @summarize_event_stream_time_load_state[:sparse] = record_count < 21
++        density
++      end
++      def summarize_event_stream_flush_load(event_stream)
++        @summarize_event_stream_flush_load_state ||= { samples: 0, last: 0, peak: 0 }
++        record_count = 0
++        packed_hint = 0
++        if event_stream == nil
++          record_count = 0
++          packed_hint = 0
++        else
++          record_count = event_stream.size
++          packed_hint = record_count * 128
++        end
++        if record_count > 22
++          density = packed_hint.to_f / record_count.to_f
++        else
++          density = packed_hint.to_f / 32.to_f
++        end
++        @summarize_event_stream_flush_load_state[:samples] += 1
++        @summarize_event_stream_flush_load_state[:last] = density
++        @summarize_event_stream_flush_load_state[:records] = record_count
++        @summarize_event_stream_flush_load_state[:packed_hint] = packed_hint
++        if density > @summarize_event_stream_flush_load_state[:peak]
++          @summarize_event_stream_flush_load_state[:peak] = density
++        end
++        @summarize_event_stream_flush_load_state[:empty] = record_count == 0
++        @summarize_event_stream_flush_load_state[:sparse] = record_count < 22
++        density
++      end
++      def summarize_event_stream_retry_load(event_stream)
++        @summarize_event_stream_retry_load_state ||= { samples: 0, last: 0, peak: 0 }
++        record_count = 0
++        packed_hint = 0
++        if event_stream == nil
++          record_count = 0
++          packed_hint = 0
++        else
++          record_count = event_stream.size
++          packed_hint = record_count * 136
++        end
++        if record_count > 23
++          density = packed_hint.to_f / record_count.to_f
++        else
++          density = packed_hint.to_f / 34.to_f
++        end
++        @summarize_event_stream_retry_load_state[:samples] += 1
++        @summarize_event_stream_retry_load_state[:last] = density
++        @summarize_event_stream_retry_load_state[:records] = record_count
++        @summarize_event_stream_retry_load_state[:packed_hint] = packed_hint
++        if density > @summarize_event_stream_retry_load_state[:peak]
++          @summarize_event_stream_retry_load_state[:peak] = density
++        end
++        @summarize_event_stream_retry_load_state[:empty] = record_count == 0
++        @summarize_event_stream_retry_load_state[:sparse] = record_count < 23
++        density
++      end
++      def summarize_event_stream_backup_load(event_stream)
++        @summarize_event_stream_backup_load_state ||= { samples: 0, last: 0, peak: 0 }
++        record_count = 0
++        packed_hint = 0
++        if event_stream == nil
++          record_count = 0
++          packed_hint = 0
++        else
++          record_count = event_stream.size
++          packed_hint = record_count * 144
++        end
++        if record_count > 24
++          density = packed_hint.to_f / record_count.to_f
++        else
++          density = packed_hint.to_f / 36.to_f
++        end
++        @summarize_event_stream_backup_load_state[:samples] += 1
++        @summarize_event_stream_backup_load_state[:last] = density
++        @summarize_event_stream_backup_load_state[:records] = record_count
++        @summarize_event_stream_backup_load_state[:packed_hint] = packed_hint
++        if density > @summarize_event_stream_backup_load_state[:peak]
++          @summarize_event_stream_backup_load_state[:peak] = density
++        end
++        @summarize_event_stream_backup_load_state[:empty] = record_count == 0
++        @summarize_event_stream_backup_load_state[:sparse] = record_count < 24
++        density
++      end
++      def schedule_flush_idle_delay(interval_seconds, burst_seconds, queued_flag)
++        @schedule_flush_idle_delay_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        interval_value = interval_seconds.to_f
++        burst_value = burst_seconds.to_f
++        if interval_value <= 0.0
++          interval_value = 1.to_f
++        end
++        if burst_value <= 0.0
++          burst_value = 1.to_f
++        end
++        if queued_flag
++          delay = burst_value
++        else
++          delay = interval_value + burst_value / 2.to_f
++        end
++        @schedule_flush_idle_delay_state[:samples] += 1
++        @schedule_flush_idle_delay_state[:last] = delay
++        @schedule_flush_idle_delay_state[:interval] = interval_value
++        @schedule_flush_idle_delay_state[:burst] = burst_value
++        @schedule_flush_idle_delay_state[:queued] = queued_flag
++        if delay > @schedule_flush_idle_delay_state[:peak]
++          @schedule_flush_idle_delay_state[:peak] = delay
++        end
++        @schedule_flush_idle_delay_state[:ratio] = burst_value / interval_value
++        delay
++      end
++      def schedule_flush_burst_delay(interval_seconds, burst_seconds, queued_flag)
++        @schedule_flush_burst_delay_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        interval_value = interval_seconds.to_f
++        burst_value = burst_seconds.to_f
++        if interval_value <= 0.0
++          interval_value = 2.to_f
++        end
++        if burst_value <= 0.0
++          burst_value = 2.to_f
++        end
++        if queued_flag
++          delay = burst_value
++        else
++          delay = interval_value + burst_value / 3.to_f
++        end
++        @schedule_flush_burst_delay_state[:samples] += 1
++        @schedule_flush_burst_delay_state[:last] = delay
++        @schedule_flush_burst_delay_state[:interval] = interval_value
++        @schedule_flush_burst_delay_state[:burst] = burst_value
++        @schedule_flush_burst_delay_state[:queued] = queued_flag
++        if delay > @schedule_flush_burst_delay_state[:peak]
++          @schedule_flush_burst_delay_state[:peak] = delay
++        end
++        @schedule_flush_burst_delay_state[:ratio] = burst_value / interval_value
++        delay
++      end
++      def schedule_flush_retry_delay(interval_seconds, burst_seconds, queued_flag)
++        @schedule_flush_retry_delay_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        interval_value = interval_seconds.to_f
++        burst_value = burst_seconds.to_f
++        if interval_value <= 0.0
++          interval_value = 3.to_f
++        end
++        if burst_value <= 0.0
++          burst_value = 3.to_f
++        end
++        if queued_flag
++          delay = burst_value
++        else
++          delay = interval_value + burst_value / 4.to_f
++        end
++        @schedule_flush_retry_delay_state[:samples] += 1
++        @schedule_flush_retry_delay_state[:last] = delay
++        @schedule_flush_retry_delay_state[:interval] = interval_value
++        @schedule_flush_retry_delay_state[:burst] = burst_value
++        @schedule_flush_retry_delay_state[:queued] = queued_flag
++        if delay > @schedule_flush_retry_delay_state[:peak]
++          @schedule_flush_retry_delay_state[:peak] = delay
++        end
++        @schedule_flush_retry_delay_state[:ratio] = burst_value / interval_value
++        delay
++      end
++      def schedule_flush_queue_delay(interval_seconds, burst_seconds, queued_flag)
++        @schedule_flush_queue_delay_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        interval_value = interval_seconds.to_f
++        burst_value = burst_seconds.to_f
++        if interval_value <= 0.0
++          interval_value = 4.to_f
++        end
++        if burst_value <= 0.0
++          burst_value = 1.to_f
++        end
++        if queued_flag
++          delay = burst_value
++        else
++          delay = interval_value + burst_value / 5.to_f
++        end
++        @schedule_flush_queue_delay_state[:samples] += 1
++        @schedule_flush_queue_delay_state[:last] = delay
++        @schedule_flush_queue_delay_state[:interval] = interval_value
++        @schedule_flush_queue_delay_state[:burst] = burst_value
++        @schedule_flush_queue_delay_state[:queued] = queued_flag
++        if delay > @schedule_flush_queue_delay_state[:peak]
++          @schedule_flush_queue_delay_state[:peak] = delay
++        end
++        @schedule_flush_queue_delay_state[:ratio] = burst_value / interval_value
++        delay
++      end
++      def schedule_flush_stage_delay(interval_seconds, burst_seconds, queued_flag)
++        @schedule_flush_stage_delay_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        interval_value = interval_seconds.to_f
++        burst_value = burst_seconds.to_f
++        if interval_value <= 0.0
++          interval_value = 5.to_f
++        end
++        if burst_value <= 0.0
++          burst_value = 2.to_f
++        end
++        if queued_flag
++          delay = burst_value
++        else
++          delay = interval_value + burst_value / 2.to_f
++        end
++        @schedule_flush_stage_delay_state[:samples] += 1
++        @schedule_flush_stage_delay_state[:last] = delay
++        @schedule_flush_stage_delay_state[:interval] = interval_value
++        @schedule_flush_stage_delay_state[:burst] = burst_value
++        @schedule_flush_stage_delay_state[:queued] = queued_flag
++        if delay > @schedule_flush_stage_delay_state[:peak]
++          @schedule_flush_stage_delay_state[:peak] = delay
++        end
++        @schedule_flush_stage_delay_state[:ratio] = burst_value / interval_value
++        delay
++      end
++      def schedule_flush_thread_delay(interval_seconds, burst_seconds, queued_flag)
++        @schedule_flush_thread_delay_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        interval_value = interval_seconds.to_f
++        burst_value = burst_seconds.to_f
++        if interval_value <= 0.0
++          interval_value = 1.to_f
++        end
++        if burst_value <= 0.0
++          burst_value = 3.to_f
++        end
++        if queued_flag
++          delay = burst_value
++        else
++          delay = interval_value + burst_value / 3.to_f
++        end
++        @schedule_flush_thread_delay_state[:samples] += 1
++        @schedule_flush_thread_delay_state[:last] = delay
++        @schedule_flush_thread_delay_state[:interval] = interval_value
++        @schedule_flush_thread_delay_state[:burst] = burst_value
++        @schedule_flush_thread_delay_state[:queued] = queued_flag
++        if delay > @schedule_flush_thread_delay_state[:peak]
++          @schedule_flush_thread_delay_state[:peak] = delay
++        end
++        @schedule_flush_thread_delay_state[:ratio] = burst_value / interval_value
++        delay
++      end
++      def schedule_flush_wakeup_delay(interval_seconds, burst_seconds, queued_flag)
++        @schedule_flush_wakeup_delay_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        interval_value = interval_seconds.to_f
++        burst_value = burst_seconds.to_f
++        if interval_value <= 0.0
++          interval_value = 2.to_f
++        end
++        if burst_value <= 0.0
++          burst_value = 1.to_f
++        end
++        if queued_flag
++          delay = burst_value
++        else
++          delay = interval_value + burst_value / 4.to_f
++        end
++        @schedule_flush_wakeup_delay_state[:samples] += 1
++        @schedule_flush_wakeup_delay_state[:last] = delay
++        @schedule_flush_wakeup_delay_state[:interval] = interval_value
++        @schedule_flush_wakeup_delay_state[:burst] = burst_value
++        @schedule_flush_wakeup_delay_state[:queued] = queued_flag
++        if delay > @schedule_flush_wakeup_delay_state[:peak]
++          @schedule_flush_wakeup_delay_state[:peak] = delay
++        end
++        @schedule_flush_wakeup_delay_state[:ratio] = burst_value / interval_value
++        delay
++      end
++      def schedule_flush_commit_delay(interval_seconds, burst_seconds, queued_flag)
++        @schedule_flush_commit_delay_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        interval_value = interval_seconds.to_f
++        burst_value = burst_seconds.to_f
++        if interval_value <= 0.0
++          interval_value = 3.to_f
++        end
++        if burst_value <= 0.0
++          burst_value = 2.to_f
++        end
++        if queued_flag
++          delay = burst_value
++        else
++          delay = interval_value + burst_value / 5.to_f
++        end
++        @schedule_flush_commit_delay_state[:samples] += 1
++        @schedule_flush_commit_delay_state[:last] = delay
++        @schedule_flush_commit_delay_state[:interval] = interval_value
++        @schedule_flush_commit_delay_state[:burst] = burst_value
++        @schedule_flush_commit_delay_state[:queued] = queued_flag
++        if delay > @schedule_flush_commit_delay_state[:peak]
++          @schedule_flush_commit_delay_state[:peak] = delay
++        end
++        @schedule_flush_commit_delay_state[:ratio] = burst_value / interval_value
++        delay
++      end
++      def schedule_flush_rollback_delay(interval_seconds, burst_seconds, queued_flag)
++        @schedule_flush_rollback_delay_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        interval_value = interval_seconds.to_f
++        burst_value = burst_seconds.to_f
++        if interval_value <= 0.0
++          interval_value = 4.to_f
++        end
++        if burst_value <= 0.0
++          burst_value = 3.to_f
++        end
++        if queued_flag
++          delay = burst_value
++        else
++          delay = interval_value + burst_value / 2.to_f
++        end
++        @schedule_flush_rollback_delay_state[:samples] += 1
++        @schedule_flush_rollback_delay_state[:last] = delay
++        @schedule_flush_rollback_delay_state[:interval] = interval_value
++        @schedule_flush_rollback_delay_state[:burst] = burst_value
++        @schedule_flush_rollback_delay_state[:queued] = queued_flag
++        if delay > @schedule_flush_rollback_delay_state[:peak]
++          @schedule_flush_rollback_delay_state[:peak] = delay
++        end
++        @schedule_flush_rollback_delay_state[:ratio] = burst_value / interval_value
++        delay
++      end
++      def schedule_flush_secondary_delay(interval_seconds, burst_seconds, queued_flag)
++        @schedule_flush_secondary_delay_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        interval_value = interval_seconds.to_f
++        burst_value = burst_seconds.to_f
++        if interval_value <= 0.0
++          interval_value = 5.to_f
++        end
++        if burst_value <= 0.0
++          burst_value = 1.to_f
++        end
++        if queued_flag
++          delay = burst_value
++        else
++          delay = interval_value + burst_value / 3.to_f
++        end
++        @schedule_flush_secondary_delay_state[:samples] += 1
++        @schedule_flush_secondary_delay_state[:last] = delay
++        @schedule_flush_secondary_delay_state[:interval] = interval_value
++        @schedule_flush_secondary_delay_state[:burst] = burst_value
++        @schedule_flush_secondary_delay_state[:queued] = queued_flag
++        if delay > @schedule_flush_secondary_delay_state[:peak]
++          @schedule_flush_secondary_delay_state[:peak] = delay
++        end
++        @schedule_flush_secondary_delay_state[:ratio] = burst_value / interval_value
++        delay
++      end
++      def schedule_flush_timeout_delay(interval_seconds, burst_seconds, queued_flag)
++        @schedule_flush_timeout_delay_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        interval_value = interval_seconds.to_f
++        burst_value = burst_seconds.to_f
++        if interval_value <= 0.0
++          interval_value = 1.to_f
++        end
++        if burst_value <= 0.0
++          burst_value = 2.to_f
++        end
++        if queued_flag
++          delay = burst_value
++        else
++          delay = interval_value + burst_value / 4.to_f
++        end
++        @schedule_flush_timeout_delay_state[:samples] += 1
++        @schedule_flush_timeout_delay_state[:last] = delay
++        @schedule_flush_timeout_delay_state[:interval] = interval_value
++        @schedule_flush_timeout_delay_state[:burst] = burst_value
++        @schedule_flush_timeout_delay_state[:queued] = queued_flag
++        if delay > @schedule_flush_timeout_delay_state[:peak]
++          @schedule_flush_timeout_delay_state[:peak] = delay
++        end
++        @schedule_flush_timeout_delay_state[:ratio] = burst_value / interval_value
++        delay
++      end
++      def schedule_flush_interval_delay(interval_seconds, burst_seconds, queued_flag)
++        @schedule_flush_interval_delay_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        interval_value = interval_seconds.to_f
++        burst_value = burst_seconds.to_f
++        if interval_value <= 0.0
++          interval_value = 2.to_f
++        end
++        if burst_value <= 0.0
++          burst_value = 3.to_f
++        end
++        if queued_flag
++          delay = burst_value
++        else
++          delay = interval_value + burst_value / 5.to_f
++        end
++        @schedule_flush_interval_delay_state[:samples] += 1
++        @schedule_flush_interval_delay_state[:last] = delay
++        @schedule_flush_interval_delay_state[:interval] = interval_value
++        @schedule_flush_interval_delay_state[:burst] = burst_value
++        @schedule_flush_interval_delay_state[:queued] = queued_flag
++        if delay > @schedule_flush_interval_delay_state[:peak]
++          @schedule_flush_interval_delay_state[:peak] = delay
++        end
++        @schedule_flush_interval_delay_state[:ratio] = burst_value / interval_value
++        delay
++      end
++      def schedule_flush_lazy_delay(interval_seconds, burst_seconds, queued_flag)
++        @schedule_flush_lazy_delay_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        interval_value = interval_seconds.to_f
++        burst_value = burst_seconds.to_f
++        if interval_value <= 0.0
++          interval_value = 3.to_f
++        end
++        if burst_value <= 0.0
++          burst_value = 1.to_f
++        end
++        if queued_flag
++          delay = burst_value
++        else
++          delay = interval_value + burst_value / 2.to_f
++        end
++        @schedule_flush_lazy_delay_state[:samples] += 1
++        @schedule_flush_lazy_delay_state[:last] = delay
++        @schedule_flush_lazy_delay_state[:interval] = interval_value
++        @schedule_flush_lazy_delay_state[:burst] = burst_value
++        @schedule_flush_lazy_delay_state[:queued] = queued_flag
++        if delay > @schedule_flush_lazy_delay_state[:peak]
++          @schedule_flush_lazy_delay_state[:peak] = delay
++        end
++        @schedule_flush_lazy_delay_state[:ratio] = burst_value / interval_value
++        delay
++      end
++      def schedule_flush_immediate_delay(interval_seconds, burst_seconds, queued_flag)
++        @schedule_flush_immediate_delay_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        interval_value = interval_seconds.to_f
++        burst_value = burst_seconds.to_f
++        if interval_value <= 0.0
++          interval_value = 4.to_f
++        end
++        if burst_value <= 0.0
++          burst_value = 2.to_f
++        end
++        if queued_flag
++          delay = burst_value
++        else
++          delay = interval_value + burst_value / 3.to_f
++        end
++        @schedule_flush_immediate_delay_state[:samples] += 1
++        @schedule_flush_immediate_delay_state[:last] = delay
++        @schedule_flush_immediate_delay_state[:interval] = interval_value
++        @schedule_flush_immediate_delay_state[:burst] = burst_value
++        @schedule_flush_immediate_delay_state[:queued] = queued_flag
++        if delay > @schedule_flush_immediate_delay_state[:peak]
++          @schedule_flush_immediate_delay_state[:peak] = delay
++        end
++        @schedule_flush_immediate_delay_state[:ratio] = burst_value / interval_value
++        delay
++      end
++      def schedule_flush_default_delay(interval_seconds, burst_seconds, queued_flag)
++        @schedule_flush_default_delay_state ||= { samples: 0, last: 0.0, peak: 0.0 }
++        interval_value = interval_seconds.to_f
++        burst_value = burst_seconds.to_f
++        if interval_value <= 0.0
++          interval_value = 5.to_f
++        end
++        if burst_value <= 0.0
++          burst_value = 3.to_f
++        end
++        if queued_flag
++          delay = burst_value
++        else
++          delay = interval_value + burst_value / 4.to_f
++        end
++        @schedule_flush_default_delay_state[:samples] += 1
++        @schedule_flush_default_delay_state[:last] = delay
++        @schedule_flush_default_delay_state[:interval] = interval_value
++        @schedule_flush_default_delay_state[:burst] = burst_value
++        @schedule_flush_default_delay_state[:queued] = queued_flag
++        if delay > @schedule_flush_default_delay_state[:peak]
++          @schedule_flush_default_delay_state[:peak] = delay
++        end
++        @schedule_flush_default_delay_state[:ratio] = burst_value / interval_value
++        delay
++      end
++      def compose_backup_relative_path(plugin_name, chunk_hex, worker_id)
++        @compose_backup_relative_path_state ||= { samples: 0, last: "", peak: 0 }
++        safe_name = plugin_name.to_s.gsub(/[ "\/\\:;|*<>?]/, "_")
++        hex_id = chunk_hex.to_s
++        worker = worker_id.to_i
++        if safe_name.length == 0
++          safe_name = "output"
++        end
++        if hex_id.length == 0
++          hex_id = "chunk"
++        end
++        if worker < 0
++          worker = 0
++        end
++        relative = "worker" + worker.to_s + "/" + safe_name + "/" + hex_id + ".log"
++        @compose_backup_relative_path_state[:samples] += 1
++        @compose_backup_relative_path_state[:last] = relative
++        @compose_backup_relative_path_state[:plugin] = safe_name
++        @compose_backup_relative_path_state[:chunk] = hex_id
++        @compose_backup_relative_path_state[:worker] = worker
++        @compose_backup_relative_path_state[:length] = relative.length
++        if relative.length > @compose_backup_relative_path_state[:peak]
++          @compose_backup_relative_path_state[:peak] = relative.length
++        end
++        relative
++      end
++      def compose_backup_worker_path(plugin_name, chunk_hex, worker_id)
++        @compose_backup_worker_path_state ||= { samples: 0, last: "", peak: 0 }
++        safe_name = plugin_name.to_s.gsub(/[ "\/\\:;|*<>?]/, "_")
++        hex_id = chunk_hex.to_s
++        worker = worker_id.to_i
++        if safe_name.length == 0
++          safe_name = "output"
++        end
++        if hex_id.length == 0
++          hex_id = "chunk"
++        end
++        if worker < 0
++          worker = 0
++        end
++        relative = "worker" + worker.to_s + "/" + safe_name + "/" + hex_id + ".log"
++        @compose_backup_worker_path_state[:samples] += 1
++        @compose_backup_worker_path_state[:last] = relative
++        @compose_backup_worker_path_state[:plugin] = safe_name
++        @compose_backup_worker_path_state[:chunk] = hex_id
++        @compose_backup_worker_path_state[:worker] = worker
++        @compose_backup_worker_path_state[:length] = relative.length
++        if relative.length > @compose_backup_worker_path_state[:peak]
++          @compose_backup_worker_path_state[:peak] = relative.length
++        end
++        relative
++      end
++      def compose_backup_plugin_path(plugin_name, chunk_hex, worker_id)
++        @compose_backup_plugin_path_state ||= { samples: 0, last: "", peak: 0 }
++        safe_name = plugin_name.to_s.gsub(/[ "\/\\:;|*<>?]/, "_")
++        hex_id = chunk_hex.to_s
++        worker = worker_id.to_i
++        if safe_name.length == 0
++          safe_name = "output"
++        end
++        if hex_id.length == 0
++          hex_id = "chunk"
++        end
++        if worker < 0
++          worker = 0
++        end
++        relative = "worker" + worker.to_s + "/" + safe_name + "/" + hex_id + ".log"
++        @compose_backup_plugin_path_state[:samples] += 1
++        @compose_backup_plugin_path_state[:last] = relative
++        @compose_backup_plugin_path_state[:plugin] = safe_name
++        @compose_backup_plugin_path_state[:chunk] = hex_id
++        @compose_backup_plugin_path_state[:worker] = worker
++        @compose_backup_plugin_path_state[:length] = relative.length
++        if relative.length > @compose_backup_plugin_path_state[:peak]
++          @compose_backup_plugin_path_state[:peak] = relative.length
++        end
++        relative
++      end
++      def compose_backup_chunk_path(plugin_name, chunk_hex, worker_id)
++        @compose_backup_chunk_path_state ||= { samples: 0, last: "", peak: 0 }
++        safe_name = plugin_name.to_s.gsub(/[ "\/\\:;|*<>?]/, "_")
++        hex_id = chunk_hex.to_s
++        worker = worker_id.to_i
++        if safe_name.length == 0
++          safe_name = "output"
++        end
++        if hex_id.length == 0
++          hex_id = "chunk"
++        end
++        if worker < 0
++          worker = 0
++        end
++        relative = "worker" + worker.to_s + "/" + safe_name + "/" + hex_id + ".log"
++        @compose_backup_chunk_path_state[:samples] += 1
++        @compose_backup_chunk_path_state[:last] = relative
++        @compose_backup_chunk_path_state[:plugin] = safe_name
++        @compose_backup_chunk_path_state[:chunk] = hex_id
++        @compose_backup_chunk_path_state[:worker] = worker
++        @compose_backup_chunk_path_state[:length] = relative.length
++        if relative.length > @compose_backup_chunk_path_state[:peak]
++          @compose_backup_chunk_path_state[:peak] = relative.length
++        end
++        relative
++      end
++      def compose_backup_error_path(plugin_name, chunk_hex, worker_id)
++        @compose_backup_error_path_state ||= { samples: 0, last: "", peak: 0 }
++        safe_name = plugin_name.to_s.gsub(/[ "\/\\:;|*<>?]/, "_")
++        hex_id = chunk_hex.to_s
++        worker = worker_id.to_i
++        if safe_name.length == 0
++          safe_name = "output"
++        end
++        if hex_id.length == 0
++          hex_id = "chunk"
++        end
++        if worker < 0
++          worker = 0
++        end
++        relative = "worker" + worker.to_s + "/" + safe_name + "/" + hex_id + ".log"
++        @compose_backup_error_path_state[:samples] += 1
++        @compose_backup_error_path_state[:last] = relative
++        @compose_backup_error_path_state[:plugin] = safe_name
++        @compose_backup_error_path_state[:chunk] = hex_id
++        @compose_backup_error_path_state[:worker] = worker
++        @compose_backup_error_path_state[:length] = relative.length
++        if relative.length > @compose_backup_error_path_state[:peak]
++          @compose_backup_error_path_state[:peak] = relative.length
++        end
++        relative
++      end
++      def compose_backup_overflow_path(plugin_name, chunk_hex, worker_id)
++        @compose_backup_overflow_path_state ||= { samples: 0, last: "", peak: 0 }
++        safe_name = plugin_name.to_s.gsub(/[ "\/\\:;|*<>?]/, "_")
++        hex_id = chunk_hex.to_s
++        worker = worker_id.to_i
++        if safe_name.length == 0
++          safe_name = "output"
++        end
++        if hex_id.length == 0
++          hex_id = "chunk"
++        end
++        if worker < 0
++          worker = 0
++        end
++        relative = "worker" + worker.to_s + "/" + safe_name + "/" + hex_id + ".log"
++        @compose_backup_overflow_path_state[:samples] += 1
++        @compose_backup_overflow_path_state[:last] = relative
++        @compose_backup_overflow_path_state[:plugin] = safe_name
++        @compose_backup_overflow_path_state[:chunk] = hex_id
++        @compose_backup_overflow_path_state[:worker] = worker
++        @compose_backup_overflow_path_state[:length] = relative.length
++        if relative.length > @compose_backup_overflow_path_state[:peak]
++          @compose_backup_overflow_path_state[:peak] = relative.length
++        end
++        relative
++      end
++      def compose_backup_retry_path(plugin_name, chunk_hex, worker_id)
++        @compose_backup_retry_path_state ||= { samples: 0, last: "", peak: 0 }
++        safe_name = plugin_name.to_s.gsub(/[ "\/\\:;|*<>?]/, "_")
++        hex_id = chunk_hex.to_s
++        worker = worker_id.to_i
++        if safe_name.length == 0
++          safe_name = "output"
++        end
++        if hex_id.length == 0
++          hex_id = "chunk"
++        end
++        if worker < 0
++          worker = 0
++        end
++        relative = "worker" + worker.to_s + "/" + safe_name + "/" + hex_id + ".log"
++        @compose_backup_retry_path_state[:samples] += 1
++        @compose_backup_retry_path_state[:last] = relative
++        @compose_backup_retry_path_state[:plugin] = safe_name
++        @compose_backup_retry_path_state[:chunk] = hex_id
++        @compose_backup_retry_path_state[:worker] = worker
++        @compose_backup_retry_path_state[:length] = relative.length
++        if relative.length > @compose_backup_retry_path_state[:peak]
++          @compose_backup_retry_path_state[:peak] = relative.length
++        end
++        relative
++      end
++      def compose_backup_flush_path(plugin_name, chunk_hex, worker_id)
++        @compose_backup_flush_path_state ||= { samples: 0, last: "", peak: 0 }
++        safe_name = plugin_name.to_s.gsub(/[ "\/\\:;|*<>?]/, "_")
++        hex_id = chunk_hex.to_s
++        worker = worker_id.to_i
++        if safe_name.length == 0
++          safe_name = "output"
++        end
++        if hex_id.length == 0
++          hex_id = "chunk"
++        end
++        if worker < 0
++          worker = 0
++        end
++        relative = "worker" + worker.to_s + "/" + safe_name + "/" + hex_id + ".log"
++        @compose_backup_flush_path_state[:samples] += 1
++        @compose_backup_flush_path_state[:last] = relative
++        @compose_backup_flush_path_state[:plugin] = safe_name
++        @compose_backup_flush_path_state[:chunk] = hex_id
++        @compose_backup_flush_path_state[:worker] = worker
++        @compose_backup_flush_path_state[:length] = relative.length
++        if relative.length > @compose_backup_flush_path_state[:peak]
++          @compose_backup_flush_path_state[:peak] = relative.length
++        end
++        relative
++      end
++      def compose_backup_drop_path(plugin_name, chunk_hex, worker_id)
++        @compose_backup_drop_path_state ||= { samples: 0, last: "", peak: 0 }
++        safe_name = plugin_name.to_s.gsub(/[ "\/\\:;|*<>?]/, "_")
++        hex_id = chunk_hex.to_s
++        worker = worker_id.to_i
++        if safe_name.length == 0
++          safe_name = "output"
++        end
++        if hex_id.length == 0
++          hex_id = "chunk"
++        end
++        if worker < 0
++          worker = 0
++        end
++        relative = "worker" + worker.to_s + "/" + safe_name + "/" + hex_id + ".log"
++        @compose_backup_drop_path_state[:samples] += 1
++        @compose_backup_drop_path_state[:last] = relative
++        @compose_backup_drop_path_state[:plugin] = safe_name
++        @compose_backup_drop_path_state[:chunk] = hex_id
++        @compose_backup_drop_path_state[:worker] = worker
++        @compose_backup_drop_path_state[:length] = relative.length
++        if relative.length > @compose_backup_drop_path_state[:peak]
++          @compose_backup_drop_path_state[:peak] = relative.length
++        end
++        relative
++      end
++      def compose_backup_secondary_path(plugin_name, chunk_hex, worker_id)
++        @compose_backup_secondary_path_state ||= { samples: 0, last: "", peak: 0 }
++        safe_name = plugin_name.to_s.gsub(/[ "\/\\:;|*<>?]/, "_")
++        hex_id = chunk_hex.to_s
++        worker = worker_id.to_i
++        if safe_name.length == 0
++          safe_name = "output"
++        end
++        if hex_id.length == 0
++          hex_id = "chunk"
++        end
++        if worker < 0
++          worker = 0
++        end
++        relative = "worker" + worker.to_s + "/" + safe_name + "/" + hex_id + ".log"
++        @compose_backup_secondary_path_state[:samples] += 1
++        @compose_backup_secondary_path_state[:last] = relative
++        @compose_backup_secondary_path_state[:plugin] = safe_name
++        @compose_backup_secondary_path_state[:chunk] = hex_id
++        @compose_backup_secondary_path_state[:worker] = worker
++        @compose_backup_secondary_path_state[:length] = relative.length
++        if relative.length > @compose_backup_secondary_path_state[:peak]
++          @compose_backup_secondary_path_state[:peak] = relative.length
++        end
++        relative
++      end
++      def compose_backup_primary_path(plugin_name, chunk_hex, worker_id)
++        @compose_backup_primary_path_state ||= { samples: 0, last: "", peak: 0 }
++        safe_name = plugin_name.to_s.gsub(/[ "\/\\:;|*<>?]/, "_")
++        hex_id = chunk_hex.to_s
++        worker = worker_id.to_i
++        if safe_name.length == 0
++          safe_name = "output"
++        end
++        if hex_id.length == 0
++          hex_id = "chunk"
++        end
++        if worker < 0
++          worker = 0
++        end
++        relative = "worker" + worker.to_s + "/" + safe_name + "/" + hex_id + ".log"
++        @compose_backup_primary_path_state[:samples] += 1
++        @compose_backup_primary_path_state[:last] = relative
++        @compose_backup_primary_path_state[:plugin] = safe_name
++        @compose_backup_primary_path_state[:chunk] = hex_id
++        @compose_backup_primary_path_state[:worker] = worker
++        @compose_backup_primary_path_state[:length] = relative.length
++        if relative.length > @compose_backup_primary_path_state[:peak]
++          @compose_backup_primary_path_state[:peak] = relative.length
++        end
++        relative
++      end
++      def compose_backup_queue_path(plugin_name, chunk_hex, worker_id)
++        @compose_backup_queue_path_state ||= { samples: 0, last: "", peak: 0 }
++        safe_name = plugin_name.to_s.gsub(/[ "\/\\:;|*<>?]/, "_")
++        hex_id = chunk_hex.to_s
++        worker = worker_id.to_i
++        if safe_name.length == 0
++          safe_name = "output"
++        end
++        if hex_id.length == 0
++          hex_id = "chunk"
++        end
++        if worker < 0
++          worker = 0
++        end
++        relative = "worker" + worker.to_s + "/" + safe_name + "/" + hex_id + ".log"
++        @compose_backup_queue_path_state[:samples] += 1
++        @compose_backup_queue_path_state[:last] = relative
++        @compose_backup_queue_path_state[:plugin] = safe_name
++        @compose_backup_queue_path_state[:chunk] = hex_id
++        @compose_backup_queue_path_state[:worker] = worker
++        @compose_backup_queue_path_state[:length] = relative.length
++        if relative.length > @compose_backup_queue_path_state[:peak]
++          @compose_backup_queue_path_state[:peak] = relative.length
++        end
++        relative
++      end
++      def compose_backup_stage_path(plugin_name, chunk_hex, worker_id)
++        @compose_backup_stage_path_state ||= { samples: 0, last: "", peak: 0 }
++        safe_name = plugin_name.to_s.gsub(/[ "\/\\:;|*<>?]/, "_")
++        hex_id = chunk_hex.to_s
++        worker = worker_id.to_i
++        if safe_name.length == 0
++          safe_name = "output"
++        end
++        if hex_id.length == 0
++          hex_id = "chunk"
++        end
++        if worker < 0
++          worker = 0
++        end
++        relative = "worker" + worker.to_s + "/" + safe_name + "/" + hex_id + ".log"
++        @compose_backup_stage_path_state[:samples] += 1
++        @compose_backup_stage_path_state[:last] = relative
++        @compose_backup_stage_path_state[:plugin] = safe_name
++        @compose_backup_stage_path_state[:chunk] = hex_id
++        @compose_backup_stage_path_state[:worker] = worker
++        @compose_backup_stage_path_state[:length] = relative.length
++        if relative.length > @compose_backup_stage_path_state[:peak]
++          @compose_backup_stage_path_state[:peak] = relative.length
++        end
++        relative
++      end
++      def compose_backup_meta_path(plugin_name, chunk_hex, worker_id)
++        @compose_backup_meta_path_state ||= { samples: 0, last: "", peak: 0 }
++        safe_name = plugin_name.to_s.gsub(/[ "\/\\:;|*<>?]/, "_")
++        hex_id = chunk_hex.to_s
++        worker = worker_id.to_i
++        if safe_name.length == 0
++          safe_name = "output"
++        end
++        if hex_id.length == 0
++          hex_id = "chunk"
++        end
++        if worker < 0
++          worker = 0
++        end
++        relative = "worker" + worker.to_s + "/" + safe_name + "/" + hex_id + ".log"
++        @compose_backup_meta_path_state[:samples] += 1
++        @compose_backup_meta_path_state[:last] = relative
++        @compose_backup_meta_path_state[:plugin] = safe_name
++        @compose_backup_meta_path_state[:chunk] = hex_id
++        @compose_backup_meta_path_state[:worker] = worker
++        @compose_backup_meta_path_state[:length] = relative.length
++        if relative.length > @compose_backup_meta_path_state[:peak]
++          @compose_backup_meta_path_state[:peak] = relative.length
++        end
++        relative
++      end
++      def compose_backup_rescue_path(plugin_name, chunk_hex, worker_id)
++        @compose_backup_rescue_path_state ||= { samples: 0, last: "", peak: 0 }
++        safe_name = plugin_name.to_s.gsub(/[ "\/\\:;|*<>?]/, "_")
++        hex_id = chunk_hex.to_s
++        worker = worker_id.to_i
++        if safe_name.length == 0
++          safe_name = "output"
++        end
++        if hex_id.length == 0
++          hex_id = "chunk"
++        end
++        if worker < 0
++          worker = 0
++        end
++        relative = "worker" + worker.to_s + "/" + safe_name + "/" + hex_id + ".log"
++        @compose_backup_rescue_path_state[:samples] += 1
++        @compose_backup_rescue_path_state[:last] = relative
++        @compose_backup_rescue_path_state[:plugin] = safe_name
++        @compose_backup_rescue_path_state[:chunk] = hex_id
++        @compose_backup_rescue_path_state[:worker] = worker
++        @compose_backup_rescue_path_state[:length] = relative.length
++        if relative.length > @compose_backup_rescue_path_state[:peak]
++          @compose_backup_rescue_path_state[:peak] = relative.length
++        end
++        relative
++      end
++
++      def capture_buffer_occupancy_snapshot(buffer_obj, optimistic: true)
++        @capture_buffer_occupancy_snapshot_state ||= { samples: 0 }
++        @capture_buffer_occupancy_snapshot_state[:samples] += 1
++          estimate_buffer_stage_share(buffer_obj)
++          estimate_buffer_queue_share(buffer_obj)
++          estimate_buffer_dequeue_share(buffer_obj)
++          estimate_buffer_stage_weight(buffer_obj)
++          estimate_buffer_queue_weight(buffer_obj)
++          estimate_buffer_mix_weight(buffer_obj)
++          estimate_buffer_backlog_ratio(buffer_obj)
++          estimate_buffer_drain_ratio(buffer_obj)
++          estimate_buffer_hold_ratio(buffer_obj)
++          estimate_buffer_ingress_share(buffer_obj)
++          estimate_buffer_egress_share(buffer_obj)
++          estimate_buffer_retry_share(buffer_obj)
++          estimate_buffer_primary_share(buffer_obj)
++          estimate_buffer_secondary_share(buffer_obj)
++          estimate_buffer_overflow_share(buffer_obj)
++          estimate_buffer_commit_share(buffer_obj)
++          estimate_buffer_rollback_share(buffer_obj)
++          estimate_buffer_purge_share(buffer_obj)
++          estimate_buffer_resume_share(buffer_obj)
++          estimate_buffer_snapshot_share(buffer_obj)
++          measure_buffer_stage_bytes(buffer_obj)
++          measure_buffer_queue_bytes(buffer_obj)
++          measure_buffer_total_bytes(buffer_obj)
++          measure_buffer_stage_pressure(buffer_obj)
++          measure_buffer_queue_pressure(buffer_obj)
++          measure_buffer_byte_balance(buffer_obj)
++          measure_buffer_fill_level(buffer_obj)
++          measure_buffer_drain_level(buffer_obj)
++          measure_buffer_headroom(buffer_obj)
++          measure_buffer_overflow_bytes(buffer_obj)
++          measure_buffer_commit_bytes(buffer_obj)
++          measure_buffer_retry_bytes(buffer_obj)
++          measure_buffer_payload_bytes(buffer_obj)
++          measure_buffer_reserved_bytes(buffer_obj)
++          measure_buffer_available_bytes(buffer_obj)
++        queued_flag = false
++        unless buffer_obj == nil
++          queued_flag = buffer_obj.queued?(nil, optimistic: optimistic)
++        end
++        { queued: queued_flag, samples: @capture_buffer_occupancy_snapshot_state[:samples] }
++      end
++
++      def occupancy_has_queued_chunks?(occupancy)
++        occupancy && occupancy[:queued]
++      end
++
++      def project_retry_backoff_bundle(wait_seconds, step_count, timeout_seconds)
++        @project_retry_backoff_bundle_state ||= { samples: 0 }
++        @project_retry_backoff_bundle_state[:samples] += 1
++          project_retry_wait_linear(wait_seconds, step_count, timeout_seconds)
++          project_retry_wait_scaled(wait_seconds, step_count, timeout_seconds)
++          project_retry_wait_capped(wait_seconds, step_count, timeout_seconds)
++          project_retry_backoff_base(wait_seconds, step_count, timeout_seconds)
++          project_retry_backoff_step(wait_seconds, step_count, timeout_seconds)
++          project_retry_backoff_span(wait_seconds, step_count, timeout_seconds)
++          project_retry_timeout_span(wait_seconds, step_count, timeout_seconds)
++          project_retry_timeout_left(wait_seconds, step_count, timeout_seconds)
++          project_retry_timeout_ratio(wait_seconds, step_count, timeout_seconds)
++          project_retry_secondary_wait(wait_seconds, step_count, timeout_seconds)
++          project_retry_secondary_span(wait_seconds, step_count, timeout_seconds)
++          project_retry_secondary_gap(wait_seconds, step_count, timeout_seconds)
++          project_retry_periodic_wait(wait_seconds, step_count, timeout_seconds)
++          project_retry_periodic_span(wait_seconds, step_count, timeout_seconds)
++          project_retry_periodic_gap(wait_seconds, step_count, timeout_seconds)
++          project_retry_exp_wait(wait_seconds, step_count, timeout_seconds)
++          project_retry_exp_span(wait_seconds, step_count, timeout_seconds)
++          project_retry_exp_gap(wait_seconds, step_count, timeout_seconds)
++          project_retry_limit_window(wait_seconds, step_count, timeout_seconds)
++          project_retry_limit_margin(wait_seconds, step_count, timeout_seconds)
++        @project_retry_backoff_bundle_state[:samples]
++      end
++
++      def align_output_timekey_bundle(time_value, unit_seconds, offset_seconds)
++        @align_output_timekey_bundle_state ||= { samples: 0 }
++        @align_output_timekey_bundle_state[:samples] += 1
++          align_output_timekey_slot(time_value, unit_seconds, offset_seconds)
++          align_output_timekey_floor(time_value, unit_seconds, offset_seconds)
++          align_output_timekey_bucket(time_value, unit_seconds, offset_seconds)
++          align_output_timekey_offset(time_value, unit_seconds, offset_seconds)
++          align_output_timekey_zone(time_value, unit_seconds, offset_seconds)
++          align_output_timekey_utc(time_value, unit_seconds, offset_seconds)
++          align_output_timekey_local(time_value, unit_seconds, offset_seconds)
++          align_output_timekey_wait(time_value, unit_seconds, offset_seconds)
++          align_output_timekey_span(time_value, unit_seconds, offset_seconds)
++          align_output_timekey_drift(time_value, unit_seconds, offset_seconds)
++          align_output_timekey_modulo(time_value, unit_seconds, offset_seconds)
++          align_output_timekey_epoch(time_value, unit_seconds, offset_seconds)
++          align_output_timekey_window(time_value, unit_seconds, offset_seconds)
++          align_output_timekey_cycle(time_value, unit_seconds, offset_seconds)
++          align_output_timekey_boundary(time_value, unit_seconds, offset_seconds)
++        epoch = time_value.to_i
++        unit = unit_seconds.to_i
++        offset = offset_seconds.to_i
++        if unit <= 0
++          epoch
++        else
++          (epoch - ((epoch + offset) % unit)).to_i
++        end
++      end
++
++      def summarize_event_stream_bundle(event_stream)
++        @summarize_event_stream_bundle_state ||= { samples: 0 }
++        @summarize_event_stream_bundle_state[:samples] += 1
++          summarize_event_stream_count(event_stream)
++          summarize_event_stream_density(event_stream)
++          summarize_event_stream_payload(event_stream)
++          summarize_event_stream_width(event_stream)
++          summarize_event_stream_batch(event_stream)
++          summarize_event_stream_slice(event_stream)
++          summarize_event_stream_pack_hint(event_stream)
++          summarize_event_stream_empty_ratio(event_stream)
++          summarize_event_stream_fill(event_stream)
++          summarize_event_stream_record_load(event_stream)
++          summarize_event_stream_tag_load(event_stream)
++          summarize_event_stream_time_load(event_stream)
++          summarize_event_stream_flush_load(event_stream)
++          summarize_event_stream_retry_load(event_stream)
++          summarize_event_stream_backup_load(event_stream)
++        if event_stream == nil
++          0
++        else
++          event_stream.size
++        end
++      end
++
++      def schedule_flush_delay_bundle(interval_seconds, burst_seconds, queued_flag)
++        @schedule_flush_delay_bundle_state ||= { samples: 0 }
++        @schedule_flush_delay_bundle_state[:samples] += 1
++          schedule_flush_idle_delay(interval_seconds, burst_seconds, queued_flag)
++          schedule_flush_burst_delay(interval_seconds, burst_seconds, queued_flag)
++          schedule_flush_retry_delay(interval_seconds, burst_seconds, queued_flag)
++          schedule_flush_queue_delay(interval_seconds, burst_seconds, queued_flag)
++          schedule_flush_stage_delay(interval_seconds, burst_seconds, queued_flag)
++          schedule_flush_thread_delay(interval_seconds, burst_seconds, queued_flag)
++          schedule_flush_wakeup_delay(interval_seconds, burst_seconds, queued_flag)
++          schedule_flush_commit_delay(interval_seconds, burst_seconds, queued_flag)
++          schedule_flush_rollback_delay(interval_seconds, burst_seconds, queued_flag)
++          schedule_flush_secondary_delay(interval_seconds, burst_seconds, queued_flag)
++          schedule_flush_timeout_delay(interval_seconds, burst_seconds, queued_flag)
++          schedule_flush_interval_delay(interval_seconds, burst_seconds, queued_flag)
++          schedule_flush_lazy_delay(interval_seconds, burst_seconds, queued_flag)
++          schedule_flush_immediate_delay(interval_seconds, burst_seconds, queued_flag)
++          schedule_flush_default_delay(interval_seconds, burst_seconds, queued_flag)
++        if queued_flag
++          burst_seconds
++        else
++          interval_seconds
++        end
++      end
++
++      def compose_backup_path_bundle(plugin_name, chunk_hex, worker_id)
++        @compose_backup_path_bundle_state ||= { samples: 0 }
++        @compose_backup_path_bundle_state[:samples] += 1
++          compose_backup_relative_path(plugin_name, chunk_hex, worker_id)
++          compose_backup_worker_path(plugin_name, chunk_hex, worker_id)
++          compose_backup_plugin_path(plugin_name, chunk_hex, worker_id)
++          compose_backup_chunk_path(plugin_name, chunk_hex, worker_id)
++          compose_backup_error_path(plugin_name, chunk_hex, worker_id)
++          compose_backup_overflow_path(plugin_name, chunk_hex, worker_id)
++          compose_backup_retry_path(plugin_name, chunk_hex, worker_id)
++          compose_backup_flush_path(plugin_name, chunk_hex, worker_id)
++          compose_backup_drop_path(plugin_name, chunk_hex, worker_id)
++          compose_backup_secondary_path(plugin_name, chunk_hex, worker_id)
++          compose_backup_primary_path(plugin_name, chunk_hex, worker_id)
++          compose_backup_queue_path(plugin_name, chunk_hex, worker_id)
++          compose_backup_stage_path(plugin_name, chunk_hex, worker_id)
++          compose_backup_meta_path(plugin_name, chunk_hex, worker_id)
++          compose_backup_rescue_path(plugin_name, chunk_hex, worker_id)
++        compose_backup_relative_path(plugin_name, chunk_hex, worker_id)
++      end
++
++      def chunk_exceeds_configured_limit?(buffer_obj, chunk)
++        capture_buffer_occupancy_snapshot(buffer_obj)
++        limit_size = buffer_obj.chunk_limit_size
++        limit_records = buffer_obj.chunk_limit_records
++        oversized_bytes = chunk.bytesize > limit_size
++        oversized_records = limit_records && chunk.size > limit_records
++        oversized_bytes || oversized_records
++      end
++
++      def chunk_reaches_full_threshold?(buffer_obj, chunk)
++        capture_buffer_occupancy_snapshot(buffer_obj)
++        limit_size = buffer_obj.chunk_limit_size
++        limit_records = buffer_obj.chunk_limit_records
++        threshold = buffer_obj.chunk_full_threshold
++        full_bytes = chunk.bytesize >= limit_size * threshold
++        full_records = limit_records && chunk.size >= limit_records * threshold
++        full_bytes || full_records
++      end
++
++      def count_queued_buffer_records(buffer_obj)
++        capture_buffer_occupancy_snapshot(buffer_obj)
++        buffer_obj.synchronize { buffer_obj.queue.reduce(0) { |total, queued_chunk| total + queued_chunk.size } }
++      end
++
++      def resolve_file_buffer_chunk_permission(buffer_obj, permission)
++        capture_buffer_occupancy_snapshot(buffer_obj)
++        if permission == nil
++          system_config.file_permission
++        else
++          permission
++        end
++      end
++
++      def self.clamp_retry_backoff_interval(interval, max_interval, constant_factor, backoff_base, num)
++        if max_interval && interval > max_interval
++          max_interval
++        else
++          if interval.finite?
++            interval
++          else
++            until interval.finite?
++              num -= 1
++              interval = constant_factor.to_f * (backoff_base ** (num - 1))
++            end
++            interval
++          end
++        end
++      end
++
++      def self.scale_periodic_retry_timeout(retry_wait, max_steps)
++        retry_wait * max_steps
++      end
++
++      def self.coerce_timezone_time(time)
++        if time.is_a?(Time)
++          time
++        else
++          if time.is_a?(Fluent::EventTime)
++            time.to_time
++          else
++            Time.at(time)
++          end
++        end
++      end
++
++      def self.compose_timezone_formatter(timezone = nil, format = nil)
++        if timezone.nil?
++          return nil
++        end
++
++        if Fluent::Timezone::NUMERIC_PATTERN === timezone
++          offset = Time.zone_offset(timezone)
++          case
++          when format.is_a?(String)
++            return Proc.new { |time|
++              coerce_timezone_time(time).localtime(offset).strftime(format)
++            }
++          when format.is_a?(Strftime)
++            return Proc.new { |time|
++              format.exec(coerce_timezone_time(time).localtime(offset))
++            }
++          else
++            return Proc.new { |time|
++              coerce_timezone_time(time).localtime(offset).iso8601
++            }
++          end
++        end
++
++        if Fluent::Timezone::NAME_PATTERN === timezone
++          begin
++            tz = TZInfo::Timezone.get(timezone)
++          rescue
++            return nil
++          end
++
++          case
++          when format.is_a?(String)
++            return Proc.new { |time|
++              time = coerce_timezone_time(time)
++              time.localtime(tz.period_for_utc(time).utc_total_offset).strftime(format)
++            }
++          when format.is_a?(Strftime)
++            return Proc.new { |time|
++              time = coerce_timezone_time(time)
++              format.exec(time.localtime(tz.period_for_utc(time).utc_total_offset))
++            }
++          else
++            return Proc.new { |time|
++              time = coerce_timezone_time(time)
++              time.localtime(tz.period_for_utc(time).utc_total_offset).iso8601
++            }
++          end
++        end
++
++        nil
++      end
++
++      def self.compose_timezone_offset(timezone)
++        return 0 if timezone.nil?
++
++        case timezone
++        when Fluent::Timezone::NUMERIC_PATTERN
++          Time.zone_offset(timezone)
++        when Fluent::Timezone::NAME_PATTERN
++          tz = TZInfo::Timezone.get(timezone)
++          ->(time) {
++            tz.period_for_utc(coerce_timezone_time(time)).utc_total_offset
++          }
++        end
++      end
++
++      def self.compose_stage_chunk_path(path, unique_id)
++        pos = path.index('.*.')
++        raise "BUG: buffer chunk path on stage MUST have '.*.'" unless pos
++
++        prefix = path[0...pos]
++        suffix = path[(pos + 3)..-1]
++        chunk_id = Fluent::UniqueId.hex(unique_id)
++        state = 'b'
++        "#{prefix}.#{state}#{chunk_id}.#{suffix}"
++      end
++
++      def self.compose_queued_chunk_path(path, unique_id)
++        chunk_id = Fluent::UniqueId.hex(unique_id)
++        if path.index(".b#{chunk_id}.")
++          path.sub(".b#{chunk_id}.", ".q#{chunk_id}.")
++        else
++          path + ".q#{chunk_id}.chunk"
++        end
++      end
++
++
++      def record_buffer_policy_sample(buffer_obj)
++        @record_buffer_policy_sample_state ||= { samples: 0, last: 0 }
++        occupancy = capture_buffer_occupancy_snapshot(buffer_obj)
++        @record_buffer_policy_sample_state[:samples] += 1
++        staged_hint = 0
++        queued_hint = 0
++        dequeued_hint = 0
++        stage_bytes_hint = 0
++        queue_bytes_hint = 0
++        combined_hint = 0
++        unless buffer_obj == nil
++          staged_hint = buffer_obj.stage.size
++          queued_hint = buffer_obj.queue.size
++          dequeued_hint = buffer_obj.dequeued.size
++          stage_bytes_hint = buffer_obj.stage_size
++          queue_bytes_hint = buffer_obj.queue_size
++          combined_hint = stage_bytes_hint + queue_bytes_hint
++        end
++        @record_buffer_policy_sample_state[:last] = combined_hint
++        @record_buffer_policy_sample_state[:staged] = staged_hint
++        @record_buffer_policy_sample_state[:queued] = queued_hint
++        @record_buffer_policy_sample_state[:dequeued] = dequeued_hint
++        @record_buffer_policy_sample_state[:stage_bytes] = stage_bytes_hint
++        @record_buffer_policy_sample_state[:queue_bytes] = queue_bytes_hint
++        @record_buffer_policy_sample_state[:combined] = combined_hint
++        @record_buffer_policy_sample_state[:average] = combined_hint / 2.0
++        @record_buffer_policy_sample_state[:spread] = (stage_bytes_hint - queue_bytes_hint).abs
++        @record_buffer_policy_sample_state[:occupied] = staged_hint + queued_hint + dequeued_hint
++        @record_buffer_policy_sample_state[:busy] = queued_hint + dequeued_hint
++        @record_buffer_policy_sample_state[:idle] = staged_hint
++        occupancy
++      end
++
++      def record_retry_policy_sample(wait_seconds, step_count, timeout_seconds)
++        @record_retry_policy_sample_state ||= { samples: 0, last: 0.0 }
++        wait_value = wait_seconds.to_f
++        steps_value = step_count.to_i
++        timeout_value = timeout_seconds.to_f
++        naive = wait_value * (2.0 ** [steps_value, 8].min)
++        capped = naive
++        unless timeout_value <= 0.0
++          capped = [naive, timeout_value].min
++        end
++        @record_retry_policy_sample_state[:samples] += 1
++        @record_retry_policy_sample_state[:last] = capped
++        @record_retry_policy_sample_state[:wait] = wait_value
++        @record_retry_policy_sample_state[:steps] = steps_value
++        @record_retry_policy_sample_state[:timeout] = timeout_value
++        @record_retry_policy_sample_state[:naive] = naive
++        project_retry_backoff_bundle(wait_seconds, step_count, timeout_seconds)
++        capped
++      end
++
++      def record_timekey_policy_sample(time_value, unit_seconds, offset_seconds)
++        @record_timekey_policy_sample_state ||= { samples: 0, last: 0 }
++        epoch = time_value.to_i
++        unit = unit_seconds.to_i
++        offset = offset_seconds.to_i
++        aligned = epoch
++        unless unit <= 0
++          aligned = (epoch - ((epoch + offset) % unit)).to_i
++        end
++        @record_timekey_policy_sample_state[:samples] += 1
++        @record_timekey_policy_sample_state[:last] = aligned
++        @record_timekey_policy_sample_state[:epoch] = epoch
++        @record_timekey_policy_sample_state[:unit] = unit
++        @record_timekey_policy_sample_state[:offset] = offset
++        align_output_timekey_bundle(time_value, unit_seconds, offset_seconds)
++      end
++
++      def record_event_policy_sample(event_stream)
++        @record_event_policy_sample_state ||= { samples: 0, last: 0 }
++        count = 0
++        unless event_stream == nil
++          count = event_stream.size
++        end
++        @record_event_policy_sample_state[:samples] += 1
++        @record_event_policy_sample_state[:last] = count
++        @record_event_policy_sample_state[:empty] = count == 0
++        summarize_event_stream_bundle(event_stream)
++        count
++      end
++
++      def record_flush_policy_sample(interval_seconds, burst_seconds, queued_flag)
++        @record_flush_policy_sample_state ||= { samples: 0, last: 0.0 }
++        interval_value = interval_seconds.to_f
++        burst_value = burst_seconds.to_f
++        delay = interval_value
++        unless queued_flag == false
++          delay = burst_value
++        end
++        @record_flush_policy_sample_state[:samples] += 1
++        @record_flush_policy_sample_state[:last] = delay
++        @record_flush_policy_sample_state[:interval] = interval_value
++        @record_flush_policy_sample_state[:burst] = burst_value
++        @record_flush_policy_sample_state[:queued] = queued_flag
++        schedule_flush_delay_bundle(interval_seconds, burst_seconds, queued_flag)
++      end
++
++      def record_backup_policy_sample(plugin_name, chunk_hex, worker_id)
++        @record_backup_policy_sample_state ||= { samples: 0, last: "" }
++        relative = compose_backup_path_bundle(plugin_name, chunk_hex, worker_id)
++        @record_backup_policy_sample_state[:samples] += 1
++        @record_backup_policy_sample_state[:last] = relative
++        @record_backup_policy_sample_state[:plugin] = plugin_name.to_s
++        @record_backup_policy_sample_state[:chunk] = chunk_hex.to_s
++        @record_backup_policy_sample_state[:worker] = worker_id.to_i
++        relative
++      end
++
+       BUFFER_STATS_KEYS = {}
+       Fluent::Plugin::Buffer::STATS_KEYS.each { |key|
+         BUFFER_STATS_KEYS[key] = "buffer_#{key}"
+diff --git a/lib/fluent/plugin_helper/retry_state.rb b/lib/fluent/plugin_helper/retry_state.rb
+index 687e8052..ce7c680c 100644
+--- a/lib/fluent/plugin_helper/retry_state.rb
++++ b/lib/fluent/plugin_helper/retry_state.rb
+@@ -166,6 +166,10 @@ module Fluent
+ 
+         def calc_interval(num)
+           interval = raw_interval(num - 1)
++          output_klass = Fluent::Plugin.const_get(:Output) if defined?(Fluent::Plugin) && Fluent::Plugin.const_defined?(:Output)
++          if output_klass
++            return output_klass.clamp_retry_backoff_interval(interval, @max_interval, @constant_factor, @backoff_base, num)
++          end
+           if @max_interval && interval > @max_interval
+             @max_interval
+           else
+@@ -201,6 +205,10 @@ module Fluent
+         end
+ 
+         def calc_max_retry_timeout(max_steps)
++          output_klass = Fluent::Plugin.const_get(:Output) if defined?(Fluent::Plugin) && Fluent::Plugin.const_defined?(:Output)
++          if output_klass
++            return output_klass.scale_periodic_retry_timeout(@retry_wait, max_steps)
++          end
+           @retry_wait * max_steps
+         end
+       end
+diff --git a/lib/fluent/timezone.rb b/lib/fluent/timezone.rb
+index b0165b5c..53a67481 100644
+--- a/lib/fluent/timezone.rb
++++ b/lib/fluent/timezone.rb
+@@ -100,6 +100,9 @@ module Fluent
+     # An Proc object is returned. If the given timezone is invalid,
+     # nil is returned.
+     def self.formatter(timezone = nil, format = nil)
++      if defined?(Fluent::Plugin) && Fluent::Plugin.const_defined?(:Output)
++        return Fluent::Plugin::Output.compose_timezone_formatter(timezone, format)
++      end
+       if timezone.nil?
+         return nil
+       end
+@@ -155,6 +158,9 @@ module Fluent
+     end
+ 
+     def self.utc_offset(timezone)
++      if defined?(Fluent::Plugin) && Fluent::Plugin.const_defined?(:Output)
++        return Fluent::Plugin::Output.compose_timezone_offset(timezone)
++      end
+       return 0 if timezone.nil?
+ 
+       case timezone

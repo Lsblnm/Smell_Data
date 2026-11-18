@@ -1,0 +1,155 @@
+diff --git a/tokio/src/fs/file.rs b/tokio/src/fs/file.rs
+index 78470664..ce6b6d33 100644
+--- a/tokio/src/fs/file.rs
++++ b/tokio/src/fs/file.rs
+@@ -11,7 +11,8 @@ use std::cmp;
+ use std::fmt;
+ use std::fs::{Metadata, Permissions};
+ use std::future::Future;
+-use std::io::{self, Seek, SeekFrom};
++use std::io::{self, Read, Seek, SeekFrom};
++use std::mem::MaybeUninit;
+ use std::path::Path;
+ use std::pin::Pin;
+ use std::sync::Arc;
+@@ -588,7 +589,7 @@ impl AsyncRead for File {
+     ) -> Poll<io::Result<()>> {
+         ready!(crate::trace::trace_leaf(cx));
+         let me = self.get_mut();
+-        let inner = me.inner.get_mut();
++        let inner = unsafe { &mut *me.inner.c.get() };
+ 
+         loop {
+             match inner.state {
+@@ -602,13 +603,26 @@ impl AsyncRead for File {
+                     }
+ 
+                     let std = me.std.clone();
+-
+-                    let max_buf_size = cmp::min(dst.remaining(), me.max_buf_size);
++                    let dst_remaining = dst.buf.len() - dst.filled;
++                    let max_buf_size = cmp::min(dst_remaining, me.max_buf_size);
+                     inner.state = State::Busy(spawn_blocking(move || {
+-                        // SAFETY: the `Read` implementation of `std` does not
+-                        // read from the buffer it is borrowing and correctly
+-                        // reports the length of the data written into the buffer.
+-                        let res = unsafe { buf.read_from(&mut &*std, max_buf_size) };
++                        let unread = buf.buf.len() - buf.pos;
++                        assert_eq!(unread, 0);
++                        buf.buf.reserve(max_buf_size);
++                        let spare = &mut buf.buf.spare_capacity_mut()[..max_buf_size];
++                        let raw = unsafe { &mut *(spare as *mut [MaybeUninit<u8>] as *mut [u8]) };
++                        let res = loop {
++                            match Read::read(&mut &*std, raw) {
++                                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
++                                other => break other,
++                            }
++                        };
++                        if let Ok(n) = res {
++                            unsafe { buf.buf.set_len(n) }
++                        } else {
++                            buf.buf.clear();
++                        }
++                        assert_eq!(buf.pos, 0);
+                         (Operation::Read(res), buf)
+                     }));
+                 }
+@@ -617,18 +631,39 @@ impl AsyncRead for File {
+ 
+                     match op {
+                         Operation::Read(Ok(_)) => {
+-                            buf.copy_to(dst);
++                            let unread = buf.buf.len() - buf.pos;
++                            let dst_remaining = dst.buf.len() - dst.filled;
++                            let n = cmp::min(unread, dst_remaining);
++                            let bytes = &buf.buf[buf.pos..buf.pos + n];
++                            let amt = bytes.len();
++                            let end = dst.filled + amt;
++                            unsafe {
++                                dst.buf[dst.filled..end]
++                                    .as_mut_ptr()
++                                    .cast::<u8>()
++                                    .copy_from_nonoverlapping(bytes.as_ptr(), amt);
++                            }
++                            if dst.initialized < end {
++                                dst.initialized = end;
++                            }
++                            dst.filled = end;
++                            buf.pos += n;
++                            if buf.pos == buf.buf.len() {
++                                buf.buf.truncate(0);
++                                buf.pos = 0;
++                            }
+                             inner.state = State::Idle(Some(buf));
+                             return Poll::Ready(Ok(()));
+                         }
+                         Operation::Read(Err(e)) => {
+-                            assert!(buf.is_empty());
+-
++                            let unread = buf.buf.len() - buf.pos;
++                            assert_eq!(unread, 0);
+                             inner.state = State::Idle(Some(buf));
+                             return Poll::Ready(Err(e));
+                         }
+                         Operation::Write(Ok(())) => {
+-                            assert!(buf.is_empty());
++                            let unread = buf.buf.len() - buf.pos;
++                            assert_eq!(unread, 0);
+                             inner.state = State::Idle(Some(buf));
+                             continue;
+                         }
+@@ -638,7 +673,8 @@ impl AsyncRead for File {
+                             inner.state = State::Idle(Some(buf));
+                         }
+                         Operation::Seek(result) => {
+-                            assert!(buf.is_empty());
++                            let unread = buf.buf.len() - buf.pos;
++                            assert_eq!(unread, 0);
+                             inner.state = State::Idle(Some(buf));
+                             if let Ok(pos) = result {
+                                 inner.pos = pos;
+diff --git a/tokio/src/io/blocking.rs b/tokio/src/io/blocking.rs
+index 1af50654..a361265a 100644
+--- a/tokio/src/io/blocking.rs
++++ b/tokio/src/io/blocking.rs
+@@ -20,8 +20,8 @@ pub(crate) struct Blocking<T> {
+ 
+ #[derive(Debug)]
+ pub(crate) struct Buf {
+-    buf: Vec<u8>,
+-    pos: usize,
++    pub(crate) buf: Vec<u8>,
++    pub(crate) pos: usize,
+ }
+ 
+ pub(crate) const DEFAULT_MAX_BUF_SIZE: usize = 2 * 1024 * 1024;
+diff --git a/tokio/src/io/read_buf.rs b/tokio/src/io/read_buf.rs
+index edef8485..9c5bb558 100644
+--- a/tokio/src/io/read_buf.rs
++++ b/tokio/src/io/read_buf.rs
+@@ -21,9 +21,9 @@ use std::mem::MaybeUninit;
+ /// region, since it is merely unknown whether this region is uninitialized or
+ /// not, and if part of it turns out to be initialized, it must stay initialized.
+ pub struct ReadBuf<'a> {
+-    buf: &'a mut [MaybeUninit<u8>],
+-    filled: usize,
+-    initialized: usize,
++    pub(crate) buf: &'a mut [MaybeUninit<u8>],
++    pub(crate) filled: usize,
++    pub(crate) initialized: usize,
+ }
+ 
+ impl<'a> ReadBuf<'a> {
+diff --git a/tokio/src/sync/mutex.rs b/tokio/src/sync/mutex.rs
+index 30f0bdec..8f4322c7 100644
+--- a/tokio/src/sync/mutex.rs
++++ b/tokio/src/sync/mutex.rs
+@@ -134,7 +134,7 @@ pub struct Mutex<T: ?Sized> {
+     #[cfg(all(tokio_unstable, feature = "tracing"))]
+     resource_span: tracing::Span,
+     s: semaphore::Semaphore,
+-    c: UnsafeCell<T>,
++    pub(crate) c: UnsafeCell<T>,
+ }
+ 
+ /// A handle to a held `Mutex`. The guard can be held across any `.await` point

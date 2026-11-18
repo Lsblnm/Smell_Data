@@ -1,0 +1,3741 @@
+diff --git a/lib/fluent/event.rb b/lib/fluent/event.rb
+index bcb06998..7483b237 100644
+--- a/lib/fluent/event.rb
++++ b/lib/fluent/event.rb
+@@ -15,6 +15,7 @@
+ #
+ 
+ require 'fluent/msgpack_factory'
++require 'fluent/time'
+ require 'fluent/plugin/compressable'
+ 
+ module Fluent
+@@ -173,8 +174,21 @@ module Fluent
+     end
+ 
+     def add(time, record)
+-      @time_array << time
+-      @record_array << record
++      require 'fluent/plugin/in_http'
++      coerced = Fluent::EventTime.coerce_event_time(time)
++      Fluent::Plugin::HttpInput.store_event_pair(@time_array, @record_array, coerced, record)
++    end
++
++    def self.current_event_time
++      Fluent::EventTime.now
++    end
++
++    def self.event_time_from_value(value)
++      Fluent::EventTime.from_time(Time.at(value))
++    end
++
++    def self.numeric_float_parser
++      Fluent::NumericTimeParser.new(:float)
+     end
+ 
+     def repeatable?
+diff --git a/lib/fluent/plugin/in_forward.rb b/lib/fluent/plugin/in_forward.rb
+index eb8b3c62..e54290c5 100644
+--- a/lib/fluent/plugin/in_forward.rb
++++ b/lib/fluent/plugin/in_forward.rb
+@@ -16,6 +16,7 @@
+ 
+ 
+ require 'fluent/plugin/input'
++require 'fluent/plugin/in_http'
+ require 'fluent/msgpack_factory'
+ require 'yajl'
+ require 'digest'
+@@ -111,8 +112,7 @@ module Fluent::Plugin
+       end
+       @enable_field_injection = @source_address_key || @source_hostname_key
+ 
+-      raise Fluent::ConfigError, "'tag' parameter must not be empty" if @tag && @tag.empty?
+-      raise Fluent::ConfigError, "'add_tag_prefix' parameter must not be empty" if @add_tag_prefix && @add_tag_prefix.empty?
++      Fluent::Plugin::HttpInput.validate_incoming_tag_settings!(@tag, @add_tag_prefix)
+ 
+       if @security
+         if @security.user_auth && @security.users.empty?
+@@ -301,8 +301,7 @@ module Fluent::Plugin
+         log.warn "Input chunk size is larger than 'chunk_size_warn_limit':", tag: tag, host: conn.remote_host, limit: @chunk_size_warn_limit, size: chunk_size
+       end
+ 
+-      tag = @tag.dup if @tag
+-      tag = "#{@add_tag_prefix}.#{tag}" if @add_tag_prefix
++      tag = Fluent::Plugin::HttpInput.apply_incoming_tag(tag, @tag, @add_tag_prefix)
+ 
+       case entries
+       when String
+diff --git a/lib/fluent/plugin/in_http.rb b/lib/fluent/plugin/in_http.rb
+index 1fe8f998..e26531fe 100644
+--- a/lib/fluent/plugin/in_http.rb
++++ b/lib/fluent/plugin/in_http.rb
+@@ -107,6 +107,22 @@ module Fluent::Plugin
+ 
+       # <parse> configured parser
+       @custom_parser = nil
++
++      @incoming_tag_state = nil
++      @incoming_tag_parts = []
++      @incoming_tag_kind = nil
++      @media_type_state = nil
++      @media_type_kind = nil
++      @media_type_params = {}
++      @event_buffer_times = []
++      @event_buffer_records = []
++      @event_buffer_count = 0
++      @enrichment_flags = {}
++      @enrichment_keys = []
++      @enrichment_snapshot = nil
++      @response_policy_state = nil
++      @response_policy_kind = nil
++      @response_policy_notes = []
+     end
+ 
+     def configure(conf)
+@@ -184,7 +200,7 @@ module Fluent::Plugin
+       event_loop_attach(@km)
+ 
+       server_create_connection(:in_http, @port, bind: @bind, backlog: @backlog, &method(:on_server_connect))
+-      @float_time_parser = Fluent::NumericTimeParser.new(:float)
++      @float_time_parser = Fluent::MultiEventStream.numeric_float_parser
+     end
+ 
+     def close
+@@ -200,6 +216,7 @@ module Fluent::Plugin
+     RES_500_STATUS = "500 Internal Server Error".freeze
+ 
+     def on_request(path_info, params)
++      prepare_http_request_workspace(path_info, params)
+       begin
+         path = path_info[1..-1]  # remove /
+         tag = path.split('/').join('.')
+@@ -215,7 +232,7 @@ module Fluent::Plugin
+ 
+           time = if param_time = params['time']
+                    param_time = param_time.to_f
+-                   param_time.zero? ? Fluent::EventTime.now : @float_time_parser.parse(param_time)
++                   param_time.zero? ? Fluent::MultiEventStream.current_event_time : @float_time_parser.parse(param_time)
+                  else
+                    record_time.nil? ? convert_time_field(record) : record_time
+                  end
+@@ -256,7 +273,7 @@ module Fluent::Plugin
+       handler = Handler.new(conn, @km, method(:on_request),
+                             @body_size_limit, @format_name, log,
+                             @cors_allow_origins, @cors_allow_credentials,
+-                            @add_query_params)
++                            @add_query_params, self)
+ 
+       conn.on(:data) do |data|
+         handler.on_read(data)
+@@ -328,18 +345,3545 @@ module Fluent::Plugin
+         if @default_time_parser
+           @default_time_parser.parse(t)
+         else
+-          Fluent::EventTime.from_time(Time.at(t))
++          Fluent::MultiEventStream.event_time_from_value(t)
+         end
+       else
+-        Fluent::EventTime.now
++        Fluent::MultiEventStream.current_event_time
++      end
++    end
++
++
++    def self.validate_incoming_tag_settings!(tag, prefix)
++      raise Fluent::ConfigError, "'tag' parameter must not be empty" if tag && tag.empty?
++      raise Fluent::ConfigError, "'add_tag_prefix' parameter must not be empty" if prefix && prefix.empty?
++    end
++
++    def self.apply_incoming_tag(tag, absolute_tag, prefix)
++      result = tag
++      result = absolute_tag.dup if absolute_tag
++      result = "#{prefix}.#{result}" if prefix
++      result
++    end
++
++    def self.store_event_pair(time_array, record_array, time, record)
++      time_array << time
++      record_array << record
++    end
++    def split_incoming_tag_pieces(raw_tag)
++      value = raw_tag.to_s
++      return [] if value.empty?
++      if value.include?("/")
++        value.split("/")
++      elsif value.include?(".")
++        value.split(".")
++      else
++        [value]
++      end
++    end
++
++    def compact_incoming_tag_pieces(pieces)
++      return [] unless pieces
++      compact = []
++      pieces.each do |piece|
++        text = piece.to_s.strip
++        compact << text unless text.empty?
++      end
++      compact
++    end
++
++    def join_incoming_tag_pieces(pieces)
++      return "" unless pieces
++      if pieces.size == 1
++        pieces.first.to_s
++      else
++        pieces.join(".")
++      end
++    end
++
++    def sanitize_incoming_tag_token(token)
++      text = token.to_s
++      return "" if text.empty?
++      if text.match?(/\A[A-Za-z0-9_.-]+\z/)
++        text
++      else
++        text.gsub(/[^A-Za-z0-9_.-]/, "_")
++      end
++    end
++
++    def normalize_incoming_tag_hint(path_info)
++      return "" if path_info.nil?
++      text = path_info.to_s
++      text = text[1..-1] if text.start_with?("/")
++      if text.empty?
++        ""
++      else
++        text.tr("/", ".")
++      end
++    end
++
++    def incoming_tag_reserved?(token)
++      word = token.to_s.downcase
++      if word.empty?
++        false
++      elsif ["debug", "test", "fluent", "http", "root"].include?(word)
++        true
++      else
++        false
++      end
++    end
++
++    def incoming_tag_numeric?(token)
++      text = token.to_s
++      if text.empty?
++        false
++      elsif text.match?(/\A\d+\z/)
++        true
++      else
++        false
++      end
++    end
++
++    def incoming_tag_length_band(text)
++      size = text.to_s.bytesize
++      if size == 0
++        :empty
++      elsif size < 8
++        :short
++      elsif size < 32
++        :medium
++      else
++        :long
++      end
++    end
++
++    def incoming_tag_separator_kind(tag)
++      text = tag.to_s
++      if text.include?(".") && text.include?("/")
++        :mixed
++      elsif text.include?(".")
++        :dot
++      elsif text.include?("/")
++        :slash
++      else
++        :plain
++      end
++    end
++
++    def incoming_tag_fingerprint(tag)
++      text = tag.to_s
++      return 0 if text.empty?
++      acc = 0
++      text.each_byte do |b|
++        acc = (acc * 33 + b) & 0xffff
++      end
++      acc
++    end
++
++    def incoming_tag_case_pattern(tag)
++      text = tag.to_s
++      if text.empty?
++        :empty
++      elsif text == text.upcase && text != text.downcase
++        :upper
++      elsif text == text.downcase
++        :lower
++      else
++        :mixed
++      end
++    end
++
++    def incoming_tag_wildcard?(tag)
++      text = tag.to_s
++      if text.include?("*")
++        true
++      elsif text.include?("#")
++        true
++      else
++        false
++      end
++    end
++
++    def incoming_tag_depth(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      if pieces.empty?
++        0
++      else
++        pieces.size
++      end
++    end
++
++    def incoming_tag_suffix(tag)
++      pieces = compact_incoming_tag_pieces(split_incoming_tag_pieces(tag))
++      if pieces.empty?
++        ""
++      else
++        pieces.last
++      end
++    end
++
++    def incoming_tag_prefix_token(tag)
++      pieces = compact_incoming_tag_pieces(split_incoming_tag_pieces(tag))
++      if pieces.empty?
++        ""
++      else
++        pieces.first
++      end
++    end
++
++    def normalize_media_type_token(content_type)
++      value = content_type.to_s.strip.downcase
++      return "" if value.empty?
++      if value.include?(";")
++        value.split(";", 2).first.strip
++      else
++        value
++      end
++    end
++
++    def media_type_payload_key(content_type)
++      kind = normalize_media_type_token(content_type)
++      if kind == "application/json" || kind == "application/csp-report"
++        "json"
++      elsif kind == "application/msgpack" || kind == "application/x-msgpack"
++        "msgpack"
++      elsif kind == "application/x-ndjson" || kind == "application/ndjson"
++        "ndjson"
++      elsif kind.include?("urlencoded")
++        "form"
++      else
++        "raw"
++      end
++    end
++
++    def media_type_family(content_type)
++      kind = normalize_media_type_token(content_type)
++      if kind.start_with?("application/")
++        :application
++      elsif kind.start_with?("text/")
++        :text
++      elsif kind.start_with?("multipart/")
++        :multipart
++      else
++        :other
++      end
++    end
++
++    def json_payload_present?(params)
++      if params.nil?
++        false
++      elsif params["json"]
++        true
++      elsif params["ndjson"]
++        true
++      else
++        false
++      end
++    end
++
++    def msgpack_payload_present?(params)
++      if params.nil?
++        false
++      elsif params["msgpack"]
++        true
++      else
++        false
++      end
++    end
++
++    def form_payload_present?(params)
++      if params.nil?
++        false
++      elsif params["json"] || params["msgpack"] || params["ndjson"]
++        false
++      else
++        true
++      end
++    end
++
++    def extract_json_payload(params)
++      return nil if params.nil?
++      if params["json"]
++        params["json"]
++      elsif params["ndjson"]
++        params["ndjson"]
++      else
++        nil
++      end
++    end
++
++    def extract_msgpack_payload(params)
++      return nil if params.nil?
++      if params["msgpack"]
++        params["msgpack"]
++      else
++        nil
++      end
++    end
++
++    def count_payload_variants(params)
++      return 0 if params.nil?
++      n = 0
++      n += 1 if params["json"]
++      n += 1 if params["msgpack"]
++      n += 1 if params["ndjson"]
++      n
++    end
++
++    def payload_encoding_hint(params)
++      return :identity if params.nil?
++      if params["gzip"] || params["Content-Encoding"] == "gzip"
++        :gzip
++      elsif params["deflate"] || params["Content-Encoding"] == "deflate"
++        :deflate
++      else
++        :identity
++      end
++    end
++
++    def charset_from_content_type(content_type)
++      text = content_type.to_s
++      return "utf-8" unless text.include?("charset=")
++      part = text.split("charset=", 2).last
++      token = part.split(";").first.to_s.strip
++      if token.empty?
++        "utf-8"
++      else
++        token.downcase
++      end
++    end
++
++    def boundary_from_content_type(content_type)
++      text = content_type.to_s
++      return nil unless text.include?("boundary=")
++      part = text.split("boundary=", 2).last
++      token = part.split(";").first.to_s.strip
++      if token.empty?
++        nil
++      else
++        token
++      end
++    end
++
++    def http_header_key?(key)
++      name = key.to_s
++      if name.start_with?("HTTP_")
++        true
++      elsif name == "CONTENT_TYPE" || name == "CONTENT_LENGTH"
++        true
++      else
++        false
++      end
++    end
++
++    def query_param_key?(key)
++      name = key.to_s
++      if name.start_with?("QUERY_")
++        true
++      else
++        false
++      end
++    end
++
++    def remote_addr_key?(key)
++      name = key.to_s
++      if name == "REMOTE_ADDR"
++        true
++      elsif name == "HTTP_X_FORWARDED_FOR"
++        true
++      else
++        false
++      end
++    end
++
++    def coerce_event_record(record)
++      if record.is_a?(Hash)
++        record
++      elsif record.nil?
++        nil
++      else
++        {"value" => record}
++      end
++    end
++
++    def event_record_empty?(record)
++      if record.nil?
++        true
++      elsif record.is_a?(Hash) && record.empty?
++        true
++      else
++        false
++      end
++    end
++
++    def event_time_missing?(time)
++      if time.nil?
++        true
++      else
++        false
++      end
++    end
++
++    def count_event_pairs(time_array, record_array)
++      times = time_array || []
++      records = record_array || []
++      if times.size < records.size
++        times.size
++      else
++        records.size
++      end
++    end
++
++    def slice_event_window(time_array, record_array)
++      n = count_event_pairs(time_array, record_array)
++      return [0, 0] if n == 0
++      if n > 32
++        [n - 32, n]
++      else
++        [0, n]
++      end
++    end
++
++    def event_record_keys(record)
++      return [] unless record.is_a?(Hash)
++      keys = record.keys.map(&:to_s)
++      if keys.size > 16
++        keys.sort.take(16)
++      else
++        keys.sort
++      end
++    end
++
++    def event_payload_bytesize(record)
++      if record.nil?
++        0
++      elsif record.is_a?(String)
++        record.bytesize
++      elsif record.is_a?(Hash)
++        record.to_s.bytesize
++      else
++        record.to_s.bytesize
++      end
++    end
++
++    def event_time_numeric(time)
++      return 0 if time.nil?
++      if time.respond_to?(:to_f)
++        time.to_f
++      else
++        0
++      end
++    end
++
++    def merge_event_record_layer(record, overlay)
++      base = record.is_a?(Hash) ? record : {}
++      extra = overlay.is_a?(Hash) ? overlay : {}
++      if extra.empty?
++        base
++      else
++        base.merge(extra)
++      end
++    end
++
++    def drop_nil_event_fields(record)
++      return {} unless record.is_a?(Hash)
++      cleaned = {}
++      record.each_pair do |key, value|
++        cleaned[key] = value unless value.nil?
++      end
++      cleaned
++    end
++
++    def event_stream_empty?(time_array)
++      if time_array.nil? || time_array.empty?
++        true
++      else
++        false
++      end
++    end
++
++    def event_pair_at(time_array, record_array, index)
++      return nil if time_array.nil? || record_array.nil?
++      return nil if index < 0 || index >= time_array.size
++      [time_array[index], record_array[index]]
++    end
++
++    def append_event_pair(time_array, record_array, time, record)
++      return if time_array.nil? || record_array.nil?
++      time_array << time
++      record_array << record
++      [time_array.size, record_array.size]
++    end
++
++    def event_record_class_name(record)
++      if record.nil?
++        "NilClass"
++      else
++        record.class.name
++      end
++    end
++
++    def event_overflow?(time_array, record_array)
++      n = count_event_pairs(time_array, record_array)
++      if n > 10000
++        true
++      else
++        false
++      end
++    end
++
++    def copy_http_headers_into(record, params)
++      return record unless record.is_a?(Hash)
++      return record unless params.is_a?(Hash)
++      params.each_pair do |key, value|
++        record[key] = value if http_header_key?(key)
++      end
++      record
++    end
++
++    def copy_query_params_into(record, params)
++      return record unless record.is_a?(Hash)
++      return record unless params.is_a?(Hash)
++      params.each_pair do |key, value|
++        record[key] = value if query_param_key?(key)
++      end
++      record
++    end
++
++    def copy_remote_addr_into(record, params)
++      return record unless record.is_a?(Hash)
++      return record unless params.is_a?(Hash)
++      if params["REMOTE_ADDR"]
++        record["REMOTE_ADDR"] = params["REMOTE_ADDR"]
++      end
++      record
++    end
++
++    def first_forwarded_for(header)
++      value = header.to_s
++      return nil if value.empty?
++      parts = value.split(",")
++      if parts.empty?
++        nil
++      else
++        parts.first.strip
++      end
++    end
++
++    def canonicalize_header_name(key)
++      name = key.to_s
++      return "" if name.empty?
++      token = name.tr("-", "_").upcase
++      if token.start_with?("HTTP_")
++        token
++      else
++        "HTTP_#{token}"
++      end
++    end
++
++    def select_http_headers(params)
++      return {} unless params.is_a?(Hash)
++      selected = {}
++      params.each_pair do |key, value|
++        selected[key] = value if http_header_key?(key)
++      end
++      selected
++    end
++
++    def select_query_params(params)
++      return {} unless params.is_a?(Hash)
++      selected = {}
++      params.each_pair do |key, value|
++        selected[key] = value if query_param_key?(key)
++      end
++      selected
++    end
++
++    def header_count(params)
++      select_http_headers(params).size
++    end
++
++    def query_param_count(params)
++      select_query_params(params).size
++    end
++
++    def remote_addr_value(params)
++      return nil unless params.is_a?(Hash)
++      if params["REMOTE_ADDR"]
++        params["REMOTE_ADDR"]
++      elsif params["HTTP_X_FORWARDED_FOR"]
++        first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      else
++        nil
++      end
++    end
++
++    def stringify_param_keys(params)
++      return {} unless params.is_a?(Hash)
++      out = {}
++      params.each_pair do |key, value|
++        out[key.to_s] = value
++      end
++      out
++    end
++
++    def compact_param_hash(params)
++      return {} unless params.is_a?(Hash)
++      out = {}
++      params.each_pair do |key, value|
++        out[key] = value unless value.nil? || value == ""
++      end
++      out
++    end
++
++    def query_prefix_name(key)
++      name = key.to_s.tr("-", "_").upcase
++      if name.start_with?("QUERY_")
++        name
++      else
++        "QUERY_#{name}"
++      end
++    end
++
++    def boolean_flag_enabled?(value)
++      if value == true || value == "true" || value == "1"
++        true
++      else
++        false
++      end
++    end
++
++    def merge_enrichment_overlay(record, overlay)
++      base = record.is_a?(Hash) ? record : {}
++      extra = overlay.is_a?(Hash) ? overlay : {}
++      extra.each_pair do |key, value|
++        base[key] = value unless value.nil?
++      end
++      base
++    end
++    def capture_incoming_tag_shape(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = incoming_tag_depth(tag)
++      secondary = incoming_tag_length_band(tag)
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :blank
++      elsif depth == 1
++        @incoming_tag_kind = :single
++      else
++        @incoming_tag_kind = :dotted
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def remember_incoming_tag_depth(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = incoming_tag_depth(tag)
++      secondary = incoming_tag_suffix(tag)
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :blank
++      elsif depth == 1
++        @incoming_tag_kind = :shallow
++      else
++        @incoming_tag_kind = :deep
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def classify_incoming_tag_charset(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = incoming_tag_case_pattern(tag)
++      secondary = incoming_tag_prefix_token(tag)
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :empty
++      elsif depth == 1
++        @incoming_tag_kind = :upper
++      else
++        @incoming_tag_kind = :lower
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def mark_incoming_tag_numeric_segments(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = compact.map { |piece| incoming_tag_numeric?(piece) }.count { |v| v }
++      secondary = incoming_tag_suffix(tag)
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :alpha
++      elsif depth == 1
++        @incoming_tag_kind = :hybrid
++      else
++        @incoming_tag_kind = :numeric
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def record_incoming_tag_suffix(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = incoming_tag_suffix(tag)
++      secondary = incoming_tag_reserved?(incoming_tag_suffix(tag))
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :blank
++      elsif depth == 1
++        @incoming_tag_kind = :reserved_suffix
++      else
++        @incoming_tag_kind = :open_suffix
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def assess_incoming_tag_reserved_words(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = compact.select { |piece| incoming_tag_reserved?(piece) }
++      secondary = incoming_tag_prefix_token(tag)
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :unreserved
++      elsif depth == 1
++        @incoming_tag_kind = :one_reserved
++      else
++        @incoming_tag_kind = :many_reserved
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def measure_incoming_tag_entropy(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = incoming_tag_fingerprint(tag)
++      secondary = incoming_tag_length_band(tag)
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :blank
++      elsif depth == 1
++        @incoming_tag_kind = :low_entropy
++      else
++        @incoming_tag_kind = :high_entropy
+       end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def bind_incoming_tag_prefix_hint(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = incoming_tag_prefix_token(tag)
++      secondary = incoming_tag_reserved?(incoming_tag_prefix_token(tag))
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :no_prefix
++      elsif depth == 1
++        @incoming_tag_kind = :reserved_prefix
++      else
++        @incoming_tag_kind = :named_prefix
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def note_incoming_tag_separator(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = incoming_tag_separator_kind(tag)
++      secondary = incoming_tag_wildcard?(tag)
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :plain
++      elsif depth == 1
++        @incoming_tag_kind = :dot
++      else
++        @incoming_tag_kind = :slash
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def track_incoming_tag_blank_ratio(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = pieces.count { |piece| piece.to_s.empty? }
++      secondary = incoming_tag_depth(tag)
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :dense
++      elsif depth == 1
++        @incoming_tag_kind = :sparse
++      else
++        @incoming_tag_kind = :blank
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def store_incoming_tag_canonical_form(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = join_incoming_tag_pieces(sanitized)
++      secondary = incoming_tag_length_band(join_incoming_tag_pieces(sanitized))
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :blank
++      elsif depth == 1
++        @incoming_tag_kind = :canonical
++      else
++        @incoming_tag_kind = :sanitized
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def inspect_incoming_tag_hierarchy(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = compact.size
++      secondary = incoming_tag_prefix_token(tag)
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :flat
++      elsif depth == 1
++        @incoming_tag_kind = :shallow
++      else
++        @incoming_tag_kind = :nested
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def score_incoming_tag_stability(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = incoming_tag_length_band(tag)
++      secondary = incoming_tag_fingerprint(tag)
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :empty
++      elsif depth == 1
++        @incoming_tag_kind = :stable
++      else
++        @incoming_tag_kind = :unstable
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def detect_incoming_tag_wildcard(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = incoming_tag_wildcard?(tag)
++      secondary = incoming_tag_separator_kind(tag)
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :literal
++      elsif depth == 1
++        @incoming_tag_kind = :wildcard
++      else
++        @incoming_tag_kind = :special
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def summarize_incoming_tag_tokens(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = compact.take(4)
++      secondary = incoming_tag_suffix(tag)
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :blank
++      elsif depth == 1
++        @incoming_tag_kind = :single
++      else
++        @incoming_tag_kind = :multi
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def persist_incoming_tag_fingerprint(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = incoming_tag_fingerprint(tag)
++      secondary = incoming_tag_case_pattern(tag)
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :blank
++      elsif depth == 1
++        @incoming_tag_kind = :even
++      else
++        @incoming_tag_kind = :odd
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def evaluate_incoming_tag_length_band(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = incoming_tag_length_band(tag)
++      secondary = incoming_tag_depth(tag)
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :empty
++      elsif depth == 1
++        @incoming_tag_kind = :short
++      else
++        @incoming_tag_kind = :long
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def capture_incoming_tag_case_pattern(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = incoming_tag_case_pattern(tag)
++      secondary = incoming_tag_prefix_token(tag)
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :empty
++      elsif depth == 1
++        @incoming_tag_kind = :lower
++      else
++        @incoming_tag_kind = :mixed
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def register_incoming_tag_origin(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = incoming_tag_prefix_token(tag)
++      secondary = incoming_tag_reserved?(incoming_tag_prefix_token(tag))
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :anonymous
++      elsif depth == 1
++        @incoming_tag_kind = :http_origin
++      else
++        @incoming_tag_kind = :named_origin
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def reconcile_incoming_tag_alias(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = incoming_tag_suffix(tag)
++      secondary = incoming_tag_prefix_token(tag)
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :no_alias
++      elsif depth == 1
++        @incoming_tag_kind = :self_alias
++      else
++        @incoming_tag_kind = :aliased
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def outline_incoming_tag_namespace(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = compact[0, 2]
++      secondary = incoming_tag_depth(tag)
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :root
++      elsif depth == 1
++        @incoming_tag_kind = :top
++      else
++        @incoming_tag_kind = :namespaced
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def flag_incoming_tag_collision(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = compact.size != compact.uniq.size
++      secondary = incoming_tag_suffix(tag)
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :unique
++      elsif depth == 1
++        @incoming_tag_kind = :collision
++      else
++        @incoming_tag_kind = :blank
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def archive_incoming_tag_history(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = join_incoming_tag_pieces(compact)
++      secondary = incoming_tag_fingerprint(tag)
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :fresh
++      elsif depth == 1
++        @incoming_tag_kind = :historical
++      else
++        @incoming_tag_kind = :blank
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def freeze_incoming_tag_workspace(tag)
++      pieces = split_incoming_tag_pieces(tag)
++      compact = compact_incoming_tag_pieces(pieces)
++      sanitized = compact.map { |piece| sanitize_incoming_tag_token(piece) }
++      joined = join_incoming_tag_pieces(sanitized)
++      depth = incoming_tag_depth(tag)
++      band = incoming_tag_length_band(tag)
++      pattern = incoming_tag_case_pattern(tag)
++      primary = incoming_tag_depth(tag)
++      secondary = incoming_tag_length_band(tag)
++      @incoming_tag_parts = sanitized
++      if sanitized.empty?
++        @incoming_tag_kind = :frozen_blank
++      elsif depth == 1
++        @incoming_tag_kind = :frozen_single
++      else
++        @incoming_tag_kind = :frozen
++      end
++      @incoming_tag_state = primary
++      @incoming_tag_kind
++    end
++
++    def capture_media_type_kind(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = media_type_payload_key(content_type)
++      secondary = media_type_family(content_type)
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :raw
++      elsif payload_key == "json"
++        @media_type_kind = :json
++      else
++        @media_type_kind = :other
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def remember_media_type_family(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = media_type_family(content_type)
++      secondary = count_payload_variants(params)
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :other
++      elsif payload_key == "json"
++        @media_type_kind = :application
++      else
++        @media_type_kind = :multipart
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def mark_json_payload_presence(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = json_payload_present?(params)
++      secondary = extract_json_payload(params)
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :absent
++      elsif payload_key == "json"
++        @media_type_kind = :json
++      else
++        @media_type_kind = :other
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def mark_msgpack_payload_presence(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = msgpack_payload_present?(params)
++      secondary = extract_msgpack_payload(params)
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :absent
++      elsif payload_key == "json"
++        @media_type_kind = :msgpack
++      else
++        @media_type_kind = :other
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def count_request_payload_variants(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = count_payload_variants(params)
++      secondary = form_payload_present?(params)
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :empty
++      elsif payload_key == "json"
++        @media_type_kind = :single
++      else
++        @media_type_kind = :multiple
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def remember_payload_encoding(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = payload_encoding_hint(params)
++      secondary = charset_from_content_type(content_type)
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :identity
++      elsif payload_key == "json"
++        @media_type_kind = :gzip
++      else
++        @media_type_kind = :deflate
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def capture_media_charset(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = charset_from_content_type(content_type)
++      secondary = media_type_family(content_type)
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :missing_charset
++      elsif payload_key == "json"
++        @media_type_kind = :utf8
++      else
++        @media_type_kind = :custom_charset
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def capture_media_boundary(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = boundary_from_content_type(content_type)
++      secondary = media_type_payload_key(content_type)
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :no_boundary
++      elsif payload_key == "json"
++        @media_type_kind = :boundary
++      else
++        @media_type_kind = :blank_boundary
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def index_json_payload(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = extract_json_payload(params).to_s.bytesize
++      secondary = json_payload_present?(params)
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :no_json
++      elsif payload_key == "json"
++        @media_type_kind = :empty_json
++      else
++        @media_type_kind = :json
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def index_msgpack_payload(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = extract_msgpack_payload(params).to_s.bytesize
++      secondary = msgpack_payload_present?(params)
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :no_msgpack
++      elsif payload_key == "json"
++        @media_type_kind = :msgpack
++      else
++        @media_type_kind = :other
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def classify_form_payload(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = form_payload_present?(params)
++      secondary = media_type_payload_key(content_type)
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :raw
++      elsif payload_key == "json"
++        @media_type_kind = :form
++      else
++        @media_type_kind = :json
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def tally_http_header_fields(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = header_count(params)
++      secondary = query_param_count(params)
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :no_headers
++      elsif payload_key == "json"
++        @media_type_kind = :few_headers
++      else
++        @media_type_kind = :many_headers
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def tally_query_fields(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = query_param_count(params)
++      secondary = header_count(params)
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :no_query
++      elsif payload_key == "json"
++        @media_type_kind = :one_query
++      else
++        @media_type_kind = :multi_query
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def capture_remote_identity(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = remote_addr_value(params)
++      secondary = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :no_remote
++      elsif payload_key == "json"
++        @media_type_kind = :direct
++      else
++        @media_type_kind = :forwarded
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def snapshot_media_params(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = compact_param_hash(params).size
++      secondary = stringify_param_keys(params).size
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :empty
++      elsif payload_key == "json"
++        @media_type_kind = :single
++      else
++        @media_type_kind = :populated
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def normalize_media_param_keys(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = stringify_param_keys(params).keys.take(8)
++      secondary = json_payload_present?(params)
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :empty
++      elsif payload_key == "json"
++        @media_type_kind = :json
++      else
++        @media_type_kind = :other
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def detect_csp_report_payload(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = content_type.to_s.include?("csp-report")
++      secondary = json_payload_present?(params)
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :other
++      elsif payload_key == "json"
++        @media_type_kind = :csp
++      else
++        @media_type_kind = :json
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def detect_ndjson_payload(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = params["ndjson"]
++      secondary = json_payload_present?(params)
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :other
++      elsif payload_key == "json"
++        @media_type_kind = :ndjson
++      else
++        @media_type_kind = :json
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def detect_urlencoded_payload(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = content_type.to_s.include?("urlencoded")
++      secondary = content_type.to_s.include?("multipart")
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :not_form
++      elsif payload_key == "json"
++        @media_type_kind = :urlencoded
++      else
++        @media_type_kind = :multipart
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def score_media_specificity(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = count_payload_variants(params)
++      secondary = media_type_family(content_type)
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :unknown
++      elsif payload_key == "json"
++        @media_type_kind = :specific
++      else
++        @media_type_kind = :broad
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def bind_media_payload_key(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = media_type_payload_key(content_type)
++      secondary = json_payload_present?(params)
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :raw
++      elsif payload_key == "json"
++        @media_type_kind = :json
++      else
++        @media_type_kind = :msgpack
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def flag_conflicting_payloads(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = count_payload_variants(params)
++      secondary = count_payload_variants(params)
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :clean
++      elsif payload_key == "json"
++        @media_type_kind = :conflict
++      else
++        @media_type_kind = :missing
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def archive_media_type_state(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = media_type_payload_key(content_type)
++      secondary = count_payload_variants(params)
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :empty
++      elsif payload_key == "json"
++        @media_type_kind = :json
++      else
++        @media_type_kind = :archived
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def freeze_media_type_workspace(params)
++      content_type = ""
++      if params
++        if params["CONTENT_TYPE"]
++          content_type = params["CONTENT_TYPE"].to_s
++        elsif params["HTTP_CONTENT_TYPE"]
++          content_type = params["HTTP_CONTENT_TYPE"].to_s
++        end
++      end
++      payload_key = media_type_payload_key(content_type)
++      family = media_type_family(content_type)
++      json_bytes = extract_json_payload(params).to_s.bytesize
++      msgpack_bytes = extract_msgpack_payload(params).to_s.bytesize
++      headers = header_count(params)
++      queries = query_param_count(params)
++      primary = media_type_payload_key(content_type)
++      secondary = media_type_family(content_type)
++      @media_type_params = compact_param_hash(params)
++      if payload_key == "raw"
++        @media_type_kind = :frozen_empty
++      elsif payload_key == "json"
++        @media_type_kind = :frozen_json
++      else
++        @media_type_kind = :frozen
++      end
++      @media_type_state = primary
++      @media_type_kind
++    end
++
++    def reset_event_buffer_workspace
++                  @event_buffer_times = []
++      @event_buffer_records = []
++      primary = 0
++      secondary = event_stream_empty?([])
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :empty
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :ready
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :stale
++      end
++      kind
++    end
++
++    def remember_event_time(time)
++                  @event_buffer_times << time
++      primary = event_time_numeric(time)
++      secondary = event_time_missing?(time)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :missing
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :numeric
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :stored
++      end
++      kind
++    end
++
++    def remember_event_record(record)
++                  @event_buffer_records << coerce_event_record(record)
++      primary = event_payload_bytesize(record)
++      secondary = event_record_empty?(record)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :empty
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :record
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :value
++      end
++      kind
++    end
++
++    def accumulate_event_pair(time, record)
++                  append_event_pair(@event_buffer_times, @event_buffer_records, time, coerce_event_record(record))
++      primary = count_event_pairs(@event_buffer_times, @event_buffer_records)
++      secondary = event_overflow?(@event_buffer_times, @event_buffer_records)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :empty
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :ok
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :overflow
++      end
++      kind
++    end
++
++    def measure_event_payload_size(record)
++                  primary = event_payload_bytesize(record)
++      secondary = event_record_class_name(record)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :empty
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :small
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :large
++      end
++      kind
++    end
++
++    def index_event_record_keys(record)
++                  primary = event_record_keys(record).size
++      secondary = event_record_keys(record)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :none
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :few
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :many
++      end
++      kind
++    end
++
++    def window_event_buffer
++                  primary = slice_event_window(@event_buffer_times, @event_buffer_records)[1]
++      secondary = event_stream_empty?(@event_buffer_times)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :empty
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :window
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :full
++      end
++      kind
++    end
++
++    def lookup_last_event_pair
++                  primary = event_pair_at(@event_buffer_times, @event_buffer_records, (@event_buffer_times || []).size - 1)
++      secondary = count_event_pairs(@event_buffer_times, @event_buffer_records)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :none
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :last
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :many
++      end
++      kind
++    end
++
++    def flag_empty_event_stream
++                  primary = event_stream_empty?(@event_buffer_times)
++      secondary = count_event_pairs(@event_buffer_times, @event_buffer_records)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :empty
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :present
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :unknown
++      end
++      kind
++    end
++
++    def compact_event_records
++                  primary = (@event_buffer_records || []).size
++      secondary = event_stream_empty?(@event_buffer_times)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :empty
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :compacted
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :raw
++      end
++      kind
++    end
++
++    def merge_event_overlay(overlay)
++                  primary = event_record_keys(overlay).size
++      secondary = event_record_empty?(overlay)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :none
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :merged
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :skipped
++      end
++      kind
++    end
++
++    def classify_event_record_type(record)
++                  primary = event_record_class_name(record)
++      secondary = event_record_empty?(record)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :nil
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :hash
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :other
++      end
++      kind
++    end
++
++    def track_event_time_gap(time)
++                  primary = event_time_numeric(time)
++      secondary = event_time_missing?(time)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :missing
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :gap
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :first
++      end
++      kind
++    end
++
++    def count_buffered_events
++                  primary = count_event_pairs(@event_buffer_times, @event_buffer_records)
++      secondary = event_overflow?(@event_buffer_times, @event_buffer_records)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :empty
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :normal
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :overflow
++      end
++      kind
++    end
++
++    def sample_event_record(record)
++                  primary = event_record_keys(record).size
++      secondary = event_payload_bytesize(record)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :empty
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :sampled
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :large
++      end
++      kind
++    end
++
++    def guard_event_overflow
++                  primary = event_overflow?(@event_buffer_times, @event_buffer_records)
++      secondary = count_event_pairs(@event_buffer_times, @event_buffer_records)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :ok
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :overflow
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :empty
++      end
++      kind
++    end
++
++    def align_event_buffer_lengths
++                  primary = count_event_pairs(@event_buffer_times, @event_buffer_records)
++      secondary = event_stream_empty?(@event_buffer_times)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :empty
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :aligned
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :trimmed
++      end
++      kind
++    end
++
++    def snapshot_event_buffer_count
++                  primary = count_event_pairs(@event_buffer_times, @event_buffer_records)
++      secondary = event_overflow?(@event_buffer_times, @event_buffer_records)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :empty
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :count
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :overflow
++      end
++      kind
++    end
++
++    def record_event_class_mix
++                  primary = (@event_buffer_records || []).map { |record| event_record_class_name(record) }.uniq.size
++      secondary = event_stream_empty?(@event_buffer_times)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :empty
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :uniform
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :mixed
++      end
++      kind
++    end
++
++    def accept_parsed_event(time, record)
++                  primary = event_record_empty?(record)
++      secondary = event_time_missing?(time)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :rejected
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :accepted
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :partial
++      end
++      kind
++    end
++
++    def replay_event_window
++                  primary = slice_event_window(@event_buffer_times, @event_buffer_records)[1]
++      secondary = event_stream_empty?(@event_buffer_times)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :empty
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :replay
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :full
++      end
++      kind
++    end
++
++    def summarize_event_workspace
++                  primary = count_event_pairs(@event_buffer_times, @event_buffer_records)
++      secondary = event_stream_empty?(@event_buffer_times)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :empty
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :one
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :many
++      end
++      kind
++    end
++
++    def archive_event_workspace
++                  primary = count_event_pairs(@event_buffer_times, @event_buffer_records)
++      secondary = event_overflow?(@event_buffer_times, @event_buffer_records)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :empty
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :archived
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :trimmed
++      end
++      kind
++    end
++
++    def freeze_event_buffer_workspace
++                  primary = count_event_pairs(@event_buffer_times, @event_buffer_records)
++      secondary = event_stream_empty?(@event_buffer_times)
++      bytes = event_payload_bytesize(@event_buffer_records.last)
++      names = event_record_class_name(@event_buffer_records.last)
++      window = slice_event_window(@event_buffer_times, @event_buffer_records)
++      if @event_buffer_times.empty?
++        @event_buffer_count = 0
++        kind = :frozen_empty
++      elsif bytes > 1_000_000
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :frozen
++      else
++        @event_buffer_count = count_event_pairs(@event_buffer_times, @event_buffer_records)
++        kind = :frozen_full
++      end
++      kind
++    end
++
++    def snapshot_record_enrichment_policy(params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = header_count(params)
++      secondary = query_param_count(params)
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :none
++      elsif queries.empty?
++        @enrichment_snapshot = :headers
++      else
++        @enrichment_snapshot = :mixed
++      end
++      @enrichment_snapshot
++    end
++
++    def capture_header_enrichment(params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = select_http_headers(params).size
++      secondary = header_count(params)
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :no_headers
++      elsif queries.empty?
++        @enrichment_snapshot = :one_header
++      else
++        @enrichment_snapshot = :headers
++      end
++      @enrichment_snapshot
++    end
++
++    def capture_query_enrichment(params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = select_query_params(params).size
++      secondary = query_param_count(params)
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :no_query
++      elsif queries.empty?
++        @enrichment_snapshot = :one_query
++      else
++        @enrichment_snapshot = :query
++      end
++      @enrichment_snapshot
++    end
++
++    def capture_remote_enrichment(params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = remote_addr_value(params)
++      secondary = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :no_remote
++      elsif queries.empty?
++        @enrichment_snapshot = :remote
++      else
++        @enrichment_snapshot = :forwarded
++      end
++      @enrichment_snapshot
++    end
++
++    def build_header_overlay(params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = select_http_headers(params)
++      secondary = header_count(params)
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :empty
++      elsif queries.empty?
++        @enrichment_snapshot = :overlay
++      else
++        @enrichment_snapshot = :headers
++      end
++      @enrichment_snapshot
++    end
++
++    def build_query_overlay(params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = select_query_params(params)
++      secondary = query_param_count(params)
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :empty
++      elsif queries.empty?
++        @enrichment_snapshot = :overlay
++      else
++        @enrichment_snapshot = :query
++      end
++      @enrichment_snapshot
++    end
++
++    def build_remote_overlay(params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = remote_addr_value(params)
++      secondary = params["REMOTE_ADDR"]
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :empty
++      elsif queries.empty?
++        @enrichment_snapshot = :overlay
++      else
++        @enrichment_snapshot = :remote
++      end
++      @enrichment_snapshot
++    end
++
++    def merge_all_enrichment_overlays(params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = header_count(params) + query_param_count(params)
++      secondary = remote_addr_value(params)
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :empty
++      elsif queries.empty?
++        @enrichment_snapshot = :merged
++      else
++        @enrichment_snapshot = :partial
++      end
++      @enrichment_snapshot
++    end
++
++    def count_enrichment_fields(params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = header_count(params) + query_param_count(params) + 1
++      secondary = select_http_headers(params).size
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :none
++      elsif queries.empty?
++        @enrichment_snapshot = :few
++      else
++        @enrichment_snapshot = :many
++      end
++      @enrichment_snapshot
++    end
++
++    def flag_header_enrichment(params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = header_count(params)
++      secondary = select_http_headers(params)
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :no_headers
++      elsif queries.empty?
++        @enrichment_snapshot = :headers
++      else
++        @enrichment_snapshot = :maybe
++      end
++      @enrichment_snapshot
++    end
++
++    def flag_query_enrichment(params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = query_param_count(params)
++      secondary = select_query_params(params)
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :no_query
++      elsif queries.empty?
++        @enrichment_snapshot = :query
++      else
++        @enrichment_snapshot = :maybe
++      end
++      @enrichment_snapshot
++    end
++
++    def flag_remote_enrichment(params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = remote_addr_value(params)
++      secondary = remote_addr_value(params)
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :no_remote
++      elsif queries.empty?
++        @enrichment_snapshot = :remote
++      else
++        @enrichment_snapshot = :maybe
++      end
++      @enrichment_snapshot
++    end
++
++    def canonicalize_enrichment_keys(params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = stringify_param_keys(params).keys.map { |key| canonicalize_header_name(key) }
++      secondary = header_count(params)
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :none
++      elsif queries.empty?
++        @enrichment_snapshot = :one
++      else
++        @enrichment_snapshot = :many
++      end
++      @enrichment_snapshot
++    end
++
++    def prefix_query_enrichment_keys(params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = select_query_params(params).keys.map { |key| query_prefix_name(key) }
++      secondary = query_param_count(params)
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :none
++      elsif queries.empty?
++        @enrichment_snapshot = :prefixed
++      else
++        @enrichment_snapshot = :raw
++      end
++      @enrichment_snapshot
++    end
++
++    def extract_forwarded_identity(params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      secondary = remote_addr_value(params)
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :direct
++      elsif queries.empty?
++        @enrichment_snapshot = :forwarded
++      else
++        @enrichment_snapshot = :unknown
++      end
++      @enrichment_snapshot
++    end
++
++    def compact_enrichment_params(params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = compact_param_hash(params).size
++      secondary = stringify_param_keys(params).size
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :empty
++      elsif queries.empty?
++        @enrichment_snapshot = :small
++      else
++        @enrichment_snapshot = :large
++      end
++      @enrichment_snapshot
++    end
++
++    def booleanize_enrichment_flags(params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = header_count(params)
++      secondary = query_param_count(params)
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :none
++      elsif queries.empty?
++        @enrichment_snapshot = :partial
++      else
++        @enrichment_snapshot = :all
++      end
++      @enrichment_snapshot
++    end
++
++    def project_enrichment_snapshot(params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = select_http_headers(params).merge(select_query_params(params)).size
++      secondary = remote_addr_value(params)
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :empty
++      elsif queries.empty?
++        @enrichment_snapshot = :snapshot
++      else
++        @enrichment_snapshot = :full
++      end
++      @enrichment_snapshot
++    end
++
++    def apply_enrichment_to_record(record, params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = select_http_headers(params).size + select_query_params(params).size
++      secondary = remote_addr_value(params)
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :unchanged
++      elsif queries.empty?
++        @enrichment_snapshot = :applied
++      else
++        @enrichment_snapshot = :partial
++      end
++      @enrichment_snapshot
++    end
++
++    def remember_enrichment_record_shape(record)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = event_record_keys(record).size
++      secondary = event_record_keys(record).include?("REMOTE_ADDR")
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :empty_record
++      elsif queries.empty?
++        @enrichment_snapshot = :with_remote
++      else
++        @enrichment_snapshot = :plain
++      end
++      @enrichment_snapshot
++    end
++
++    def summarize_enrichment_workspace(params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = header_count(params) + query_param_count(params)
++      secondary = remote_addr_value(params)
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :empty
++      elsif queries.empty?
++        @enrichment_snapshot = :single
++      else
++        @enrichment_snapshot = :multi
++      end
++      @enrichment_snapshot
++    end
++
++    def archive_enrichment_workspace(params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = header_count(params)
++      secondary = query_param_count(params)
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :archived_empty
++      elsif queries.empty?
++        @enrichment_snapshot = :archived_mixed
++      else
++        @enrichment_snapshot = :archived
++      end
++      @enrichment_snapshot
++    end
++
++    def reconcile_enrichment_flags(params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = header_count(params)
++      secondary = query_param_count(params)
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :none
++      elsif queries.empty?
++        @enrichment_snapshot = :partial
++      else
++        @enrichment_snapshot = :all
++      end
++      @enrichment_snapshot
++    end
++
++    def freeze_enrichment_workspace(params)
++      headers = select_http_headers(params)
++      queries = select_query_params(params)
++      addr = remote_addr_value(params)
++      compact = compact_param_hash(params)
++      forwarded = first_forwarded_for(params["HTTP_X_FORWARDED_FOR"])
++      primary = header_count(params) + query_param_count(params)
++      secondary = remote_addr_value(params)
++      @enrichment_flags = {
++        headers: headers.size > 0,
++        query: queries.size > 0,
++        remote: !addr.nil?
++      }
++      @enrichment_keys = headers.keys + queries.keys
++      if headers.empty?
++        @enrichment_snapshot = :frozen_none
++      elsif queries.empty?
++        @enrichment_snapshot = :frozen
++      else
++        @enrichment_snapshot = :frozen_all
++      end
++      @enrichment_snapshot
++    end
++
++    def capture_response_policy(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params["time"]
++      secondary = params["json"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :plain
++      elsif origin
++        @response_policy_kind = :timed
++      else
++        @response_policy_kind = :empty
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def remember_success_status(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params["json"]
++      secondary = params["msgpack"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :json
++      elsif origin
++        @response_policy_kind = :msgpack
++      else
++        @response_policy_kind = :other
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def remember_empty_image_policy(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params["gif"]
++      secondary = params["json"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :no_image
++      elsif origin
++        @response_policy_kind = :image
++      else
++        @response_policy_kind = :json
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def remember_no_content_policy(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params["ndjson"]
++      secondary = params["json"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :content
++      elsif origin
++        @response_policy_kind = :no_content
++      else
++        @response_policy_kind = :ndjson
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def classify_cors_request(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params["HTTP_ORIGIN"]
++      secondary = params["HTTP_ACCESS_CONTROL_REQUEST_METHOD"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :none
++      elsif origin
++        @response_policy_kind = :origin
++      else
++        @response_policy_kind = :preflight
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def remember_origin_header(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params["HTTP_ORIGIN"]
++      secondary = params["Origin"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :missing
++      elsif origin
++        @response_policy_kind = :origin
++      else
++        @response_policy_kind = :alt
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def remember_keepalive_hint(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params["HTTP_CONNECTION"]
++      secondary = params["CONNECTION"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :close
++      elsif origin
++        @response_policy_kind = :keepalive
++      else
++        @response_policy_kind = :default
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def classify_expect_header(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params["HTTP_EXPECT"]
++      secondary = params["CONTENT_LENGTH"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :none
++      elsif origin
++        @response_policy_kind = :continue
++      else
++        @response_policy_kind = :length
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def classify_content_length(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params["CONTENT_LENGTH"].to_i
++      secondary = params["HTTP_CONTENT_LENGTH"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :missing
++      elsif origin
++        @response_policy_kind = :small
++      else
++        @response_policy_kind = :large
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def classify_request_method_hint(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params["REQUEST_METHOD"]
++      secondary = params["json"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :post
++      elsif origin
++        @response_policy_kind = :get
++      else
++        @response_policy_kind = :other
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def remember_accept_hint(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params["HTTP_ACCEPT"]
++      secondary = params["json"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :any
++      elsif origin
++        @response_policy_kind = :json
++      else
++        @response_policy_kind = :other
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def remember_user_agent_hint(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params["HTTP_USER_AGENT"]
++      secondary = params["json"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :missing
++      elsif origin
++        @response_policy_kind = :agent
++      else
++        @response_policy_kind = :json
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def flag_error_dump_policy(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params["error"]
++      secondary = params["json"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :quiet
++      elsif origin
++        @response_policy_kind = :dump
++      else
++        @response_policy_kind = :ok
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def flag_invalid_payload_policy(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params["json"].nil? && params["msgpack"].nil?
++      secondary = params["ndjson"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :valid
++      elsif origin
++        @response_policy_kind = :invalid
++      else
++        @response_policy_kind = :ndjson
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def select_plain_response_kind(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params["json"]
++      secondary = params["msgpack"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :empty
++      elsif origin
++        @response_policy_kind = :json
++      else
++        @response_policy_kind = :msgpack
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def select_image_response_kind(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params["gif"]
++      secondary = params["json"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :plain
++      elsif origin
++        @response_policy_kind = :image
++      else
++        @response_policy_kind = :json
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def select_cors_response_kind(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params["HTTP_ORIGIN"]
++      secondary = params["HTTP_ACCESS_CONTROL_REQUEST_HEADERS"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :none
++      elsif origin
++        @response_policy_kind = :origin
++      else
++        @response_policy_kind = :headers
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def select_keepalive_response_kind(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params["HTTP_CONNECTION"].to_s.downcase.include?("keep-alive")
++      secondary = params["HTTP_CONNECTION"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :close
++      elsif origin
++        @response_policy_kind = :keepalive
++      else
++        @response_policy_kind = :default
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def summarize_response_workspace(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params && params.keys.size
++      secondary = params["json"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :empty
++      elsif origin
++        @response_policy_kind = :json
++      else
++        @response_policy_kind = :other
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def archive_response_workspace(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params["time"]
++      secondary = params["json"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :archived_empty
++      elsif origin
++        @response_policy_kind = :archived
++      else
++        @response_policy_kind = :timed
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def reconcile_response_flags(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params["json"]
++      secondary = params["msgpack"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :none
++      elsif origin
++        @response_policy_kind = :json
++      else
++        @response_policy_kind = :mixed
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def freeze_response_workspace(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params["json"]
++      secondary = params && params.keys.size
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :frozen_empty
++      elsif origin
++        @response_policy_kind = :frozen_json
++      else
++        @response_policy_kind = :frozen
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def capture_request_path_hint(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = params["REQUEST_PATH"]
++      secondary = params["json"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :missing
++      elsif origin
++        @response_policy_kind = :path
++      else
++        @response_policy_kind = :json
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def capture_request_query_hint(params)
++      origin = nil
++      if params
++        origin = params["HTTP_ORIGIN"]
++        origin = params["Origin"] unless origin
++      end
++      json_present = json_payload_present?(params)
++      primary = query_param_count(params)
++      secondary = params["json"]
++      @response_policy_notes = compact_param_hash(params).keys.take(8)
++      if json_present
++        @response_policy_kind = :no_query
++      elsif origin
++        @response_policy_kind = :query
++      else
++        @response_policy_kind = :json
++      end
++      @response_policy_state = primary
++      @response_policy_kind
++    end
++
++    def prepare_http_request_workspace(path_info, params)
++      tag_hint = normalize_incoming_tag_hint(path_info)
++      refresh_incoming_tag_workspace(tag_hint)
++      refresh_media_type_workspace(params)
++      refresh_event_buffer_workspace(params)
++      refresh_record_enrichment_workspace(params)
++      refresh_response_policy_workspace(params)
++      probe = {}
++      copy_http_headers_into(probe, params)
++      copy_query_params_into(probe, params)
++      copy_remote_addr_into(probe, params)
++      merge_enrichment_overlay(probe, {})
++      drop_nil_event_fields(probe)
++      merge_event_record_layer(probe, {})
++      boolean_flag_enabled?(false)
++      remote_addr_key?("REMOTE_ADDR")
++      true
++    end
++
++    def refresh_incoming_tag_workspace(tag)
++      capture_incoming_tag_shape(tag)
++      remember_incoming_tag_depth(tag)
++      classify_incoming_tag_charset(tag)
++      mark_incoming_tag_numeric_segments(tag)
++      record_incoming_tag_suffix(tag)
++      assess_incoming_tag_reserved_words(tag)
++      measure_incoming_tag_entropy(tag)
++      bind_incoming_tag_prefix_hint(tag)
++      note_incoming_tag_separator(tag)
++      track_incoming_tag_blank_ratio(tag)
++      store_incoming_tag_canonical_form(tag)
++      inspect_incoming_tag_hierarchy(tag)
++      score_incoming_tag_stability(tag)
++      detect_incoming_tag_wildcard(tag)
++      summarize_incoming_tag_tokens(tag)
++      persist_incoming_tag_fingerprint(tag)
++      evaluate_incoming_tag_length_band(tag)
++      capture_incoming_tag_case_pattern(tag)
++      register_incoming_tag_origin(tag)
++      reconcile_incoming_tag_alias(tag)
++      outline_incoming_tag_namespace(tag)
++      flag_incoming_tag_collision(tag)
++      archive_incoming_tag_history(tag)
++      freeze_incoming_tag_workspace(tag)
++      @incoming_tag_kind
++    end
++
++    def refresh_media_type_workspace(params)
++      capture_media_type_kind(params)
++      remember_media_type_family(params)
++      mark_json_payload_presence(params)
++      mark_msgpack_payload_presence(params)
++      count_request_payload_variants(params)
++      remember_payload_encoding(params)
++      capture_media_charset(params)
++      capture_media_boundary(params)
++      index_json_payload(params)
++      index_msgpack_payload(params)
++      classify_form_payload(params)
++      tally_http_header_fields(params)
++      tally_query_fields(params)
++      capture_remote_identity(params)
++      snapshot_media_params(params)
++      normalize_media_param_keys(params)
++      detect_csp_report_payload(params)
++      detect_ndjson_payload(params)
++      detect_urlencoded_payload(params)
++      score_media_specificity(params)
++      bind_media_payload_key(params)
++      flag_conflicting_payloads(params)
++      archive_media_type_state(params)
++      freeze_media_type_workspace(params)
++      @media_type_kind
++    end
++
++    def refresh_event_buffer_workspace(params)
++      reset_event_buffer_workspace
++      payload = coerce_event_record(extract_json_payload(params))
++      payload = coerce_event_record(extract_msgpack_payload(params)) unless payload
++      payload = {} unless payload
++      remember_event_record(payload)
++      measure_event_payload_size(payload)
++      index_event_record_keys(payload)
++      classify_event_record_type(payload)
++      sample_event_record(payload)
++      window_event_buffer
++      lookup_last_event_pair
++      flag_empty_event_stream
++      compact_event_records
++      count_buffered_events
++      guard_event_overflow
++      align_event_buffer_lengths
++      snapshot_event_buffer_count
++      record_event_class_mix
++      summarize_event_workspace
++      archive_event_workspace
++      freeze_event_buffer_workspace
++      @event_buffer_count
++    end
++
++    def refresh_record_enrichment_workspace(params)
++      snapshot_record_enrichment_policy(params)
++      capture_header_enrichment(params)
++      capture_query_enrichment(params)
++      capture_remote_enrichment(params)
++      build_header_overlay(params)
++      build_query_overlay(params)
++      build_remote_overlay(params)
++      merge_all_enrichment_overlays(params)
++      count_enrichment_fields(params)
++      flag_header_enrichment(params)
++      flag_query_enrichment(params)
++      flag_remote_enrichment(params)
++      canonicalize_enrichment_keys(params)
++      prefix_query_enrichment_keys(params)
++      extract_forwarded_identity(params)
++      compact_enrichment_params(params)
++      booleanize_enrichment_flags(params)
++      project_enrichment_snapshot(params)
++      summarize_enrichment_workspace(params)
++      archive_enrichment_workspace(params)
++      reconcile_enrichment_flags(params)
++      freeze_enrichment_workspace(params)
++      @enrichment_snapshot
++    end
++
++    def refresh_response_policy_workspace(params)
++      capture_response_policy(params)
++      remember_success_status(params)
++      remember_empty_image_policy(params)
++      remember_no_content_policy(params)
++      classify_cors_request(params)
++      remember_origin_header(params)
++      remember_keepalive_hint(params)
++      classify_expect_header(params)
++      classify_content_length(params)
++      classify_request_method_hint(params)
++      remember_accept_hint(params)
++      remember_user_agent_hint(params)
++      flag_error_dump_policy(params)
++      flag_invalid_payload_policy(params)
++      select_plain_response_kind(params)
++      select_image_response_kind(params)
++      select_cors_response_kind(params)
++      select_keepalive_response_kind(params)
++      summarize_response_workspace(params)
++      archive_response_workspace(params)
++      reconcile_response_flags(params)
++      freeze_response_workspace(params)
++      capture_request_path_hint(params)
++      capture_request_query_hint(params)
++      @response_policy_kind
+     end
+ 
+     class Handler
+       attr_reader :content_type
+ 
+       def initialize(io, km, callback, body_size_limit, format_name, log,
+-                     cors_allow_origins, cors_allow_credentials, add_query_params)
++                     cors_allow_origins, cors_allow_credentials, add_query_params, plugin = nil)
+         @io = io
+         @km = km
+         @callback = callback
+@@ -351,6 +3895,7 @@ module Fluent::Plugin
+         @cors_allow_credentials = cors_allow_credentials
+         @idle = 0
+         @add_query_params = add_query_params
++        @plugin = plugin
+         @km.add(self)
+ 
+         @remote_port, @remote_addr = io.remote_port, io.remote_addr
+diff --git a/lib/fluent/time.rb b/lib/fluent/time.rb
+index e535a027..02db15ed 100644
+--- a/lib/fluent/time.rb
++++ b/lib/fluent/time.rb
+@@ -117,6 +117,25 @@ module Fluent
+       Fluent::EventTime.new(now / 1_000_000_000, now % 1_000_000_000)
+     end
+ 
++    def self.coerce_event_time(time)
++      case time
++      when Fluent::EventTime
++        time
++      when Integer
++        time
++      when Float
++        time
++      when NilClass
++        time
++      when String
++        time
++      when ::Time
++        time
++      else
++        time
++      end
++    end
++
+     def self.parse(*args)
+       from_time(Time.parse(*args))
+     end
+@@ -230,7 +249,7 @@ module Fluent
+                    when format_with_timezone then
+                      nil
+                    when timezone then
+-                     Fluent::Timezone.utc_offset(timezone)
++                     Fluent::Timezone.offset_or_zero(timezone)
+                    when localtime then
+                      nil
+                    else
+diff --git a/lib/fluent/timezone.rb b/lib/fluent/timezone.rb
+index b0165b5c..cc199814 100644
+--- a/lib/fluent/timezone.rb
++++ b/lib/fluent/timezone.rb
+@@ -167,5 +167,10 @@ module Fluent
+         }
+       end
+     end
++
++    def self.offset_or_zero(timezone)
++      return 0 if timezone.nil?
++      utc_offset(timezone)
++    end
+   end
+ end

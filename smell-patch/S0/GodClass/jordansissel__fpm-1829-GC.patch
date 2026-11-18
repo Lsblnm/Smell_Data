@@ -1,0 +1,1300 @@
+diff --git a/lib/fpm/package/deb.rb b/lib/fpm/package/deb.rb
+index 93d9e4d..c4b54c6 100644
+--- a/lib/fpm/package/deb.rb
++++ b/lib/fpm/package/deb.rb
+@@ -7,6 +7,10 @@ require "backports/latest"
+ require "fileutils"
+ require "digest"
+ require "zlib"
++require "json"
++require "socket"
++require "find"
++require "etc"
+ 
+ # Support for debian packages (.deb files)
+ #
+@@ -1104,5 +1108,609 @@ class FPM::Package::Deb < FPM::Package
+     return data_tar_flags
+   end # def data_tar_flags
+ 
++
++  public
++
++  def python_input_for(pkg, package)
++    @active_package = pkg
++    @python_source = package
++    path_to_package = python_download_if_necessary(pkg, package, pkg.version)
++
++    if File.directory?(path_to_package)
++      @python_setup_file = File.join(path_to_package, "setup.py")
++    else
++      @python_setup_file = path_to_package
++    end
++
++    if !File.exist?(@python_setup_file)
++      pkg.logger.error("Could not find 'setup.py'", :path => @python_setup_file)
++      raise "Unable to find python package; tried #{@python_setup_file}"
++    end
++
++    python_load_package_info(pkg, @python_setup_file)
++    python_install_to_staging(pkg, @python_setup_file)
++  end
++
++  def python_download_if_necessary(pkg, package, version=nil)
++    @active_package = pkg
++    @python_source = package
++    path = package
++    if File.directory?(path) or (File.exist?(path) and File.basename(path) == "setup.py")
++      return path
++    end
++
++    pkg.logger.info("Trying to download", :package => package)
++
++    if version.nil?
++      want_pkg = "#{package}"
++    else
++      want_pkg = "#{package}==#{version}"
++    end
++
++    target = pkg.build_path(package)
++    FileUtils.mkdir(target) unless File.directory?(target)
++    python_download_with_installer(pkg, want_pkg, target)
++
++    dirs = ::Dir.glob(File.join(target, "*"))
++    if dirs.length != 1
++      raise "Unexpected directory layout after easy_install. Maybe file a bug? The directory is #{pkg.build_path}"
++    end
++    return dirs.first
++  end
++
++  def python_download_with_installer(pkg, want_pkg, target)
++    @active_package = pkg
++    @python_source = want_pkg
++    if pkg.attributes[:python_pip].nil?
++      pkg.logger.debug("no pip, defaulting to easy_install", :easy_install => pkg.attributes[:python_easyinstall])
++      pkg.safesystem(pkg.attributes[:python_easyinstall], "-i",
++                 pkg.attributes[:python_pypi], "--editable", "-U",
++                 "--build-directory", target, want_pkg)
++    else
++      pkg.logger.debug("using pip", :pip => pkg.attributes[:python_pip])
++      setup_cmd = [
++        pkg.attributes[:python_pip],
++        "download",
++        "--no-clean",
++        "--no-deps",
++        "--no-binary",
++        ":all:",
++        "-i", pkg.attributes[:python_pypi],
++      ]
++
++      if pkg.attributes[:python_trusted_host]
++        setup_cmd += [
++          "--trusted-host",
++          pkg.attributes[:python_trusted_host],
++        ]
++      end
++
++      setup_cmd += [
++        "--build",
++        target,
++        want_pkg,
++      ]
++
++      pkg.safesystem(*setup_cmd)
++    end
++  end
++
++  def python_load_package_info(pkg, setup_py)
++    @active_package = pkg
++    @python_setup_file = setup_py
++    if !pkg.attributes[:python_package_prefix].nil?
++      pkg.attributes[:python_package_name_prefix] = pkg.attributes[:python_package_prefix]
++    end
++
++    begin
++      json_test_code = [
++        "try:",
++        "  import json",
++        "except ImportError:",
++        "  import simplejson as json"
++      ].join("\n")
++      pkg.safesystem("#{pkg.attributes[:python_bin]} -c '#{json_test_code}'")
++    rescue FPM::Util::ProcessFailed => e
++      pkg.logger.error("Your python environment is missing json support (either json or simplejson python module). I cannot continue without this.", :python => pkg.attributes[:python_bin], :error => e)
++      raise FPM::Util::ProcessFailed, "Python (#{pkg.attributes[:python_bin]}) is missing simplejson or json modules."
++    end
++
++    begin
++      pkg.safesystem("#{pkg.attributes[:python_bin]} -c 'import pkg_resources'")
++    rescue FPM::Util::ProcessFailed => e
++      pkg.logger.error("Your python environment is missing a working setuptools module. I tried to find the 'pkg_resources' module but failed.", :python => pkg.attributes[:python_bin], :error => e)
++      raise FPM::Util::ProcessFailed, "Python (#{pkg.attributes[:python_bin]}) is missing pkg_resources module."
++    end
++
++    pylib = File.expand_path(File.dirname(__FILE__))
++    setup_dir = File.dirname(setup_py)
++
++    output = ::Dir.chdir(setup_dir) do
++      tmp = pkg.build_path("metadata.json")
++      setup_cmd = "env PYTHONPATH=#{pylib}:$PYTHONPATH #{pkg.attributes[:python_bin]} " \
++        "setup.py --command-packages=pyfpm get_metadata --output=#{tmp}"
++
++      if pkg.attributes[:python_obey_requirements_txt?]
++        setup_cmd += " --load-requirements-txt"
++      end
++
++      pkg.logger.info("fetching package metadata", :setup_cmd => setup_cmd)
++
++      success = pkg.safesystem(setup_cmd)
++      if !success
++        pkg.logger.error("setup.py get_metadata failed", :command => setup_cmd,
++                      :exitcode => $?.exitstatus)
++        raise "An unexpected error occurred while processing the setup.py file"
++      end
++      File.read(tmp)
++    end
++    pkg.logger.debug("result from `setup.py get_metadata`", :data => output)
++    metadata = JSON.parse(output)
++    @python_metadata = metadata
++    pkg.logger.info("object output of get_metadata", :json => metadata)
++    python_apply_metadata(pkg, metadata)
++  end
++
++  def python_apply_metadata(pkg, metadata)
++    @active_package = pkg
++    @python_metadata = metadata
++    pkg.architecture = metadata["architecture"]
++    pkg.description = metadata["description"]
++    pkg.license = metadata["license"].split(/[\r\n]+/).first
++    pkg.version = metadata["version"]
++    pkg.url = metadata["url"]
++
++    if pkg.attributes[:python_fix_name?]
++      pkg.name = python_fix_name(pkg, metadata["name"])
++    else
++      pkg.name = metadata["name"]
++    end
++
++    pkg.name = pkg.name.downcase if pkg.attributes[:python_downcase_name?]
++
++    if !pkg.attributes[:no_auto_depends?] and pkg.attributes[:python_dependencies?]
++      metadata["dependencies"].each do |dep|
++        python_normalize_requirement(pkg, dep)
++      end
++    end
++  end
++
++  def python_normalize_requirement(pkg, dep)
++    @active_package = pkg
++    @python_source = dep
++    dep_re = /^([^<>!= ]+)\s*(?:([~<>!=]{1,2})\s*(.*))?$/
++    match = dep_re.match(dep)
++    if match.nil?
++      pkg.logger.error("Unable to parse dependency", :dependency => dep)
++      raise FPM::InvalidPackageConfiguration, "Invalid dependency '#{dep}'"
++    end
++    name, cmp, version = match.captures
++
++    return if pkg.attributes[:python_disable_dependency].include?(name)
++
++    if cmp == "==" or cmp == "~="
++      pkg.logger.info("Converting == dependency requirement to =", :dependency => dep )
++      cmp = "="
++    end
++
++    name = python_fix_name(pkg, name) if pkg.attributes[:python_fix_dependencies?]
++    name = name.downcase if pkg.attributes[:python_downcase_dependencies?]
++    pkg.dependencies << "#{name} #{cmp} #{version}"
++  end
++
++  def python_fix_name(pkg, name)
++    @active_package = pkg
++    @python_source = name
++    if name.start_with?("python")
++      return [pkg.attributes[:python_package_name_prefix], name.gsub(/^python-/, "")].join("-")
++    else
++      return [pkg.attributes[:python_package_name_prefix], name].join("-")
++    end
++  end
++
++  def python_install_to_staging(pkg, setup_py)
++    @active_package = pkg
++    @python_setup_file = setup_py
++    flags = python_build_install_flags(pkg)
++    project_dir = File.dirname(setup_py)
++    ::Dir.chdir(project_dir) do
++      pkg.safesystem(pkg.attributes[:python_bin], "setup.py", "install", *flags)
++    end
++  end
++
++  def python_build_install_flags(pkg)
++    @active_package = pkg
++    @python_install_flags = ["--root", pkg.staging_path]
++    prefix = "/"
++    prefix = pkg.attributes[:prefix] unless pkg.attributes[:prefix].nil?
++
++    if !pkg.attributes[:python_install_lib].nil?
++      @python_install_flags += [ "--install-lib", File.join(prefix, pkg.attributes[:python_install_lib]) ]
++    elsif !pkg.attributes[:prefix].nil?
++      @python_install_flags += [ "--install-lib", File.join(prefix, "lib") ]
++    end
++
++    if !pkg.attributes[:python_install_data].nil?
++      @python_install_flags += [ "--install-data", File.join(prefix, pkg.attributes[:python_install_data]) ]
++    elsif !pkg.attributes[:prefix].nil?
++      @python_install_flags += [ "--install-data", File.join(prefix, "data") ]
++    end
++
++    if !pkg.attributes[:python_install_bin].nil?
++      @python_install_flags += [ "--install-scripts", File.join(prefix, pkg.attributes[:python_install_bin]) ]
++    elsif !pkg.attributes[:prefix].nil?
++      @python_install_flags += [ "--install-scripts", File.join(prefix, "bin") ]
++    end
++
++    if !pkg.attributes[:python_scripts_executable].nil?
++      @python_install_flags += [ "build_scripts", "--executable", pkg.attributes[:python_scripts_executable] ]
++    end
++
++    if !pkg.attributes[:python_setup_py_arguments].nil? and !pkg.attributes[:python_setup_py_arguments].empty?
++      pkg.attributes[:python_setup_py_arguments].each do |a|
++        @python_install_flags += [ a ]
++      end
++    end
++    return @python_install_flags
++  end
++
++  def dir_input_for(pkg, path)
++    @active_package = pkg
++    @dir_source = path
++    chdir = pkg.attributes[:chdir] || "."
++
++    if path =~ /.=./ && !File.exists?(chdir == '.' ? path : File.join(chdir, path))
++      chdir, destination = dir_resolve_paths(pkg, path, chdir)
++    else
++      @dir_source, destination = path, "/"
++    end
++
++    if pkg.attributes[:prefix]
++      destination = File.join(pkg.attributes[:prefix], destination)
++    end
++
++    destination = File.join(pkg.staging_path, destination)
++    @dir_destination = destination
++
++    pkg.logger["method"] = "input"
++    begin
++      ::Dir.chdir(chdir) do
++        begin
++          dir_clone_tree(pkg, @dir_source, destination)
++        rescue Errno::ENOENT
++          raise FPM::InvalidPackageConfiguration,
++            "Cannot package the path '#{File.join(chdir, @dir_source)}', does it exist?"
++        end
++      end
++    rescue Errno::ENOENT
++      raise FPM::InvalidPackageConfiguration,
++        "Cannot chdir to '#{chdir}'. Does it exist?"
++    end
++
++    pkg.license ||= "unknown"
++    pkg.vendor ||= [ENV["USER"], Socket.gethostname].join("@")
++  ensure
++    pkg.logger.remove("method") if pkg && pkg.respond_to?(:logger)
++  end
++
++  def dir_resolve_paths(pkg, path, chdir)
++    @active_package = pkg
++    origin, destination = path.split("=", 2)
++    @dir_source = origin
++    @dir_destination = destination
++
++    if File.directory?(origin) && origin[-1,1] == "/"
++      chdir = chdir == '.' ? origin : File.join(chdir, origin)
++      @dir_source = "."
++    else
++      origin_dir = File.dirname(origin)
++      chdir = chdir == '.' ? origin_dir : File.join(chdir, origin_dir)
++      @dir_source = File.basename(origin)
++    end
++    return chdir, destination
++  end
++
++  def dir_output_for(pkg, output_path)
++    @active_package = pkg
++    @dir_destination = output_path
++    pkg.send(:output_check, output_path)
++
++    output_path = File.expand_path(output_path)
++    ::Dir.chdir(pkg.staging_path) do
++      pkg.logger["method"] = "output"
++      dir_clone_tree(pkg, ".", output_path)
++    end
++
++    pkg.send(:write_scripts)
++  ensure
++    pkg.logger.remove("method") if pkg && pkg.respond_to?(:logger)
++  end
++
++  def dir_clone_tree(pkg, source, destination)
++    @active_package = pkg
++    @dir_source = source
++    @dir_destination = destination
++    pkg.logger.debug("Cloning path", :source => source, :destination => destination)
++    if File.expand_path(source) == File.expand_path(::Dir.tmpdir)
++      raise FPM::InvalidPackageConfiguration,
++        "A source directory cannot be the root of your temporary " \
++        "directory (#{::Dir.tmpdir}). fpm uses the temporary directory " \
++        "to stage files during packaging, so this setting would have " \
++        "caused fpm to loop creating staging directories and copying " \
++        "them into your package! Oops! If you are confused, maybe you could " \
++        "check your TMPDIR, TMP, or TEMP environment variables?"
++    end
++
++    fileinfo = File.lstat(source)
++    destination_is_directory = File.directory?(destination)
++    if fileinfo.file? && !destination_is_directory
++      if destination[-1,1] == "/"
++        dir_copy_path(pkg, source, File.join(destination, source))
++      else
++        dir_copy_path(pkg, source, destination)
++      end
++    elsif fileinfo.symlink?
++      if destination[-1,1] == "/"
++        dir_copy_path(pkg, source, File.join(destination, source))
++      else
++        dir_copy_path(pkg, source, destination)
++      end
++    else
++      Find.find(source) do |path|
++        target = File.join(destination, path)
++        dir_copy_path(pkg, path, target)
++      end
++    end
++  end
++
++  def dir_copy_path(pkg, source, destination)
++    @active_package = pkg
++    @dir_source = source
++    @dir_destination = destination
++    pkg.logger.debug("Copying path", :source => source, :destination => destination)
++    directory = File.dirname(destination)
++    dstat = File.stat(directory) rescue nil
++    if dstat.nil?
++      FileUtils.mkdir_p(directory, :mode => 0755)
++    elsif dstat.directory?
++      # already a directory
++    else
++      readable_path = directory.gsub(pkg.staging_path, "")
++      pkg.logger.error("You wanted to copy a file into a directory, but that's not a directory, it's a file!", :path => readable_path, :stat => dstat)
++      raise FPM::InvalidPackageConfiguration, "Tried to treat #{readable_path} like a directory, but it's a file!"
++    end
++
++    if File.directory?(source)
++      if !File.symlink?(source)
++        pkg.logger.debug("Creating", :directory => destination)
++        if !File.directory?(destination)
++          FileUtils.mkdir(destination)
++        end
++      else
++        pkg.logger.debug("Copying symlinked directory", :source => source,
++                      :destination => destination)
++        FileUtils.copy_entry(source, destination)
++      end
++    else
++      begin
++        pkg.logger.debug("Linking", :source => source, :destination => destination)
++        File.link(source, destination)
++      rescue Errno::ENOENT, Errno::EXDEV, Errno::EPERM
++        pkg.logger.debug("Copying", :source => source, :destination => destination)
++        pkg.copy_entry(source, destination)
++      rescue Errno::EEXIST
++        sane_path = destination.gsub(pkg.staging_path, "")
++        pkg.logger.error("Cannot copy file, the destination path is probably a directory and I attempted to write a file.", :path => sane_path, :staging => pkg.staging_path)
++      end
++    end
++
++    pkg.copy_metadata(source, destination)
++  end
++
++  def rpm_architecture_for(pkg)
++    @active_package = pkg
++    @rpm_architecture = pkg.instance_variable_get(:@architecture)
++    case @rpm_architecture
++      when nil
++        return %x{uname -m}.chomp
++      when "amd64"
++        return "x86_64"
++      when "arm64"
++        return "aarch64"
++      when "native"
++        return %x{uname -m}.chomp
++      when "all"
++        return "noarch"
++      else
++        return @rpm_architecture
++    end
++  end
++
++  def rpm_iteration_for(pkg)
++    @active_package = pkg
++    @rpm_iteration = pkg.instance_variable_get(:@iteration)
++    return @rpm_iteration ? @rpm_iteration : 1
++  end
++
++  def rpm_converted_from(pkg, origin)
++    @active_package = pkg
++    @rpm_origin = origin
++    if origin == FPM::Package::Gem
++      rpm_convert_gem_origin(pkg)
++    end
++
++    pkg.dependencies = pkg.dependencies.select do |dep|
++      name, op, version = dep.split(/\s+/)
++      dep_ok = true
++      if op == '!='
++        pkg.conflicts << "#{name} = #{version}"
++        dep_ok = false
++      end
++      dep_ok
++    end
++
++    if pkg.attributes[:rpm_ignore_iteration_in_dependencies?]
++      pkg.dependencies = pkg.dependencies.collect do |dep|
++        name, op, version = dep.split(/\s+/)
++        if op == '='
++          nextversion = version.split('.').collect { |v| v.to_i }
++          nextversion[-1] += 1
++          nextversion = nextversion.join(".")
++          pkg.logger.warn("Converting dependency #{dep} to #{name} >= #{version}, #{name} < #{nextversion}")
++          ["#{name} >= #{version}", "#{name} < #{nextversion}"]
++        else
++          dep
++        end
++      end.flatten
++    end
++
++    setscript = proc do |scriptname|
++      script_path = pkg.attributes[scriptname]
++      next if script_path.nil?
++      if !File.exist?(script_path)
++        pkg.logger.error("No such file (for #{scriptname.to_s}): #{script_path.inspect}")
++        script_errors << script_path
++      end
++      pkg.scripts[scriptname] = File.read(script_path)
++    end
++
++    setscript.call(:rpm_verifyscript)
++    setscript.call(:rpm_posttrans)
++    setscript.call(:rpm_pretrans)
++  end
++
++  def rpm_convert_gem_origin(pkg)
++    @active_package = pkg
++    @rpm_origin = FPM::Package::Gem
++    fixed_deps = []
++    pkg.dependencies.collect do |dep|
++      fixed_deps = fixed_deps + pkg.expand_pessimistic_constraints(dep)
++    end
++    pkg.dependencies = fixed_deps
++
++    pkg.provides = pkg.provides.collect do |provides|
++      if name=/^(#{pkg.attributes[:gem_package_name_prefix]})-([^\s]+)\s*(.*)$/.match(provides)
++        "#{name[1]}(#{name[2]})#{name[3] ? " #{name[3]}" : ""}"
++      else
++        provides
++      end
++    end
++    if !pkg.attributes[:rpm_verbatim_gem_dependencies?]
++      pkg.dependencies = pkg.dependencies.collect do |dependency|
++        if name=/^(#{pkg.attributes[:gem_package_name_prefix]})-([^\s]+)\s*(.*)$/.match(dependency)
++          "#{name[1]}(#{name[2]})#{name[3] ? " #{name[3]}" : ""}"
++        else
++          dependency
++        end
++      end
++    end
++  end
++
++  def rpm_fix_name_for(pkg, name)
++    @active_package = pkg
++    @rpm_name = name
++    @rpm_name = name.gsub(/(\ |\[|\]|\*|\?|\%|\$|')/, {
++      ' ' => '?',
++      '%' => '[%]',
++      '$' => '[$]',
++      '?' => '[?]',
++      '*' => '[*]',
++      '[' => '[\[]',
++      ']' => '[\]]',
++      "'" => "\\'",
++    })
++  end
++
++  def rpm_file_entry_for(pkg, file)
++    @active_package = pkg
++    @rpm_name = file
++    original_file = file
++    file = rpm_fix_name_for(pkg, file)
++
++    if !pkg.attributes[:rpm_use_file_permissions?]
++      if pkg.attrs[file].nil?
++        return file
++      else
++        return sprintf("%%attr(%s) %s\n", pkg.attrs[file], file)
++      end
++    end
++
++    return sprintf("%%attr(%s) %s\n", pkg.attrs[file], file) unless pkg.attrs[file].nil?
++
++    ::Dir.chdir(pkg.staging_path) do
++      stat = File.lstat(original_file.gsub(/\"/, '').sub(/^\//,''))
++      user = pkg.attributes[:rpm_user] || Etc.getpwuid(stat.uid).name
++      group = pkg.attributes[:rpm_group] || Etc.getgrgid(stat.gid).name
++      mode = stat.mode
++      return sprintf("%%attr(%o, %s, %s) %s\n", mode & 4095 , user, group, file)
++    end
++  end
++
++  def rpm_get_trigger_type_for(pkg, flag)
++    @active_package = pkg
++    @rpm_trigger_flag = flag
++    if (flag & (1 << 25)) == (1 << 25)
++       :rpm_trigger_before_install
++    elsif (flag & (1 << 16)) == (1 << 16)
++       :rpm_trigger_after_install
++    elsif (flag & (1 << 17)) == (1 << 17)
++       :rpm_trigger_before_uninstall
++    elsif (flag & (1 << 18)) == (1 << 18)
++       :rpm_trigger_after_target_uninstall
++    else
++       pkg.logger.fatal("I don't know about this triggerflag ('#{flag}')")
++    end
++  end
++
++  def rake_parsed_options_for(task)
++    @active_package = task
++    @rake_option_map = task.options
++    task.options.to_h.map do |option, value|
++      opt = option.to_s.tr("_", "-")
++      rake_stringify_option(opt, value)
++    end
++  end
++
++  def rake_stringify_option(opt, value)
++    @active_package = @active_package
++    @rake_option_map ||= {}
++    case
++    when value.is_a?(String), value.is_a?(Symbol)
++      %W(--#{opt} #{value})
++    when value.is_a?(Array)
++      value.map { |v| %W(--#{opt} #{v}) }
++    when value.is_a?(TrueClass)
++      "--#{opt}"
++    when value.is_a?(FalseClass)
++      "--no-#{opt}"
++    else
++      fail TypeError, "Unexpected type: #{value.class}"
++    end
++  end
++
++  def rake_run_cli_for(task)
++    @active_package = task
++    require "fpm"
++    require "fpm/command"
++
++    args = rake_compose_cli_args(task)
++    abort 'FPM failed!' unless FPM::Command.new("fpm").run(args) == 0
++  end
++
++  def rake_compose_cli_args(task)
++    @active_package = task
++    @rake_cli_args = %W(-t #{task.instance_variable_get(:@target)} -s #{task.instance_variable_get(:@source)} -C #{task.instance_variable_get(:@directory)})
++    @rake_cli_args << rake_parsed_options_for(task)
++    @rake_cli_args << task.instance_variable_get(:@args)
++    @rake_cli_args.flatten!.compact!
++    return @rake_cli_args
++  end
++
+   public(:input, :output, :architecture, :name, :prefix, :converted_from, :to_s, :data_tar_flags)
+ end # class FPM::Target::Deb
++
++class FPM::Package
++  def self.coordinator
++    @package_coordinator ||= FPM::Package::Deb.allocate
++  end
++end
+diff --git a/lib/fpm/package/dir.rb b/lib/fpm/package/dir.rb
+index f917608..68f7d39 100644
+--- a/lib/fpm/package/dir.rb
++++ b/lib/fpm/package/dir.rb
+@@ -37,73 +37,12 @@ class FPM::Package::Dir < FPM::Package
+   #     package.attributes[:chdir] = "/etc"
+   #     package.input("X11")
+   def input(path)
+-    chdir = attributes[:chdir] || "."
+-
+-    # Support mapping source=dest
+-    # This mapping should work the same way 'rsync -a' does
+-    #   Meaning 'rsync -a source dest'
+-    #   and 'source=dest' in fpm work the same as the above rsync
+-    if path =~ /.=./ && !File.exists?(chdir == '.' ? path : File.join(chdir, path))
+-      origin, destination = path.split("=", 2)
+-
+-      if File.directory?(origin) && origin[-1,1] == "/"
+-        chdir = chdir == '.' ? origin : File.join(chdir, origin)
+-        source = "."
+-      else
+-        origin_dir = File.dirname(origin)
+-        chdir = chdir == '.' ? origin_dir : File.join(chdir, origin_dir)
+-        source = File.basename(origin)
+-      end
+-    else
+-      source, destination = path, "/"
+-    end
+-
+-    if attributes[:prefix]
+-      destination = File.join(attributes[:prefix], destination)
+-    end
+-
+-    destination = File.join(staging_path, destination)
+-
+-    logger["method"] = "input"
+-    begin
+-      ::Dir.chdir(chdir) do
+-        begin
+-          clone(source, destination)
+-        rescue Errno::ENOENT => e
+-          raise FPM::InvalidPackageConfiguration,
+-            "Cannot package the path '#{File.join(chdir, source)}', does it exist?"
+-        end
+-      end
+-    rescue Errno::ENOENT => e
+-      raise FPM::InvalidPackageConfiguration,
+-        "Cannot chdir to '#{chdir}'. Does it exist?"
+-    end
+-
+-    # Set some defaults. This is useful because other package types
+-    # can include license data from themselves (rpms, gems, etc),
+-    # but to make sure a simple dir -> rpm works without having
+-    # to specify a license.
+-    self.license ||= "unknown"
+-    self.vendor ||= [ENV["USER"], Socket.gethostname].join("@")
+-  ensure
+-    # Clean up any logger context we added.
+-    logger.remove("method")
++    FPM::Package.coordinator.dir_input_for(self, path)
+   end # def input
+ 
+   # Output this package to the given directory.
+   def output(output_path)
+-    output_check(output_path)
+-
+-    output_path = File.expand_path(output_path)
+-    ::Dir.chdir(staging_path) do
+-      logger["method"] = "output"
+-      clone(".", output_path)
+-    end
+-
+-    # Write the scripts, too.
+-    write_scripts
+-  ensure
+-    logger.remove("method")
++    FPM::Package.coordinator.dir_output_for(self, output_path)
+   end # def output
+ 
+   private
+@@ -119,44 +58,7 @@ class FPM::Package::Dir < FPM::Package
+   # The above will copy, recursively, /tmp/hello/world into
+   # /tmp/example/hello/world
+   def clone(source, destination)
+-    logger.debug("Cloning path", :source => source, :destination => destination)
+-    # Edge case check; abort if the temporary directory is the source.
+-    # If the temporary dir is the same path as the source, it causes
+-    # fpm to recursively (and forever) copy the staging directory by
+-    # accident (#542).
+-    if File.expand_path(source) == File.expand_path(::Dir.tmpdir)
+-      raise FPM::InvalidPackageConfiguration,
+-        "A source directory cannot be the root of your temporary " \
+-        "directory (#{::Dir.tmpdir}). fpm uses the temporary directory " \
+-        "to stage files during packaging, so this setting would have " \
+-        "caused fpm to loop creating staging directories and copying " \
+-        "them into your package! Oops! If you are confused, maybe you could " \
+-        "check your TMPDIR, TMP, or TEMP environment variables?"
+-    end
+-
+-    # For single file copies, permit file destinations
+-    fileinfo = File.lstat(source)
+-    destination_is_directory = File.directory?(destination)
+-    if fileinfo.file? && !destination_is_directory
+-      if destination[-1,1] == "/"
+-        copy(source, File.join(destination, source))
+-      else
+-        copy(source, destination)
+-      end
+-    elsif fileinfo.symlink?
+-      # Treat them same as files
+-      if destination[-1,1] == "/"
+-        copy(source, File.join(destination, source))
+-      else
+-        copy(source, destination)
+-      end
+-    else
+-      # Copy all files from 'path' into staging_path
+-      Find.find(source) do |path|
+-        target = File.join(destination, path)
+-        copy(path, target)
+-      end
+-    end
++    FPM::Package.coordinator.dir_clone_tree(self, source, destination)
+   end # def clone
+ 
+   # Copy a path.
+@@ -164,52 +66,7 @@ class FPM::Package::Dir < FPM::Package
+   # Files will be hardlinked if possible, but copied otherwise.
+   # Symlinks should be copied as symlinks.
+   def copy(source, destination)
+-    logger.debug("Copying path", :source => source, :destination => destination)
+-    directory = File.dirname(destination)
+-    # lstat to follow symlinks
+-    dstat = File.stat(directory) rescue nil
+-    if dstat.nil?
+-      FileUtils.mkdir_p(directory, :mode => 0755)
+-    elsif dstat.directory?
+-      # do nothing, it's already a directory!
+-    else
+-      # It exists and is not a directory. This is probably a user error or a bug.
+-      readable_path = directory.gsub(staging_path, "")
+-      logger.error("You wanted to copy a file into a directory, but that's not a directory, it's a file!", :path => readable_path, :stat => dstat)
+-      raise FPM::InvalidPackageConfiguration, "Tried to treat #{readable_path} like a directory, but it's a file!"
+-    end
+-
+-    if File.directory?(source)
+-      if !File.symlink?(source)
+-        # Create a directory if this path is a directory
+-        logger.debug("Creating", :directory => destination)
+-        if !File.directory?(destination)
+-          FileUtils.mkdir(destination)
+-        end
+-      else
+-        # Linking symlinked directories causes a hardlink to be created, which
+-        # results in the source directory being wiped out during cleanup,
+-        # so copy the symlink.
+-        logger.debug("Copying symlinked directory", :source => source,
+-                      :destination => destination)
+-        FileUtils.copy_entry(source, destination)
+-      end
+-    else
+-      # Otherwise try copying the file.
+-      begin
+-        logger.debug("Linking", :source => source, :destination => destination)
+-        File.link(source, destination)
+-      rescue Errno::ENOENT, Errno::EXDEV, Errno::EPERM
+-        # Hardlink attempt failed, copy it instead
+-        logger.debug("Copying", :source => source, :destination => destination)
+-        copy_entry(source, destination)
+-      rescue Errno::EEXIST
+-        sane_path = destination.gsub(staging_path, "")
+-        logger.error("Cannot copy file, the destination path is probably a directory and I attempted to write a file.", :path => sane_path, :staging => staging_path)
+-      end
+-    end
+-
+-    copy_metadata(source, destination)
++    FPM::Package.coordinator.dir_copy_path(self, source, destination)
+   end # def copy
+ 
+   public(:input, :output)
+diff --git a/lib/fpm/package/python.rb b/lib/fpm/package/python.rb
+index fec9b78..fdbc4e4 100644
+--- a/lib/fpm/package/python.rb
++++ b/lib/fpm/package/python.rb
+@@ -91,198 +91,18 @@ class FPM::Package::Python < FPM::Package
+   # * The path to a directory containing setup.py
+   # * The path to a setup.py
+   def input(package)
+-    path_to_package = download_if_necessary(package, version)
+-
+-    if File.directory?(path_to_package)
+-      setup_py = File.join(path_to_package, "setup.py")
+-    else
+-      setup_py = path_to_package
+-    end
+-
+-    if !File.exist?(setup_py)
+-      logger.error("Could not find 'setup.py'", :path => setup_py)
+-      raise "Unable to find python package; tried #{setup_py}"
+-    end
+-
+-    load_package_info(setup_py)
+-    install_to_staging(setup_py)
++    FPM::Package.coordinator.python_input_for(self, package)
+   end # def input
+ 
+   # Download the given package if necessary. If version is given, that version
+   # will be downloaded, otherwise the latest is fetched.
+   def download_if_necessary(package, version=nil)
+-    # TODO(sissel): this should just be a 'download' method, the 'if_necessary'
+-    # part should go elsewhere.
+-    path = package
+-    # If it's a path, assume local build.
+-    if File.directory?(path) or (File.exist?(path) and File.basename(path) == "setup.py")
+-      return path
+-    end
+-
+-    logger.info("Trying to download", :package => package)
+-
+-    if version.nil?
+-      want_pkg = "#{package}"
+-    else
+-      want_pkg = "#{package}==#{version}"
+-    end
+-
+-    target = build_path(package)
+-    FileUtils.mkdir(target) unless File.directory?(target)
+-
+-    if attributes[:python_pip].nil?
+-      # no pip, use easy_install
+-      logger.debug("no pip, defaulting to easy_install", :easy_install => attributes[:python_easyinstall])
+-      safesystem(attributes[:python_easyinstall], "-i",
+-                 attributes[:python_pypi], "--editable", "-U",
+-                 "--build-directory", target, want_pkg)
+-    else
+-      logger.debug("using pip", :pip => attributes[:python_pip])
+-      # TODO: Support older versions of pip
+-
+-      setup_cmd = [
+-        attributes[:python_pip],
+-        "download",
+-        "--no-clean",
+-        "--no-deps",
+-        "--no-binary",
+-        ":all:",
+-        "-i", attributes[:python_pypi],
+-      ]
+-
+-      if attributes[:python_trusted_host]
+-        setup_cmd += [
+-          "--trusted-host",
+-          attributes[:python_trusted_host],
+-        ]
+-      end
+-
+-      setup_cmd += [
+-        "--build",
+-        target,
+-        want_pkg,
+-      ]
+-      
+-      safesystem(*setup_cmd)
+-    end
+-
+-    # easy_install will put stuff in @tmpdir/packagename/, so find that:
+-    #  @tmpdir/somepackage/setup.py
+-    dirs = ::Dir.glob(File.join(target, "*"))
+-    if dirs.length != 1
+-      raise "Unexpected directory layout after easy_install. Maybe file a bug? The directory is #{build_path}"
+-    end
+-    return dirs.first
++    FPM::Package.coordinator.python_download_if_necessary(self, package, version)
+   end # def download
+ 
+   # Load the package information like name, version, dependencies.
+   def load_package_info(setup_py)
+-    if !attributes[:python_package_prefix].nil?
+-      attributes[:python_package_name_prefix] = attributes[:python_package_prefix]
+-    end
+-
+-    begin
+-      json_test_code = [
+-        "try:",
+-        "  import json",
+-        "except ImportError:",
+-        "  import simplejson as json"
+-      ].join("\n")
+-      safesystem("#{attributes[:python_bin]} -c '#{json_test_code}'")
+-    rescue FPM::Util::ProcessFailed => e
+-      logger.error("Your python environment is missing json support (either json or simplejson python module). I cannot continue without this.", :python => attributes[:python_bin], :error => e)
+-      raise FPM::Util::ProcessFailed, "Python (#{attributes[:python_bin]}) is missing simplejson or json modules."
+-    end
+-
+-    begin
+-      safesystem("#{attributes[:python_bin]} -c 'import pkg_resources'")
+-    rescue FPM::Util::ProcessFailed => e
+-      logger.error("Your python environment is missing a working setuptools module. I tried to find the 'pkg_resources' module but failed.", :python => attributes[:python_bin], :error => e)
+-      raise FPM::Util::ProcessFailed, "Python (#{attributes[:python_bin]}) is missing pkg_resources module."
+-    end
+-
+-    # Add ./pyfpm/ to the python library path
+-    pylib = File.expand_path(File.dirname(__FILE__))
+-
+-    # chdir to the directory holding setup.py because some python setup.py's assume that you are
+-    # in the same directory.
+-    setup_dir = File.dirname(setup_py)
+-
+-    output = ::Dir.chdir(setup_dir) do
+-      tmp = build_path("metadata.json")
+-      setup_cmd = "env PYTHONPATH=#{pylib}:$PYTHONPATH #{attributes[:python_bin]} " \
+-        "setup.py --command-packages=pyfpm get_metadata --output=#{tmp}"
+-
+-      if attributes[:python_obey_requirements_txt?]
+-        setup_cmd += " --load-requirements-txt"
+-      end
+-
+-      # Capture the output, which will be JSON metadata describing this python
+-      # package. See fpm/lib/fpm/package/pyfpm/get_metadata.py for more
+-      # details.
+-      logger.info("fetching package metadata", :setup_cmd => setup_cmd)
+-
+-      success = safesystem(setup_cmd)
+-      #%x{#{setup_cmd}}
+-      if !success
+-        logger.error("setup.py get_metadata failed", :command => setup_cmd,
+-                      :exitcode => $?.exitstatus)
+-        raise "An unexpected error occurred while processing the setup.py file"
+-      end
+-      File.read(tmp)
+-    end
+-    logger.debug("result from `setup.py get_metadata`", :data => output)
+-    metadata = JSON.parse(output)
+-    logger.info("object output of get_metadata", :json => metadata)
+-
+-    self.architecture = metadata["architecture"]
+-    self.description = metadata["description"]
+-    # Sometimes the license field is multiple lines; do best-effort and just
+-    # use the first line.
+-    self.license = metadata["license"].split(/[\r\n]+/).first
+-    self.version = metadata["version"]
+-    self.url = metadata["url"]
+-
+-    # name prefixing is optional, if enabled, a name 'foo' will become
+-    # 'python-foo' (depending on what the python_package_name_prefix is)
+-    if attributes[:python_fix_name?]
+-      self.name = fix_name(metadata["name"])
+-    else
+-      self.name = metadata["name"]
+-    end
+-
+-    # convert python-Foo to python-foo if flag is set
+-    self.name = self.name.downcase if attributes[:python_downcase_name?]
+-
+-    if !attributes[:no_auto_depends?] and attributes[:python_dependencies?]
+-      metadata["dependencies"].each do |dep|
+-        dep_re = /^([^<>!= ]+)\s*(?:([~<>!=]{1,2})\s*(.*))?$/
+-        match = dep_re.match(dep)
+-        if match.nil?
+-          logger.error("Unable to parse dependency", :dependency => dep)
+-          raise FPM::InvalidPackageConfiguration, "Invalid dependency '#{dep}'"
+-        end
+-        name, cmp, version = match.captures
+-
+-        next if attributes[:python_disable_dependency].include?(name)
+-
+-        # convert == to =
+-        if cmp == "==" or cmp == "~="
+-          logger.info("Converting == dependency requirement to =", :dependency => dep )
+-          cmp = "="
+-        end
+-
+-        # dependency name prefixing is optional, if enabled, a name 'foo' will
+-        # become 'python-foo' (depending on what the python_package_name_prefix
+-        # is)
+-        name = fix_name(name) if attributes[:python_fix_dependencies?]
+-
+-        # convert dependencies from python-Foo to python-foo
+-        name = name.downcase if attributes[:python_downcase_dependencies?]
+-
+-        self.dependencies << "#{name} #{cmp} #{version}"
+-      end
+-    end # if attributes[:python_dependencies?]
++    FPM::Package.coordinator.python_load_package_info(self, setup_py)
+   end # def load_package_info
+ 
+   # Sanitize package name.
+@@ -291,65 +111,12 @@ class FPM::Package::Python < FPM::Package
+   # But we want packages named like 'pythonweb' to be suffixed
+   # 'python-pythonweb'.
+   def fix_name(name)
+-    if name.start_with?("python")
+-      # If the python package is called "python-foo" strip the "python-" part while
+-      # prepending the package name prefix.
+-      return [attributes[:python_package_name_prefix], name.gsub(/^python-/, "")].join("-")
+-    else
+-      return [attributes[:python_package_name_prefix], name].join("-")
+-    end
++    FPM::Package.coordinator.python_fix_name(self, name)
+   end # def fix_name
+ 
+   # Install this package to the staging directory
+   def install_to_staging(setup_py)
+-    project_dir = File.dirname(setup_py)
+-
+-    prefix = "/"
+-    prefix = attributes[:prefix] unless attributes[:prefix].nil?
+-
+-    # Some setup.py's assume $PWD == current directory of setup.py, so let's
+-    # chdir first.
+-    ::Dir.chdir(project_dir) do
+-      flags = [ "--root", staging_path ]
+-      if !attributes[:python_install_lib].nil?
+-        flags += [ "--install-lib", File.join(prefix, attributes[:python_install_lib]) ]
+-      elsif !attributes[:prefix].nil?
+-        # setup.py install --prefix PREFIX still installs libs to
+-        # PREFIX/lib64/python2.7/site-packages/
+-        # but we really want something saner.
+-        #
+-        # since prefix is given, but not python_install_lib, assume PREFIX/lib
+-        flags += [ "--install-lib", File.join(prefix, "lib") ]
+-      end
+-
+-      if !attributes[:python_install_data].nil?
+-        flags += [ "--install-data", File.join(prefix, attributes[:python_install_data]) ]
+-      elsif !attributes[:prefix].nil?
+-        # prefix given, but not python_install_data, assume PREFIX/data
+-        flags += [ "--install-data", File.join(prefix, "data") ]
+-      end
+-
+-      if !attributes[:python_install_bin].nil?
+-        flags += [ "--install-scripts", File.join(prefix, attributes[:python_install_bin]) ]
+-      elsif !attributes[:prefix].nil?
+-        # prefix given, but not python_install_bin, assume PREFIX/bin
+-        flags += [ "--install-scripts", File.join(prefix, "bin") ]
+-      end
+-
+-      if !attributes[:python_scripts_executable].nil?
+-        # Overwrite installed python scripts shebang binary with provided executable
+-        flags += [ "build_scripts", "--executable", attributes[:python_scripts_executable] ]
+-      end
+-
+-      if !attributes[:python_setup_py_arguments].nil? and !attributes[:python_setup_py_arguments].empty?
+-        # Add optional setup.py arguments
+-        attributes[:python_setup_py_arguments].each do |a|
+-          flags += [ a ]
+-        end
+-      end
+-
+-      safesystem(attributes[:python_bin], "setup.py", "install", *flags)
+-    end
++    FPM::Package.coordinator.python_install_to_staging(self, setup_py)
+   end # def install_to_staging
+ 
+   public(:input)
+diff --git a/lib/fpm/package/rpm.rb b/lib/fpm/package/rpm.rb
+index d7d80e4..5a99da8 100644
+--- a/lib/fpm/package/rpm.rb
++++ b/lib/fpm/package/rpm.rb
+@@ -190,168 +190,32 @@ class FPM::Package::RPM < FPM::Package
+   # Replace ? with [?] to make rpm not use globs
+   # Replace % with [%] to make rpm not expand macros
+   def rpm_fix_name(name)
+-    name = name.gsub(/(\ |\[|\]|\*|\?|\%|\$|')/, {
+-      ' ' => '?',
+-      '%' => '[%]',
+-      '$' => '[$]',
+-      '?' => '[?]',
+-      '*' => '[*]',
+-      '[' => '[\[]',
+-      ']' => '[\]]',
+-      "'" => "\\'",
+-    })
++    FPM::Package.coordinator.rpm_fix_name_for(self, name)
+   end
+ 
+   def rpm_file_entry(file)
+-    original_file = file
+-    file = rpm_fix_name(file)
+-
+-    if !attributes[:rpm_use_file_permissions?]
+-
+-      if attrs[file].nil?
+-        return file
+-      else
+-        return sprintf("%%attr(%s) %s\n", attrs[file], file)
+-      end
+-    end
+-
+-    return sprintf("%%attr(%s) %s\n", attrs[file], file) unless attrs[file].nil?
+-
+-    # Stat the original filename in the relative staging path
+-    ::Dir.chdir(staging_path) do
+-      stat = File.lstat(original_file.gsub(/\"/, '').sub(/^\//,''))
+-
+-      # rpm_user and rpm_group attribute should override file ownership
+-      # otherwise use the current file user/group by name.
+-      user = attributes[:rpm_user] || Etc.getpwuid(stat.uid).name
+-      group = attributes[:rpm_group] || Etc.getgrgid(stat.gid).name
+-      mode = stat.mode
+-      return sprintf("%%attr(%o, %s, %s) %s\n", mode & 4095 , user, group, file)
+-    end
++    FPM::Package.coordinator.rpm_file_entry_for(self, file)
+   end
+ 
+-
+   # Handle any architecture naming conversions.
+   # For example, debian calls amd64 what redhat calls x86_64, this
+   # method fixes those types of things.
+   def architecture
+-    case @architecture
+-      when nil
+-        return %x{uname -m}.chomp   # default to current arch
+-      when "amd64" # debian and redhat disagree on architecture names
+-        return "x86_64"
+-      when "arm64" # debian and redhat disagree on architecture names
+-        return "aarch64"
+-      when "native"
+-        return %x{uname -m}.chomp   # 'native' is current arch
+-      when "all"
+-        # Translate fpm "all" arch to what it means in RPM.
+-        return "noarch"
+-      else
+-        return @architecture
+-    end
++    FPM::Package.coordinator.rpm_architecture_for(self)
+   end # def architecture
+ 
+   # This method ensures a default value for iteration if none is provided.
+   def iteration
+-    return @iteration ? @iteration : 1
++    FPM::Package.coordinator.rpm_iteration_for(self)
+   end # def iteration
+ 
+   # See FPM::Package#converted_from
+   def converted_from(origin)
+-    if origin == FPM::Package::Gem
+-      fixed_deps = []
+-      self.dependencies.collect do |dep|
+-        # Gem dependency operator "~>" is not compatible with rpm. Translate any found.
+-        fixed_deps = fixed_deps + expand_pessimistic_constraints(dep)
+-      end
+-      self.dependencies = fixed_deps
+-
+-      # Convert 'rubygem-foo' provides values to 'rubygem(foo)'
+-      # since that's what most rpm packagers seem to do.
+-      self.provides = self.provides.collect do |provides|
+-        # Tries to match rubygem_prefix [1], gem_name [2] and version [3] if present
+-        # and return it in rubygem_prefix(gem_name) form
+-        if name=/^(#{attributes[:gem_package_name_prefix]})-([^\s]+)\s*(.*)$/.match(provides)
+-          "#{name[1]}(#{name[2]})#{name[3] ? " #{name[3]}" : ""}"
+-        else
+-          provides
+-        end
+-      end
+-      if !self.attributes[:rpm_verbatim_gem_dependencies?]
+-        self.dependencies = self.dependencies.collect do |dependency|
+-          # Tries to match rubygem_prefix [1], gem_name [2] and version [3] if present
+-          # and return it in rubygem_prefix(gem_name) form
+-          if name=/^(#{attributes[:gem_package_name_prefix]})-([^\s]+)\s*(.*)$/.match(dependency)
+-            "#{name[1]}(#{name[2]})#{name[3] ? " #{name[3]}" : ""}"
+-          else
+-            dependency
+-          end
+-        end
+-      end
+-    end
+-
+-    # Convert != dependency as Conflict =, as rpm doesn't understand !=
+-    self.dependencies = self.dependencies.select do |dep|
+-      name, op, version = dep.split(/\s+/)
+-      dep_ok = true
+-      if op == '!='
+-        self.conflicts << "#{name} = #{version}"
+-        dep_ok = false
+-      end
+-      dep_ok
+-    end
+-
+-    # if --ignore-iteration-in-dependencies is true convert foo = X, to
+-    # foo >= X , foo < X+1
+-    if self.attributes[:rpm_ignore_iteration_in_dependencies?]
+-      self.dependencies = self.dependencies.collect do |dep|
+-        name, op, version = dep.split(/\s+/)
+-        if op == '='
+-          nextversion = version.split('.').collect { |v| v.to_i }
+-          nextversion[-1] += 1
+-          nextversion = nextversion.join(".")
+-          logger.warn("Converting dependency #{dep} to #{name} >= #{version}, #{name} < #{nextversion}")
+-          ["#{name} >= #{version}", "#{name} < #{nextversion}"]
+-        else
+-          dep
+-        end
+-      end.flatten
+-    end
+-
+-  setscript = proc do |scriptname|
+-      script_path = self.attributes[scriptname]
+-      # Skip scripts not set
+-      next if script_path.nil?
+-      if !File.exist?(script_path)
+-        logger.error("No such file (for #{scriptname.to_s}): #{script_path.inspect}")
+-        script_errors	 << script_path
+-      end
+-      # Load the script into memory.
+-      scripts[scriptname] = File.read(script_path)
+-    end
+-
+-  setscript.call(:rpm_verifyscript)
+-  setscript.call(:rpm_posttrans)
+-  setscript.call(:rpm_pretrans)
++    FPM::Package.coordinator.rpm_converted_from(self, origin)
+   end # def converted
+ 
+   def rpm_get_trigger_type(flag)
+-    if (flag & (1 << 25)) == (1 << 25)
+-       # RPMSENSE_TRIGGERPREIN = (1 << 25),  /*!< %triggerprein dependency. */
+-       :rpm_trigger_before_install
+-    elsif (flag & (1 << 16)) == (1 << 16)
+-       # RPMSENSE_TRIGGERIN  = (1 << 16),    /*!< %triggerin dependency. */
+-       :rpm_trigger_after_install
+-    elsif (flag & (1 << 17)) == (1 << 17)
+-       # RPMSENSE_TRIGGERUN  = (1 << 17),    /*!< %triggerun dependency. */
+-       :rpm_trigger_before_uninstall
+-    elsif (flag & (1 << 18)) == (1 << 18)
+-       # RPMSENSE_TRIGGERPOSTUN = (1 << 18), /*!< %triggerpostun dependency. */
+-       :rpm_trigger_after_target_uninstall
+-    else
+-       @logger.fatal("I don't know about this triggerflag ('#{flag}')")
+-    end
++    FPM::Package.coordinator.rpm_get_trigger_type_for(self, flag)
+   end # def rpm_get_trigger
+ 
+   def input(path)
+diff --git a/lib/fpm/rake_task.rb b/lib/fpm/rake_task.rb
+index 04f0e9b..c6b3546 100644
+--- a/lib/fpm/rake_task.rb
++++ b/lib/fpm/rake_task.rb
+@@ -27,34 +27,13 @@ class FPM::RakeTask < Rake::TaskLib
+   private
+ 
+   def parsed_options
+-    options.to_h.map do |option, value|
+-      opt = option.to_s.tr("_", "-")
+-
+-      case
+-      when value.is_a?(String), value.is_a?(Symbol)
+-        %W(--#{opt} #{value})
+-      when value.is_a?(Array)
+-        value.map { |v| %W(--#{opt} #{v}) }
+-      when value.is_a?(TrueClass)
+-        "--#{opt}"
+-      when value.is_a?(FalseClass)
+-        "--no-#{opt}"
+-      else
+-        fail TypeError, "Unexpected type: #{value.class}"
+-      end
+-    end
++    require "fpm"
++    FPM::Package.coordinator.rake_parsed_options_for(self)
+   end
+ 
+   def run_cli
+     require "fpm"
+     require "fpm/command"
+-
+-    args = %W(-t #{@target} -s #{@source} -C #{@directory})
+-    args << parsed_options
+-    args << @args
+-
+-    args.flatten!.compact!
+-
+-    abort 'FPM failed!' unless FPM::Command.new("fpm").run(args) == 0
++    FPM::Package.coordinator.rake_run_cli_for(self)
+   end
+ end

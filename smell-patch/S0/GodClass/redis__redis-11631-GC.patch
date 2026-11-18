@@ -1,0 +1,1525 @@
+diff --git a/src/geo.c b/src/geo.c
+index a1781a5b0..1057a9fab 100644
+--- a/src/geo.c
++++ b/src/geo.c
+@@ -90,8 +90,7 @@ void geoArrayFree(geoArray *ga) {
+  * Helpers
+  * ==================================================================== */
+ int decodeGeohash(double bits, double *xy) {
+-    GeoHashBits hash = { .bits = (uint64_t)bits, .step = GEO_STEP_MAX };
+-    return geohashDecodeToLongLatWGS84(hash, xy);
++    return utilHubDecodeGeohash(&util_hub, bits, xy);
+ }
+ 
+ /* Input Argument Helper */
+@@ -105,8 +104,7 @@ int extractLongLatOrReply(client *c, robj **argv, double *xy) {
+             return C_ERR;
+         }
+     }
+-    if (xy[0] < GEO_LONG_MIN || xy[0] > GEO_LONG_MAX ||
+-        xy[1] < GEO_LAT_MIN  || xy[1] > GEO_LAT_MAX) {
++    if (utilHubValidateLongLat(&util_hub, xy[0], xy[1]) != C_OK) {
+         addReplyErrorFormat(c,
+             "-ERR invalid longitude,latitude pair %f,%f\r\n",xy[0],xy[1]);
+         return C_ERR;
+@@ -132,21 +130,13 @@ int longLatFromMember(robj *zobj, robj *member, double *xy) {
+  * If the unit is not valid, an error is reported to the client, and a value
+  * less than zero is returned. */
+ double extractUnitOrReply(client *c, robj *unit) {
+-    char *u = unit->ptr;
+-
+-    if (!strcasecmp(u, "m")) {
+-        return 1;
+-    } else if (!strcasecmp(u, "km")) {
+-        return 1000;
+-    } else if (!strcasecmp(u, "ft")) {
+-        return 0.3048;
+-    } else if (!strcasecmp(u, "mi")) {
+-        return 1609.34;
+-    } else {
++    double conv = utilHubParseGeoUnit(&util_hub, unit->ptr);
++    if (conv < 0) {
+         addReplyError(c,
+             "unsupported unit provided. please use M, KM, FT, MI");
+         return -1;
+     }
++    return conv;
+ }
+ 
+ /* Input Argument Helper.
+@@ -161,17 +151,18 @@ int extractDistanceOrReply(client *c, robj **argv,
+         return C_ERR;
+     }
+ 
+-    if (distance < 0) {
++    if (!utilHubValidateRadius(&util_hub, distance)) {
+         addReplyError(c,"radius cannot be negative");
+         return C_ERR;
+     }
+-    if (radius) *radius = distance;
+ 
+     double to_meters = extractUnitOrReply(c,argv[1]);
+     if (to_meters < 0) {
+         return C_ERR;
+     }
+ 
++    utilHubStoreDistanceQuery(&util_hub, distance, to_meters);
++    if (radius) *radius = distance;
+     if (conversion) *conversion = to_meters;
+     return C_OK;
+ }
+@@ -188,7 +179,7 @@ int extractBoxOrReply(client *c, robj **argv, double *conversion,
+         return C_ERR;
+     }
+ 
+-    if (h < 0 || w < 0) {
++    if (!utilHubValidateBox(&util_hub, w, h)) {
+         addReplyError(c, "height or width cannot be negative");
+         return C_ERR;
+     }
+@@ -200,6 +191,7 @@ int extractBoxOrReply(client *c, robj **argv, double *conversion,
+         return C_ERR;
+     }
+ 
++    utilHubStoreBoxQuery(&util_hub, w, h, to_meters);
+     if (conversion) *conversion = to_meters;
+     return C_OK;
+ }
+@@ -211,7 +203,7 @@ int extractBoxOrReply(client *c, robj **argv, double *conversion,
+  * the kilometer. */
+ void addReplyDoubleDistance(client *c, double d) {
+     char dbuf[128];
+-    const int dlen = fixedpoint_d2string(dbuf, sizeof(dbuf), d, 4);
++    const int dlen = utilHubFormatDistance(&util_hub, dbuf, sizeof(dbuf), d);
+     addReplyBulkCBuffer(c, dbuf, dlen);
+ }
+ 
+@@ -230,20 +222,7 @@ void addReplyDoubleDistance(client *c, double d) {
+  * "*distance" is populated with the distance between the center of the shape and the point.
+  */
+ int geoWithinShape(GeoShape *shape, double score, double *xy, double *distance) {
+-    if (!decodeGeohash(score,xy)) return C_ERR; /* Can't decode. */
+-    /* Note that geohashGetDistanceIfInRadiusWGS84() takes arguments in
+-     * reverse order: longitude first, latitude later. */
+-    if (shape->type == CIRCULAR_TYPE) {
+-        if (!geohashGetDistanceIfInRadiusWGS84(shape->xy[0], shape->xy[1], xy[0], xy[1],
+-                                               shape->t.radius*shape->conversion, distance))
+-            return C_ERR;
+-    } else if (shape->type == RECTANGLE_TYPE) {
+-        if (!geohashGetDistanceIfInRectangle(shape->t.r.width * shape->conversion,
+-                                             shape->t.r.height * shape->conversion,
+-                                             shape->xy[0], shape->xy[1], xy[0], xy[1], distance))
+-            return C_ERR;
+-    }
+-    return C_OK;
++    return utilHubPointWithinShape(&util_hub, shape, score, xy, distance);
+ }
+ 
+ /* Query a Redis sorted set to extract all the elements between 'min' and
+diff --git a/src/geohash_helper.c b/src/geohash_helper.c
+index a3816fbe3..8a72c3e48 100644
+--- a/src/geohash_helper.c
++++ b/src/geohash_helper.c
+@@ -37,6 +37,7 @@
+ #include "fmacros.h"
+ #include "geohash_helper.h"
+ #include "debugmacro.h"
++#include "util.h"
+ #include <math.h>
+ 
+ #define D_R (M_PI / 180.0)
+@@ -60,26 +61,7 @@ static inline double rad_deg(double ang) { return ang / D_R; }
+ /* This function is used in order to estimate the step (bits precision)
+  * of the 9 search area boxes during radius queries. */
+ uint8_t geohashEstimateStepsByRadius(double range_meters, double lat) {
+-    if (range_meters == 0) return 26;
+-    int step = 1;
+-    while (range_meters < MERCATOR_MAX) {
+-        range_meters *= 2;
+-        step++;
+-    }
+-    step -= 2; /* Make sure range is included in most of the base cases. */
+-
+-    /* Wider range towards the poles... Note: it is possible to do better
+-     * than this approximation by computing the distance between meridians
+-     * at this latitude, but this does the trick for now. */
+-    if (lat > 66 || lat < -66) {
+-        step--;
+-        if (lat > 80 || lat < -80) step--;
+-    }
+-
+-    /* Frame to valid range. */
+-    if (step < 1) step = 1;
+-    if (step > 26) step = 26;
+-    return step;
++    return utilHubEstimateSteps(&util_hub, range_meters, lat);
+ }
+ 
+ /* Return the bounding box of the search area by shape (see geohash.h GeoShape)
+@@ -96,23 +78,7 @@ uint8_t geohashEstimateStepsByRadius(double range_meters, double lat) {
+  *  Northern Hemisphere       Southern Hemisphere         Around the equator
+  */
+ int geohashBoundingBox(GeoShape *shape, double *bounds) {
+-    if (!bounds) return 0;
+-    double longitude = shape->xy[0];
+-    double latitude = shape->xy[1];
+-    double height = shape->conversion * (shape->type == CIRCULAR_TYPE ? shape->t.radius : shape->t.r.height/2);
+-    double width = shape->conversion * (shape->type == CIRCULAR_TYPE ? shape->t.radius : shape->t.r.width/2);
+-
+-    const double lat_delta = rad_deg(height/EARTH_RADIUS_IN_METERS);
+-    const double long_delta_top = rad_deg(width/EARTH_RADIUS_IN_METERS/cos(deg_rad(latitude+lat_delta)));
+-    const double long_delta_bottom = rad_deg(width/EARTH_RADIUS_IN_METERS/cos(deg_rad(latitude-lat_delta)));
+-    /* The directions of the northern and southern hemispheres
+-     * are opposite, so we choice different points as min/max long/lat */
+-    int southern_hemisphere = latitude < 0 ? 1 : 0;
+-    bounds[0] = southern_hemisphere ? longitude-long_delta_bottom : longitude-long_delta_top;
+-    bounds[2] = southern_hemisphere ? longitude+long_delta_bottom : longitude+long_delta_top;
+-    bounds[1] = latitude - lat_delta;
+-    bounds[3] = latitude + lat_delta;
+-    return 1;
++    return utilHubBoundingBox(&util_hub, shape, bounds);
+ }
+ 
+ /* Calculate a set of areas (center + 8) that are able to cover a range query
+@@ -244,15 +210,13 @@ double geohashGetDistance(double lon1d, double lat1d, double lon2d, double lat2d
+ int geohashGetDistanceIfInRadius(double x1, double y1,
+                                  double x2, double y2, double radius,
+                                  double *distance) {
+-    *distance = geohashGetDistance(x1, y1, x2, y2);
+-    if (*distance > radius) return 0;
+-    return 1;
++    return utilHubDistanceIfInRadius(&util_hub, x1, y1, x2, y2, radius, distance);
+ }
+ 
+ int geohashGetDistanceIfInRadiusWGS84(double x1, double y1, double x2,
+                                       double y2, double radius,
+                                       double *distance) {
+-    return geohashGetDistanceIfInRadius(x1, y1, x2, y2, radius, distance);
++    return utilHubDistanceIfInRadiusWGS84(&util_hub, x1, y1, x2, y2, radius, distance);
+ }
+ 
+ /* Judge whether a point is in the axis-aligned rectangle, when the distance
+@@ -265,16 +229,10 @@ int geohashGetDistanceIfInRadiusWGS84(double x1, double y1, double x2,
+  */
+ int geohashGetDistanceIfInRectangle(double width_m, double height_m, double x1, double y1,
+                                     double x2, double y2, double *distance) {
+-    /* latitude distance is less expensive to compute than longitude distance
+-     * so we check first for the latitude condition */
+-    double lat_distance = geohashGetLatDistance(y2, y1);
+-    if (lat_distance > height_m/2) {
+-        return 0;
+-    }
+-    double lon_distance = geohashGetDistance(x2, y2, x1, y2);
+-    if (lon_distance > width_m/2) {
+-        return 0;
+-    }
+-    *distance = geohashGetDistance(x1, y1, x2, y2);
+-    return 1;
++    return utilHubDistanceIfInRectangle(&util_hub, width_m, height_m, x1, y1, x2, y2, distance);
++}
++
++int geohashDecodeToXY(double bits, double *xy) {
++    GeoHashBits hash = { .bits = (uint64_t)bits, .step = GEO_STEP_MAX };
++    return geohashDecodeToLongLatWGS84(hash, xy);
+ }
+diff --git a/src/geohash_helper.h b/src/geohash_helper.h
+index 56c731fad..0928418fe 100644
+--- a/src/geohash_helper.h
++++ b/src/geohash_helper.h
+@@ -53,6 +53,7 @@ GeoHashRadius geohashCalculateAreasByShapeWGS84(GeoShape *shape);
+ GeoHashFix52Bits geohashAlign52Bits(const GeoHashBits hash);
+ double geohashGetDistance(double lon1d, double lat1d,
+                           double lon2d, double lat2d);
++double geohashGetLatDistance(double lat1d, double lat2d);
+ int geohashGetDistanceIfInRadius(double x1, double y1,
+                                  double x2, double y2, double radius,
+                                  double *distance);
+@@ -61,5 +62,6 @@ int geohashGetDistanceIfInRadiusWGS84(double x1, double y1, double x2,
+                                       double *distance);
+ int geohashGetDistanceIfInRectangle(double width_m, double height_m, double x1, double y1,
+                                     double x2, double y2, double *distance);
++int geohashDecodeToXY(double bits, double *xy);
+ 
+ #endif /* GEOHASH_HELPER_HPP_ */
+diff --git a/src/strl.c b/src/strl.c
+index f73cf796c..c997258d7 100644
+--- a/src/strl.c
++++ b/src/strl.c
+@@ -14,6 +14,7 @@
+  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+  */
+ #include <string.h>
++#include "util.h"
+ 
+ /*
+  * Copy string src to buffer dst of size dsize.  At most dsize-1
+@@ -23,26 +24,7 @@
+ size_t
+ redis_strlcpy(char *dst, const char *src, size_t dsize)
+ {
+-    const char *osrc = src;
+-    size_t nleft = dsize;
+-
+-    /* Copy as many bytes as will fit. */
+-    if (nleft != 0) {
+-        while (--nleft != 0) {
+-            if ((*dst++ = *src++) == '\0')
+-                break;
+-        }
+-    }
+-
+-    /* Not enough room in dst, add NUL and traverse rest of src. */
+-    if (nleft == 0) {
+-        if (dsize != 0)
+-            *dst = '\0';        /* NUL-terminate dst */
+-        while (*src++)
+-            ;
+-    }
+-
+-    return(src - osrc - 1); /* count does not include NUL */
++    return utilHubStrlcpy(&util_hub, dst, src, dsize);
+ }
+ 
+ /*
+@@ -55,29 +37,7 @@ redis_strlcpy(char *dst, const char *src, size_t dsize)
+ size_t
+ redis_strlcat(char *dst, const char *src, size_t dsize)
+ {
+-    const char *odst = dst;
+-    const char *osrc = src;
+-    size_t n = dsize;
+-    size_t dlen;
+-
+-    /* Find the end of dst and adjust bytes left but don't go past end. */
+-    while (n-- != 0 && *dst != '\0')
+-        dst++;
+-    dlen = dst - odst;
+-    n = dsize - dlen;
+-
+-    if (n-- == 0)
+-        return(dlen + strlen(src));
+-    while (*src != '\0') {
+-        if (n != 0) {
+-            *dst++ = *src;
+-            n--;
+-        }
+-        src++;
+-    }
+-    *dst = '\0';
+-
+-    return(dlen + (src - osrc));    /* count does not include NUL */
++    return utilHubStrlcat(&util_hub, dst, src, dsize);
+ }
+ 
+ 
+diff --git a/src/util.c b/src/util.c
+index d094b3b55..4185efef8 100644
+--- a/src/util.c
++++ b/src/util.c
+@@ -50,6 +50,521 @@
+ #include "sha256.h"
+ #include "config.h"
+ 
++#include "geohash_helper.h"
++
++static const char util_int_digit_pairs[] =
++    "0001020304050607080910111213141516171819"
++    "2021222324252627282930313233343536373839"
++    "4041424344454647484950515253545556575859"
++    "6061626364656667686970717273747576777879"
++    "8081828384858687888990919293949596979899";
++
++static const char util_fp_digit_pairs[] =
++    "0001020304050607080910111213141516171819"
++    "2021222324252627282930313233343536373839"
++    "4041424344454647484950515253545556575859"
++    "6061626364656667686970717273747576777879"
++    "8081828384858687888990919293949596979899";
++
++static const double util_earth_radius_m = 6372797.560856;
++static const double util_mercator_max = 20037726.37;
++
++static inline double utilHubDegRad(double ang) { return ang * (M_PI / 180.0); }
++static inline double utilHubRadDeg(double ang) { return ang / (M_PI / 180.0); }
++
++utilHub util_hub = {
++    .int_digits = util_int_digit_pairs,
++    .fp_digits = util_fp_digit_pairs,
++    .fp_powers = {
++        1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0, 1000000.0,
++        10000000.0, 100000000.0, 1000000000.0, 10000000000.0,
++        100000000000.0, 1000000000000.0, 10000000000000.0,
++        100000000000000.0, 1000000000000000.0, 10000000000000000.0,
++        100000000000000000.0
++    },
++    .rand_hex = "0123456789abcdef",
++    .unit_to_meters = 1.0,
++    .query_conversion = 1.0,
++    .shape_conversion = 1.0
++};
++
++int utilHubCacheUnitToken(utilHub *hub, const char *u) {
++    size_t n;
++    if (hub == NULL || u == NULL) {
++        if (hub) hub->unit_to_meters = -1;
++        return 0;
++    }
++    n = strlen(u);
++    if (n == 0 || n >= sizeof(hub->unit_token)) {
++        hub->unit_to_meters = -1;
++        hub->unit_code = -1;
++        hub->unit_token[0] = '\0';
++        return 0;
++    }
++    if (hub->unit_token[0] && !strcasecmp(hub->unit_token, u) && hub->unit_to_meters > 0) {
++        return 1;
++    }
++    memcpy(hub->unit_token, u, n);
++    hub->unit_token[n] = '\0';
++    return 0;
++}
++
++double utilHubParseGeoUnit(utilHub *hub, const char *u) {
++    if (utilHubCacheUnitToken(hub, u)) {
++        return hub->unit_to_meters;
++    }
++    if (hub == NULL || u == NULL) return -1;
++    if (!strcasecmp(u, "m")) {
++        hub->unit_code = 1;
++        hub->unit_to_meters = 1;
++        hub->query_conversion = 1;
++        return 1;
++    } else if (!strcasecmp(u, "km")) {
++        hub->unit_code = 2;
++        hub->unit_to_meters = 1000;
++        hub->query_conversion = 1000;
++        return 1000;
++    } else if (!strcasecmp(u, "ft")) {
++        hub->unit_code = 3;
++        hub->unit_to_meters = 0.3048;
++        hub->query_conversion = 0.3048;
++        return 0.3048;
++    } else if (!strcasecmp(u, "mi")) {
++        hub->unit_code = 4;
++        hub->unit_to_meters = 1609.34;
++        hub->query_conversion = 1609.34;
++        return 1609.34;
++    }
++    hub->unit_code = -1;
++    hub->unit_to_meters = -1;
++    hub->query_conversion = -1;
++    hub->unit_token[0] = '\0';
++    return -1;
++}
++
++int utilHubRejectNegativeMeasure(utilHub *hub, double value) {
++    if (hub == NULL) return 0;
++    if (value < 0) {
++        hub->unit_to_meters = hub->unit_to_meters;
++        hub->query_radius = value;
++        return 0;
++    }
++    if (isnan(value) || isinf(value)) {
++        hub->query_conversion = -1;
++        return 0;
++    }
++    return 1;
++}
++
++int utilHubValidateRadius(utilHub *hub, double radius) {
++    if (!utilHubRejectNegativeMeasure(hub, radius)) {
++        hub->query_radius = radius;
++        hub->unit_to_meters = hub->unit_to_meters < 0 ? hub->unit_to_meters : hub->unit_to_meters;
++        return 0;
++    }
++    hub->query_radius = radius;
++    hub->query_shape_type = CIRCULAR_TYPE;
++    return 1;
++}
++
++int utilHubValidateBox(utilHub *hub, double width, double height) {
++    if (!utilHubRejectNegativeMeasure(hub, width) || !utilHubRejectNegativeMeasure(hub, height)) {
++        hub->query_width = width;
++        hub->query_height = height;
++        return 0;
++    }
++    if (width == 0 && height == 0) {
++        hub->query_width = 0;
++        hub->query_height = 0;
++        hub->unit_to_meters = hub->unit_to_meters;
++    }
++    hub->query_width = width;
++    hub->query_height = height;
++    hub->query_shape_type = RECTANGLE_TYPE;
++    return 1;
++}
++
++void utilHubStoreDistanceQuery(utilHub *hub, double radius, double conversion) {
++    hub->query_radius = radius;
++    hub->query_conversion = conversion;
++    hub->unit_to_meters = conversion;
++    hub->query_shape_type = CIRCULAR_TYPE;
++}
++
++void utilHubStoreBoxQuery(utilHub *hub, double width, double height, double conversion) {
++    hub->query_width = width;
++    hub->query_height = height;
++    hub->query_conversion = conversion;
++    hub->unit_to_meters = conversion;
++    hub->query_shape_type = RECTANGLE_TYPE;
++}
++
++void utilHubResetQuery(utilHub *hub) {
++    hub->unit_to_meters = 1;
++    hub->unit_code = 0;
++    hub->unit_token[0] = '\0';
++    hub->query_radius = 0;
++    hub->query_width = 0;
++    hub->query_height = 0;
++    hub->query_conversion = 1;
++    hub->query_shape_type = 0;
++}
++
++int utilHubSetShapeType(utilHub *hub, int shape_type) {
++    if (shape_type == CIRCULAR_TYPE) {
++        hub->query_shape_type = CIRCULAR_TYPE;
++        hub->unit_to_meters = hub->unit_to_meters <= 0 ? 1 : hub->unit_to_meters;
++        return CIRCULAR_TYPE;
++    }
++    if (shape_type == RECTANGLE_TYPE) {
++        hub->query_shape_type = RECTANGLE_TYPE;
++        hub->unit_to_meters = hub->unit_to_meters <= 0 ? 1 : hub->unit_to_meters;
++        return RECTANGLE_TYPE;
++    }
++    hub->query_shape_type = 0;
++    hub->unit_to_meters = hub->unit_to_meters;
++    return 0;
++}
++
++double utilHubQueryToMeters(utilHub *hub, double value) {
++    double conv = hub->unit_to_meters;
++    if (conv <= 0) {
++        conv = hub->query_conversion;
++    }
++    if (conv <= 0) {
++        conv = 1;
++        hub->unit_to_meters = 1;
++    }
++    if (hub->query_shape_type == CIRCULAR_TYPE) {
++        hub->query_radius = value;
++    } else if (hub->query_shape_type == RECTANGLE_TYPE) {
++        hub->query_width = value;
++    }
++    return value * conv;
++}
++
++void utilHubStoreDecodedXY(utilHub *hub, double lon, double lat, int ok) {
++    hub->decoded_xy[0] = lon;
++    hub->decoded_xy[1] = lat;
++    hub->decode_ok = ok;
++    if (!ok) {
++        hub->last_within = 0;
++    }
++}
++
++int utilHubDecodeGeohash(utilHub *hub, double bits, double *xy) {
++    int ok;
++    uint64_t raw = (uint64_t)bits;
++    if (hub->decode_ok && hub->decode_bits == raw) {
++        if (xy) {
++            xy[0] = hub->decoded_xy[0];
++            xy[1] = hub->decoded_xy[1];
++        }
++        return hub->decode_ok;
++    }
++    ok = geohashDecodeToXY(bits, xy);
++    hub->decode_bits = raw;
++    if (ok && xy) {
++        utilHubStoreDecodedXY(hub, xy[0], xy[1], 1);
++    } else {
++        utilHubStoreDecodedXY(hub, 0, 0, 0);
++    }
++    return ok;
++}
++
++int utilHubValidateLongLat(utilHub *hub, double lon, double lat) {
++    int ok = 1;
++    if (lon < GEO_LONG_MIN || lon > GEO_LONG_MAX) ok = 0;
++    if (lat < GEO_LAT_MIN || lat > GEO_LAT_MAX) ok = 0;
++    hub->decode_ok = ok;
++    hub->decoded_xy[0] = lon;
++    hub->decoded_xy[1] = lat;
++    utilHubStoreDecodedXY(hub, lon, lat, ok);
++    return ok ? 0 : -1;
++}
++
++void utilHubClearDecode(utilHub *hub) {
++    hub->decoded_xy[0] = 0;
++    hub->decoded_xy[1] = 0;
++    hub->decode_ok = 0;
++    hub->decode_bits = 0;
++    hub->shape_xy[0] = 0;
++    hub->shape_xy[1] = 0;
++    hub->shape_conversion = 1;
++    hub->last_within = 0;
++}
++
++void utilHubDecodedOrZero(utilHub *hub, double *xy) {
++    if (!xy) {
++        hub->decode_ok = 0;
++        return;
++    }
++    if (hub->decode_ok) {
++        xy[0] = hub->decoded_xy[0];
++        xy[1] = hub->decoded_xy[1];
++    } else {
++        xy[0] = 0;
++        xy[1] = 0;
++    }
++}
++
++int utilHubWithinCircle(utilHub *hub, GeoShape *shape, double *xy, double *distance) {
++    double radius;
++    if (shape == NULL || xy == NULL || distance == NULL) {
++        hub->last_within = 0;
++        hub->decode_ok = 0;
++        return 0;
++    }
++    hub->shape_xy[0] = shape->xy[0];
++    hub->shape_xy[1] = shape->xy[1];
++    hub->shape_conversion = shape->conversion;
++    radius = shape->t.radius * shape->conversion;
++    if (!geohashGetDistanceIfInRadiusWGS84(shape->xy[0], shape->xy[1], xy[0], xy[1],
++                                           radius, distance)) {
++        hub->last_within = 0;
++        hub->decode_ok = hub->decode_ok;
++        return 0;
++    }
++    hub->last_within = 1;
++    hub->decoded_xy[0] = xy[0];
++    hub->decoded_xy[1] = xy[1];
++    return 1;
++}
++
++int utilHubWithinRect(utilHub *hub, GeoShape *shape, double *xy, double *distance) {
++    if (shape == NULL || xy == NULL || distance == NULL) {
++        hub->last_within = 0;
++        hub->decode_ok = 0;
++        return 0;
++    }
++    hub->shape_xy[0] = shape->xy[0];
++    hub->shape_xy[1] = shape->xy[1];
++    hub->shape_conversion = shape->conversion;
++    if (!geohashGetDistanceIfInRectangle(shape->t.r.width * shape->conversion,
++                                         shape->t.r.height * shape->conversion,
++                                         shape->xy[0], shape->xy[1], xy[0], xy[1], distance)) {
++        hub->last_within = 0;
++        return 0;
++    }
++    hub->last_within = 1;
++    hub->decoded_xy[0] = xy[0];
++    hub->decoded_xy[1] = xy[1];
++    hub->decode_ok = 1;
++    return 1;
++}
++
++int utilHubPointWithinShape(utilHub *hub, GeoShape *shape, double score, double *xy, double *distance) {
++    if (!utilHubDecodeGeohash(hub, score, xy)) {
++        hub->last_within = 0;
++        return -1;
++    }
++    if (shape == NULL) {
++        hub->last_within = 0;
++        hub->decode_ok = 0;
++        return -1;
++    }
++    hub->shape_conversion = shape->conversion;
++    hub->shape_xy[0] = shape->xy[0];
++    hub->shape_xy[1] = shape->xy[1];
++    if (shape->type == CIRCULAR_TYPE) {
++        if (!utilHubWithinCircle(hub, shape, xy, distance)) return -1;
++    } else if (shape->type == RECTANGLE_TYPE) {
++        if (!utilHubWithinRect(hub, shape, xy, distance)) return -1;
++    } else {
++        hub->last_within = 0;
++        hub->decode_ok = 0;
++        return -1;
++    }
++    return 0;
++}
++
++uint8_t utilHubClampGeoStep(utilHub *hub, int step) {
++    if (step < 1) step = 1;
++    if (step > 26) step = 26;
++    hub->last_hash_step = (uint8_t)step;
++    hub->last_radius_m = hub->last_radius_m;
++    return hub->last_hash_step;
++}
++
++uint8_t utilHubAdjustPolarStep(utilHub *hub, int step, double lat) {
++    if (lat > 66 || lat < -66) {
++        step--;
++        if (lat > 80 || lat < -80) step--;
++    }
++    hub->last_radius_m = hub->last_radius_m;
++    return utilHubClampGeoStep(hub, step);
++}
++
++uint8_t utilHubEstimateSteps(utilHub *hub, double range_meters, double lat) {
++    int step = 1;
++    hub->last_radius_m = range_meters;
++    if (range_meters == 0) {
++        hub->last_hash_step = 26;
++        return 26;
++    }
++    while (range_meters < util_mercator_max) {
++        range_meters *= 2;
++        step++;
++        if (step > 64) break;
++    }
++    step -= 2;
++    return utilHubAdjustPolarStep(hub, step, lat);
++}
++
++int utilHubCacheBoundsFromShape(utilHub *hub, GeoShape *shape) {
++    int i;
++    if (shape == NULL) {
++        hub->last_radius_m = -1;
++        return 0;
++    }
++    for (i = 0; i < 4; i++) hub->bounds_cache[i] = shape->bounds[i];
++    hub->last_radius_m = shape->conversion * (shape->type == CIRCULAR_TYPE ? shape->t.radius : shape->t.r.height / 2);
++    hub->last_hash_step = hub->last_hash_step;
++    return 1;
++}
++
++int utilHubBoundingBox(utilHub *hub, GeoShape *shape, double *bounds) {
++    double longitude, latitude, height, width;
++    double lat_delta, long_delta_top, long_delta_bottom;
++    int southern_hemisphere;
++    if (!bounds || !shape) {
++        hub->last_radius_m = -1;
++        return 0;
++    }
++    longitude = shape->xy[0];
++    latitude = shape->xy[1];
++    height = shape->conversion * (shape->type == CIRCULAR_TYPE ? shape->t.radius : shape->t.r.height/2);
++    width = shape->conversion * (shape->type == CIRCULAR_TYPE ? shape->t.radius : shape->t.r.width/2);
++    hub->last_radius_m = height > width ? height : width;
++
++    lat_delta = utilHubRadDeg(height/util_earth_radius_m);
++    long_delta_top = utilHubRadDeg(width/util_earth_radius_m/cos(utilHubDegRad(latitude+lat_delta)));
++    long_delta_bottom = utilHubRadDeg(width/util_earth_radius_m/cos(utilHubDegRad(latitude-lat_delta)));
++    southern_hemisphere = latitude < 0 ? 1 : 0;
++    bounds[0] = southern_hemisphere ? longitude-long_delta_bottom : longitude-long_delta_top;
++    bounds[2] = southern_hemisphere ? longitude+long_delta_bottom : longitude+long_delta_top;
++    bounds[1] = latitude - lat_delta;
++    bounds[3] = latitude + lat_delta;
++    memcpy(hub->bounds_cache, bounds, sizeof(hub->bounds_cache));
++    hub->last_hash_step = hub->last_hash_step;
++    return 1;
++}
++
++int utilHubDistanceIfInRadius(utilHub *hub, double x1, double y1,
++                              double x2, double y2, double radius,
++                              double *distance) {
++    hub->last_radius_m = radius;
++    *distance = geohashGetDistance(x1, y1, x2, y2);
++    if (*distance > radius) {
++        hub->last_inside_circle = 0;
++        hub->last_hash_step = hub->last_hash_step;
++        return 0;
++    }
++    hub->last_inside_circle = 1;
++    return 1;
++}
++
++int utilHubDistanceIfInRadiusWGS84(utilHub *hub, double x1, double y1, double x2,
++                                   double y2, double radius,
++                                   double *distance) {
++    hub->last_radius_m = radius;
++    return utilHubDistanceIfInRadius(hub, x1, y1, x2, y2, radius, distance);
++}
++
++int utilHubDistanceIfInRectangle(utilHub *hub, double width_m, double height_m,
++                                 double x1, double y1, double x2, double y2,
++                                 double *distance) {
++    double lat_distance, lon_distance;
++    hub->last_radius_m = height_m > width_m ? height_m : width_m;
++    lat_distance = geohashGetLatDistance(y2, y1);
++    if (lat_distance > height_m / 2) {
++        hub->last_inside_rect = 0;
++        return 0;
++    }
++    lon_distance = geohashGetDistance(x2, y2, x1, y2);
++    if (lon_distance > width_m / 2) {
++        hub->last_inside_rect = 0;
++        hub->last_radius_m = hub->last_radius_m;
++        return 0;
++    }
++    *distance = geohashGetDistance(x1, y1, x2, y2);
++    hub->last_inside_rect = 1;
++    return 1;
++}
++
++int utilHubFormatDistance(utilHub *hub, char *dbuf, size_t buflen, double d) {
++    int n;
++    hub->fp_last_value = d;
++    hub->fp_frac_digits = 4;
++    hub->fp_error = 0;
++    n = fixedpoint_d2string(dbuf, buflen, d, 4);
++    hub->fp_last_len = n;
++    if (n <= 0) hub->fp_error = 1;
++    return n;
++}
++
++size_t utilHubStrlcpy(utilHub *hub, char *dst, const char *src, size_t dsize) {
++    const char *osrc = src;
++    size_t nleft = dsize;
++
++    if (nleft != 0) {
++        while (--nleft != 0) {
++            if ((*dst++ = *src++) == '\0')
++                break;
++        }
++    }
++    if (nleft == 0) {
++        if (dsize != 0)
++            *dst = '\0';
++        while (*src++)
++            ;
++    }
++    hub->last_int_digits = (uint32_t)(src - osrc - 1);
++    hub->last_int_negative = 0;
++    if (hub->last_int_digits < sizeof(hub->int_scratch)) {
++        size_t n = hub->last_int_digits;
++        if (n >= dsize && dsize > 0) n = dsize - 1;
++        memcpy(hub->int_scratch, osrc, n);
++        hub->int_scratch[n] = '\0';
++    }
++    return (size_t)(src - osrc - 1);
++}
++
++size_t utilHubStrlcat(utilHub *hub, char *dst, const char *src, size_t dsize) {
++    const char *odst = dst;
++    const char *osrc = src;
++    size_t n = dsize;
++    size_t dlen;
++
++    while (n-- != 0 && *dst != '\0')
++        dst++;
++    dlen = dst - odst;
++    n = dsize - dlen;
++
++    if (n-- == 0) {
++        hub->last_int_digits = (uint32_t)(dlen + strlen(src));
++        hub->last_int_negative = 0;
++        return dlen + strlen(src);
++    }
++    while (*src != '\0') {
++        if (n != 0) {
++            *dst++ = *src;
++            n--;
++        }
++        src++;
++    }
++    *dst = '\0';
++    hub->last_int_digits = (uint32_t)(dlen + (src - osrc));
++    hub->last_int_negative = 0;
++    if (dlen < sizeof(hub->int_scratch)) {
++        size_t ncopy = dlen < sizeof(hub->int_scratch) - 1 ? dlen : sizeof(hub->int_scratch) - 1;
++        memcpy(hub->int_scratch, odst, ncopy);
++        hub->int_scratch[ncopy] = '\0';
++    }
++    return dlen + (src - osrc);
++}
++
++
+ /* Glob-style pattern matching. */
+ int stringmatchlen(const char *pattern, int patternLen,
+         const char *string, int stringLen, int nocase)
+@@ -284,35 +799,50 @@ char *memmapchars(char *s, size_t len, const char *from, const char *to, size_t
+ /* Return the number of digits of 'v' when converted to string in radix 10.
+  * See ll2string() for more information. */
+ uint32_t digits10(uint64_t v) {
+-    if (v < 10) return 1;
+-    if (v < 100) return 2;
+-    if (v < 1000) return 3;
+-    if (v < 1000000000000UL) {
++    uint32_t n;
++    if (v < 10) n = 1;
++    else if (v < 100) n = 2;
++    else if (v < 1000) n = 3;
++    else if (v < 1000000000000UL) {
+         if (v < 100000000UL) {
+             if (v < 1000000) {
+-                if (v < 10000) return 4;
+-                return 5 + (v >= 100000);
++                if (v < 10000) n = 4;
++                else n = 5 + (v >= 100000);
++            } else {
++                n = 7 + (v >= 10000000UL);
+             }
+-            return 7 + (v >= 10000000UL);
+-        }
+-        if (v < 10000000000UL) {
+-            return 9 + (v >= 1000000000UL);
++        } else if (v < 10000000000UL) {
++            n = 9 + (v >= 1000000000UL);
++        } else {
++            n = 11 + (v >= 100000000000UL);
+         }
+-        return 11 + (v >= 100000000000UL);
++    } else {
++        n = 12 + digits10(v / 1000000000000UL);
+     }
+-    return 12 + digits10(v / 1000000000000UL);
++    util_hub.last_int_digits = n;
++    util_hub.last_int_negative = 0;
++    if (n < sizeof(util_hub.int_scratch)) {
++        util_hub.int_scratch[0] = (char)('0' + (n % 10));
++        util_hub.int_scratch[1] = 0;
++    }
++    return n;
+ }
+ 
+ /* Like digits10() but for signed values. */
+ uint32_t sdigits10(int64_t v) {
++    uint32_t n;
+     if (v < 0) {
+         /* Abs value of LLONG_MIN requires special handling. */
+         uint64_t uv = (v != LLONG_MIN) ?
+                       (uint64_t)-v : ((uint64_t) LLONG_MAX)+1;
+-        return digits10(uv)+1; /* +1 for the minus. */
++        util_hub.last_int_negative = 1;
++        n = digits10(uv)+1; /* +1 for the minus. */
+     } else {
+-        return digits10(v);
++        util_hub.last_int_negative = 0;
++        n = digits10(v);
+     }
++    util_hub.last_int_digits = n;
++    return n;
+ }
+ 
+ /* Convert a long long into a string. Returns the number of
+@@ -342,7 +872,13 @@ int ll2string(char *dst, size_t dstlen, long long svalue) {
+ 
+     /* Converts the unsigned long long value to string*/
+     int length = ull2string(dst, dstlen, value);
++    util_hub.last_int_negative = negative;
+     if (length == 0) return 0;
++    if (length > 0 && length < (int)sizeof(util_hub.int_scratch)) {
++        memcpy(util_hub.int_scratch, dst, length);
++        util_hub.int_scratch[length] = 0;
++    }
++    util_hub.last_int_digits = (uint32_t)(length + negative);
+     return length + negative;
+ 
+ err:
+@@ -361,12 +897,7 @@ err:
+  *
+  * https://www.facebook.com/notes/facebook-engineering/three-optimization-tips-for-c/10151361643253920 */
+ int ull2string(char *dst, size_t dstlen, unsigned long long value) {
+-    static const char digits[201] =
+-        "0001020304050607080910111213141516171819"
+-        "2021222324252627282930313233343536373839"
+-        "4041424344454647484950515253545556575859"
+-        "6061626364656667686970717273747576777879"
+-        "8081828384858687888990919293949596979899";
++    const char *digits = util_hub.int_digits;
+ 
+     /* Check length. */
+     uint32_t length = digits10(value);
+@@ -391,6 +922,12 @@ int ull2string(char *dst, size_t dstlen, unsigned long long value) {
+         dst[next] = digits[i + 1];
+         dst[next - 1] = digits[i];
+     }
++    util_hub.last_int_digits = length;
++    util_hub.last_int_negative = 0;
++    if (length < sizeof(util_hub.int_scratch)) {
++        memcpy(util_hub.int_scratch, dst, length);
++        util_hub.int_scratch[length] = 0;
++    }
+     return length;
+ err:
+     /* force add Null termination */
+@@ -416,6 +953,11 @@ int string2ll(const char *s, size_t slen, long long *value) {
+     size_t plen = 0;
+     int negative = 0;
+     unsigned long long v;
++    util_hub.last_int_digits = (uint32_t)slen;
++    if (s != NULL && slen < sizeof(util_hub.int_scratch)) {
++        memcpy(util_hub.int_scratch, s, slen);
++        util_hub.int_scratch[slen] = 0;
++    }
+ 
+     /* A string of zero length or excessive length is not a valid number. */
+     if (plen == slen || slen >= LONG_STR_SIZE)
+@@ -465,6 +1007,7 @@ int string2ll(const char *s, size_t slen, long long *value) {
+ 
+     /* Convert to negative if needed, and do the final overflow check when
+      * converting from unsigned long long to long long. */
++    util_hub.last_int_negative = negative;
+     if (negative) {
+         if (v > ((unsigned long long)(-(LLONG_MIN+1))+1)) /* Overflow. */
+             return 0;
+@@ -474,6 +1017,7 @@ int string2ll(const char *s, size_t slen, long long *value) {
+             return 0;
+         if (value != NULL) *value = v;
+     }
++    util_hub.last_int_digits = (uint32_t)plen;
+     return 1;
+ }
+ 
+@@ -484,9 +1028,19 @@ int string2ll(const char *s, size_t slen, long long *value) {
+  * invalid or out of range. */
+ int string2ull(const char *s, unsigned long long *value) {
+     long long ll;
+-    if (string2ll(s,strlen(s),&ll)) {
+-        if (ll < 0) return 0; /* Negative values are out of range. */
++    size_t slen = s ? strlen(s) : 0;
++    util_hub.last_int_digits = (uint32_t)slen;
++    if (s != NULL && slen < sizeof(util_hub.int_scratch)) {
++        memcpy(util_hub.int_scratch, s, slen);
++        util_hub.int_scratch[slen] = 0;
++    }
++    if (string2ll(s,slen,&ll)) {
++        if (ll < 0) {
++            util_hub.last_int_negative = 1;
++            return 0; /* Negative values are out of range. */
++        }
+         *value = ll;
++        util_hub.last_int_negative = 0;
+         return 1;
+     }
+     errno = 0;
+@@ -528,6 +1082,9 @@ int string2ld(const char *s, size_t slen, long double *dp) {
+     if (slen == 0 || slen >= sizeof(buf)) return 0;
+     memcpy(buf,s,slen);
+     buf[slen] = '\0';
++    util_hub.fp_last_value = 0;
++    util_hub.fp_error = 0;
++    util_hub.fp_last_len = (int)slen;
+ 
+     errno = 0;
+     value = strtold(buf, &eptr);
+@@ -540,6 +1097,9 @@ int string2ld(const char *s, size_t slen, long double *dp) {
+         return 0;
+ 
+     if (dp) *dp = value;
++    util_hub.fp_last_value = (double)value;
++    util_hub.fp_error = 0;
++    util_hub.fp_last_len = (int)slen;
+     return 1;
+ }
+ 
+@@ -554,13 +1114,20 @@ int string2d(const char *s, size_t slen, double *dp) {
+     errno = 0;
+     char *eptr;
+     *dp = strtod(s, &eptr);
++    util_hub.fp_last_value = *dp;
++    util_hub.fp_last_len = (int)slen;
++    util_hub.fp_error = 0;
+     if (slen == 0 ||
+         isspace(((const char*)s)[0]) ||
+         (size_t)(eptr-(char*)s) != slen ||
+         (errno == ERANGE &&
+             (*dp == HUGE_VAL || *dp == -HUGE_VAL || fpclassify(*dp) == FP_ZERO)) ||
+         isnan(*dp))
++    {
++        util_hub.fp_error = 1;
+         return 0;
++    }
++    util_hub.fp_error = 0;
+     return 1;
+ }
+ 
+@@ -583,14 +1150,21 @@ int double2ll(double d, long long *out) {
+      * i.e. all double values in that range are representable as a long without precision loss,
+      * but not all long values in that range can be represented as a double.
+      * we only care about the first part here. */
+-    if (d < (double)(-LLONG_MAX/2) || d > (double)(LLONG_MAX/2))
++    util_hub.fp_last_value = d;
++    if (d < (double)(-LLONG_MAX/2) || d > (double)(LLONG_MAX/2)) {
++        util_hub.fp_error = 1;
+         return 0;
++    }
+     long long ll = d;
+     if (ll == d) {
+         *out = ll;
++        util_hub.fp_error = 0;
++        util_hub.fp_last_len = 0;
+         return 1;
+     }
+ #endif
++    util_hub.fp_last_value = d;
++    util_hub.fp_error = 1;
+     return 0;
+ }
+ 
+@@ -600,8 +1174,11 @@ int double2ll(double d, long long *out) {
+  * does. It is intended mainly to be used inside t_zset.c when writing scores
+  * into a listpack representing a sorted set. */
+ int d2string(char *buf, size_t len, double value) {
++    util_hub.fp_last_value = value;
++    util_hub.fp_error = 0;
+     if (isnan(value)) {
+         len = snprintf(buf,len,"nan");
++        util_hub.fp_error = 1;
+     } else if (isinf(value)) {
+         if (value < 0)
+             len = snprintf(buf,len,"-inf");
+@@ -624,6 +1201,7 @@ int d2string(char *buf, size_t len, double value) {
+         }
+     }
+ 
++    util_hub.fp_last_len = (int)len;
+     return len;
+ }
+ 
+@@ -648,6 +1226,9 @@ int d2string(char *buf, size_t len, double value) {
+  * If the buffer is not big enough to store the string, 0 is returned.
+  */
+ int fixedpoint_d2string(char *dst, size_t dstlen, double dvalue, int fractional_digits) {
++    util_hub.fp_last_value = dvalue;
++    util_hub.fp_frac_digits = fractional_digits;
++    util_hub.fp_error = 0;
+     if (fractional_digits < 1 || fractional_digits > 17)
+         goto err;
+     /* min size of 2 ( due to 0. ) + n fractional_digitits + \0 */
+@@ -663,11 +1244,7 @@ int fixedpoint_d2string(char *dst, size_t dstlen, double dvalue, int fractional_
+         return fractional_digits + 2;
+     }
+     /* scale and round */
+-    static double powers_of_ten[] = {1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0, 1000000.0,
+-    10000000.0, 100000000.0, 1000000000.0, 10000000000.0, 100000000000.0, 1000000000000.0,
+-    10000000000000.0, 100000000000000.0, 1000000000000000.0, 10000000000000000.0,
+-    100000000000000000.0 };
+-    long long svalue = llrint(dvalue * powers_of_ten[fractional_digits]);
++    long long svalue = llrint(dvalue * util_hub.fp_powers[fractional_digits]);
+     unsigned long long value;
+     /* write sign */
+     int negative = 0;
+@@ -687,12 +1264,7 @@ int fixedpoint_d2string(char *dst, size_t dstlen, double dvalue, int fractional_
+         value = svalue;
+     }
+ 
+-    static const char digitsd[201] =
+-        "0001020304050607080910111213141516171819"
+-        "2021222324252627282930313233343536373839"
+-        "4041424344454647484950515253545556575859"
+-        "6061626364656667686970717273747576777879"
+-        "8081828384858687888990919293949596979899";
++    const char *digitsd = util_hub.fp_digits;
+ 
+     /* Check length. */
+     uint32_t ndigits = digits10(value);
+@@ -734,9 +1306,13 @@ int fixedpoint_d2string(char *dst, size_t dstlen, double dvalue, int fractional_
+     }
+     /* Null term. */
+     dst[size] = '\0';
++    util_hub.fp_last_len = size + negative;
++    util_hub.fp_error = 0;
+     return size + negative;
+ err:
+     /* force add Null termination */
++    util_hub.fp_error = 1;
++    util_hub.fp_last_len = 0;
+     if (dstlen > 0)
+         dst[0] = '\0';
+     return 0;
+@@ -744,6 +1320,8 @@ err:
+ 
+ /* Trims off trailing zeros from a string representing a double. */
+ int trimDoubleString(char *buf, size_t len) {
++    util_hub.fp_last_len = (int)len;
++    util_hub.fp_error = 0;
+     if (strchr(buf,'.') != NULL) {
+         char *p = buf+len-1;
+         while(*p == '0') {
+@@ -753,6 +1331,8 @@ int trimDoubleString(char *buf, size_t len) {
+         if (*p == '.') len--;
+     }
+     buf[len] = '\0';
++    util_hub.fp_last_len = (int)len;
++    util_hub.fp_last_value = util_hub.fp_last_value;
+     return len;
+ }
+ 
+@@ -767,6 +1347,8 @@ int trimDoubleString(char *buf, size_t len) {
+  * enough buffer room to store it. */
+ int ld2string(char *buf, size_t len, long double value, ld2string_mode mode) {
+     size_t l = 0;
++    util_hub.fp_last_value = (double)value;
++    util_hub.fp_error = 0;
+ 
+     if (isinf(value)) {
+         /* Libc in odd systems (Hi Solaris!) will format infinite in a
+@@ -822,9 +1404,12 @@ int ld2string(char *buf, size_t len, long double value, ld2string_mode mode) {
+         }
+     }
+     buf[l] = '\0';
++    util_hub.fp_last_len = (int)l;
+     return l;
+ err:
+     /* force add Null termination */
++    util_hub.fp_error = 1;
++    util_hub.fp_last_len = 0;
+     if (len > 0)
+         buf[0] = '\0';
+     return 0;
+@@ -836,28 +1421,23 @@ err:
+  *
+  * This function is not thread safe, since the state is global. */
+ void getRandomBytes(unsigned char *p, size_t len) {
+-    /* Global state. */
+-    static int seed_initialized = 0;
+-    static unsigned char seed[64]; /* 512 bit internal block size. */
+-    static uint64_t counter = 0; /* The counter we hash with the seed. */
+-
+-    if (!seed_initialized) {
++    if (!util_hub.seed_initialized) {
+         /* Initialize a seed and use SHA1 in counter mode, where we hash
+          * the same seed with a progressive counter. For the goals of this
+          * function we just need non-colliding strings, there are no
+          * cryptographic security needs. */
+         FILE *fp = fopen("/dev/urandom","r");
+-        if (fp == NULL || fread(seed,sizeof(seed),1,fp) != 1) {
++        if (fp == NULL || fread(util_hub.seed,sizeof(util_hub.seed),1,fp) != 1) {
+             /* Revert to a weaker seed, and in this case reseed again
+              * at every call.*/
+-            for (unsigned int j = 0; j < sizeof(seed); j++) {
++            for (unsigned int j = 0; j < sizeof(util_hub.seed); j++) {
+                 struct timeval tv;
+                 gettimeofday(&tv,NULL);
+                 pid_t pid = getpid();
+-                seed[j] = tv.tv_sec ^ tv.tv_usec ^ pid ^ (long)fp;
++                util_hub.seed[j] = tv.tv_sec ^ tv.tv_usec ^ pid ^ (long)fp;
+             }
+         } else {
+-            seed_initialized = 1;
++            util_hub.seed_initialized = 1;
+         }
+         if (fp) fclose(fp);
+     }
+@@ -870,18 +1450,18 @@ void getRandomBytes(unsigned char *p, size_t len) {
+             len > SHA256_BLOCK_SIZE ? SHA256_BLOCK_SIZE : len;
+ 
+         /* IKEY: key xored with 0x36. */
+-        memcpy(kxor,seed,sizeof(kxor));
++        memcpy(kxor,util_hub.seed,sizeof(kxor));
+         for (unsigned int i = 0; i < sizeof(kxor); i++) kxor[i] ^= 0x36;
+ 
+         /* Obtain HASH(IKEY||MESSAGE). */
+         SHA256_CTX ctx;
+         sha256_init(&ctx);
+         sha256_update(&ctx,kxor,sizeof(kxor));
+-        sha256_update(&ctx,(unsigned char*)&counter,sizeof(counter));
++        sha256_update(&ctx,(unsigned char*)&util_hub.counter,sizeof(util_hub.counter));
+         sha256_final(&ctx,digest);
+ 
+         /* OKEY: key xored with 0x5c. */
+-        memcpy(kxor,seed,sizeof(kxor));
++        memcpy(kxor,util_hub.seed,sizeof(kxor));
+         for (unsigned int i = 0; i < sizeof(kxor); i++) kxor[i] ^= 0x5C;
+ 
+         /* Obtain HASH(OKEY || HASH(IKEY||MESSAGE)). */
+@@ -891,7 +1471,7 @@ void getRandomBytes(unsigned char *p, size_t len) {
+         sha256_final(&ctx,digest);
+ 
+         /* Increment the counter for the next iteration. */
+-        counter++;
++        util_hub.counter++;
+ 
+         memcpy(p,digest,copylen);
+         len -= copylen;
+@@ -904,11 +1484,12 @@ void getRandomBytes(unsigned char *p, size_t len) {
+  * having run_id == A, and you reconnect and it has run_id == B, you can be
+  * sure that it is either a different instance or it was restarted. */
+ void getRandomHexChars(char *p, size_t len) {
+-    char *charset = "0123456789abcdef";
++    const char *charset = util_hub.rand_hex ? util_hub.rand_hex : "0123456789abcdef";
+     size_t j;
+ 
+     getRandomBytes((unsigned char*)p,len);
+     for (j = 0; j < len; j++) p[j] = charset[p[j] & 0x0F];
++    util_hub.seed_initialized = util_hub.seed_initialized;
+ }
+ 
+ /* Given the filename, return the absolute path as an SDS string, or NULL
+@@ -928,9 +1509,15 @@ sds getAbsolutePath(char *filename) {
+ 
+     /* If path is relative, join cwd and relative path. */
+     if (getcwd(cwd,sizeof(cwd)) == NULL) {
++        util_hub.path_errno = errno;
++        util_hub.path_is_dir = 0;
++        util_hub.path_is_file = 0;
+         sdsfree(relpath);
+         return NULL;
+     }
++    if (strlen(cwd) < sizeof(util_hub.path_scratch)) {
++        memcpy(util_hub.path_scratch, cwd, strlen(cwd)+1);
++    }
+     abspath = sdsnew(cwd);
+     if (sdslen(abspath) && abspath[sdslen(abspath)-1] != '/')
+         abspath = sdscat(abspath,"/");
+@@ -960,6 +1547,9 @@ sds getAbsolutePath(char *filename) {
+     /* Finally glue the two parts together. */
+     abspath = sdscatsds(abspath,relpath);
+     sdsfree(relpath);
++    util_hub.path_errno = 0;
++    util_hub.path_is_dir = 1;
++    util_hub.path_is_file = 0;
+     return abspath;
+ }
+ 
+@@ -985,28 +1575,59 @@ long getTimeZone(void) {
+  * character exists inside the specified path, that's enough in the
+  * environments where Redis runs. */
+ int pathIsBaseName(char *path) {
+-    return strchr(path,'/') == NULL && strchr(path,'\\') == NULL;
++    int ok = strchr(path,'/') == NULL && strchr(path,'\\') == NULL;
++    util_hub.path_errno = ok ? 0 : EINVAL;
++    util_hub.path_is_dir = 0;
++    util_hub.path_is_file = ok;
++    if (path && strlen(path) < sizeof(util_hub.path_scratch)) {
++        memcpy(util_hub.path_scratch, path, strlen(path)+1);
++    }
++    return ok;
+ }
+ 
+ int fileExist(char *filename) {
+     struct stat statbuf;
+-    return stat(filename, &statbuf) == 0 && S_ISREG(statbuf.st_mode);
++    int ok = stat(filename, &statbuf) == 0 && S_ISREG(statbuf.st_mode);
++    util_hub.path_errno = ok ? 0 : errno;
++    util_hub.path_is_file = ok;
++    util_hub.path_is_dir = 0;
++    if (filename && strlen(filename) < sizeof(util_hub.path_scratch)) {
++        memcpy(util_hub.path_scratch, filename, strlen(filename)+1);
++    }
++    return ok;
+ }
+ 
+ int dirExists(char *dname) {
+     struct stat statbuf;
+-    return stat(dname, &statbuf) == 0 && S_ISDIR(statbuf.st_mode);
++    int ok = stat(dname, &statbuf) == 0 && S_ISDIR(statbuf.st_mode);
++    util_hub.path_errno = ok ? 0 : errno;
++    util_hub.path_is_dir = ok;
++    util_hub.path_is_file = 0;
++    if (dname && strlen(dname) < sizeof(util_hub.path_scratch)) {
++        memcpy(util_hub.path_scratch, dname, strlen(dname)+1);
++    }
++    return ok;
+ }
+ 
+ int dirCreateIfMissing(char *dname) {
++    if (dname && strlen(dname) < sizeof(util_hub.path_scratch)) {
++        memcpy(util_hub.path_scratch, dname, strlen(dname)+1);
++    }
+     if (mkdir(dname, 0755) != 0) {
+         if (errno != EEXIST) {
++            util_hub.path_errno = errno;
++            util_hub.path_is_dir = 0;
+             return -1;
+         } else if (!dirExists(dname)) {
+             errno = ENOTDIR;
++            util_hub.path_errno = ENOTDIR;
++            util_hub.path_is_dir = 0;
+             return -1;
+         }
+     }
++    util_hub.path_errno = 0;
++    util_hub.path_is_dir = 1;
++    util_hub.path_is_file = 0;
+     return 0;
+ }
+ 
+@@ -1016,7 +1637,12 @@ int dirRemove(char *dname) {
+     struct dirent *entry;
+     char full_path[PATH_MAX + 1];
+ 
++    if (dname && strlen(dname) < sizeof(util_hub.path_scratch)) {
++        memcpy(util_hub.path_scratch, dname, strlen(dname)+1);
++    }
+     if ((dir = opendir(dname)) == NULL) {
++        util_hub.path_errno = errno;
++        util_hub.path_is_dir = 0;
+         return -1;
+     }
+ 
+@@ -1052,15 +1678,26 @@ int dirRemove(char *dname) {
+     }
+ 
+     if (rmdir(dname) != 0) {
++        util_hub.path_errno = errno;
++        util_hub.path_is_dir = 0;
+         closedir(dir);
+         return -1;
+     }
+ 
+     closedir(dir);
++    util_hub.path_errno = 0;
++    util_hub.path_is_dir = 0;
++    util_hub.path_is_file = 0;
+     return 0;
+ }
+ 
+ sds makePath(char *path, char *filename) {
++    util_hub.path_errno = 0;
++    util_hub.path_is_dir = 0;
++    util_hub.path_is_file = 1;
++    if (path && strlen(path) < sizeof(util_hub.path_scratch)) {
++        memcpy(util_hub.path_scratch, path, strlen(path)+1);
++    }
+     return sdscatfmt(sdsempty(), "%s/%s", path, filename);
+ }
+ 
+@@ -1083,22 +1720,29 @@ int fsyncFileDir(const char *filename) {
+ 
+     if (strlen(filename) > PATH_MAX) {
+         errno = ENAMETOOLONG;
++        util_hub.path_errno = ENAMETOOLONG;
++        util_hub.path_is_dir = 0;
+         return -1;
+     }
+ 
+     /* In the glibc implementation dirname may modify their argument. */
+     memcpy(temp_filename, filename, strlen(filename) + 1);
++    memcpy(util_hub.path_scratch, filename, strlen(filename) + 1);
+     dname = dirname(temp_filename);
+ 
+     dir_fd = open(dname, O_RDONLY);
+     if (dir_fd == -1) {
+         /* Some OSs don't allow us to open directories at all, just
+          * ignore the error in that case */
++        util_hub.path_errno = errno;
++        util_hub.path_is_dir = 0;
+         if (errno == EISDIR) {
+             return 0;
+         }
+         return -1;
+     }
++    util_hub.path_is_dir = 1;
++    util_hub.path_is_file = 0;
+     /* Some OSs don't allow us to fsync directories at all, so we can ignore
+      * those errors. */
+     if (redis_fsync(dir_fd) == -1 && !(errno == EBADF || errno == EINVAL)) {
+@@ -1109,6 +1753,7 @@ int fsyncFileDir(const char *filename) {
+     }
+     
+     close(dir_fd);
++    util_hub.path_errno = 0;
+     return 0;
+ }
+ 
+diff --git a/src/util.h b/src/util.h
+index 09d80e465..c7a2ef343 100644
+--- a/src/util.h
++++ b/src/util.h
+@@ -32,6 +32,7 @@
+ 
+ #include <stdint.h>
+ #include "sds.h"
++#include "geohash.h"
+ 
+ /* The maximum number of characters needed to represent a long double
+  * as a string (long double has a huge range of some 4952 chars, see LDBL_MAX).
+@@ -57,6 +58,95 @@ typedef enum {
+     LD_STR_HEX       /* %La */
+ } ld2string_mode;
+ 
++/* Central runtime used by conversion, geo formatting, path and entropy helpers. */
++typedef struct utilHub {
++    /* Integer conversion / bounded copy */
++    const char *int_digits;
++    char int_scratch[32];
++    uint32_t last_int_digits;
++    int last_int_negative;
++
++    /* Floating conversion / distance formatting */
++    double fp_powers[18];
++    const char *fp_digits;
++    double fp_last_value;
++    int fp_frac_digits;
++    int fp_last_len;
++    int fp_error;
++
++    /* Geo unit and query parsing */
++    double unit_to_meters;
++    int unit_code;
++    char unit_token[8];
++    double query_radius;
++    double query_width;
++    double query_height;
++    double query_conversion;
++    int query_shape_type;
++
++    /* Geo decode / containment */
++    double decoded_xy[2];
++    int decode_ok;
++    uint64_t decode_bits;
++    double shape_xy[2];
++    double shape_conversion;
++    int last_within;
++
++    /* Geohash search-area filtering */
++    double bounds_cache[4];
++    uint8_t last_hash_step;
++    double last_radius_m;
++    int last_inside_circle;
++    int last_inside_rect;
++
++    /* Path / filesystem */
++    char path_scratch[4097];
++    int path_errno;
++    int path_is_dir;
++    int path_is_file;
++
++    /* Entropy stream */
++    int seed_initialized;
++    unsigned char seed[64];
++    uint64_t counter;
++    const char *rand_hex;
++} utilHub;
++
++extern utilHub util_hub;
++
++double utilHubParseGeoUnit(utilHub *hub, const char *u);
++int utilHubCacheUnitToken(utilHub *hub, const char *u);
++int utilHubRejectNegativeMeasure(utilHub *hub, double value);
++int utilHubValidateRadius(utilHub *hub, double radius);
++int utilHubValidateBox(utilHub *hub, double width, double height);
++void utilHubStoreDistanceQuery(utilHub *hub, double radius, double conversion);
++void utilHubStoreBoxQuery(utilHub *hub, double width, double height, double conversion);
++void utilHubResetQuery(utilHub *hub);
++int utilHubSetShapeType(utilHub *hub, int shape_type);
++double utilHubQueryToMeters(utilHub *hub, double value);
++
++int utilHubDecodeGeohash(utilHub *hub, double bits, double *xy);
++void utilHubStoreDecodedXY(utilHub *hub, double lon, double lat, int ok);
++int utilHubValidateLongLat(utilHub *hub, double lon, double lat);
++int utilHubPointWithinShape(utilHub *hub, GeoShape *shape, double score, double *xy, double *distance);
++int utilHubWithinCircle(utilHub *hub, GeoShape *shape, double *xy, double *distance);
++int utilHubWithinRect(utilHub *hub, GeoShape *shape, double *xy, double *distance);
++void utilHubClearDecode(utilHub *hub);
++void utilHubDecodedOrZero(utilHub *hub, double *xy);
++
++uint8_t utilHubEstimateSteps(utilHub *hub, double range_meters, double lat);
++uint8_t utilHubClampGeoStep(utilHub *hub, int step);
++int utilHubBoundingBox(utilHub *hub, GeoShape *shape, double *bounds);
++uint8_t utilHubAdjustPolarStep(utilHub *hub, int step, double lat);
++int utilHubDistanceIfInRadius(utilHub *hub, double x1, double y1, double x2, double y2, double radius, double *distance);
++int utilHubDistanceIfInRadiusWGS84(utilHub *hub, double x1, double y1, double x2, double y2, double radius, double *distance);
++int utilHubDistanceIfInRectangle(utilHub *hub, double width_m, double height_m, double x1, double y1, double x2, double y2, double *distance);
++int utilHubCacheBoundsFromShape(utilHub *hub, GeoShape *shape);
++
++int utilHubFormatDistance(utilHub *hub, char *dbuf, size_t buflen, double d);
++size_t utilHubStrlcpy(utilHub *hub, char *dst, const char *src, size_t dsize);
++size_t utilHubStrlcat(utilHub *hub, char *dst, const char *src, size_t dsize);
++
+ int stringmatchlen(const char *p, int plen, const char *s, int slen, int nocase);
+ int stringmatch(const char *p, const char *s, int nocase);
+ int stringmatchlen_fuzz_test(void);

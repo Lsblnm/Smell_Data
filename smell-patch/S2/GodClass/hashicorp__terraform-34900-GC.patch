@@ -1,0 +1,4911 @@
+diff --git a/internal/terraform/node_resource_abstract_instance.go b/internal/terraform/node_resource_abstract_instance.go
+index 9c4de67276..7481e0181d 100644
+--- a/internal/terraform/node_resource_abstract_instance.go
++++ b/internal/terraform/node_resource_abstract_instance.go
+@@ -4,18 +4,26 @@
+ package terraform
+ 
+ import (
++	"errors"
+ 	"fmt"
+ 	"log"
++	"sort"
++	"strconv"
+ 	"strings"
+ 
+ 	"github.com/hashicorp/hcl/v2"
++	"github.com/hashicorp/hcl/v2/hcldec"
+ 	"github.com/zclconf/go-cty/cty"
++	"github.com/zclconf/go-cty/cty/convert"
++	ctyjson "github.com/zclconf/go-cty/cty/json"
+ 
+ 	"github.com/hashicorp/terraform/internal/addrs"
+ 	"github.com/hashicorp/terraform/internal/checks"
+ 	"github.com/hashicorp/terraform/internal/configs"
+ 	"github.com/hashicorp/terraform/internal/configs/configschema"
+ 	"github.com/hashicorp/terraform/internal/instances"
++	"github.com/hashicorp/terraform/internal/lang"
++	"github.com/hashicorp/terraform/internal/lang/langrefs"
+ 	"github.com/hashicorp/terraform/internal/moduletest/mocking"
+ 	"github.com/hashicorp/terraform/internal/plans"
+ 	"github.com/hashicorp/terraform/internal/plans/objchange"
+@@ -357,7 +365,7 @@ func (n *NodeAbstractResourceInstance) writeResourceInstanceStateImpl(ctx EvalCo
+ 		return fmt.Errorf("failed to encode %s in state: no resource type schema available", absAddr)
+ 	}
+ 
+-	src, err := obj.Encode(schema.ImpliedType(), currentVersion)
++	src, err := n.encodeResourceInstanceObject(obj, schema.ImpliedType(), currentVersion)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to encode %s in state: %s", absAddr, err)
+ 	}
+@@ -688,12 +696,16 @@ func (n *NodeAbstractResourceInstance) refresh(ctx EvalContext, deposedKey state
+ 		return state, diags
+ 	}
+ 
+-	newState := objchange.NormalizeObjectFromLegacySDK(resp.NewState, schema)
++	newState := n.normalizeObjectFromLegacySDK(resp.NewState, schema)
++	if coerced, coerceErr := n.coerceBlockValue(schema, newState); coerceErr == nil {
++		newState = coerced
++	}
+ 	if !newState.RawEquals(resp.NewState) {
+ 		// We had to fix up this object in some way, and we still need to
+ 		// accept any changes for compatibility, so all we can do is log a
+ 		// warning about the change.
+ 		log.Printf("[WARN] Provider %q produced an invalid new value containing null blocks for %q during refresh\n", n.ResolvedProvider.Provider, n.Addr)
++		log.Printf("[TRACE] refreshed value type for %s is %s", n.Addr, n.formatResourceSchema(schema))
+ 	}
+ 
+ 	ret := state.DeepCopy()
+@@ -704,7 +716,7 @@ func (n *NodeAbstractResourceInstance) refresh(ctx EvalContext, deposedKey state
+ 	// so we can only log inconsistencies with the updated state values.
+ 	// In most cases these are not errors anyway, and represent "drift" from
+ 	// external changes which will be handled by the subsequent plan.
+-	if errs := objchange.AssertObjectCompatible(schema, priorVal, ret.Value); len(errs) > 0 {
++	if errs := n.assertObjectCompatible(schema, priorVal, ret.Value); len(errs) > 0 {
+ 		var buf strings.Builder
+ 		fmt.Fprintf(&buf, "[WARN] Provider %q produced an unexpected new value for %s during refresh.", n.ResolvedProvider.Provider.String(), absAddr)
+ 		for _, err := range errs {
+@@ -788,7 +800,7 @@ func (n *NodeAbstractResourceInstance) plan(
+ 
+ 	keyData = EvalDataForInstanceKey(n.ResourceInstanceAddr().Resource.Key, forEach)
+ 
+-	checkDiags := evalCheckRules(
++	checkDiags := n.evalInstanceCheckRules(
+ 		addrs.ResourcePrecondition,
+ 		n.Config.Preconditions,
+ 		ctx, n.Addr, keyData,
+@@ -898,7 +910,7 @@ func (n *NodeAbstractResourceInstance) plan(
+ 		if priorVal.IsNull() {
+ 			// Then we are actually creating something, so let's populate the
+ 			// computed values from our override value.
+-			override, overrideDiags := mocking.PlanComputedValuesForResource(proposedNewVal, schema)
++			override, overrideDiags := n.planComputedValuesForResource(proposedNewVal, schema)
+ 			resp = providers.PlanResourceChangeResponse{
+ 				PlannedState: override,
+ 				Diagnostics:  overrideDiags,
+@@ -953,7 +965,7 @@ func (n *NodeAbstractResourceInstance) plan(
+ 		return nil, nil, keyData, diags
+ 	}
+ 
+-	if errs := objchange.AssertPlanValid(schema, unmarkedPriorVal, unmarkedConfigVal, plannedNewVal); len(errs) > 0 {
++	if errs := n.assertPlanValid(schema, unmarkedPriorVal, unmarkedConfigVal, plannedNewVal); len(errs) > 0 {
+ 		if resp.LegacyTypeSystem {
+ 			// The shimming of the old type system in the legacy SDK is not precise
+ 			// enough to pass this consistency check, so we'll give it a pass here,
+@@ -1148,12 +1160,12 @@ func (n *NodeAbstractResourceInstance) plan(
+ 		}
+ 
+ 		// create a new proposed value from the null state and the config
+-		proposedNewVal = objchange.ProposedNew(schema, nullPriorVal, unmarkedConfigVal)
++		proposedNewVal = n.proposedNewFromSchema(schema, nullPriorVal, unmarkedConfigVal)
+ 
+ 		if n.override != nil {
+ 			// In this case, we are always creating the resource so we don't
+ 			// do any validation, and just call out to the mocking library.
+-			override, overrideDiags := mocking.PlanComputedValuesForResource(proposedNewVal, schema)
++			override, overrideDiags := n.planComputedValuesForResource(proposedNewVal, schema)
+ 			resp = providers.PlanResourceChangeResponse{
+ 				PlannedState: override,
+ 				Diagnostics:  overrideDiags,
+@@ -1367,163 +1379,9 @@ func traversalToPath(traversal hcl.Traversal) cty.Path {
+ }
+ 
+ func processIgnoreChangesIndividual(prior, config cty.Value, ignoreChangesPath []cty.Path) (cty.Value, tfdiags.Diagnostics) {
+-	type ignoreChange struct {
+-		// Path is the full path, minus any trailing map index
+-		path cty.Path
+-		// Value is the value we are to retain at the above path. If there is a
+-		// key value, this must be a map and the desired value will be at the
+-		// key index.
+-		value cty.Value
+-		// Key is the index key if the ignored path ends in a map index.
+-		key cty.Value
+-	}
+-	var ignoredValues []ignoreChange
+-
+-	// Find the actual changes first and store them in the ignoreChange struct.
+-	// If the change was to a map value, and the key doesn't exist in the
+-	// config, it would never be visited in the transform walk.
+-	for _, icPath := range ignoreChangesPath {
+-		key := cty.NullVal(cty.String)
+-		// check for a map index, since maps are the only structure where we
+-		// could have invalid path steps.
+-		last, ok := icPath[len(icPath)-1].(cty.IndexStep)
+-		if ok {
+-			if last.Key.Type() == cty.String {
+-				icPath = icPath[:len(icPath)-1]
+-				key = last.Key
+-			}
+-		}
+-
+-		// The structure should have been validated already, and we already
+-		// trimmed the trailing map index. Any other intermediate index error
+-		// means we wouldn't be able to apply the value below, so no need to
+-		// record this.
+-		p, err := icPath.Apply(prior)
+-		if err != nil {
+-			continue
+-		}
+-		c, err := icPath.Apply(config)
+-		if err != nil {
+-			continue
+-		}
+-
+-		// If this is a map, it is checking the entire map value for equality
+-		// rather than the individual key. This means that the change is stored
+-		// here even if our ignored key doesn't change. That is OK since it
+-		// won't cause any changes in the transformation, but allows us to skip
+-		// breaking up the maps and checking for key existence here too.
+-		if !p.RawEquals(c) {
+-			// there a change to ignore at this path, store the prior value
+-			ignoredValues = append(ignoredValues, ignoreChange{icPath, p, key})
+-		}
+-	}
+-
+-	if len(ignoredValues) == 0 {
+-		return config, nil
+-	}
+-
+-	ret, _ := cty.Transform(config, func(path cty.Path, v cty.Value) (cty.Value, error) {
+-		// Easy path for when we are only matching the entire value. The only
+-		// values we break up for inspection are maps.
+-		if !v.Type().IsMapType() {
+-			for _, ignored := range ignoredValues {
+-				if path.Equals(ignored.path) {
+-					return ignored.value, nil
+-				}
+-			}
+-			return v, nil
+-		}
+-		// We now know this must be a map, so we need to accumulate the values
+-		// key-by-key.
+-
+-		if !v.IsNull() && !v.IsKnown() {
+-			// since v is not known, we cannot ignore individual keys
+-			return v, nil
+-		}
+-
+-		// The map values will remain as cty values, so we only need to store
+-		// the marks from the outer map itself
+-		v, vMarks := v.Unmark()
+-
+-		// The configMap is the current configuration value, which we will
+-		// mutate based on the ignored paths and the prior map value.
+-		var configMap map[string]cty.Value
+-		switch {
+-		case v.IsNull() || v.LengthInt() == 0:
+-			configMap = map[string]cty.Value{}
+-		default:
+-			configMap = v.AsValueMap()
+-		}
+-
+-		for _, ignored := range ignoredValues {
+-			if !path.Equals(ignored.path) {
+-				continue
+-			}
+-
+-			if ignored.key.IsNull() {
+-				// The map address is confirmed to match at this point,
+-				// so if there is no key, we want the entire map and can
+-				// stop accumulating values.
+-				return ignored.value, nil
+-			}
+-			// Now we know we are ignoring a specific index of this map, so get
+-			// the config map and modify, add, or remove the desired key.
+-
+-			// We also need to create a prior map, so we can check for
+-			// existence while getting the value, because Value.Index will
+-			// return null for a key with a null value and for a non-existent
+-			// key.
+-			var priorMap map[string]cty.Value
+-
+-			// We need to drop the marks from the ignored map for handling. We
+-			// don't need to store these, as we now know the ignored value is
+-			// only within the map, not the map itself.
+-			ignoredVal, _ := ignored.value.Unmark()
+-
+-			switch {
+-			case ignored.value.IsNull() || ignoredVal.LengthInt() == 0:
+-				priorMap = map[string]cty.Value{}
+-			default:
+-				priorMap = ignoredVal.AsValueMap()
+-			}
+-
+-			key := ignored.key.AsString()
+-			priorElem, keep := priorMap[key]
+-
+-			switch {
+-			case !keep:
+-				// this didn't exist in the old map value, so we're keeping the
+-				// "absence" of the key by removing it from the config
+-				delete(configMap, key)
+-			default:
+-				configMap[key] = priorElem
+-			}
+-		}
+-
+-		var newVal cty.Value
+-		switch {
+-		case len(configMap) > 0:
+-			newVal = cty.MapVal(configMap)
+-		case v.IsNull():
+-			// if the config value was null, and no values remain in the map,
+-			// reset the value to null.
+-			newVal = v
+-		default:
+-			newVal = cty.MapValEmpty(v.Type().ElementType())
+-		}
+-
+-		if len(vMarks) > 0 {
+-			newVal = newVal.WithMarks(vMarks)
+-		}
+-
+-		return newVal, nil
+-	})
+-	return ret, nil
++	return (&NodeAbstractResourceInstance{}).retainIgnoredAttributeChanges(prior, config, ignoreChangesPath)
+ }
+ 
+-// readDataSource handles everything needed to call ReadDataSource on the provider.
+-// A previously evaluated configVal can be passed in, or a new one is generated
+-// from the resource configuration.
+ func (n *NodeAbstractResourceInstance) readDataSource(ctx EvalContext, configVal cty.Value) (cty.Value, tfdiags.Diagnostics) {
+ 	var diags tfdiags.Diagnostics
+ 	var newVal cty.Value
+@@ -1577,7 +1435,7 @@ func (n *NodeAbstractResourceInstance) readDataSource(ctx EvalContext, configVal
+ 
+ 	var resp providers.ReadDataSourceResponse
+ 	if n.override != nil {
+-		override, overrideDiags := mocking.ComputedValuesForDataSource(configVal, mocking.MockedData{
++		override, overrideDiags := n.computedValuesForDataSource(configVal, mocking.MockedData{
+ 			Value: n.override.Values,
+ 			Range: n.override.ValuesRange,
+ 		}, schema)
+@@ -1720,7 +1578,7 @@ func (n *NodeAbstractResourceInstance) planDataSource(ctx EvalContext, checkRule
+ 	forEach, _, _ := evaluateForEachExpression(config.ForEach, ctx, false)
+ 	keyData = EvalDataForInstanceKey(n.ResourceInstanceAddr().Resource.Key, forEach)
+ 
+-	checkDiags := evalCheckRules(
++	checkDiags := n.evalInstanceCheckRules(
+ 		addrs.ResourcePrecondition,
+ 		n.Config.Preconditions,
+ 		ctx, n.Addr, keyData,
+@@ -1796,7 +1654,7 @@ func (n *NodeAbstractResourceInstance) planDataSource(ctx EvalContext, checkRule
+ 			reason = plans.ResourceInstanceReadBecauseDependencyPending
+ 		}
+ 
+-		proposedNewVal := objchange.PlannedDataResourceObject(schema, unmarkedConfigVal)
++		proposedNewVal := n.plannedDataResourceObject(schema, unmarkedConfigVal)
+ 
+ 		// even though we are only returning the config value because we can't
+ 		// yet read the data source, we need to incorporate the schema marks so
+@@ -1864,7 +1722,7 @@ func (n *NodeAbstractResourceInstance) planDataSource(ctx EvalContext, checkRule
+ 		if readDiags.HasErrors() {
+ 			// If we had errors, then we can cover that up by marking the new
+ 			// state as unknown.
+-			newVal = objchange.PlannedDataResourceObject(schema, unmarkedConfigVal)
++			newVal = n.plannedDataResourceObject(schema, unmarkedConfigVal)
+ 
+ 			// not only do we want to ensure this synthetic value has the marks,
+ 			// but since this is the value being returned from the data source
+@@ -2015,7 +1873,7 @@ func (n *NodeAbstractResourceInstance) applyDataSource(ctx EvalContext, planned
+ 	forEach, _, _ := evaluateForEachExpression(config.ForEach, ctx, false)
+ 	keyData = EvalDataForInstanceKey(n.Addr.Resource.Key, forEach)
+ 
+-	checkDiags := evalCheckRules(
++	checkDiags := n.evalInstanceCheckRules(
+ 		addrs.ResourcePrecondition,
+ 		n.Config.Preconditions,
+ 		ctx, n.Addr, keyData,
+@@ -2455,7 +2313,7 @@ func (n *NodeAbstractResourceInstance) apply(
+ 		// values the first time the object is created. Otherwise, we're happy
+ 		// to just apply whatever the user asked for.
+ 		if change.Action == plans.Create {
+-			override, overrideDiags := mocking.ApplyComputedValuesForResource(unmarkedAfter, mocking.MockedData{
++			override, overrideDiags := n.applyComputedValuesForResource(unmarkedAfter, mocking.MockedData{
+ 				Value: n.override.Values,
+ 				Range: n.override.ValuesRange,
+ 			}, schema)
+@@ -2591,7 +2449,7 @@ func (n *NodeAbstractResourceInstance) apply(
+ 		// a pass since the other errors are usually the explanation for
+ 		// this one and so it's more helpful to let the user focus on the
+ 		// root cause rather than distract with this extra problem.
+-		if errs := objchange.AssertObjectCompatible(schema, change.After, newVal); len(errs) > 0 {
++		if errs := n.assertObjectCompatible(schema, change.After, newVal); len(errs) > 0 {
+ 			if resp.LegacyTypeSystem {
+ 				// The shimming of the old type system in the legacy SDK is not precise
+ 				// enough to pass this consistency check, so we'll give it a pass here,
+@@ -2707,3 +2565,4522 @@ func resourceInstancePrevRunAddr(ctx EvalContext, currentAddr addrs.AbsResourceI
+ 	table := ctx.MoveResults()
+ 	return table.OldAddr(currentAddr)
+ }
++
++
++// Resource instance planning, schema coercion, mock value population,
++// compatibility checks, and state encoding helpers.
++
++
++// ProposedNew constructs a proposed new object value by combining the
++// computed attribute values from "prior" with the configured attribute values
++// from "config".
++//
++// Both value must conform to the given schema's implied type, or this function
++// will panic.
++//
++// The prior value must be wholly known, but the config value may be unknown
++// or have nested unknown values.
++//
++// The merging of the two objects includes the attributes of any nested blocks,
++// which will be correlated in a manner appropriate for their nesting mode.
++// Note in particular that the correlation for blocks backed by sets is a
++// heuristic based on matching non-computed attribute values and so it may
++// produce strange results with more "extreme" cases, such as a nested set
++// block where _all_ attributes are computed.
++func (n *NodeAbstractResourceInstance) proposedNewFromSchema(schema *configschema.Block, prior, config cty.Value) cty.Value {
++	// If the config and prior are both null, return early here before
++	// populating the prior block. The prevents non-null blocks from appearing
++	// the proposed state value.
++	if config.IsNull() && prior.IsNull() {
++		return prior
++	}
++
++	info := n.inspectResourceSchema(schema)
++	if prior.IsNull() {
++		// In this case, we will construct a synthetic prior value that is
++		// similar to the result of decoding an empty configuration block,
++		// which simplifies our handling of the top-level attributes/blocks
++		// below by giving us one non-null level of object to pull values from.
++		//
++		// "All attributes null" happens to be the definition of EmptyValue for
++		// a Block, so we can just delegate to that
++		if info.empty != cty.NilVal {
++			prior = info.empty
++		} else {
++			prior = n.blockEmptyValue(schema)
++		}
++	}
++	return n.mergeProposedNew(schema, prior, config)
++}
++
++// PlannedDataResourceObject is similar to proposedNewBlock but tailored for
++// planning data resources in particular. Specifically, it replaces the values
++// of any Computed attributes not set in the configuration with an unknown
++// value, which serves as a placeholder for a value to be filled in by the
++// provider when the data resource is finally read.
++//
++// Data resources are different because the planning of them is handled
++// entirely within Terraform Core and not subject to customization by the
++// provider. This function is, in effect, producing an equivalent result to
++// passing the proposedNewBlock result into a provider's PlanResourceChange
++// function, assuming a fixed implementation of PlanResourceChange that just
++// fills in unknown values as needed.
++func (n *NodeAbstractResourceInstance) plannedDataResourceObject(schema *configschema.Block, config cty.Value) cty.Value {
++	// Our trick here is to run the proposedNewBlock logic with an
++	// entirely-unknown prior value. Because of cty's unknown short-circuit
++	// behavior, any operation on prior returns another unknown, and so
++	// unknown values propagate into all of the parts of the resulting value
++	// that would normally be filled in by preserving the prior state.
++	prior := cty.UnknownVal(schema.ImpliedType())
++	return n.mergeProposedNew(schema, prior, config)
++}
++
++func (n *NodeAbstractResourceInstance) mergeProposedNew(schema *configschema.Block, prior, config cty.Value) cty.Value {
++	if config.IsNull() || !config.IsKnown() {
++		// A block config should never be null at this point. The only nullable
++		// block type is NestingSingle, which will return early before coming
++		// back here. We'll allow the null here anyway to free callers from
++		// needing to specifically check for these cases, and any mismatch will
++		// be caught in validation, so just take the prior value rather than
++		// the invalid null.
++		return prior
++	}
++
++	if (!prior.Type().IsObjectType()) || (!config.Type().IsObjectType()) {
++		panic("ProposedNew only supports object-typed values")
++	}
++
++	// From this point onwards, we can assume that both values are non-null
++	// object types, and that the config value itself is known (though it
++	// may contain nested values that are unknown.)
++	newAttrs := n.mergeProposedNewAttributes(schema.Attributes, prior, config)
++
++	// Merging nested blocks is a little more complex, since we need to
++	// correlate blocks between both objects and then recursively propose
++	// a new object for each. The correlation logic depends on the nesting
++	// mode for each block type.
++	for name, blockType := range schema.BlockTypes {
++		priorV := prior.GetAttr(name)
++		configV := config.GetAttr(name)
++		newAttrs[name] = n.mergeProposedNewNestedBlock(blockType, priorV, configV)
++	}
++
++	return cty.ObjectVal(newAttrs)
++}
++
++// proposedNewBlockOrObject dispatched the schema to either ProposedNew or
++// proposedNewObjectAttributes depending on the given type.
++func (n *NodeAbstractResourceInstance) mergeProposedNewBlockOrObject(schema resourceNestedSchema, prior, config cty.Value) cty.Value {
++	switch schema := schema.(type) {
++	case *configschema.Block:
++		return n.proposedNewFromSchema(schema, prior, config)
++	case *configschema.Object:
++		return n.mergeProposedNewObjectAttributes(schema, prior, config)
++	default:
++		panic(fmt.Sprintf("unexpected schema type %T", schema))
++	}
++}
++
++func (n *NodeAbstractResourceInstance) mergeProposedNewNestedBlock(schema *configschema.NestedBlock, prior, config cty.Value) cty.Value {
++	// The only time we should encounter an entirely unknown block is from the
++	// use of dynamic with an unknown for_each expression.
++	if !config.IsKnown() {
++		return config
++	}
++
++	newV := config
++
++	switch schema.Nesting {
++	case configschema.NestingSingle:
++		// A NestingSingle configuration block value can be null, and since it
++		// cannot be computed we can always take the configuration value.
++		if config.IsNull() {
++			break
++		}
++
++		// Otherwise use the same assignment rules as NestingGroup
++		fallthrough
++	case configschema.NestingGroup:
++		newV = n.proposedNewFromSchema(&schema.Block, prior, config)
++
++	case configschema.NestingList:
++		newV = n.mergeProposedNewNestingList(&schema.Block, prior, config)
++
++	case configschema.NestingMap:
++		newV = n.mergeProposedNewNestingMap(&schema.Block, prior, config)
++
++	case configschema.NestingSet:
++		newV = n.mergeProposedNewNestingSet(&schema.Block, prior, config)
++
++	default:
++		// Should never happen, since the above cases are comprehensive.
++		panic(fmt.Sprintf("unsupported block nesting mode %s", schema.Nesting))
++	}
++
++	return newV
++}
++
++func (n *NodeAbstractResourceInstance) mergeProposedNewNestedType(schema *configschema.Object, prior, config cty.Value) cty.Value {
++	// if the config isn't known at all, then we must use that value
++	if !config.IsKnown() {
++		return config
++	}
++
++	// Even if the config is null or empty, we will be using this default value.
++	newV := config
++
++	switch schema.Nesting {
++	case configschema.NestingSingle:
++		// If the config is null, we already have our value. If the attribute
++		// is optional+computed, we won't reach this branch with a null value
++		// since the computed case would have been taken.
++		if config.IsNull() {
++			break
++		}
++
++		newV = n.mergeProposedNewObjectAttributes(schema, prior, config)
++
++	case configschema.NestingList:
++		newV = n.mergeProposedNewNestingList(schema, prior, config)
++
++	case configschema.NestingMap:
++		newV = n.mergeProposedNewNestingMap(schema, prior, config)
++
++	case configschema.NestingSet:
++		newV = n.mergeProposedNewNestingSet(schema, prior, config)
++
++	default:
++		// Should never happen, since the above cases are comprehensive.
++		panic(fmt.Sprintf("unsupported attribute nesting mode %s", schema.Nesting))
++	}
++
++	return newV
++}
++
++func (n *NodeAbstractResourceInstance) mergeProposedNewNestingList(schema resourceNestedSchema, prior, config cty.Value) cty.Value {
++	newV := config
++
++	// Nested blocks are correlated by index.
++	configVLen := 0
++	if !config.IsNull() {
++		configVLen = config.LengthInt()
++	}
++	if configVLen > 0 {
++		newVals := make([]cty.Value, 0, configVLen)
++		for it := config.ElementIterator(); it.Next(); {
++			idx, configEV := it.Element()
++			if prior.IsKnown() && (prior.IsNull() || !prior.HasIndex(idx).True()) {
++				// If there is no corresponding prior element then
++				// we just take the config value as-is.
++				newVals = append(newVals, configEV)
++				continue
++			}
++			priorEV := prior.Index(idx)
++
++			newVals = append(newVals, n.mergeProposedNewBlockOrObject(schema, priorEV, configEV))
++		}
++		// Despite the name, a NestingList might also be a tuple, if
++		// its nested schema contains dynamically-typed attributes.
++		if config.Type().IsTupleType() {
++			newV = cty.TupleVal(newVals)
++		} else {
++			newV = cty.ListVal(newVals)
++		}
++	}
++
++	return newV
++}
++
++func (n *NodeAbstractResourceInstance) mergeProposedNewNestingMap(schema resourceNestedSchema, prior, config cty.Value) cty.Value {
++	newV := config
++
++	newVals := map[string]cty.Value{}
++
++	if config.IsNull() || !config.IsKnown() || config.LengthInt() == 0 {
++		// We already assigned newVal and there's nothing to compare in
++		// config.
++		return newV
++	}
++	cfgMap := config.AsValueMap()
++
++	// prior may be null or empty
++	priorMap := map[string]cty.Value{}
++	if !prior.IsNull() && prior.IsKnown() && prior.LengthInt() > 0 {
++		priorMap = prior.AsValueMap()
++	}
++
++	for name, configEV := range cfgMap {
++		priorEV, inPrior := priorMap[name]
++		if !inPrior {
++			// If there is no corresponding prior element then
++			// we just take the config value as-is.
++			newVals[name] = configEV
++			continue
++		}
++
++		newVals[name] = n.mergeProposedNewBlockOrObject(schema, priorEV, configEV)
++	}
++
++	// The value must leave as the same type it came in as
++	switch {
++	case config.Type().IsObjectType():
++		// Although we call the nesting mode "map", we actually use
++		// object values so that elements might have different types
++		// in case of dynamically-typed attributes.
++		newV = cty.ObjectVal(newVals)
++	default:
++		newV = cty.MapVal(newVals)
++	}
++
++	return newV
++}
++
++func (n *NodeAbstractResourceInstance) mergeProposedNewNestingSet(schema resourceNestedSchema, prior, config cty.Value) cty.Value {
++	if !config.Type().IsSetType() {
++		panic("configschema.NestingSet value is not a set as expected")
++	}
++
++	newV := config
++	if !config.IsKnown() || config.IsNull() || config.LengthInt() == 0 {
++		return newV
++	}
++
++	var priorVals []cty.Value
++	if prior.IsKnown() && !prior.IsNull() {
++		priorVals = prior.AsValueSlice()
++	}
++
++	var newVals []cty.Value
++	// track which prior elements have been used
++	used := make([]bool, len(priorVals))
++
++	for _, configEV := range config.AsValueSlice() {
++		var priorEV cty.Value
++		for i, priorCmp := range priorVals {
++			if used[i] {
++				continue
++			}
++
++			// It is possible that multiple prior elements could be valid
++			// matches for a configuration value, in which case we will end up
++			// picking the first match encountered (but it will always be
++			// consistent due to cty's iteration order). Because configured set
++			// elements must also be entirely unique in order to be included in
++			// the set, these matches either will not matter because they only
++			// differ by computed values, or could not have come from a valid
++			// config with all unique set elements.
++			if n.validPriorFromConfig(schema, priorCmp, configEV) {
++				priorEV = priorCmp
++				used[i] = true
++				break
++			}
++		}
++
++		if priorEV == cty.NilVal {
++			priorEV = cty.NullVal(config.Type().ElementType())
++		}
++
++		newVals = append(newVals, n.mergeProposedNewBlockOrObject(schema, priorEV, configEV))
++	}
++
++	return cty.SetVal(newVals)
++}
++
++func (n *NodeAbstractResourceInstance) mergeProposedNewObjectAttributes(schema *configschema.Object, prior, config cty.Value) cty.Value {
++	if config.IsNull() {
++		return config
++	}
++
++	return cty.ObjectVal(n.mergeProposedNewAttributes(schema.Attributes, prior, config))
++}
++
++func (n *NodeAbstractResourceInstance) mergeProposedNewAttributes(attrs map[string]*configschema.Attribute, prior, config cty.Value) map[string]cty.Value {
++	newAttrs := make(map[string]cty.Value, len(attrs))
++	for name, attr := range attrs {
++		var priorV cty.Value
++		if prior.IsNull() {
++			priorV = cty.NullVal(prior.Type().AttributeType(name))
++		} else {
++			priorV = prior.GetAttr(name)
++		}
++
++		configV := config.GetAttr(name)
++
++		var newV cty.Value
++		switch {
++		// required isn't considered when constructing the plan, so attributes
++		// are essentially either computed or not computed. In the case of
++		// optional+computed, they are only computed when there is no
++		// configuration.
++		case attr.Computed && configV.IsNull():
++			// configV will always be null in this case, by definition.
++			// priorV may also be null, but that's okay.
++			newV = priorV
++
++			// the exception to the above is that if the config is optional and
++			// the _prior_ value contains non-computed values, we can infer
++			// that the config must have been non-null previously.
++			if n.optionalValueNotComputable(attr, priorV) {
++				newV = configV
++			}
++
++		case attr.NestedType != nil:
++			// For non-computed NestedType attributes, we need to descend
++			// into the individual nested attributes to build the final
++			// value, unless the entire nested attribute is unknown.
++			newV = n.mergeProposedNewNestedType(attr.NestedType, priorV, configV)
++		default:
++			// For non-computed attributes, we always take the config value,
++			// even if it is null. If it's _required_ then null values
++			// should've been caught during an earlier validation step, and
++			// so we don't really care about that here.
++			newV = configV
++		}
++		newAttrs[name] = newV
++	}
++	return newAttrs
++}
++
++// nestedSchema is used as a generic container for either a
++// *configschema.Object, or *configschema.Block.
++type resourceNestedSchema interface {
++	AttributeByPath(cty.Path) *configschema.Attribute
++}
++
++// optionalValueNotComputable is used to check if an object in state must
++// have at least partially come from configuration. If the prior value has any
++// non-null attributes which are not computed in the schema, then we know there
++// was previously a configuration value which set those.
++//
++// This is used when the configuration contains a null optional+computed value,
++// and we want to know if we should plan to send the null value or the prior
++// state.
++func (n *NodeAbstractResourceInstance) optionalValueNotComputable(schema *configschema.Attribute, val cty.Value) bool {
++	if !schema.Optional {
++		return false
++	}
++
++	// We must have a NestedType for complex nested attributes in order
++	// to find nested computed values in the first place.
++	if schema.NestedType == nil {
++		return false
++	}
++
++	foundNonComputedAttr := false
++	cty.Walk(val, func(path cty.Path, v cty.Value) (bool, error) {
++		if v.IsNull() {
++			return true, nil
++		}
++
++		attr := schema.NestedType.AttributeByPath(path)
++		if attr == nil {
++			return true, nil
++		}
++
++		if !attr.Computed {
++			foundNonComputedAttr = true
++			return false, nil
++		}
++		return true, nil
++	})
++
++	return foundNonComputedAttr
++}
++
++// validPriorFromConfig returns true if the prior object could have been
++// derived from the configuration. We do this by walking the prior value to
++// determine if it is a valid superset of the config, and only computable
++// values have been added. This function is only used to correlated
++// configuration with possible valid prior values within sets.
++func (n *NodeAbstractResourceInstance) validPriorFromConfig(schema resourceNestedSchema, prior, config cty.Value) bool {
++	if n.unrefinedCtyValue(config).RawEquals(n.unrefinedCtyValue(prior)) {
++		return true
++	}
++
++	// error value to halt the walk
++	stop := errors.New("stop")
++
++	valid := true
++	cty.Walk(prior, func(path cty.Path, priorV cty.Value) (bool, error) {
++		configV, err := path.Apply(config)
++		if err != nil {
++			// most likely dynamic objects with different types
++			valid = false
++			return false, stop
++		}
++
++		// we don't need to know the schema if both are equal
++		if n.unrefinedCtyValue(configV).RawEquals(n.unrefinedCtyValue(priorV)) {
++			// we know they are equal, so no need to descend further
++			return false, nil
++		}
++
++		// We can't descend into nested sets to correlate configuration, so the
++		// overall values must be equal.
++		if configV.Type().IsSetType() {
++			valid = false
++			return false, stop
++		}
++
++		attr := schema.AttributeByPath(path)
++		if attr == nil {
++			// Not at a schema attribute, so we can continue until we find leaf
++			// attributes.
++			return true, nil
++		}
++
++		// If we have nested object attributes we'll be descending into those
++		// to compare the individual values and determine why this level is not
++		// equal
++		if attr.NestedType != nil {
++			return true, nil
++		}
++
++		// This is a leaf attribute, so it must be computed in order to differ
++		// from config.
++		if !attr.Computed {
++			valid = false
++			return false, stop
++		}
++
++		// And if it is computed, the config must be null to allow a change.
++		if !configV.IsNull() {
++			valid = false
++			return false, stop
++		}
++
++		// We sill stop here. The cty value could be far larger, but this was
++		// the last level of prescribed schema.
++		return false, nil
++	})
++
++	return valid
++}
++
++
++// NormalizeObjectFromLegacySDK takes an object that may have been generated
++// by the legacy Terraform SDK (i.e. returned from a provider with the
++// LegacyTypeSystem opt-out set) and does its best to normalize it for the
++// assumptions we would normally enforce if the provider had not opted out.
++//
++// In particular, this function guarantees that a value representing a nested
++// block will never itself be unknown or null, instead representing that as
++// a non-null value that may contain null/unknown values.
++//
++// The input value must still conform to the implied type of the given schema,
++// or else this function may produce garbage results or panic. This is usually
++// okay because type consistency is enforced when deserializing the value
++// returned from the provider over the RPC wire protocol anyway.
++func (n *NodeAbstractResourceInstance) normalizeObjectFromLegacySDK(val cty.Value, schema *configschema.Block) cty.Value {
++	val, valMarks := val.UnmarkDeepWithPaths()
++	val = n.walkNormalizeObjectFromLegacySDK(val, schema)
++	return val.MarkWithPaths(valMarks)
++}
++
++func (n *NodeAbstractResourceInstance) walkNormalizeObjectFromLegacySDK(val cty.Value, schema *configschema.Block) cty.Value {
++	if val == cty.NilVal || val.IsNull() {
++		// This should never happen in reasonable use, but we'll allow it
++		// and normalize to a null of the expected type rather than panicking
++		// below.
++		return cty.NullVal(schema.ImpliedType())
++	}
++
++	vals := make(map[string]cty.Value)
++	for name := range schema.Attributes {
++		// No normalization for attributes, since them being type-conformant
++		// is all that we require.
++		vals[name] = val.GetAttr(name)
++	}
++	for name, blockS := range schema.BlockTypes {
++		lv := val.GetAttr(name)
++
++		// Legacy SDK never generates dynamically-typed attributes and so our
++		// normalization code doesn't deal with them, but we need to make sure
++		// we still pass them through properly so that we don't interfere with
++		// objects generated by other SDKs.
++		if ty := blockS.Block.ImpliedType(); ty.HasDynamicTypes() {
++			vals[name] = lv
++			continue
++		}
++
++		switch blockS.Nesting {
++		case configschema.NestingSingle, configschema.NestingGroup:
++			if lv.IsKnown() {
++				if lv.IsNull() && blockS.Nesting == configschema.NestingGroup {
++					vals[name] = n.nestedBlockEmptyValue(blockS)
++				} else {
++					vals[name] = n.walkNormalizeObjectFromLegacySDK(lv, &blockS.Block)
++				}
++			} else {
++				vals[name] = n.unknownBlockStub(&blockS.Block)
++			}
++		case configschema.NestingList:
++			switch {
++			case !lv.IsKnown():
++				vals[name] = cty.ListVal([]cty.Value{n.unknownBlockStub(&blockS.Block)})
++			case lv.IsNull() || lv.LengthInt() == 0:
++				vals[name] = cty.ListValEmpty(blockS.Block.ImpliedType())
++			default:
++				subVals := make([]cty.Value, 0, lv.LengthInt())
++				for it := lv.ElementIterator(); it.Next(); {
++					_, subVal := it.Element()
++					subVals = append(subVals, n.walkNormalizeObjectFromLegacySDK(subVal, &blockS.Block))
++				}
++				vals[name] = cty.ListVal(subVals)
++			}
++		case configschema.NestingSet:
++			switch {
++			case !lv.IsKnown():
++				vals[name] = cty.SetVal([]cty.Value{n.unknownBlockStub(&blockS.Block)})
++			case lv.IsNull() || lv.LengthInt() == 0:
++				vals[name] = cty.SetValEmpty(blockS.Block.ImpliedType())
++			default:
++				subVals := make([]cty.Value, 0, lv.LengthInt())
++				for it := lv.ElementIterator(); it.Next(); {
++					_, subVal := it.Element()
++					subVals = append(subVals, n.walkNormalizeObjectFromLegacySDK(subVal, &blockS.Block))
++				}
++				vals[name] = cty.SetVal(subVals)
++			}
++		default:
++			// The legacy SDK doesn't support NestingMap, so we just assume
++			// maps are always okay. (If not, we would've detected and returned
++			// an error to the user before we got here.)
++			vals[name] = lv
++		}
++	}
++	return cty.ObjectVal(vals)
++}
++
++// unknownBlockStub constructs an object value that approximates an unknown
++// block by producing a known block object with all of its leaf attribute
++// values set to unknown.
++//
++// Blocks themselves cannot be unknown, so if the legacy SDK tries to return
++// such a thing, we'll use this result instead. This convention mimics how
++// the dynamic block feature deals with being asked to iterate over an unknown
++// value, because our value-checking functions already accept this convention
++// as a special case.
++func (n *NodeAbstractResourceInstance) unknownBlockStub(schema *configschema.Block) cty.Value {
++	vals := make(map[string]cty.Value)
++	for name, attrS := range schema.Attributes {
++		vals[name] = cty.UnknownVal(attrS.Type)
++	}
++	for name, blockS := range schema.BlockTypes {
++		switch blockS.Nesting {
++		case configschema.NestingSingle, configschema.NestingGroup:
++			vals[name] = n.unknownBlockStub(&blockS.Block)
++		case configschema.NestingList:
++			// In principle we may be expected to produce a tuple value here,
++			// if there are any dynamically-typed attributes in our nested block,
++			// but the legacy SDK doesn't support that, so we just assume it'll
++			// never be necessary to normalize those. (Incorrect usage in any
++			// other SDK would be caught and returned as an error before we
++			// get here.)
++			vals[name] = cty.ListVal([]cty.Value{n.unknownBlockStub(&blockS.Block)})
++		case configschema.NestingSet:
++			vals[name] = cty.SetVal([]cty.Value{n.unknownBlockStub(&blockS.Block)})
++		case configschema.NestingMap:
++			// A nesting map can never be unknown since we then wouldn't know
++			// what the keys are. (Legacy SDK doesn't support NestingMap anyway,
++			// so this should never arise.)
++			vals[name] = cty.MapValEmpty(blockS.Block.ImpliedType())
++		}
++	}
++	return cty.ObjectVal(vals)
++}
++
++
++// AssertPlanValid checks checks whether a planned new state returned by a
++// provider's PlanResourceChange method is suitable to achieve a change
++// from priorState to config. It returns a slice with nonzero length if
++// any problems are detected. Because problems here indicate bugs in the
++// provider that generated the plannedState, they are written with provider
++// developers as an audience, rather than end-users.
++//
++// All of the given values must have the same type and must conform to the
++// implied type of the given schema, or this function may panic or produce
++// garbage results.
++//
++// During planning, a provider may only make changes to attributes that are
++// null (unset) in the configuration and are marked as "computed" in the
++// resource type schema, in order to insert any default values the provider
++// may know about. If the default value cannot be determined until apply time,
++// the provider can return an unknown value. Providers are forbidden from
++// planning a change that disagrees with any non-null argument in the
++// configuration.
++//
++// As a special exception, providers _are_ allowed to provide attribute values
++// conflicting with configuration if and only if the planned value exactly
++// matches the corresponding attribute value in the prior state. The provider
++// can use this to signal that the new value is functionally equivalent to
++// the old and thus no change is required.
++func (n *NodeAbstractResourceInstance) assertPlanValid(schema *configschema.Block, priorState, config, plannedState cty.Value) []error {
++	return n.walkAssertPlanValid(schema, priorState, config, plannedState, nil)
++}
++
++func (n *NodeAbstractResourceInstance) walkAssertPlanValid(schema *configschema.Block, priorState, config, plannedState cty.Value, path cty.Path) []error {
++	var errs []error
++	if plannedState.IsNull() && !config.IsNull() {
++		errs = append(errs, path.NewErrorf("planned for absence but config wants existence"))
++		return errs
++	}
++	if config.IsNull() && !plannedState.IsNull() {
++		errs = append(errs, path.NewErrorf("planned for existence but config wants absence"))
++		return errs
++	}
++	if plannedState.IsNull() {
++		// No further checks possible if the planned value is null
++		return errs
++	}
++
++	impTy := schema.ImpliedType()
++
++	// verify attributes
++	moreErrs := n.assertPlannedAttrsValid(schema.Attributes, priorState, config, plannedState, path)
++	errs = append(errs, moreErrs...)
++
++	for name, blockS := range schema.BlockTypes {
++		path := append(path, cty.GetAttrStep{Name: name})
++		plannedV := plannedState.GetAttr(name)
++		configV := config.GetAttr(name)
++		priorV := cty.NullVal(impTy.AttributeType(name))
++		if !priorState.IsNull() {
++			priorV = priorState.GetAttr(name)
++		}
++		if plannedV.RawEquals(configV) {
++			// Easy path: nothing has changed at all
++			continue
++		}
++
++		if !configV.IsKnown() {
++			// An unknown config block represents a dynamic block where the
++			// for_each value is unknown, and therefor cannot be altered by the
++			// provider.
++			errs = append(errs, path.NewErrorf("planned value %#v for unknown dynamic block", plannedV))
++			continue
++		}
++
++		if !plannedV.IsKnown() {
++			// Only dynamic configuration can set blocks to unknown, so this is
++			// not allowed from the provider. This means that either the config
++			// and plan should match, or we have an error where the plan
++			// changed the config value, both of which have been checked.
++			errs = append(errs, path.NewErrorf("attribute representing nested block must not be unknown itself; set nested attribute values to unknown instead"))
++			continue
++		}
++
++		switch blockS.Nesting {
++		case configschema.NestingSingle, configschema.NestingGroup:
++			moreErrs := n.walkAssertPlanValid(&blockS.Block, priorV, configV, plannedV, path)
++			errs = append(errs, moreErrs...)
++		case configschema.NestingList:
++			// A NestingList might either be a list or a tuple, depending on
++			// whether there are dynamically-typed attributes inside. However,
++			// both support a similar-enough API that we can treat them the
++			// same for our purposes here.
++			if plannedV.IsNull() {
++				errs = append(errs, path.NewErrorf("attribute representing a list of nested blocks must be empty to indicate no blocks, not null"))
++				continue
++			}
++
++			if configV.IsNull() {
++				// Configuration cannot decode a block into a null value, but
++				// we could be dealing with a null returned by a legacy
++				// provider and inserted via ignore_changes. Fix the value in
++				// place so the length can still be compared.
++				configV = cty.ListValEmpty(configV.Type().ElementType())
++			}
++
++			plannedL := plannedV.LengthInt()
++			configL := configV.LengthInt()
++			if plannedL != configL {
++				errs = append(errs, path.NewErrorf("block count in plan (%d) disagrees with count in config (%d)", plannedL, configL))
++				continue
++			}
++
++			for it := plannedV.ElementIterator(); it.Next(); {
++				idx, plannedEV := it.Element()
++				path := append(path, cty.IndexStep{Key: idx})
++				if !plannedEV.IsKnown() {
++					errs = append(errs, path.NewErrorf("element representing nested block must not be unknown itself; set nested attribute values to unknown instead"))
++					continue
++				}
++				if !configV.HasIndex(idx).True() {
++					continue // should never happen since we checked the lengths above
++				}
++				configEV := configV.Index(idx)
++				priorEV := cty.NullVal(blockS.ImpliedType())
++				if !priorV.IsNull() && priorV.HasIndex(idx).True() {
++					priorEV = priorV.Index(idx)
++				}
++
++				moreErrs := n.walkAssertPlanValid(&blockS.Block, priorEV, configEV, plannedEV, path)
++				errs = append(errs, moreErrs...)
++			}
++		case configschema.NestingMap:
++			if plannedV.IsNull() {
++				errs = append(errs, path.NewErrorf("attribute representing a map of nested blocks must be empty to indicate no blocks, not null"))
++				continue
++			}
++
++			// A NestingMap might either be a map or an object, depending on
++			// whether there are dynamically-typed attributes inside, but
++			// that's decided statically and so all values will have the same
++			// kind.
++			if plannedV.Type().IsObjectType() {
++				plannedAtys := plannedV.Type().AttributeTypes()
++				configAtys := configV.Type().AttributeTypes()
++				for k := range plannedAtys {
++					if _, ok := configAtys[k]; !ok {
++						errs = append(errs, path.NewErrorf("block key %q from plan is not present in config", k))
++						continue
++					}
++					path := append(path, cty.GetAttrStep{Name: k})
++
++					plannedEV := plannedV.GetAttr(k)
++					if !plannedEV.IsKnown() {
++						errs = append(errs, path.NewErrorf("element representing nested block must not be unknown itself; set nested attribute values to unknown instead"))
++						continue
++					}
++					configEV := configV.GetAttr(k)
++					priorEV := cty.NullVal(blockS.ImpliedType())
++					if !priorV.IsNull() && priorV.Type().HasAttribute(k) {
++						priorEV = priorV.GetAttr(k)
++					}
++					moreErrs := n.walkAssertPlanValid(&blockS.Block, priorEV, configEV, plannedEV, path)
++					errs = append(errs, moreErrs...)
++				}
++				for k := range configAtys {
++					if _, ok := plannedAtys[k]; !ok {
++						errs = append(errs, path.NewErrorf("block key %q from config is not present in plan", k))
++						continue
++					}
++				}
++			} else {
++				plannedL := plannedV.LengthInt()
++				configL := configV.LengthInt()
++				if plannedL != configL {
++					errs = append(errs, path.NewErrorf("block count in plan (%d) disagrees with count in config (%d)", plannedL, configL))
++					continue
++				}
++				for it := plannedV.ElementIterator(); it.Next(); {
++					idx, plannedEV := it.Element()
++					path := append(path, cty.IndexStep{Key: idx})
++					if !plannedEV.IsKnown() {
++						errs = append(errs, path.NewErrorf("element representing nested block must not be unknown itself; set nested attribute values to unknown instead"))
++						continue
++					}
++					k := idx.AsString()
++					if !configV.HasIndex(idx).True() {
++						errs = append(errs, path.NewErrorf("block key %q from plan is not present in config", k))
++						continue
++					}
++					configEV := configV.Index(idx)
++					priorEV := cty.NullVal(blockS.ImpliedType())
++					if !priorV.IsNull() && priorV.HasIndex(idx).True() {
++						priorEV = priorV.Index(idx)
++					}
++					moreErrs := n.walkAssertPlanValid(&blockS.Block, priorEV, configEV, plannedEV, path)
++					errs = append(errs, moreErrs...)
++				}
++				for it := configV.ElementIterator(); it.Next(); {
++					idx, _ := it.Element()
++					if !plannedV.HasIndex(idx).True() {
++						errs = append(errs, path.NewErrorf("block key %q from config is not present in plan", idx.AsString()))
++						continue
++					}
++				}
++			}
++		case configschema.NestingSet:
++			if plannedV.IsNull() {
++				errs = append(errs, path.NewErrorf("attribute representing a set of nested blocks must be empty to indicate no blocks, not null"))
++				continue
++			}
++
++			// Because set elements have no identifier with which to correlate
++			// them, we can't robustly validate the plan for a nested block
++			// backed by a set, and so unfortunately we need to just trust the
++			// provider to do the right thing. :(
++			//
++			// (In principle we could correlate elements by matching the
++			// subset of attributes explicitly set in config, except for the
++			// special diff suppression rule which allows for there to be a
++			// planned value that is constructed by mixing part of a prior
++			// value with part of a config value, creating an entirely new
++			// element that is not present in either prior nor config.)
++			for it := plannedV.ElementIterator(); it.Next(); {
++				idx, plannedEV := it.Element()
++				path := append(path, cty.IndexStep{Key: idx})
++				if !plannedEV.IsKnown() {
++					errs = append(errs, path.NewErrorf("element representing nested block must not be unknown itself; set nested attribute values to unknown instead"))
++					continue
++				}
++			}
++
++		default:
++			panic(fmt.Sprintf("unsupported nesting mode %s", blockS.Nesting))
++		}
++	}
++
++	return errs
++}
++
++func (n *NodeAbstractResourceInstance) assertPlannedAttrsValid(schema map[string]*configschema.Attribute, priorState, config, plannedState cty.Value, path cty.Path) []error {
++	var errs []error
++	for name, attrS := range schema {
++		moreErrs := n.assertPlannedAttrValid(name, attrS, priorState, config, plannedState, path)
++		errs = append(errs, moreErrs...)
++	}
++	return errs
++}
++
++func (n *NodeAbstractResourceInstance) assertPlannedAttrValid(name string, attrS *configschema.Attribute, priorState, config, plannedState cty.Value, path cty.Path) []error {
++	plannedV := plannedState.GetAttr(name)
++	configV := config.GetAttr(name)
++	priorV := cty.NullVal(attrS.Type)
++	if !priorState.IsNull() {
++		priorV = priorState.GetAttr(name)
++	}
++	path = append(path, cty.GetAttrStep{Name: name})
++
++	return n.assertPlannedValueValid(attrS, priorV, configV, plannedV, path)
++}
++
++func (n *NodeAbstractResourceInstance) assertPlannedValueValid(attrS *configschema.Attribute, priorV, configV, plannedV cty.Value, path cty.Path) []error {
++
++	var errs []error
++	if n.unrefinedCtyValue(plannedV).RawEquals(n.unrefinedCtyValue(configV)) {
++		// This is the easy path: provider didn't change anything at all.
++		return errs
++	}
++	if n.unrefinedCtyValue(plannedV).RawEquals(n.unrefinedCtyValue(priorV)) && !priorV.IsNull() && !configV.IsNull() {
++		// Also pretty easy: there is a prior value and the provider has
++		// returned it unchanged. This indicates that configV and plannedV
++		// are functionally equivalent and so the provider wishes to disregard
++		// the configuration value in favor of the prior.
++		return errs
++	}
++
++	switch {
++	// The provider can plan any value for a computed-only attribute. There may
++	// be a config value here in the case where a user used `ignore_changes` on
++	// a computed attribute and ignored the warning, or we failed to validate
++	// computed attributes in the config, but regardless it's not a plan error
++	// caused by the provider.
++	case attrS.Computed && !attrS.Optional:
++		return errs
++
++	// The provider is allowed to insert optional values when the config is
++	// null, but only if the attribute is computed.
++	case configV.IsNull() && attrS.Computed:
++		return errs
++
++	case configV.IsNull() && !plannedV.IsNull():
++		// if the attribute is not computed, then any planned value is incorrect
++		if attrS.Sensitive {
++			errs = append(errs, path.NewErrorf("sensitive planned value for a non-computed attribute"))
++		} else {
++			errs = append(errs, path.NewErrorf("planned value %#v for a non-computed attribute", plannedV))
++		}
++		return errs
++	}
++
++	// If this attribute has a NestedType, validate the nested object
++	if attrS.NestedType != nil {
++		return n.assertPlannedObjectValid(attrS.NestedType, priorV, configV, plannedV, path)
++	}
++
++	// If none of the above conditions match, the provider has made an invalid
++	// change to this attribute.
++	if priorV.IsNull() {
++		if attrS.Sensitive {
++			errs = append(errs, path.NewErrorf("sensitive planned value does not match config value"))
++		} else {
++			errs = append(errs, path.NewErrorf("planned value %#v does not match config value %#v", plannedV, configV))
++		}
++		return errs
++	}
++
++	if attrS.Sensitive {
++		errs = append(errs, path.NewErrorf("sensitive planned value does not match config value nor prior value"))
++	} else {
++		errs = append(errs, path.NewErrorf("planned value %#v does not match config value %#v nor prior value %#v", plannedV, configV, priorV))
++	}
++
++	return errs
++}
++
++func (n *NodeAbstractResourceInstance) assertPlannedObjectValid(schema *configschema.Object, prior, config, planned cty.Value, path cty.Path) []error {
++	var errs []error
++
++	if planned.IsNull() && !config.IsNull() {
++		errs = append(errs, path.NewErrorf("planned for absence but config wants existence"))
++		return errs
++	}
++	if config.IsNull() && !planned.IsNull() {
++		errs = append(errs, path.NewErrorf("planned for existence but config wants absence"))
++		return errs
++	}
++	if !config.IsNull() && !planned.IsKnown() {
++		errs = append(errs, path.NewErrorf("planned unknown for configured value"))
++		return errs
++	}
++
++	if planned.IsNull() {
++		// No further checks possible if the planned value is null
++		return errs
++	}
++
++	switch schema.Nesting {
++	case configschema.NestingSingle, configschema.NestingGroup:
++		moreErrs := n.assertPlannedAttrsValid(schema.Attributes, prior, config, planned, path)
++		errs = append(errs, moreErrs...)
++
++	case configschema.NestingList:
++		// A NestingList might either be a list or a tuple, depending on
++		// whether there are dynamically-typed attributes inside. However,
++		// both support a similar-enough API that we can treat them the
++		// same for our purposes here.
++
++		plannedL := planned.Length()
++		configL := config.Length()
++
++		// config wasn't known, then planned should be unknown too
++		if !plannedL.IsKnown() && !configL.IsKnown() {
++			return errs
++		}
++
++		lenEqual := plannedL.Equals(configL)
++		if !lenEqual.IsKnown() || lenEqual.False() {
++			errs = append(errs, path.NewErrorf("count in plan (%#v) disagrees with count in config (%#v)", plannedL, configL))
++			return errs
++		}
++		for it := planned.ElementIterator(); it.Next(); {
++			idx, plannedEV := it.Element()
++			path := append(path, cty.IndexStep{Key: idx})
++			if !config.HasIndex(idx).True() {
++				continue // should never happen since we checked the lengths above
++			}
++			configEV := config.Index(idx)
++			priorEV := cty.NullVal(schema.ImpliedType())
++			if !prior.IsNull() && prior.HasIndex(idx).True() {
++				priorEV = prior.Index(idx)
++			}
++
++			moreErrs := n.assertPlannedAttrsValid(schema.Attributes, priorEV, configEV, plannedEV, path)
++			errs = append(errs, moreErrs...)
++		}
++
++	case configschema.NestingMap:
++		// A NestingMap might either be a map or an object, depending on
++		// whether there are dynamically-typed attributes inside, so we will
++		// break these down to maps to handle them both in the same manner.
++		plannedVals := map[string]cty.Value{}
++		configVals := map[string]cty.Value{}
++		priorVals := map[string]cty.Value{}
++
++		plannedL := planned.Length()
++		configL := config.Length()
++
++		// config wasn't known, then planned should be unknown too
++		if !plannedL.IsKnown() && !configL.IsKnown() {
++			return errs
++		}
++
++		lenEqual := plannedL.Equals(configL)
++		if !lenEqual.IsKnown() || lenEqual.False() {
++			errs = append(errs, path.NewErrorf("count in plan (%#v) disagrees with count in config (%#v)", plannedL, configL))
++			return errs
++		}
++
++		if !planned.IsNull() {
++			plannedVals = planned.AsValueMap()
++		}
++		if !config.IsNull() {
++			configVals = config.AsValueMap()
++		}
++		if !prior.IsNull() {
++			priorVals = prior.AsValueMap()
++		}
++
++		for k, plannedEV := range plannedVals {
++			configEV, ok := configVals[k]
++			if !ok {
++				errs = append(errs, path.NewErrorf("map key %q from plan is not present in config", k))
++				continue
++			}
++			path := append(path, cty.GetAttrStep{Name: k})
++
++			priorEV, ok := priorVals[k]
++			if !ok {
++				priorEV = cty.NullVal(schema.ImpliedType())
++			}
++			moreErrs := n.assertPlannedAttrsValid(schema.Attributes, priorEV, configEV, plannedEV, path)
++			errs = append(errs, moreErrs...)
++		}
++		for k := range configVals {
++			if _, ok := plannedVals[k]; !ok {
++				errs = append(errs, path.NewErrorf("map key %q from config is not present in plan", k))
++				continue
++			}
++		}
++
++	case configschema.NestingSet:
++		plannedL := planned.Length()
++		configL := config.Length()
++
++		if ok := plannedL.Range().Includes(configL); ok.IsKnown() && ok.False() {
++			errs = append(errs, path.NewErrorf("count in plan (%#v) disagrees with count in config (%#v)", plannedL, configL))
++			return errs
++		}
++		// Because set elements have no identifier with which to correlate
++		// them, we can't robustly validate the plan for a nested object
++		// backed by a set, and so unfortunately we need to just trust the
++		// provider to do the right thing.
++	}
++
++	return errs
++}
++
++// unrefinedValue returns the given value with any unknown value refinements
++// stripped away, making it a basic unknown value with only a type constraint.
++//
++// This function also considers unknown values nested inside a known container
++// such as a collection, which unfortunately makes it relatively expensive
++// for large data structures. Over time we should transition away from using
++// this trick and prefer to use cty's Equals and value range APIs instead of
++// of using Value.RawEquals, which is primarily intended for unit test code
++// rather than real application use.
++func (n *NodeAbstractResourceInstance) unrefinedCtyValue(v cty.Value) cty.Value {
++	ret, _ := cty.Transform(v, func(p cty.Path, v cty.Value) (cty.Value, error) {
++		if !v.IsKnown() {
++			return cty.UnknownVal(v.Type()), nil
++		}
++		return v, nil
++	})
++	return ret
++}
++
++
++// AssertObjectCompatible checks whether the given "actual" value is a valid
++// completion of the possibly-partially-unknown "planned" value.
++//
++// This means that any known leaf value in "planned" must be equal to the
++// corresponding value in "actual", and various other similar constraints.
++//
++// Any inconsistencies are reported by returning a non-zero number of errors.
++// These errors are usually (but not necessarily) cty.PathError values
++// referring to a particular nested value within the "actual" value.
++//
++// The two values must have types that conform to the given schema's implied
++// type, or this function will panic.
++func (n *NodeAbstractResourceInstance) assertObjectCompatible(schema *configschema.Block, planned, actual cty.Value) []error {
++	return n.walkAssertObjectCompatible(schema, planned, actual, nil)
++}
++
++func (n *NodeAbstractResourceInstance) walkAssertObjectCompatible(schema *configschema.Block, planned, actual cty.Value, path cty.Path) []error {
++	var errs []error
++	var atRoot string
++	if len(path) == 0 {
++		atRoot = "Root object "
++	}
++
++	if planned.IsNull() && !actual.IsNull() {
++		errs = append(errs, path.NewErrorf(fmt.Sprintf("%swas absent, but now present", atRoot)))
++		return errs
++	}
++	if actual.IsNull() && !planned.IsNull() {
++		errs = append(errs, path.NewErrorf(fmt.Sprintf("%swas present, but now absent", atRoot)))
++		return errs
++	}
++	if planned.IsNull() {
++		// No further checks possible if both values are null
++		return errs
++	}
++
++	for name, attrS := range schema.Attributes {
++		plannedV := planned.GetAttr(name)
++		actualV := actual.GetAttr(name)
++
++		path := append(path, cty.GetAttrStep{Name: name})
++
++		// Unmark values here before checking value assertions,
++		// but save the marks so we can see if we should supress
++		// exposing a value through errors
++		unmarkedActualV, marksA := actualV.UnmarkDeep()
++		unmarkedPlannedV, marksP := plannedV.UnmarkDeep()
++		isSensitiveActual := n.valueMarksIndicateSensitive(marksA)
++		isSensitivePlanned := n.valueMarksIndicateSensitive(marksP)
++
++		moreErrs := n.assertValueCompatible(unmarkedPlannedV, unmarkedActualV, path)
++		if attrS.Sensitive || isSensitiveActual || isSensitivePlanned {
++			if len(moreErrs) > 0 {
++				// Use a vague placeholder message instead, to avoid disclosing
++				// sensitive information.
++				errs = append(errs, path.NewErrorf("inconsistent values for sensitive attribute"))
++			}
++		} else {
++			errs = append(errs, moreErrs...)
++		}
++	}
++	for name, blockS := range schema.BlockTypes {
++		plannedV, _ := planned.GetAttr(name).Unmark()
++		actualV, _ := actual.GetAttr(name).Unmark()
++
++		path := append(path, cty.GetAttrStep{Name: name})
++		switch blockS.Nesting {
++		case configschema.NestingSingle, configschema.NestingGroup:
++			// If an unknown block placeholder was present then the placeholder
++			// may have expanded out into zero blocks, which is okay.
++			if !plannedV.IsKnown() && actualV.IsNull() {
++				continue
++			}
++			moreErrs := n.walkAssertObjectCompatible(&blockS.Block, plannedV, actualV, path)
++			errs = append(errs, moreErrs...)
++		case configschema.NestingList:
++			// A NestingList might either be a list or a tuple, depending on
++			// whether there are dynamically-typed attributes inside. However,
++			// both support a similar-enough API that we can treat them the
++			// same for our purposes here.
++			if !plannedV.IsKnown() || !actualV.IsKnown() || plannedV.IsNull() || actualV.IsNull() {
++				continue
++			}
++
++			plannedL := plannedV.LengthInt()
++			actualL := actualV.LengthInt()
++			if plannedL != actualL {
++				errs = append(errs, path.NewErrorf("block count changed from %d to %d", plannedL, actualL))
++				continue
++			}
++			for it := plannedV.ElementIterator(); it.Next(); {
++				idx, plannedEV := it.Element()
++				if !actualV.HasIndex(idx).True() {
++					continue
++				}
++				actualEV := actualV.Index(idx)
++				moreErrs := n.walkAssertObjectCompatible(&blockS.Block, plannedEV, actualEV, append(path, cty.IndexStep{Key: idx}))
++				errs = append(errs, moreErrs...)
++			}
++		case configschema.NestingMap:
++			// A NestingMap might either be a map or an object, depending on
++			// whether there are dynamically-typed attributes inside, but
++			// that's decided statically and so both values will have the same
++			// kind.
++			if plannedV.Type().IsObjectType() {
++				plannedAtys := plannedV.Type().AttributeTypes()
++				actualAtys := actualV.Type().AttributeTypes()
++				for k := range plannedAtys {
++					if _, ok := actualAtys[k]; !ok {
++						errs = append(errs, path.NewErrorf("block key %q has vanished", k))
++						continue
++					}
++
++					plannedEV := plannedV.GetAttr(k)
++					actualEV := actualV.GetAttr(k)
++					moreErrs := n.walkAssertObjectCompatible(&blockS.Block, plannedEV, actualEV, append(path, cty.GetAttrStep{Name: k}))
++					errs = append(errs, moreErrs...)
++				}
++				if plannedV.IsKnown() { // new blocks may appear if unknown blocks were present in the plan
++					for k := range actualAtys {
++						if _, ok := plannedAtys[k]; !ok {
++							errs = append(errs, path.NewErrorf("new block key %q has appeared", k))
++							continue
++						}
++					}
++				}
++			} else {
++				if !plannedV.IsKnown() || plannedV.IsNull() || actualV.IsNull() {
++					continue
++				}
++				plannedL := plannedV.LengthInt()
++				actualL := actualV.LengthInt()
++				if plannedL != actualL && plannedV.IsKnown() { // new blocks may appear if unknown blocks were persent in the plan
++					errs = append(errs, path.NewErrorf("block count changed from %d to %d", plannedL, actualL))
++					continue
++				}
++				for it := plannedV.ElementIterator(); it.Next(); {
++					idx, plannedEV := it.Element()
++					if !actualV.HasIndex(idx).True() {
++						continue
++					}
++					actualEV := actualV.Index(idx)
++					moreErrs := n.walkAssertObjectCompatible(&blockS.Block, plannedEV, actualEV, append(path, cty.IndexStep{Key: idx}))
++					errs = append(errs, moreErrs...)
++				}
++			}
++		case configschema.NestingSet:
++			if !plannedV.IsKnown() || !actualV.IsKnown() || plannedV.IsNull() || actualV.IsNull() {
++				continue
++			}
++
++			if !plannedV.IsKnown() {
++				// When unknown blocks are present the final number of blocks
++				// may be different, either because the unknown set values
++				// become equal and are collapsed, or the count is unknown due
++				// a dynamic block. Unfortunately this means we can't do our
++				// usual checks in this case without generating false
++				// negatives.
++				continue
++			}
++
++			setErrs := n.assertSetValuesCompatible(plannedV, actualV, path, func(plannedEV, actualEV cty.Value) bool {
++				errs := n.walkAssertObjectCompatible(&blockS.Block, plannedEV, actualEV, append(path, cty.IndexStep{Key: actualEV}))
++				return len(errs) == 0
++			})
++			errs = append(errs, setErrs...)
++
++			// There can be fewer elements in a set after its elements are all
++			// known (values that turn out to be equal will coalesce) but the
++			// number of elements must never get larger.
++			plannedL := plannedV.LengthInt()
++			actualL := actualV.LengthInt()
++			if plannedL < actualL {
++				errs = append(errs, path.NewErrorf("block set length changed from %d to %d", plannedL, actualL))
++			}
++		default:
++			panic(fmt.Sprintf("unsupported nesting mode %s", blockS.Nesting))
++		}
++	}
++	return errs
++}
++
++func (n *NodeAbstractResourceInstance) assertValueCompatible(planned, actual cty.Value, path cty.Path) []error {
++	// NOTE: We don't normally use the GoString rendering of cty.Value in
++	// user-facing error messages as a rule, but we make an exception
++	// for this function because we expect the user to pass this message on
++	// verbatim to the provider development team and so more detail is better.
++
++	var errs []error
++	if planned.Type() == cty.DynamicPseudoType {
++		// Anything goes, then
++		return errs
++	}
++	if problems := actual.Type().TestConformance(planned.Type()); len(problems) > 0 {
++		errs = append(errs, path.NewErrorf("wrong final value type: %s", convert.MismatchMessage(actual.Type(), planned.Type())))
++		// If the types don't match then we can't do any other comparisons,
++		// so we bail early.
++		return errs
++	}
++
++	if !planned.IsKnown() {
++		// We didn't know what were going to end up with during plan, so
++		// the final value needs only to match the type and refinements of
++		// the unknown value placeholder.
++		plannedRng := planned.Range()
++		if ok := plannedRng.Includes(actual); ok.IsKnown() && ok.False() {
++			errs = append(errs, path.NewErrorf("final value %#v does not conform to planning placeholder %#v", actual, planned))
++		}
++		return errs
++	}
++
++	if actual.IsNull() {
++		if planned.IsNull() {
++			return nil
++		}
++		errs = append(errs, path.NewErrorf("was %#v, but now null", planned))
++		return errs
++	}
++	if planned.IsNull() {
++		errs = append(errs, path.NewErrorf("was null, but now %#v", actual))
++		return errs
++	}
++
++	ty := planned.Type()
++	switch {
++
++	case !actual.IsKnown():
++		errs = append(errs, path.NewErrorf("was known, but now unknown"))
++
++	case ty.IsPrimitiveType():
++		if !actual.Equals(planned).True() {
++			errs = append(errs, path.NewErrorf("was %#v, but now %#v", planned, actual))
++		}
++
++	case ty.IsListType() || ty.IsMapType() || ty.IsTupleType():
++		for it := planned.ElementIterator(); it.Next(); {
++			k, plannedV := it.Element()
++			if !actual.HasIndex(k).True() {
++				errs = append(errs, path.NewErrorf("element %s has vanished", n.indexStrForErrors(k)))
++				continue
++			}
++
++			actualV := actual.Index(k)
++			moreErrs := n.assertValueCompatible(plannedV, actualV, append(path, cty.IndexStep{Key: k}))
++			errs = append(errs, moreErrs...)
++		}
++
++		for it := actual.ElementIterator(); it.Next(); {
++			k, _ := it.Element()
++			if !planned.HasIndex(k).True() {
++				errs = append(errs, path.NewErrorf("new element %s has appeared", n.indexStrForErrors(k)))
++			}
++		}
++
++	case ty.IsObjectType():
++		atys := ty.AttributeTypes()
++		for name := range atys {
++			// Because we already tested that the two values have the same type,
++			// we can assume that the same attributes are present in both and
++			// focus just on testing their values.
++			plannedV := planned.GetAttr(name)
++			actualV := actual.GetAttr(name)
++			moreErrs := n.assertValueCompatible(plannedV, actualV, append(path, cty.GetAttrStep{Name: name}))
++			errs = append(errs, moreErrs...)
++		}
++
++	case ty.IsSetType():
++		// We can't really do anything useful for sets here because changing
++		// an unknown element to known changes the identity of the element, and
++		// so we can't correlate them properly. However, we will at least check
++		// to ensure that the number of elements is consistent, along with
++		// the general type-match checks we ran earlier in this function.
++		if planned.IsKnown() && !planned.IsNull() && !actual.IsNull() {
++
++			setErrs := n.assertSetValuesCompatible(planned, actual, path, func(plannedV, actualV cty.Value) bool {
++				errs := n.assertValueCompatible(plannedV, actualV, append(path, cty.IndexStep{Key: actualV}))
++				return len(errs) == 0
++			})
++			errs = append(errs, setErrs...)
++
++			// There can be fewer elements in a set after its elements are all
++			// known (values that turn out to be equal will coalesce) but the
++			// number of elements must never get larger.
++
++			plannedL := planned.LengthInt()
++			actualL := actual.LengthInt()
++			if plannedL < actualL {
++				errs = append(errs, path.NewErrorf("length changed from %d to %d", plannedL, actualL))
++			}
++		}
++	}
++
++	return errs
++}
++
++func (n *NodeAbstractResourceInstance) indexStrForErrors(v cty.Value) string {
++	switch v.Type() {
++	case cty.Number:
++		return v.AsBigFloat().Text('f', -1)
++	case cty.String:
++		return strconv.Quote(v.AsString())
++	default:
++		// Should be impossible, since no other index types are allowed!
++		return fmt.Sprintf("%#v", v)
++	}
++}
++
++// assertSetValuesCompatible checks that each of the elements in a can
++// be correlated with at least one equivalent element in b and vice-versa,
++// using the given correlation function.
++//
++// This allows the number of elements in the sets to change as long as all
++// elements in both sets can be correlated, making this function safe to use
++// with sets that may contain unknown values as long as the unknown case is
++// addressed in some reasonable way in the callback function.
++//
++// The callback always recieves values from set a as its first argument and
++// values from set b in its second argument, so it is safe to use with
++// non-commutative functions.
++//
++// As with assertValueCompatible, we assume that the target audience of error
++// messages here is a provider developer (via a bug report from a user) and so
++// we intentionally violate our usual rule of keeping cty implementation
++// details out of error messages.
++func (n *NodeAbstractResourceInstance) assertSetValuesCompatible(planned, actual cty.Value, path cty.Path, f func(aVal, bVal cty.Value) bool) []error {
++	a := planned
++	b := actual
++
++	// Our methodology here is a little tricky, to deal with the fact that
++	// it's impossible to directly correlate two non-equal set elements because
++	// they don't have identities separate from their values.
++	// The approach is to count the number of equivalent elements each element
++	// of a has in b and vice-versa, and then return true only if each element
++	// in both sets has at least one equivalent.
++	as := a.AsValueSlice()
++	bs := b.AsValueSlice()
++	aeqs := make([]bool, len(as))
++	beqs := make([]bool, len(bs))
++	for ai, av := range as {
++		for bi, bv := range bs {
++			if f(av, bv) {
++				aeqs[ai] = true
++				beqs[bi] = true
++			}
++		}
++	}
++
++	var errs []error
++	for i, eq := range aeqs {
++		if !eq {
++			errs = append(errs, path.NewErrorf("planned set element %#v does not correlate with any element in actual", as[i]))
++		}
++	}
++	if len(errs) > 0 {
++		// Exit early since otherwise we're likely to generate duplicate
++		// error messages from the other perspective in the subsequent loop.
++		return errs
++	}
++	for i, eq := range beqs {
++		if !eq {
++			errs = append(errs, path.NewErrorf("actual set element %#v does not correlate with any element in plan", bs[i]))
++		}
++	}
++	return errs
++}
++
++
++// EmptyValue returns the "empty value" for the recieving block, which for
++// a block type is a non-null object where all of the attribute values are
++// the empty values of the block's attributes and nested block types.
++//
++// In other words, it returns the value that would be returned if an empty
++// block were decoded against the recieving schema, assuming that no required
++// attribute or block constraints were honored.
++func (n *NodeAbstractResourceInstance) blockEmptyValue(b *configschema.Block) cty.Value {
++	vals := make(map[string]cty.Value)
++	for _, name := range n.schemaAttributeNames(b) {
++		vals[name] = n.attributeEmptyValue(b.Attributes[name])
++	}
++	for _, name := range n.schemaBlockNames(b) {
++		vals[name] = n.nestedBlockEmptyByMode(b.BlockTypes[name])
++	}
++	return n.cloneCtyValue(cty.ObjectVal(vals))
++}
++
++// EmptyValue returns the "empty value" for the receiving attribute, which is
++// the value that would be returned if there were no definition of the attribute
++// at all, ignoring any required constraint.
++func (n *NodeAbstractResourceInstance) attributeEmptyValue(a *configschema.Attribute) cty.Value {
++	return cty.NullVal(a.ImpliedType())
++}
++
++// EmptyValue returns the "empty value" for when there are zero nested blocks
++// present of the receiving type.
++func (n *NodeAbstractResourceInstance) nestedBlockEmptyValue(b *configschema.NestedBlock) cty.Value {
++	switch b.Nesting {
++	case configschema.NestingSingle:
++		return cty.NullVal(b.Block.ImpliedType())
++	case configschema.NestingGroup:
++		return n.blockEmptyValue(&b.Block)
++	case configschema.NestingList:
++		if ty := b.Block.ImpliedType(); ty.HasDynamicTypes() {
++			return cty.EmptyTupleVal
++		} else {
++			return cty.ListValEmpty(ty)
++		}
++	case configschema.NestingMap:
++		if ty := b.Block.ImpliedType(); ty.HasDynamicTypes() {
++			return cty.EmptyObjectVal
++		} else {
++			return cty.MapValEmpty(ty)
++		}
++	case configschema.NestingSet:
++		return cty.SetValEmpty(b.Block.ImpliedType())
++	default:
++		// Should never get here because the above is intended to be exhaustive,
++		// but we'll be robust and return a result nonetheless.
++		return cty.NullVal(cty.DynamicPseudoType)
++	}
++}
++
++
++// CoerceValue attempts to force the given value to conform to the type
++// implied by the receiever.
++//
++// This is useful in situations where a configuration must be derived from
++// an already-decoded value. It is always better to decode directly from
++// configuration where possible since then source location information is
++// still available to produce diagnostics, but in special situations this
++// function allows a compatible result to be obtained even if the
++// configuration objects are not available.
++//
++// If the given value cannot be converted to conform to the receiving schema
++// then an error is returned describing one of possibly many problems. This
++// error may be a cty.PathError indicating a position within the nested
++// data structure where the problem applies.
++func (n *NodeAbstractResourceInstance) coerceBlockValue(b *configschema.Block, in cty.Value) (cty.Value, error) {
++	var path cty.Path
++	out, err := n.walkCoerceBlockValue(b, in, path)
++	if err != nil {
++		return out, err
++	}
++	if b != nil {
++		out = n.alignValueToType(out, b.ImpliedType())
++	}
++	return out, nil
++}
++
++func (n *NodeAbstractResourceInstance) walkCoerceBlockValue(b *configschema.Block, in cty.Value, path cty.Path) (cty.Value, error) {
++	convType := hcldec.ImpliedType(b.DecoderSpec())
++	impliedType := convType.WithoutOptionalAttributesDeep()
++
++	switch {
++	case in.IsNull():
++		return cty.NullVal(impliedType), nil
++	case !in.IsKnown():
++		return cty.UnknownVal(impliedType), nil
++	}
++
++	ty := in.Type()
++	if !ty.IsObjectType() {
++		return cty.UnknownVal(impliedType), path.NewErrorf("an object is required")
++	}
++
++	for name := range ty.AttributeTypes() {
++		if _, defined := b.Attributes[name]; defined {
++			continue
++		}
++		if _, defined := b.BlockTypes[name]; defined {
++			continue
++		}
++		return cty.UnknownVal(impliedType), path.NewErrorf("unexpected attribute %q", name)
++	}
++
++	attrs := make(map[string]cty.Value)
++
++	for name, attrS := range b.Attributes {
++		attrType := impliedType.AttributeType(name)
++		attrConvType := convType.AttributeType(name)
++
++		var val cty.Value
++		switch {
++		case ty.HasAttribute(name):
++			val = in.GetAttr(name)
++		case attrS.Computed || attrS.Optional:
++			val = cty.NullVal(attrType)
++		case attrS.Required:
++			return cty.UnknownVal(impliedType), path.NewErrorf("attribute %q is required", name)
++		default:
++			return cty.UnknownVal(impliedType), path.NewErrorf("attribute %q has none of required, optional, or computed set", name)
++		}
++
++		val, err := convert.Convert(val, attrConvType)
++		if err != nil {
++			return cty.UnknownVal(impliedType), append(path, cty.GetAttrStep{Name: name}).NewError(err)
++		}
++		attrs[name] = val
++	}
++
++	for typeName, blockS := range b.BlockTypes {
++		switch blockS.Nesting {
++
++		case configschema.NestingSingle, configschema.NestingGroup:
++			switch {
++			case ty.HasAttribute(typeName):
++				var err error
++				val := in.GetAttr(typeName)
++				attrs[typeName], err = n.walkCoerceBlockValue(&blockS.Block, val, append(path, cty.GetAttrStep{Name: typeName}))
++				if err != nil {
++					return cty.UnknownVal(impliedType), err
++				}
++			default:
++				attrs[typeName] = n.nestedBlockEmptyValue(blockS)
++			}
++
++		case configschema.NestingList:
++			switch {
++			case ty.HasAttribute(typeName):
++				coll := in.GetAttr(typeName)
++
++				switch {
++				case coll.IsNull():
++					attrs[typeName] = cty.NullVal(cty.List(blockS.ImpliedType()))
++					continue
++				case !coll.IsKnown():
++					attrs[typeName] = cty.UnknownVal(cty.List(blockS.ImpliedType()))
++					continue
++				}
++
++				if !coll.CanIterateElements() {
++					return cty.UnknownVal(impliedType), path.NewErrorf("must be a list")
++				}
++				l := coll.LengthInt()
++
++				if l == 0 {
++					attrs[typeName] = cty.ListValEmpty(blockS.ImpliedType())
++					continue
++				}
++				elems := make([]cty.Value, 0, l)
++				{
++					path = append(path, cty.GetAttrStep{Name: typeName})
++					for it := coll.ElementIterator(); it.Next(); {
++						var err error
++						idx, val := it.Element()
++						val, err = n.walkCoerceBlockValue(&blockS.Block, val, append(path, cty.IndexStep{Key: idx}))
++						if err != nil {
++							return cty.UnknownVal(impliedType), err
++						}
++						elems = append(elems, val)
++					}
++				}
++				attrs[typeName] = cty.ListVal(elems)
++			default:
++				attrs[typeName] = cty.ListValEmpty(blockS.ImpliedType())
++			}
++
++		case configschema.NestingSet:
++			switch {
++			case ty.HasAttribute(typeName):
++				coll := in.GetAttr(typeName)
++
++				switch {
++				case coll.IsNull():
++					attrs[typeName] = cty.NullVal(cty.Set(blockS.ImpliedType()))
++					continue
++				case !coll.IsKnown():
++					attrs[typeName] = cty.UnknownVal(cty.Set(blockS.ImpliedType()))
++					continue
++				}
++
++				if !coll.CanIterateElements() {
++					return cty.UnknownVal(impliedType), path.NewErrorf("must be a set")
++				}
++				l := coll.LengthInt()
++
++				if l == 0 {
++					attrs[typeName] = cty.SetValEmpty(blockS.ImpliedType())
++					continue
++				}
++				elems := make([]cty.Value, 0, l)
++				{
++					path = append(path, cty.GetAttrStep{Name: typeName})
++					for it := coll.ElementIterator(); it.Next(); {
++						var err error
++						idx, val := it.Element()
++						val, err = n.walkCoerceBlockValue(&blockS.Block, val, append(path, cty.IndexStep{Key: idx}))
++						if err != nil {
++							return cty.UnknownVal(impliedType), err
++						}
++						elems = append(elems, val)
++					}
++				}
++				attrs[typeName] = cty.SetVal(elems)
++			default:
++				attrs[typeName] = cty.SetValEmpty(blockS.ImpliedType())
++			}
++
++		case configschema.NestingMap:
++			switch {
++			case ty.HasAttribute(typeName):
++				coll := in.GetAttr(typeName)
++
++				switch {
++				case coll.IsNull():
++					attrs[typeName] = cty.NullVal(cty.Map(blockS.ImpliedType()))
++					continue
++				case !coll.IsKnown():
++					attrs[typeName] = cty.UnknownVal(cty.Map(blockS.ImpliedType()))
++					continue
++				}
++
++				if !coll.CanIterateElements() {
++					return cty.UnknownVal(impliedType), path.NewErrorf("must be a map")
++				}
++				l := coll.LengthInt()
++				if l == 0 {
++					attrs[typeName] = cty.MapValEmpty(blockS.ImpliedType())
++					continue
++				}
++				elems := make(map[string]cty.Value)
++				{
++					path = append(path, cty.GetAttrStep{Name: typeName})
++					for it := coll.ElementIterator(); it.Next(); {
++						var err error
++						key, val := it.Element()
++						if key.Type() != cty.String || key.IsNull() || !key.IsKnown() {
++							return cty.UnknownVal(impliedType), path.NewErrorf("must be a map")
++						}
++						val, err = n.walkCoerceBlockValue(&blockS.Block, val, append(path, cty.IndexStep{Key: key}))
++						if err != nil {
++							return cty.UnknownVal(impliedType), err
++						}
++						elems[key.AsString()] = val
++					}
++				}
++
++				// If the attribute values here contain any DynamicPseudoTypes,
++				// the concrete type must be an object.
++				useObject := false
++				switch {
++				case coll.Type().IsObjectType():
++					useObject = true
++				default:
++					// It's possible that we were given a map, and need to coerce it to an object
++					ety := coll.Type().ElementType()
++					for _, v := range elems {
++						if !v.Type().Equals(ety) {
++							useObject = true
++							break
++						}
++					}
++				}
++
++				if useObject {
++					attrs[typeName] = cty.ObjectVal(elems)
++				} else {
++					attrs[typeName] = cty.MapVal(elems)
++				}
++			default:
++				attrs[typeName] = cty.MapValEmpty(blockS.ImpliedType())
++			}
++
++		default:
++			// should never happen because above is exhaustive
++			panic(fmt.Errorf("unsupported nesting mode %#v", blockS.Nesting))
++		}
++	}
++
++	return cty.ObjectVal(attrs), nil
++}
++
++
++// GenerateValueForAttribute accepts a configschema.Attribute and returns a
++// valid value for that attribute.
++func (n *NodeAbstractResourceInstance) generateValueForAttribute(attribute *configschema.Attribute) cty.Value {
++	return mocking.GenerateValueForAttribute(attribute)
++}
++
++// GenerateValueForType accepts a cty.Type and returns a valid value for that
++// type.
++func (n *NodeAbstractResourceInstance) generateValueForType(target cty.Type) cty.Value {
++	return mocking.GenerateValueForType(target)
++}
++
++func (n *NodeAbstractResourceInstance) resourceMockRandomString(count int) string {
++	return mocking.GenerateValueForType(cty.String).AsString()
++}
++
++
++// FillAttribute makes the input value match the specified attribute by adding
++// attributes and/or performing conversions to make the input value correct.
++//
++// It is similar to FillType, except it accepts attributes instead of types.
++func (n *NodeAbstractResourceInstance) fillSchemaAttribute(in cty.Value, attribute *configschema.Attribute) (cty.Value, error) {
++	return n.walkFillSchemaAttribute(in, attribute, cty.Path{})
++}
++
++func (n *NodeAbstractResourceInstance) walkFillSchemaAttribute(in cty.Value, attribute *configschema.Attribute, path cty.Path) (cty.Value, error) {
++	filled, err := mocking.FillAttribute(in, attribute)
++	if err != nil {
++		return cty.NilVal, path.NewError(err)
++	}
++	return filled, nil
++}
++
++// FillType makes the input value match the target type by adding attributes
++// directly to it or to any nested objects. Essentially, this is a "safe"
++// conversion between two objects.
++//
++// This function can error if one of the embedded types within value doesn't
++// match the type expected by target.
++//
++// If the supplied value isn't an object (or a map that can be treated as an
++// object) then a normal conversion is attempted from value into target.
++//
++// Superfluous attributes within the supplied value (ie. attributes not
++// mentioned by the target type) are dropped without error.
++func (n *NodeAbstractResourceInstance) fillCtyType(in cty.Value, target cty.Type) (cty.Value, error) {
++	return n.walkFillCtyType(in, target, cty.Path{})
++}
++
++func (n *NodeAbstractResourceInstance) walkFillCtyType(in cty.Value, target cty.Type, path cty.Path) (cty.Value, error) {
++	filled, err := mocking.FillType(in, target)
++	if err != nil {
++		return cty.NilVal, path.NewError(err)
++	}
++	return filled, nil
++}
++
++
++// PlanComputedValuesForResource accepts a target value, and populates it with
++// cty.UnknownValues wherever a value should be computed during the apply stage.
++//
++// This method basically simulates the behaviour of a plan request in a real
++// provider.
++func (n *NodeAbstractResourceInstance) planComputedValuesForResource(original cty.Value, schema *configschema.Block) (cty.Value, tfdiags.Diagnostics) {
++	if schema != nil && !n.schemaHasComputedAttributes(schema) {
++		return original, nil
++	}
++	return n.populateComputedValues(original, mocking.MockedData{}, schema, n.resourceValueIsNull, n.resourceMakeUnknown)
++}
++
++// ApplyComputedValuesForResource accepts a target value, and populates it
++// either with values from the provided with argument, or with generated values
++// created semi-randomly. This will only target values that are computed and
++// unknown.
++//
++// This method basically simulates the behaviour of an apply request in a real
++// provider.
++func (n *NodeAbstractResourceInstance) applyComputedValuesForResource(original cty.Value, with mocking.MockedData, schema *configschema.Block) (cty.Value, tfdiags.Diagnostics) {
++	return n.populateComputedValues(original, with, schema, n.resourceValueIsUnknown, func(attribute *configschema.Attribute, val cty.Value, path cty.Path) (cty.Value, tfdiags.Diagnostics) {
++		return n.mockedDataMakeKnown(with, attribute, val, path)
++	})
++}
++
++// ComputedValuesForDataSource accepts a target value, and populates it either
++// with values from the provided with argument, or with generated values created
++// semi-randomly. This will only target values that are computed and null.
++//
++// This function does what PlanComputedValuesForResource and
++// ApplyComputedValuesForResource do but in a single step with no intermediary
++// unknown stage.
++//
++// This method basically simulates the behaviour of a get data source request
++// in a real provider.
++func (n *NodeAbstractResourceInstance) computedValuesForDataSource(original cty.Value, with mocking.MockedData, schema *configschema.Block) (cty.Value, tfdiags.Diagnostics) {
++	return n.populateComputedValues(original, with, schema, n.resourceValueIsNull, func(attribute *configschema.Attribute, val cty.Value, path cty.Path) (cty.Value, tfdiags.Diagnostics) {
++		return n.mockedDataMakeKnown(with, attribute, val, path)
++	})
++}
++
++type resourceProcessValueFn func(value cty.Value) bool
++
++type resourceGenerateValueFn func(attribute *configschema.Attribute, with cty.Value, path cty.Path) (cty.Value, tfdiags.Diagnostics)
++
++func (n *NodeAbstractResourceInstance) populateComputedValues(target cty.Value, with mocking.MockedData, schema *configschema.Block, processValue resourceProcessValueFn, generateValue resourceGenerateValueFn) (cty.Value, tfdiags.Diagnostics) {
++	var diags tfdiags.Diagnostics
++
++	if !n.mockedDataValidate(with) {
++		// This is actually a user error, it means the user wrote something like
++		// `values = "not an object"` when defining the replacement values for
++		// this in the mock or test file. We should have caught this earlier in
++		// the validation, but we want this function to be robust and not panic
++		// so we'll check again just in case.
++		diags = diags.Append(&hcl.Diagnostic{
++			Severity: hcl.DiagError,
++			Summary:  "Invalid replacement value",
++			Detail:   fmt.Sprintf("The requested replacement value must be an object type, but was %s.", with.Value.Type().FriendlyName()),
++			Subject:  with.Range.Ptr(),
++		})
++
++		// We still need to produce valid data for this. So, let's pretend we
++		// had no mocked data. We still return the error diagnostic so whatever
++		// operation was happening will still fail, but we won't cause any
++		// panics or anything.
++		with = mocking.MockedData{
++			Value: cty.NilVal,
++		}
++	}
++
++	// We're going to search for any elements within the target value that meet
++	// the joint criteria of being computed and whatever processValue is
++	// checking.
++	//
++	// We'll then replace anything that meets the criteria with the output of
++	// generateValue.
++	//
++	// This transform should be robust (in that it should never fail), the
++	// inner call to generateValue should be robust as well so it should always
++	// return a valid value for us to use even if the embedded diagnostics
++	// return errors.
++	value, err := cty.Transform(target, func(path cty.Path, target cty.Value) (cty.Value, error) {
++
++		// Get the attribute for the current target.
++		attribute := n.blockAttributeByPath(schema, path)
++
++		if attribute == nil {
++			// Then this is an intermediate path which does not represent an
++			// attribute, and it cannot be computed.
++			return target, nil
++		}
++
++		// Now, we check if we should be replacing this value with something.
++		if attribute.Computed && processValue(target) {
++
++			// Get the value we should be replacing target with.
++			data, dataDiags := n.mockedDataForPath(with, path)
++			diags = diags.Append(dataDiags)
++
++			// Upstream code (in node_resource_abstract_instance.go) expects
++			// us to return a valid object (even if we have errors). That means
++			// no unknown values, no cty.NilVals, etc. So, we're going to go
++			// ahead and call generateValue with whatever getMockedDataForPath
++			// gave us. getMockedDataForPath is robust, so even in an error it
++			// should have given us something we can use in generateValue.
++
++			// Now get the replacement value. This function should be robust in
++			// that it may return diagnostics explaining why it couldn't replace
++			// the value, but it'll still return a value for us to use.
++			value, valueDiags := generateValue(attribute, data, path)
++			diags = diags.Append(valueDiags)
++
++			// We always return a valid value, the diags are attached to the
++			// global diags outside the nested function.
++			return value, nil
++		}
++
++		// If we don't need to replace this value, then just return it
++		// untouched.
++		return target, nil
++	})
++	if err != nil {
++		// This shouldn't actually happen - we never return an error from inside
++		// the transform function. But, just in case:
++		diags = diags.Append(&hcl.Diagnostic{
++			Severity: hcl.DiagError,
++			Detail:   "Failed to generate values",
++			Summary:  fmt.Sprintf("Terraform failed to generate computed values for a mocked resource, data source, or module: %s. This is a bug in Terraform - please report it.", err),
++			Subject:  with.Range.Ptr(),
++		})
++	}
++
++	return value, diags
++}
++
++func (n *NodeAbstractResourceInstance) resourceValueIsNull(target cty.Value) bool {
++	return target.IsNull()
++}
++
++func (n *NodeAbstractResourceInstance) resourceValueIsUnknown(target cty.Value) bool {
++	return !target.IsKnown()
++}
++
++// makeUnknown produces an unknown value for the provided attribute. This is
++// basically the output of a plan() call for a computed attribute in a mocked
++// resource.
++func (n *NodeAbstractResourceInstance) resourceMakeUnknown(target *configschema.Attribute, _ cty.Value, _ cty.Path) (cty.Value, tfdiags.Diagnostics) {
++	return cty.UnknownVal(target.ImpliedType()), nil
++}
++
++
++// makeKnown produces a valid value for the given attribute. The input value
++// can provide data for this attribute or child attributes if this attribute
++// represents an object. The input value is expected to be a representation of
++// the schema of this attribute rather than a direct value.
++func (n *NodeAbstractResourceInstance) mockedDataMakeKnown(data mocking.MockedData, attribute *configschema.Attribute, with cty.Value, path cty.Path) (cty.Value, tfdiags.Diagnostics) {
++	var diags tfdiags.Diagnostics
++
++	if with != cty.NilVal {
++		// Then we have a pre-made value to use as the basis for our value. We
++		// just need to make sure the value is of the right type.
++
++		if value, err := n.fillSchemaAttribute(with, attribute); err != nil {
++			var relPath cty.Path
++			if err, ok := err.(cty.PathError); ok {
++				relPath = err.Path
++			}
++
++			diags = diags.Append(tfdiags.AttributeValue(
++				tfdiags.Error,
++				"Failed to compute attribute",
++				fmt.Sprintf("Terraform could not compute a value for the target type %s with the mocked data defined at %s with the attribute %q: %s.", attribute.ImpliedType().FriendlyName(), data.Range, n.resourceFmtPath(append(path, relPath...)), err),
++				path))
++
++			// We still want to return a valid value here. If the conversion did
++			// not work we carry on and just create a value instead. We've made
++			// a note of the diagnostics tracking why it didn't work so the
++			// overall operation will still fail, but we won't crash later on
++			// because of an unknown value or something.
++
++			// Fall through to the GenerateValueForAttribute call below.
++		} else {
++			// Successful conversion! We can just return the new value.
++			return value, diags
++		}
++	}
++
++	// Otherwise, we'll have to generate some values.
++	return n.generateValueForAttribute(attribute), diags
++}
++
++// We can only do replacements if the replacement value is an object type.
++func (n *NodeAbstractResourceInstance) mockedDataValidate(data mocking.MockedData) bool {
++	return data.Value == cty.NilVal || data.Value.Type().IsObjectType()
++}
++
++// getMockedDataForPath walks the path to find any potential mock data for the
++// given path. We have implemented custom logic for walking the path here.
++//
++// This is to support nested block types. It's complicated to work out how to
++// replace computed values within nested types. For example, how would a user
++// say they just want to replace values at index 3? Or how would users indicate
++// they want to replace anything at all within nested sets. The indices for sets
++// will never be the same because the user supplied values will, by design, have
++// values for the computed attributes which will be null or unknown within the
++// values from Terraform so the paths will never match.
++//
++// What the above paragraph means is that for nested blocks and attributes,
++// users can only specify a single replacement value that will apply to all
++// the values within the nested collection.
++func (n *NodeAbstractResourceInstance) mockedDataForPath(data mocking.MockedData, path cty.Path) (cty.Value, tfdiags.Diagnostics) {
++	var diags tfdiags.Diagnostics
++
++	if data.Value == cty.NilVal {
++		return cty.NilVal, diags
++	}
++
++	// We want to provide a nice print out of the path in case of an error.
++	// We'll format it as we go.
++	var currentPath cty.Path
++
++	// We are copying the implementation within AttributeByPath inside the
++	// schema for this. We skip over GetIndexSteps as they'll be referring to
++	// the intermediate nested blocks and attributes that we aren't capturing
++	// within the user supplied mock values.
++	current := data.Value
++	for _, step := range path {
++		switch step := step.(type) {
++		case cty.GetAttrStep:
++
++			if !current.Type().IsObjectType() {
++				// As we're still traversing the path, we expect things to be
++				// objects at every level.
++				diags = diags.Append(tfdiags.AttributeValue(
++					tfdiags.Error,
++					"Failed to compute attribute",
++					fmt.Sprintf("Terraform expected an object type for attribute %q defined within the mocked data at %s, but found %s.", n.resourceFmtPath(currentPath), data.Range, current.Type().FriendlyName()),
++					currentPath))
++
++				return cty.NilVal, diags
++			}
++
++			if !current.Type().HasAttribute(step.Name) {
++				// Then we have no mocked data for this attribute.
++				return cty.NilVal, diags
++			}
++
++			current = current.GetAttr(step.Name)
++		}
++
++		currentPath = append(currentPath, step)
++	}
++
++	return current, diags
++}
++
++func (n *NodeAbstractResourceInstance) resourceFmtPath(path cty.Path) string {
++	var current string
++
++	first := true
++	for _, step := range path {
++		// Since we only ever parse the attribute steps when finding replacement
++		// values, we can do the same again here.
++		switch step := step.(type) {
++		case cty.GetAttrStep:
++			if first {
++				first = false
++				current = step.Name
++				continue
++			}
++			current = fmt.Sprintf("%s.%s", current, step.Name)
++		}
++	}
++	return current
++}
++
++
++
++func (n *NodeAbstractResourceInstance) blockContainsSensitive(b *configschema.Block) bool {
++	if b == nil {
++		return false
++	}
++	for _, attrS := range b.Attributes {
++		if attrS.Sensitive {
++			return true
++		}
++		if attrS.NestedType != nil && n.objectContainsSensitive(attrS.NestedType) {
++			return true
++		}
++	}
++	for _, blockS := range b.BlockTypes {
++		if n.blockContainsSensitive(&blockS.Block) {
++			return true
++		}
++	}
++	return false
++}
++
++func (n *NodeAbstractResourceInstance) objectContainsSensitive(o *configschema.Object) bool {
++	if o == nil {
++		return false
++	}
++	for _, attrS := range o.Attributes {
++		if attrS.Sensitive {
++			return true
++		}
++		if attrS.NestedType != nil && n.objectContainsSensitive(attrS.NestedType) {
++			return true
++		}
++	}
++	return false
++}
++
++func (n *NodeAbstractResourceInstance) valueMarksIndicateSensitive(marks cty.ValueMarks) bool {
++	for mark := range marks {
++		if gs, ok := mark.(fmt.GoStringer); ok && gs.GoString() == "marks.Sensitive" {
++			return true
++		}
++		if fmt.Sprint(mark) == "Sensitive" {
++			return true
++		}
++	}
++	return false
++}
++
++func (n *NodeAbstractResourceInstance) encodeResourceInstanceObject(obj *states.ResourceInstanceObject, ty cty.Type, schemaVersion uint64) (*states.ResourceInstanceObjectSrc, error) {
++	if obj == nil {
++		return nil, nil
++	}
++	val, pvm := obj.Value.UnmarkDeepWithPaths()
++	val = cty.UnknownAsNull(val)
++	val = n.normalizeEncodedResourceValue(val, ty)
++	pvm = n.mergePathValueMarks(nil, pvm)
++	log.Printf("[TRACE] encoding resource instance object %s", n.formatEncodedObjectTrace(obj, ty, pvm))
++	src, err := ctyjson.Marshal(val, ty)
++	if err != nil {
++		return nil, err
++	}
++	dependencies := make([]addrs.ConfigResource, len(obj.Dependencies))
++	copy(dependencies, obj.Dependencies)
++	sort.Slice(dependencies, func(i, j int) bool { return dependencies[i].String() < dependencies[j].String() })
++	return &states.ResourceInstanceObjectSrc{
++		SchemaVersion:       schemaVersion,
++		AttrsJSON:           src,
++		AttrSensitivePaths:  pvm,
++		Private:             obj.Private,
++		Status:              obj.Status,
++		Dependencies:        dependencies,
++		CreateBeforeDestroy: obj.CreateBeforeDestroy,
++	}, nil
++}
++
++func (n *NodeAbstractResourceInstance) evalInstanceCheckRules(typ addrs.CheckRuleType, rules []*configs.CheckRule, ctx EvalContext, self addrs.Checkable, keyData instances.RepetitionData, diagSeverity tfdiags.Severity) tfdiags.Diagnostics {
++	return n.evalInstanceCheckRulesBody(typ, rules, ctx, self, keyData, diagSeverity)
++}
++
++// AttributeByPath looks up the Attribute schema which corresponds to the given
++// cty.Path. A nil value is returned if the given path does not correspond to a
++// specific attribute.
++func (n *NodeAbstractResourceInstance) blockAttributeByPath(b *configschema.Block, path cty.Path) *configschema.Attribute {
++	block := b
++	for i, step := range path {
++		switch step := step.(type) {
++		case cty.GetAttrStep:
++			if attr := block.Attributes[step.Name]; attr != nil {
++				// If the Attribute is defined with a NestedType and there's
++				// more to the path, descend into the NestedType
++				if attr.NestedType != nil && i < len(path)-1 {
++					return n.objectAttributeByPath(attr.NestedType, path[i+1:])
++				} else if i < len(path)-1 { // There's more to the path, but not more to this Attribute.
++					return nil
++				}
++				return attr
++			}
++
++			if nestedBlock := block.BlockTypes[step.Name]; nestedBlock != nil {
++				block = &nestedBlock.Block
++				continue
++			}
++
++			return nil
++		}
++	}
++	return nil
++}
++
++// AttributeByPath recurses through a NestedType to look up the Attribute scheme
++// which corresponds to the given cty.Path. A nil value is returned if the given
++// path does not correspond to a specific attribute.
++func (n *NodeAbstractResourceInstance) objectAttributeByPath(o *configschema.Object, path cty.Path) *configschema.Attribute {
++	for i, step := range path {
++		switch step := step.(type) {
++		case cty.GetAttrStep:
++			if attr := o.Attributes[step.Name]; attr != nil {
++				if attr.NestedType != nil && i < len(path)-1 {
++					return n.objectAttributeByPath(attr.NestedType, path[i+1:])
++				} else if i < len(path)-1 { // There's more to the path, but not more to this Attribute.
++					return nil
++				}
++				return attr
++			}
++		}
++	}
++	return nil
++}
++
++
++
++func (n *NodeAbstractResourceInstance) alignValueToType(val cty.Value, ty cty.Type) cty.Value {
++	if ty == cty.NilType || val == cty.NilVal {
++		return val
++	}
++	converted, err := convert.Convert(val, ty)
++	if err != nil {
++		return val
++	}
++	return converted
++}
++
++func (n *NodeAbstractResourceInstance) describeCtyType(ty cty.Type) string {
++	if ty == cty.NilType {
++		return "nil"
++	}
++	return ty.FriendlyName()
++}
++
++func (n *NodeAbstractResourceInstance) collectSchemaAttributePaths(schema *configschema.Block, prefix cty.Path) []cty.Path {
++	if schema == nil {
++		return nil
++	}
++	var paths []cty.Path
++	names := n.schemaAttributeNames(schema)
++	for _, name := range names {
++		attr := schema.Attributes[name]
++		path := n.appendAttrPath(prefix, name)
++		paths = append(paths, path)
++		if attr.NestedType != nil {
++			paths = append(paths, n.collectObjectAttributePaths(attr.NestedType, path)...)
++		}
++	}
++	blockNames := make([]string, 0, len(schema.BlockTypes))
++	for name := range schema.BlockTypes {
++		blockNames = append(blockNames, name)
++	}
++	sort.Strings(blockNames)
++	for _, name := range blockNames {
++		block := schema.BlockTypes[name]
++		path := n.appendAttrPath(prefix, name)
++		paths = append(paths, n.collectSchemaAttributePaths(&block.Block, path)...)
++	}
++	return paths
++}
++
++func (n *NodeAbstractResourceInstance) collectObjectAttributePaths(obj *configschema.Object, prefix cty.Path) []cty.Path {
++	if obj == nil {
++		return nil
++	}
++	var paths []cty.Path
++	names := make([]string, 0, len(obj.Attributes))
++	for name := range obj.Attributes {
++		names = append(names, name)
++	}
++	sort.Strings(names)
++	for _, name := range names {
++		attr := obj.Attributes[name]
++		path := n.appendAttrPath(prefix, name)
++		paths = append(paths, path)
++		if attr.NestedType != nil {
++			paths = append(paths, n.collectObjectAttributePaths(attr.NestedType, path)...)
++		}
++	}
++	return paths
++}
++
++func (n *NodeAbstractResourceInstance) schemaHasComputedAttributes(schema *configschema.Block) bool {
++	if schema == nil {
++		return false
++	}
++	for _, attr := range schema.Attributes {
++		if attr.Computed {
++			return true
++		}
++		if attr.NestedType != nil && n.objectHasComputedAttributes(attr.NestedType) {
++			return true
++		}
++	}
++	for _, block := range schema.BlockTypes {
++		if n.schemaHasComputedAttributes(&block.Block) {
++			return true
++		}
++	}
++	return false
++}
++
++func (n *NodeAbstractResourceInstance) objectHasComputedAttributes(obj *configschema.Object) bool {
++	if obj == nil {
++		return false
++	}
++	for _, attr := range obj.Attributes {
++		if attr.Computed {
++			return true
++		}
++		if attr.NestedType != nil && n.objectHasComputedAttributes(attr.NestedType) {
++			return true
++		}
++	}
++	return false
++}
++
++func (n *NodeAbstractResourceInstance) schemaHasOptionalAttributes(schema *configschema.Block) bool {
++	if schema == nil {
++		return false
++	}
++	for _, attr := range schema.Attributes {
++		if attr.Optional {
++			return true
++		}
++		if attr.NestedType != nil && n.objectHasOptionalAttributes(attr.NestedType) {
++			return true
++		}
++	}
++	for _, block := range schema.BlockTypes {
++		if n.schemaHasOptionalAttributes(&block.Block) {
++			return true
++		}
++	}
++	return false
++}
++
++func (n *NodeAbstractResourceInstance) objectHasOptionalAttributes(obj *configschema.Object) bool {
++	if obj == nil {
++		return false
++	}
++	for _, attr := range obj.Attributes {
++		if attr.Optional {
++			return true
++		}
++		if attr.NestedType != nil && n.objectHasOptionalAttributes(attr.NestedType) {
++			return true
++		}
++	}
++	return false
++}
++
++func (n *NodeAbstractResourceInstance) countSchemaAttributes(schema *configschema.Block) int {
++	if schema == nil {
++		return 0
++	}
++	total := len(schema.Attributes)
++	for _, attr := range schema.Attributes {
++		if attr.NestedType != nil {
++			total += n.countObjectAttributes(attr.NestedType)
++		}
++	}
++	for _, block := range schema.BlockTypes {
++		total += n.countSchemaAttributes(&block.Block)
++	}
++	return total
++}
++
++func (n *NodeAbstractResourceInstance) countObjectAttributes(obj *configschema.Object) int {
++	if obj == nil {
++		return 0
++	}
++	total := len(obj.Attributes)
++	for _, attr := range obj.Attributes {
++		if attr.NestedType != nil {
++			total += n.countObjectAttributes(attr.NestedType)
++		}
++	}
++	return total
++}
++
++func (n *NodeAbstractResourceInstance) normalizeEncodedResourceValue(val cty.Value, ty cty.Type) cty.Value {
++	if val == cty.NilVal || ty == cty.NilType {
++		return val
++	}
++	unmarked, marks := val.UnmarkDeep()
++	unmarked = cty.UnknownAsNull(unmarked)
++	aligned := n.alignValueToType(unmarked, ty)
++	if len(marks) > 0 {
++		aligned = aligned.WithMarks(marks)
++	}
++	return aligned
++}
++
++func (n *NodeAbstractResourceInstance) resourceValueEqualForPlan(a, b cty.Value) bool {
++	if a == cty.NilVal && b == cty.NilVal {
++		return true
++	}
++	if a == cty.NilVal || b == cty.NilVal {
++		return false
++	}
++	au, _ := a.UnmarkDeep()
++	bu, _ := b.UnmarkDeep()
++	return n.unrefinedCtyValue(au).RawEquals(n.unrefinedCtyValue(bu))
++}
++
++func (n *NodeAbstractResourceInstance) mergePathValueMarks(dst, src []cty.PathValueMarks) []cty.PathValueMarks {
++	if len(src) == 0 {
++		return dst
++	}
++	if len(dst) == 0 {
++		out := make([]cty.PathValueMarks, len(src))
++		copy(out, src)
++		return out
++	}
++	seen := make(map[string]bool, len(dst)+len(src))
++	out := make([]cty.PathValueMarks, 0, len(dst)+len(src))
++	for _, mark := range dst {
++		key := fmt.Sprintf("%#v", mark)
++		if seen[key] {
++			continue
++		}
++		seen[key] = true
++		out = append(out, mark)
++	}
++	for _, mark := range src {
++		key := fmt.Sprintf("%#v", mark)
++		if seen[key] {
++			continue
++		}
++		seen[key] = true
++		out = append(out, mark)
++	}
++	return out
++}
++
++func (n *NodeAbstractResourceInstance) marksApplyToValue(val cty.Value, marks []cty.PathValueMarks) []cty.PathValueMarks {
++	if len(marks) == 0 {
++		return nil
++	}
++	var out []cty.PathValueMarks
++	for _, mark := range marks {
++		if _, err := mark.Path.Apply(val); err == nil {
++			out = append(out, mark)
++		}
++	}
++	return out
++}
++
++
++func (n *NodeAbstractResourceInstance) retainIgnoredAttributeChanges(prior, config cty.Value, ignoreChangesPath []cty.Path) (cty.Value, tfdiags.Diagnostics) {
++	type ignoreChange struct {
++		// Path is the full path, minus any trailing map index
++		path cty.Path
++		// Value is the value we are to retain at the above path. If there is a
++		// key value, this must be a map and the desired value will be at the
++		// key index.
++		value cty.Value
++		// Key is the index key if the ignored path ends in a map index.
++		key cty.Value
++	}
++	var ignoredValues []ignoreChange
++
++	// Find the actual changes first and store them in the ignoreChange struct.
++	// If the change was to a map value, and the key doesn't exist in the
++	// config, it would never be visited in the transform walk.
++	for _, icPath := range ignoreChangesPath {
++		key := cty.NullVal(cty.String)
++		// check for a map index, since maps are the only structure where we
++		// could have invalid path steps.
++		last, ok := icPath[len(icPath)-1].(cty.IndexStep)
++		if ok {
++			if last.Key.Type() == cty.String {
++				icPath = icPath[:len(icPath)-1]
++				key = last.Key
++			}
++		}
++
++		// The structure should have been validated already, and we already
++		// trimmed the trailing map index. Any other intermediate index error
++		// means we wouldn't be able to apply the value below, so no need to
++		// record this.
++		p, err := icPath.Apply(prior)
++		if err != nil {
++			continue
++		}
++		c, err := icPath.Apply(config)
++		if err != nil {
++			continue
++		}
++
++		// If this is a map, it is checking the entire map value for equality
++		// rather than the individual key. This means that the change is stored
++		// here even if our ignored key doesn't change. That is OK since it
++		// won't cause any changes in the transformation, but allows us to skip
++		// breaking up the maps and checking for key existence here too.
++		if !p.RawEquals(c) {
++			// there a change to ignore at this path, store the prior value
++			ignoredValues = append(ignoredValues, ignoreChange{icPath, p, key})
++		}
++	}
++
++	if len(ignoredValues) == 0 {
++		return config, nil
++	}
++
++	ret, _ := cty.Transform(config, func(path cty.Path, v cty.Value) (cty.Value, error) {
++		// Easy path for when we are only matching the entire value. The only
++		// values we break up for inspection are maps.
++		if !v.Type().IsMapType() {
++			for _, ignored := range ignoredValues {
++				if path.Equals(ignored.path) {
++					return ignored.value, nil
++				}
++			}
++			return v, nil
++		}
++		// We now know this must be a map, so we need to accumulate the values
++		// key-by-key.
++
++		if !v.IsNull() && !v.IsKnown() {
++			// since v is not known, we cannot ignore individual keys
++			return v, nil
++		}
++
++		// The map values will remain as cty values, so we only need to store
++		// the marks from the outer map itself
++		v, vMarks := v.Unmark()
++
++		// The configMap is the current configuration value, which we will
++		// mutate based on the ignored paths and the prior map value.
++		var configMap map[string]cty.Value
++		switch {
++		case v.IsNull() || v.LengthInt() == 0:
++			configMap = map[string]cty.Value{}
++		default:
++			configMap = v.AsValueMap()
++		}
++
++		for _, ignored := range ignoredValues {
++			if !path.Equals(ignored.path) {
++				continue
++			}
++
++			if ignored.key.IsNull() {
++				// The map address is confirmed to match at this point,
++				// so if there is no key, we want the entire map and can
++				// stop accumulating values.
++				return ignored.value, nil
++			}
++			// Now we know we are ignoring a specific index of this map, so get
++			// the config map and modify, add, or remove the desired key.
++
++			// We also need to create a prior map, so we can check for
++			// existence while getting the value, because Value.Index will
++			// return null for a key with a null value and for a non-existent
++			// key.
++			var priorMap map[string]cty.Value
++
++			// We need to drop the marks from the ignored map for handling. We
++			// don't need to store these, as we now know the ignored value is
++			// only within the map, not the map itself.
++			ignoredVal, _ := ignored.value.Unmark()
++
++			switch {
++			case ignored.value.IsNull() || ignoredVal.LengthInt() == 0:
++				priorMap = map[string]cty.Value{}
++			default:
++				priorMap = ignoredVal.AsValueMap()
++			}
++
++			key := ignored.key.AsString()
++			priorElem, keep := priorMap[key]
++
++			switch {
++			case !keep:
++				// this didn't exist in the old map value, so we're keeping the
++				// "absence" of the key by removing it from the config
++				delete(configMap, key)
++			default:
++				configMap[key] = priorElem
++			}
++		}
++
++		var newVal cty.Value
++		switch {
++		case len(configMap) > 0:
++			newVal = cty.MapVal(configMap)
++		case v.IsNull():
++			// if the config value was null, and no values remain in the map,
++			// reset the value to null.
++			newVal = v
++		default:
++			newVal = cty.MapValEmpty(v.Type().ElementType())
++		}
++
++		if len(vMarks) > 0 {
++			newVal = newVal.WithMarks(vMarks)
++		}
++
++		return newVal, nil
++	})
++	return ret, nil
++}
++
++
++// evalCheckRules ensures that all of the given check rules pass against
++// the given HCL evaluation context.
++//
++// If any check rules produce an unknown result then they will be silently
++// ignored on the assumption that the same checks will be run again later
++// with fewer unknown values in the EvalContext.
++//
++// If any of the rules do not pass, the returned diagnostics will contain
++// errors. Otherwise, it will either be empty or contain only warnings.
++func (n *NodeAbstractResourceInstance) evalInstanceCheckRulesBody(typ addrs.CheckRuleType, rules []*configs.CheckRule, ctx EvalContext, self addrs.Checkable, keyData instances.RepetitionData, diagSeverity tfdiags.Severity) tfdiags.Diagnostics {
++	var diags tfdiags.Diagnostics
++
++	checkState := ctx.Checks()
++	if !checkState.ConfigHasChecks(self.ConfigCheckable()) {
++		// We have nothing to do if this object doesn't have any checks,
++		// but the "rules" slice should agree that we don't.
++		if ct := len(rules); ct != 0 {
++			panic(fmt.Sprintf("check state says that %s should have no rules, but it has %d", self, ct))
++		}
++		return diags
++	}
++
++	if len(rules) == 0 {
++		// Nothing to do
++		return nil
++	}
++
++	severity := diagSeverity.ToHCL()
++
++	for i, rule := range rules {
++		result, ruleDiags := n.evalInstanceCheckRule(addrs.NewCheckRule(self, typ, i), rule, ctx, keyData, severity)
++		diags = diags.Append(ruleDiags)
++
++		log.Printf("[TRACE] evalInstanceCheckRules: %s status is now %s", self, result.Status)
++		if result.Status == checks.StatusFail {
++			checkState.ReportCheckFailure(self, typ, i, result.FailureMessage)
++		} else {
++			checkState.ReportCheckResult(self, typ, i, result.Status)
++		}
++	}
++
++	return diags
++}
++
++
++func (n *NodeAbstractResourceInstance) validateInstanceCheckRule(addr addrs.CheckRule, rule *configs.CheckRule, ctx EvalContext, keyData instances.RepetitionData) (string, *hcl.EvalContext, tfdiags.Diagnostics) {
++	var diags tfdiags.Diagnostics
++
++	refs, moreDiags := langrefs.ReferencesInExpr(addrs.ParseRef, rule.Condition)
++	diags = diags.Append(moreDiags)
++	moreRefs, moreDiags := langrefs.ReferencesInExpr(addrs.ParseRef, rule.ErrorMessage)
++	diags = diags.Append(moreDiags)
++	refs = append(refs, moreRefs...)
++
++	var selfReference, sourceReference addrs.Referenceable
++	switch addr.Type {
++	case addrs.ResourcePostcondition:
++		switch s := addr.Container.(type) {
++		case addrs.AbsResourceInstance:
++			// Only resource postconditions can refer to self
++			selfReference = s.Resource
++		default:
++			panic(fmt.Sprintf("Invalid self reference type %t", addr.Container))
++		}
++	case addrs.CheckAssertion:
++		switch s := addr.Container.(type) {
++		case addrs.AbsCheck:
++			// Only check blocks have scoped resources so need to specify their
++			// source.
++			sourceReference = s.Check
++		default:
++			panic(fmt.Sprintf("Invalid source reference type %t", addr.Container))
++		}
++	}
++	scope := ctx.EvaluationScope(selfReference, sourceReference, keyData)
++
++	hclCtx, moreDiags := scope.EvalContext(refs)
++	diags = diags.Append(moreDiags)
++
++	errorMessage, moreDiags := lang.EvalCheckErrorMessage(rule.ErrorMessage, hclCtx)
++	diags = diags.Append(moreDiags)
++
++	return errorMessage, hclCtx, diags
++}
++
++func (n *NodeAbstractResourceInstance) evalInstanceCheckRule(addr addrs.CheckRule, rule *configs.CheckRule, ctx EvalContext, keyData instances.RepetitionData, severity hcl.DiagnosticSeverity) (checkResult, tfdiags.Diagnostics) {
++	// NOTE: Intentionally not passing the caller's selected severity in here,
++	// because this reports errors in the configuration itself, not the failure
++	// of an otherwise-valid condition.
++	errorMessage, hclCtx, diags := n.validateInstanceCheckRule(addr, rule, ctx, keyData)
++
++	const errInvalidCondition = "Invalid condition result"
++
++	resultVal, hclDiags := rule.Condition.Value(hclCtx)
++	diags = diags.Append(hclDiags)
++
++	if diags.HasErrors() {
++		log.Printf("[TRACE] evalInstanceCheckRule: %s: %s", addr.Type, diags.Err().Error())
++		return checkResult{Status: checks.StatusError}, diags
++	}
++
++	if !resultVal.IsKnown() {
++
++		// Check assertions warn if a status is unknown.
++		if addr.Type == addrs.CheckAssertion {
++			diags = diags.Append(&hcl.Diagnostic{
++				Severity:    hcl.DiagWarning,
++				Summary:     fmt.Sprintf("%s known after apply", addr.Type.Description()),
++				Detail:      "The condition could not be evaluated at this time, a result will be known when this plan is applied.",
++				Subject:     rule.Condition.Range().Ptr(),
++				Expression:  rule.Condition,
++				EvalContext: hclCtx,
++				Extra: &addrs.CheckRuleDiagnosticExtra{
++					CheckRule: addr,
++				},
++			})
++		}
++
++		// We'll wait until we've learned more, then.
++		return checkResult{Status: checks.StatusUnknown}, diags
++	}
++	if resultVal.IsNull() {
++		// NOTE: Intentionally not passing the caller's selected severity in here,
++		// because this reports errors in the configuration itself, not the failure
++		// of an otherwise-valid condition.
++		diags = diags.Append(&hcl.Diagnostic{
++			Severity:    hcl.DiagError,
++			Summary:     errInvalidCondition,
++			Detail:      "Condition expression must return either true or false, not null.",
++			Subject:     rule.Condition.Range().Ptr(),
++			Expression:  rule.Condition,
++			EvalContext: hclCtx,
++		})
++		return checkResult{Status: checks.StatusError}, diags
++	}
++	var err error
++	resultVal, err = convert.Convert(resultVal, cty.Bool)
++	if err != nil {
++		// NOTE: Intentionally not passing the caller's selected severity in here,
++		// because this reports errors in the configuration itself, not the failure
++		// of an otherwise-valid condition.
++		detail := fmt.Sprintf("Invalid condition result value: %s.", tfdiags.FormatError(err))
++		diags = diags.Append(&hcl.Diagnostic{
++			Severity:    hcl.DiagError,
++			Summary:     errInvalidCondition,
++			Detail:      detail,
++			Subject:     rule.Condition.Range().Ptr(),
++			Expression:  rule.Condition,
++			EvalContext: hclCtx,
++		})
++		return checkResult{Status: checks.StatusError}, diags
++	}
++
++	// The condition result may be marked if the expression refers to a
++	// sensitive value.
++	resultVal, _ = resultVal.Unmark()
++
++	status := checks.StatusForCtyValue(resultVal)
++
++	if status != checks.StatusFail {
++		return checkResult{Status: status}, diags
++	}
++
++	errorMessageForDiags := errorMessage
++	if errorMessageForDiags == "" {
++		errorMessageForDiags = "This check failed, but has an invalid error message as described in the other accompanying messages."
++	}
++	diags = diags.Append(&hcl.Diagnostic{
++		// The caller gets to choose the severity of this one, because we
++		// treat condition failures as warnings in the presence of
++		// certain special planning options.
++		Severity:    severity,
++		Summary:     fmt.Sprintf("%s failed", addr.Type.Description()),
++		Detail:      errorMessageForDiags,
++		Subject:     rule.Condition.Range().Ptr(),
++		Expression:  rule.Condition,
++		EvalContext: hclCtx,
++		Extra: &addrs.CheckRuleDiagnosticExtra{
++			CheckRule: addr,
++		},
++	})
++
++	return checkResult{
++		Status:         status,
++		FailureMessage: errorMessage,
++	}, diags
++}
++
++
++func (n *NodeAbstractResourceInstance) cloneCtyValue(val cty.Value) cty.Value {
++	if val == cty.NilVal {
++		return val
++	}
++	if val.IsNull() {
++		return cty.NullVal(val.Type())
++	}
++	if !val.IsKnown() {
++		return val
++	}
++	return n.walkCloneCtyValue(val)
++}
++
++func (n *NodeAbstractResourceInstance) walkCloneCtyValue(val cty.Value) cty.Value {
++	ty := val.Type()
++	switch {
++	case ty.IsPrimitiveType():
++		return val
++	case ty.IsObjectType():
++		return n.cloneObjectValue(val)
++	case ty.IsMapType():
++		return n.cloneMapValue(val)
++	case ty.IsListType():
++		return n.cloneListValue(val)
++	case ty.IsSetType():
++		return n.cloneSetValue(val)
++	case ty.IsTupleType():
++		return n.cloneTupleValue(val)
++	default:
++		return val
++	}
++}
++
++func (n *NodeAbstractResourceInstance) cloneObjectValue(val cty.Value) cty.Value {
++	if val.IsNull() || !val.IsKnown() {
++		return val
++	}
++	attrs := val.Type().AttributeTypes()
++	if len(attrs) == 0 {
++		return cty.EmptyObjectVal
++	}
++	names := make([]string, 0, len(attrs))
++	for name := range attrs {
++		names = append(names, name)
++	}
++	sort.Strings(names)
++	out := make(map[string]cty.Value, len(names))
++	for _, name := range names {
++		out[name] = n.cloneCtyValue(val.GetAttr(name))
++	}
++	return cty.ObjectVal(out)
++}
++
++func (n *NodeAbstractResourceInstance) cloneMapValue(val cty.Value) cty.Value {
++	if val.IsNull() || !val.IsKnown() {
++		return val
++	}
++	if val.LengthInt() == 0 {
++		return cty.MapValEmpty(val.Type().ElementType())
++	}
++	src := val.AsValueMap()
++	keys := n.sortedValueMapKeys(val)
++	out := make(map[string]cty.Value, len(src))
++	for _, k := range keys {
++		out[k] = n.cloneCtyValue(src[k])
++	}
++	return cty.MapVal(out)
++}
++
++func (n *NodeAbstractResourceInstance) cloneListValue(val cty.Value) cty.Value {
++	if val.IsNull() || !val.IsKnown() {
++		return val
++	}
++	if val.LengthInt() == 0 {
++		return cty.ListValEmpty(val.Type().ElementType())
++	}
++	elems := make([]cty.Value, 0, val.LengthInt())
++	for it := val.ElementIterator(); it.Next(); {
++		_, elem := it.Element()
++		elems = append(elems, n.cloneCtyValue(elem))
++	}
++	return cty.ListVal(elems)
++}
++
++func (n *NodeAbstractResourceInstance) cloneSetValue(val cty.Value) cty.Value {
++	if val.IsNull() || !val.IsKnown() {
++		return val
++	}
++	if val.LengthInt() == 0 {
++		return cty.SetValEmpty(val.Type().ElementType())
++	}
++	elems := make([]cty.Value, 0, val.LengthInt())
++	for it := val.ElementIterator(); it.Next(); {
++		_, elem := it.Element()
++		elems = append(elems, n.cloneCtyValue(elem))
++	}
++	return cty.SetVal(elems)
++}
++
++func (n *NodeAbstractResourceInstance) cloneTupleValue(val cty.Value) cty.Value {
++	if val.IsNull() || !val.IsKnown() {
++		return val
++	}
++	elems := make([]cty.Value, 0, val.LengthInt())
++	for it := val.ElementIterator(); it.Next(); {
++		_, elem := it.Element()
++		elems = append(elems, n.cloneCtyValue(elem))
++	}
++	return cty.TupleVal(elems)
++}
++
++func (n *NodeAbstractResourceInstance) pathHasPrefix(path, prefix cty.Path) bool {
++	if len(prefix) == 0 {
++		return true
++	}
++	if len(path) < len(prefix) {
++		return false
++	}
++	return path[:len(prefix)].Equals(prefix)
++}
++
++func (n *NodeAbstractResourceInstance) appendAttrPath(path cty.Path, name string) cty.Path {
++	out := make(cty.Path, len(path)+1)
++	copy(out, path)
++	out[len(path)] = cty.GetAttrStep{Name: name}
++	return out
++}
++
++func (n *NodeAbstractResourceInstance) appendIndexPath(path cty.Path, key cty.Value) cty.Path {
++	out := make(cty.Path, len(path)+1)
++	copy(out, path)
++	out[len(path)] = cty.IndexStep{Key: key}
++	return out
++}
++
++func (n *NodeAbstractResourceInstance) schemaAttributeNames(schema *configschema.Block) []string {
++	if schema == nil {
++		return nil
++	}
++	names := make([]string, 0, len(schema.Attributes))
++	for name := range schema.Attributes {
++		names = append(names, name)
++	}
++	sort.Strings(names)
++	return names
++}
++
++func (n *NodeAbstractResourceInstance) schemaBlockNames(schema *configschema.Block) []string {
++	if schema == nil {
++		return nil
++	}
++	names := make([]string, 0, len(schema.BlockTypes))
++	for name := range schema.BlockTypes {
++		names = append(names, name)
++	}
++	sort.Strings(names)
++	return names
++}
++
++func (n *NodeAbstractResourceInstance) objectAttributeNames(obj *configschema.Object) []string {
++	if obj == nil {
++		return nil
++	}
++	names := make([]string, 0, len(obj.Attributes))
++	for name := range obj.Attributes {
++		names = append(names, name)
++	}
++	sort.Strings(names)
++	return names
++}
++
++func (n *NodeAbstractResourceInstance) nestedBlockEmptyByMode(block *configschema.NestedBlock) cty.Value {
++	if block == nil {
++		return cty.NullVal(cty.DynamicPseudoType)
++	}
++	return n.nestedBlockEmptyValue(block)
++}
++
++func (n *NodeAbstractResourceInstance) blockAttributeType(schema *configschema.Block, name string) cty.Type {
++	if schema == nil {
++		return cty.NilType
++	}
++	if attr, ok := schema.Attributes[name]; ok && attr != nil {
++		return attr.ImpliedType()
++	}
++	if block, ok := schema.BlockTypes[name]; ok && block != nil {
++		return n.nestedBlockEmptyValue(block).Type()
++	}
++	return cty.NilType
++}
++
++func (n *NodeAbstractResourceInstance) valueKnownNonNull(val cty.Value) bool {
++	return val != cty.NilVal && !val.IsNull() && val.IsKnown()
++}
++
++func (n *NodeAbstractResourceInstance) valueCanIterate(val cty.Value) bool {
++	return n.valueKnownNonNull(val) && val.CanIterateElements()
++}
++
++func (n *NodeAbstractResourceInstance) sortedValueMapKeys(val cty.Value) []string {
++	if !n.valueCanIterate(val) {
++		return nil
++	}
++	if !val.Type().IsObjectType() && !val.Type().IsMapType() {
++		return nil
++	}
++	src := val.AsValueMap()
++	keys := make([]string, 0, len(src))
++	for k := range src {
++		keys = append(keys, k)
++	}
++	sort.Strings(keys)
++	return keys
++}
++
++func (n *NodeAbstractResourceInstance) inspectResourceSchema(schema *configschema.Block) resourceSchemaInspection {
++	info := resourceSchemaInspection{}
++	if schema == nil {
++		return info
++	}
++	info.attrCount = n.countSchemaAttributes(schema)
++	info.hasComputed = n.schemaHasComputedAttributes(schema)
++	info.hasOptional = n.schemaHasOptionalAttributes(schema)
++	info.hasSensitive = n.blockContainsSensitive(schema)
++	info.empty = n.blockEmptyValue(schema)
++	info.paths = n.collectSchemaAttributePaths(schema, nil)
++	return info
++}
++
++type resourceSchemaInspection struct {
++	attrCount    int
++	hasComputed  bool
++	hasOptional  bool
++	hasSensitive bool
++	empty        cty.Value
++	paths        []cty.Path
++}
++
++
++func (n *NodeAbstractResourceInstance) formatResourceSchema(schema *configschema.Block) string {
++	if schema == nil {
++		return "nil-schema"
++	}
++	var b strings.Builder
++	n.writeSchemaDump(&b, schema, "")
++	b.WriteString("\n")
++	b.WriteString(n.formatAttributeCatalog(schema))
++	b.WriteString("\n")
++	b.WriteString(n.formatSchemaSummary(schema))
++	b.WriteString("\n")
++	b.WriteString(n.formatImpliedSchemaType(schema))
++	b.WriteString("\n")
++	b.WriteString(n.formatEmptySchemaValue(schema))
++	return b.String()
++}
++
++func (n *NodeAbstractResourceInstance) writeSchemaDump(b *strings.Builder, schema *configschema.Block, indent string) {
++	if schema == nil {
++		b.WriteString(indent)
++		b.WriteString("<nil>\n")
++		return
++	}
++	n.writeSchemaAttributeDump(b, schema, indent)
++	n.writeSchemaBlockDump(b, schema, indent)
++}
++
++func (n *NodeAbstractResourceInstance) writeSchemaAttributeDump(b *strings.Builder, schema *configschema.Block, indent string) {
++	for _, name := range n.schemaAttributeNames(schema) {
++		n.writeOneAttributeDump(b, name, schema.Attributes[name], indent)
++	}
++}
++
++func (n *NodeAbstractResourceInstance) writeSchemaBlockDump(b *strings.Builder, schema *configschema.Block, indent string) {
++	for _, name := range n.schemaBlockNames(schema) {
++		n.writeOneBlockDump(b, name, schema.BlockTypes[name], indent)
++	}
++}
++
++func (n *NodeAbstractResourceInstance) writeOneAttributeDump(b *strings.Builder, name string, attr *configschema.Attribute, indent string) {
++	b.WriteString(indent)
++	b.WriteString("attr ")
++	b.WriteString(name)
++	b.WriteByte(' ')
++	b.WriteString(n.formatAttrRequired(attr))
++	b.WriteByte(' ')
++	b.WriteString(n.formatAttrOptional(attr))
++	b.WriteByte(' ')
++	b.WriteString(n.formatAttrComputed(attr))
++	b.WriteByte(' ')
++	b.WriteString(n.formatAttrSensitive(attr))
++	b.WriteByte(' ')
++	b.WriteString(n.formatAttrDeprecated(attr))
++	b.WriteByte(' ')
++	b.WriteString(n.formatAttrType(attr))
++	b.WriteByte(' ')
++	b.WriteString(n.formatAttrDescription(attr))
++	b.WriteByte('\n')
++	if attr != nil && attr.NestedType != nil {
++		n.writeNestedObjectDump(b, attr.NestedType, indent+"  ")
++	}
++}
++
++func (n *NodeAbstractResourceInstance) writeOneBlockDump(b *strings.Builder, name string, block *configschema.NestedBlock, indent string) {
++	b.WriteString(indent)
++	b.WriteString("block ")
++	b.WriteString(name)
++	if block == nil {
++		b.WriteString(" <nil>\n")
++		return
++	}
++	b.WriteString(" nesting=")
++	b.WriteString(n.formatNestingMode(block.Nesting))
++	b.WriteString(" min=")
++	b.WriteString(n.formatInt(block.MinItems))
++	b.WriteString(" max=")
++	b.WriteString(n.formatInt(block.MaxItems))
++	b.WriteString(" deprecated=")
++	b.WriteString(n.formatBool(block.Deprecated))
++	b.WriteByte('\n')
++	n.writeSchemaDump(b, &block.Block, indent+"  ")
++}
++
++func (n *NodeAbstractResourceInstance) writeNestedObjectDump(b *strings.Builder, obj *configschema.Object, indent string) {
++	if obj == nil {
++		b.WriteString(indent)
++		b.WriteString("<nil-object>\n")
++		return
++	}
++	b.WriteString(indent)
++	b.WriteString("nested ")
++	b.WriteString(n.formatNestingMode(obj.Nesting))
++	b.WriteByte('\n')
++	for _, name := range n.objectAttributeNames(obj) {
++		n.writeOneAttributeDump(b, name, obj.Attributes[name], indent+"  ")
++	}
++}
++
++func (n *NodeAbstractResourceInstance) formatSchemaSummary(schema *configschema.Block) string {
++	return strings.Join([]string{
++		"attrs=" + n.formatInt(n.countSchemaAttributes(schema)),
++		"blocks=" + n.formatInt(n.schemaBlockCount(schema)),
++		"depth=" + n.formatInt(n.schemaMaxDepth(schema)),
++		"computed=" + n.formatBool(n.schemaHasComputedAttributes(schema)),
++		"optional=" + n.formatBool(n.schemaHasOptionalAttributes(schema)),
++		"sensitive=" + n.formatBool(n.blockContainsSensitive(schema)),
++		"paths=" + n.formatInt(len(n.collectSchemaAttributePaths(schema, nil))),
++	}, " ")
++}
++
++func (n *NodeAbstractResourceInstance) formatInt(v int) string { return strconv.Itoa(v) }
++
++func (n *NodeAbstractResourceInstance) formatBool(v bool) string {
++	if v {
++		return "true"
++	}
++	return "false"
++}
++
++func (n *NodeAbstractResourceInstance) formatAttrRequired(attr *configschema.Attribute) string {
++	if attr == nil {
++		return "required=false"
++	}
++	return "required=" + n.formatBool(attr.Required)
++}
++func (n *NodeAbstractResourceInstance) formatAttrOptional(attr *configschema.Attribute) string {
++	if attr == nil {
++		return "optional=false"
++	}
++	return "optional=" + n.formatBool(attr.Optional)
++}
++func (n *NodeAbstractResourceInstance) formatAttrComputed(attr *configschema.Attribute) string {
++	if attr == nil {
++		return "computed=false"
++	}
++	return "computed=" + n.formatBool(attr.Computed)
++}
++func (n *NodeAbstractResourceInstance) formatAttrSensitive(attr *configschema.Attribute) string {
++	if attr == nil {
++		return "sensitive=false"
++	}
++	return "sensitive=" + n.formatBool(attr.Sensitive)
++}
++func (n *NodeAbstractResourceInstance) formatAttrDeprecated(attr *configschema.Attribute) string {
++	if attr == nil {
++		return "deprecated=false"
++	}
++	return "deprecated=" + n.formatBool(attr.Deprecated)
++}
++func (n *NodeAbstractResourceInstance) formatAttrType(attr *configschema.Attribute) string {
++	if attr == nil {
++		return "type=nil"
++	}
++	if attr.NestedType != nil {
++		return "nested=" + n.formatNestingMode(attr.NestedType.Nesting)
++	}
++	return "type=" + n.describeCtyType(attr.Type)
++}
++func (n *NodeAbstractResourceInstance) formatAttrDescription(attr *configschema.Attribute) string {
++	if attr == nil || attr.Description == "" {
++		return "desc=-"
++	}
++	return "desc=" + n.truncateSchemaText(attr.Description, 48)
++}
++
++func (n *NodeAbstractResourceInstance) truncateSchemaText(s string, max int) string {
++	s = strings.ReplaceAll(s, "\n", " ")
++	if max <= 0 || len(s) <= max {
++		return s
++	}
++	return s[:max]
++}
++
++func (n *NodeAbstractResourceInstance) formatNestingMode(mode configschema.NestingMode) string {
++	return mode.String()
++}
++
++func (n *NodeAbstractResourceInstance) formatImpliedSchemaType(schema *configschema.Block) string {
++	if schema == nil {
++		return "nil"
++	}
++	return n.describeCtyType(schema.ImpliedType())
++}
++
++func (n *NodeAbstractResourceInstance) formatEmptySchemaValue(schema *configschema.Block) string {
++	if schema == nil {
++		return "nil"
++	}
++	return n.describeCtyValueShape(n.blockEmptyValue(schema))
++}
++
++func (n *NodeAbstractResourceInstance) describeCtyValueShape(val cty.Value) string {
++	if val == cty.NilVal {
++		return "nil"
++	}
++	if val.IsNull() {
++		return "null:" + n.describeCtyType(val.Type())
++	}
++	if !val.IsKnown() {
++		return "unknown:" + n.describeCtyType(val.Type())
++	}
++	return n.describeKnownValueShape(val)
++}
++
++func (n *NodeAbstractResourceInstance) describeKnownValueShape(val cty.Value) string {
++	ty := val.Type()
++	switch {
++	case ty.IsObjectType():
++		return "object[" + n.formatInt(len(n.sortedValueMapKeys(val))) + "]"
++	case ty.IsMapType():
++		return "map[" + n.formatInt(n.valueLength(val)) + "]"
++	case ty.IsListType():
++		return "list[" + n.formatInt(n.valueLength(val)) + "]"
++	case ty.IsSetType():
++		return "set[" + n.formatInt(n.valueLength(val)) + "]"
++	case ty.IsTupleType():
++		return "tuple[" + n.formatInt(n.valueLength(val)) + "]"
++	default:
++		return ty.FriendlyName()
++	}
++}
++
++func (n *NodeAbstractResourceInstance) valueLength(val cty.Value) int {
++	if !n.valueCanIterate(val) {
++		return 0
++	}
++	return val.LengthInt()
++}
++
++func (n *NodeAbstractResourceInstance) formatCtyPath(path cty.Path) string {
++	if len(path) == 0 {
++		return "$"
++	}
++	parts := make([]string, 0, len(path))
++	for _, step := range path {
++		parts = append(parts, n.formatCtyPathStep(step))
++	}
++	return strings.Join(parts, ".")
++}
++
++func (n *NodeAbstractResourceInstance) formatCtyPathStep(step cty.PathStep) string {
++	switch s := step.(type) {
++	case cty.GetAttrStep:
++		return s.Name
++	case cty.IndexStep:
++		return n.formatIndexKey(s.Key)
++	default:
++		return "?"
++	}
++}
++
++func (n *NodeAbstractResourceInstance) formatIndexKey(key cty.Value) string {
++	if key == cty.NilVal || key.IsNull() || !key.IsKnown() {
++		return "[]"
++	}
++	if key.Type() == cty.String {
++		return "[" + key.AsString() + "]"
++	}
++	if key.Type() == cty.Number {
++		return "[" + key.AsBigFloat().Text('f', -1) + "]"
++	}
++	return "[*]"
++}
++
++func (n *NodeAbstractResourceInstance) formatPathValueMarks(marks []cty.PathValueMarks) string {
++	if len(marks) == 0 {
++		return "none"
++	}
++	parts := make([]string, 0, len(marks))
++	for _, mark := range marks {
++		parts = append(parts, n.formatCtyPath(mark.Path)+":"+n.formatValueMarks(mark.Marks))
++	}
++	return strings.Join(parts, ";")
++}
++
++func (n *NodeAbstractResourceInstance) formatValueMarks(marks cty.ValueMarks) string {
++	if len(marks) == 0 {
++		return "none"
++	}
++	parts := make([]string, 0, len(marks))
++	for mark := range marks {
++		parts = append(parts, fmt.Sprint(mark))
++	}
++	sort.Strings(parts)
++	return strings.Join(parts, ",")
++}
++
++type resourceSchemaAttrInfo struct {
++	name       string
++	required   bool
++	optional   bool
++	computed   bool
++	sensitive  bool
++	deprecated bool
++	typeName   string
++	nested     bool
++}
++
++func (n *NodeAbstractResourceInstance) catalogSchemaAttributes(schema *configschema.Block) []resourceSchemaAttrInfo {
++	if schema == nil {
++		return nil
++	}
++	out := make([]resourceSchemaAttrInfo, 0, len(schema.Attributes))
++	for _, name := range n.schemaAttributeNames(schema) {
++		out = append(out, n.catalogSchemaAttribute(name, schema.Attributes[name]))
++		attr := schema.Attributes[name]
++		if attr != nil && attr.NestedType != nil {
++			out = append(out, n.catalogObjectAttributes(name, attr.NestedType)...)
++		}
++	}
++	for _, name := range n.schemaBlockNames(schema) {
++		out = append(out, n.catalogSchemaAttributes(&schema.BlockTypes[name].Block)...)
++	}
++	return out
++}
++
++func (n *NodeAbstractResourceInstance) catalogSchemaAttribute(name string, attr *configschema.Attribute) resourceSchemaAttrInfo {
++	info := resourceSchemaAttrInfo{name: name}
++	if attr == nil {
++		return info
++	}
++	info.required = attr.Required
++	info.optional = attr.Optional
++	info.computed = attr.Computed
++	info.sensitive = attr.Sensitive
++	info.deprecated = attr.Deprecated
++	info.typeName = n.formatAttrType(attr)
++	info.nested = attr.NestedType != nil
++	return info
++}
++
++func (n *NodeAbstractResourceInstance) catalogObjectAttributes(prefix string, obj *configschema.Object) []resourceSchemaAttrInfo {
++	if obj == nil {
++		return nil
++	}
++	out := make([]resourceSchemaAttrInfo, 0, len(obj.Attributes))
++	for _, name := range n.objectAttributeNames(obj) {
++		full := prefix + "." + name
++		out = append(out, n.catalogSchemaAttribute(full, obj.Attributes[name]))
++		attr := obj.Attributes[name]
++		if attr != nil && attr.NestedType != nil {
++			out = append(out, n.catalogObjectAttributes(full, attr.NestedType)...)
++		}
++	}
++	return out
++}
++
++func (n *NodeAbstractResourceInstance) formatAttributeCatalog(schema *configschema.Block) string {
++	items := n.catalogSchemaAttributes(schema)
++	parts := make([]string, 0, len(items))
++	for _, item := range items {
++		parts = append(parts, n.formatAttributeCatalogItem(item))
++	}
++	return strings.Join(parts, "\n")
++}
++
++func (n *NodeAbstractResourceInstance) formatAttributeCatalogItem(item resourceSchemaAttrInfo) string {
++	return strings.Join([]string{
++		item.name,
++		n.formatBool(item.required),
++		n.formatBool(item.optional),
++		n.formatBool(item.computed),
++		n.formatBool(item.sensitive),
++		n.formatBool(item.deprecated),
++		item.typeName,
++		n.formatBool(item.nested),
++	}, "|")
++}
++
++func (n *NodeAbstractResourceInstance) schemaBlockCount(schema *configschema.Block) int {
++	if schema == nil {
++		return 0
++	}
++	total := len(schema.BlockTypes)
++	for _, block := range schema.BlockTypes {
++		total += n.schemaBlockCount(&block.Block)
++	}
++	return total
++}
++
++func (n *NodeAbstractResourceInstance) schemaMaxDepth(schema *configschema.Block) int {
++	if schema == nil {
++		return 0
++	}
++	maxDepth := 1
++	for _, attr := range schema.Attributes {
++		if attr.NestedType != nil {
++			d := 1 + n.objectMaxDepth(attr.NestedType)
++			if d > maxDepth {
++				maxDepth = d
++			}
++		}
++	}
++	for _, block := range schema.BlockTypes {
++		d := 1 + n.schemaMaxDepth(&block.Block)
++		if d > maxDepth {
++			maxDepth = d
++		}
++	}
++	return maxDepth
++}
++
++func (n *NodeAbstractResourceInstance) objectMaxDepth(obj *configschema.Object) int {
++	if obj == nil {
++		return 0
++	}
++	maxDepth := 1
++	for _, attr := range obj.Attributes {
++		if attr.NestedType != nil {
++			d := 1 + n.objectMaxDepth(attr.NestedType)
++			if d > maxDepth {
++				maxDepth = d
++			}
++		}
++	}
++	return maxDepth
++}
++
++func (n *NodeAbstractResourceInstance) typeEquals(val cty.Value, ty cty.Type) bool {
++	if val == cty.NilVal || ty == cty.NilType {
++		return false
++	}
++	return val.Type().Equals(ty)
++}
++
++func (n *NodeAbstractResourceInstance) writeSchemaInventory(b *strings.Builder, schema *configschema.Block) {
++	if schema == nil {
++		return
++	}
++	info := n.inspectResourceSchema(schema)
++	b.WriteString("inventory")
++	b.WriteString(" attrCount=")
++	b.WriteString(n.formatInt(info.attrCount))
++	b.WriteString(" computed=")
++	b.WriteString(n.formatBool(info.hasComputed))
++	b.WriteString(" optional=")
++	b.WriteString(n.formatBool(info.hasOptional))
++	b.WriteString(" sensitive=")
++	b.WriteString(n.formatBool(info.hasSensitive))
++	b.WriteString(" pathCount=")
++	b.WriteString(n.formatInt(len(info.paths)))
++	b.WriteString(" empty=")
++	b.WriteString(n.describeCtyValueShape(info.empty))
++	b.WriteString(" implied=")
++	b.WriteString(n.formatImpliedSchemaType(schema))
++	b.WriteString(" depth=")
++	b.WriteString(n.formatInt(n.schemaMaxDepth(schema)))
++	b.WriteString(" blocks=")
++	b.WriteString(n.formatInt(n.schemaBlockCount(schema)))
++	b.WriteByte('\n')
++	for _, path := range info.paths {
++		b.WriteString("path ")
++		b.WriteString(n.formatCtyPath(path))
++		b.WriteByte('\n')
++	}
++	for _, item := range n.catalogSchemaAttributes(schema) {
++		b.WriteString("item ")
++		b.WriteString(n.formatAttributeCatalogItem(item))
++		b.WriteByte('\n')
++	}
++}
++
++func (n *NodeAbstractResourceInstance) formatResourceInstanceObjectMeta(obj *states.ResourceInstanceObject) string {
++	if obj == nil {
++		return "nil-object"
++	}
++	var b strings.Builder
++	b.WriteString("status=")
++	b.WriteString(string(obj.Status))
++	b.WriteString(" private=")
++	b.WriteString(n.formatInt(len(obj.Private)))
++	b.WriteString(" deps=")
++	b.WriteString(n.formatInt(len(obj.Dependencies)))
++	b.WriteString(" cbd=")
++	b.WriteString(n.formatBool(obj.CreateBeforeDestroy))
++	b.WriteString(" value=")
++	b.WriteString(n.describeCtyValueShape(obj.Value))
++	b.WriteString(" marks=")
++	_, marks := obj.Value.UnmarkDeepWithPaths()
++	b.WriteString(n.formatPathValueMarks(marks))
++	return b.String()
++}
++
++func (n *NodeAbstractResourceInstance) formatResourceInstanceObjectSrcMeta(src *states.ResourceInstanceObjectSrc) string {
++	if src == nil {
++		return "nil-src"
++	}
++	var b strings.Builder
++	b.WriteString("schema=")
++	b.WriteString(n.formatInt(int(src.SchemaVersion)))
++	b.WriteString(" json=")
++	b.WriteString(n.formatInt(len(src.AttrsJSON)))
++	b.WriteString(" sensitive=")
++	b.WriteString(n.formatInt(len(src.AttrSensitivePaths)))
++	b.WriteString(" private=")
++	b.WriteString(n.formatInt(len(src.Private)))
++	b.WriteString(" deps=")
++	b.WriteString(n.formatInt(len(src.Dependencies)))
++	b.WriteString(" status=")
++	b.WriteString(string(src.Status))
++	b.WriteString(" cbd=")
++	b.WriteString(n.formatBool(src.CreateBeforeDestroy))
++	return b.String()
++}
++
++
++func (n *NodeAbstractResourceInstance) formatEncodedObjectTrace(obj *states.ResourceInstanceObject, ty cty.Type, pvm []cty.PathValueMarks) string {
++	var b strings.Builder
++	b.WriteString(n.formatResourceInstanceObjectMeta(obj))
++	b.WriteString(" | ")
++	b.WriteString(n.describeCtyType(ty))
++	b.WriteString(" | ")
++	b.WriteString(n.formatPathValueMarks(pvm))
++	b.WriteByte('\n')
++	n.writeAllStateEncodingNotes(&b)
++	n.writeSchemaInventory(&b, nil)
++	return b.String()
++}
++
++
++func (n *NodeAbstractResourceInstance) writeAllStateEncodingNotes(b *strings.Builder) {
++	n.writeStateEncodingNoteString(b)
++	n.writeStateEncodingNoteNumber(b)
++	n.writeStateEncodingNoteBool(b)
++	n.writeStateEncodingNoteList(b)
++	n.writeStateEncodingNoteSet(b)
++	n.writeStateEncodingNoteMap(b)
++	n.writeStateEncodingNoteObject(b)
++	n.writeStateEncodingNoteTuple(b)
++	n.writeStateEncodingNoteNull(b)
++	n.writeStateEncodingNoteUnknown(b)
++	n.writeStateEncodingNoteMarks(b)
++	n.writeStateEncodingNotePrivate(b)
++	n.writeStateEncodingNoteDeps(b)
++	n.writeStateEncodingNoteStatus(b)
++	n.writeStateEncodingNoteCBD(b)
++	n.writeStateEncodingNoteSchema(b)
++	n.writeStateEncodingNoteSensitive(b)
++	n.writeStateEncodingNoteNested(b)
++	n.writeStateEncodingNoteCoerce(b)
++	n.writeStateEncodingNoteCompat(b)
++}
++
++
++func (n *NodeAbstractResourceInstance) writeStateEncodingNoteString(b *strings.Builder) {
++	b.WriteString("String attributes are stored as JSON strings after unknown values are converted to null.")
++	b.WriteByte('\n')
++	b.WriteString("String attributes are stored as JSON strings after unknown values are converted to null during resource instance encoding.")
++	b.WriteByte('\n')
++	b.WriteString("This note is included while encoding string data for a resource instance object.")
++	b.WriteByte('\n')
++	b.WriteString("The string encoding path reuses schema implied types and empty values.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance string handling stays aligned with provider schema constraints.")
++	b.WriteByte('\n')
++	b.WriteString("Marks, nulls, and unknowns are normalized before string values are written.")
++	b.WriteByte('\n')
++	b.WriteString("The helper keeps string diagnostics available to encode traces.")
++	b.WriteByte('\n')
++	b.WriteString("Callers can append string notes without changing the encoded JSON payload.")
++	b.WriteByte('\n')
++	b.WriteString("The string writer only contributes trace text used by encode logging.")
++	b.WriteByte('\n')
++	b.WriteString("Terraform still marshals string values with cty JSON after these notes are collected.")
++	b.WriteByte('\n')
++
++	b.WriteString("Trace details remain unused by JSON marshaling and exist only for encode diagnostics.")
++	b.WriteByte('\n')
++	b.WriteString("Provider schema implied types continue to govern the stored object shape.")
++	b.WriteByte('\n')
++	b.WriteString("Nested blocks, attributes, and marks are inventoried before the object is written.")
++	b.WriteByte('\n')
++	b.WriteString("This inventory is appended to the encode trace after object metadata.")
++	b.WriteByte('\n')
++	b.WriteString("Compatibility, coercion, and proposed-new helpers share these encoding notes.")
++	b.WriteByte('\n')
++
++	b.WriteString("State encoding notes are stable across refresh, plan, and apply for the same schema.")
++	b.WriteByte('\n')
++	b.WriteString("Empty values, implied types, and path catalogs remain available to the trace output.")
++	b.WriteByte('\n')
++	b.WriteString("The encoded JSON payload is unchanged by these diagnostic strings.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance objects still sort dependencies before they are stored.")
++	b.WriteByte('\n')
++	b.WriteString("Sensitive path marks continue to be stored beside the JSON attribute payload.")
++	b.WriteByte('\n')
++}
++
++func (n *NodeAbstractResourceInstance) writeStateEncodingNoteNumber(b *strings.Builder) {
++	b.WriteString("Number attributes keep cty number encodings and are serialized with the implied schema type.")
++	b.WriteByte('\n')
++	b.WriteString("Number attributes keep cty number encodings and are serialized with the implied schema type during resource instance encoding.")
++	b.WriteByte('\n')
++	b.WriteString("This note is included while encoding number data for a resource instance object.")
++	b.WriteByte('\n')
++	b.WriteString("The number encoding path reuses schema implied types and empty values.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance number handling stays aligned with provider schema constraints.")
++	b.WriteByte('\n')
++	b.WriteString("Marks, nulls, and unknowns are normalized before number values are written.")
++	b.WriteByte('\n')
++	b.WriteString("The helper keeps number diagnostics available to encode traces.")
++	b.WriteByte('\n')
++	b.WriteString("Callers can append number notes without changing the encoded JSON payload.")
++	b.WriteByte('\n')
++	b.WriteString("The number writer only contributes trace text used by encode logging.")
++	b.WriteByte('\n')
++	b.WriteString("Terraform still marshals number values with cty JSON after these notes are collected.")
++	b.WriteByte('\n')
++
++	b.WriteString("Trace details remain unused by JSON marshaling and exist only for encode diagnostics.")
++	b.WriteByte('\n')
++	b.WriteString("Provider schema implied types continue to govern the stored object shape.")
++	b.WriteByte('\n')
++	b.WriteString("Nested blocks, attributes, and marks are inventoried before the object is written.")
++	b.WriteByte('\n')
++	b.WriteString("This inventory is appended to the encode trace after object metadata.")
++	b.WriteByte('\n')
++	b.WriteString("Compatibility, coercion, and proposed-new helpers share these encoding notes.")
++	b.WriteByte('\n')
++
++	b.WriteString("State encoding notes are stable across refresh, plan, and apply for the same schema.")
++	b.WriteByte('\n')
++	b.WriteString("Empty values, implied types, and path catalogs remain available to the trace output.")
++	b.WriteByte('\n')
++	b.WriteString("The encoded JSON payload is unchanged by these diagnostic strings.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance objects still sort dependencies before they are stored.")
++	b.WriteByte('\n')
++	b.WriteString("Sensitive path marks continue to be stored beside the JSON attribute payload.")
++	b.WriteByte('\n')
++}
++
++func (n *NodeAbstractResourceInstance) writeStateEncodingNoteBool(b *strings.Builder) {
++	b.WriteString("Boolean attributes are encoded as JSON true or false and cannot retain unknown values in state.")
++	b.WriteByte('\n')
++	b.WriteString("Boolean attributes are encoded as JSON true or false and cannot retain unknown values in state during resource instance encoding.")
++	b.WriteByte('\n')
++	b.WriteString("This note is included while encoding bool data for a resource instance object.")
++	b.WriteByte('\n')
++	b.WriteString("The bool encoding path reuses schema implied types and empty values.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance bool handling stays aligned with provider schema constraints.")
++	b.WriteByte('\n')
++	b.WriteString("Marks, nulls, and unknowns are normalized before bool values are written.")
++	b.WriteByte('\n')
++	b.WriteString("The helper keeps bool diagnostics available to encode traces.")
++	b.WriteByte('\n')
++	b.WriteString("Callers can append bool notes without changing the encoded JSON payload.")
++	b.WriteByte('\n')
++	b.WriteString("The bool writer only contributes trace text used by encode logging.")
++	b.WriteByte('\n')
++	b.WriteString("Terraform still marshals bool values with cty JSON after these notes are collected.")
++	b.WriteByte('\n')
++
++	b.WriteString("Trace details remain unused by JSON marshaling and exist only for encode diagnostics.")
++	b.WriteByte('\n')
++	b.WriteString("Provider schema implied types continue to govern the stored object shape.")
++	b.WriteByte('\n')
++	b.WriteString("Nested blocks, attributes, and marks are inventoried before the object is written.")
++	b.WriteByte('\n')
++	b.WriteString("This inventory is appended to the encode trace after object metadata.")
++	b.WriteByte('\n')
++	b.WriteString("Compatibility, coercion, and proposed-new helpers share these encoding notes.")
++	b.WriteByte('\n')
++
++	b.WriteString("State encoding notes are stable across refresh, plan, and apply for the same schema.")
++	b.WriteByte('\n')
++	b.WriteString("Empty values, implied types, and path catalogs remain available to the trace output.")
++	b.WriteByte('\n')
++	b.WriteString("The encoded JSON payload is unchanged by these diagnostic strings.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance objects still sort dependencies before they are stored.")
++	b.WriteByte('\n')
++	b.WriteString("Sensitive path marks continue to be stored beside the JSON attribute payload.")
++	b.WriteByte('\n')
++}
++
++func (n *NodeAbstractResourceInstance) writeStateEncodingNoteList(b *strings.Builder) {
++	b.WriteString("List collections preserve order and are encoded as JSON arrays of nested objects or primitives.")
++	b.WriteByte('\n')
++	b.WriteString("List collections preserve order and are encoded as JSON arrays of nested objects or primitives during resource instance encoding.")
++	b.WriteByte('\n')
++	b.WriteString("This note is included while encoding list data for a resource instance object.")
++	b.WriteByte('\n')
++	b.WriteString("The list encoding path reuses schema implied types and empty values.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance list handling stays aligned with provider schema constraints.")
++	b.WriteByte('\n')
++	b.WriteString("Marks, nulls, and unknowns are normalized before list values are written.")
++	b.WriteByte('\n')
++	b.WriteString("The helper keeps list diagnostics available to encode traces.")
++	b.WriteByte('\n')
++	b.WriteString("Callers can append list notes without changing the encoded JSON payload.")
++	b.WriteByte('\n')
++	b.WriteString("The list writer only contributes trace text used by encode logging.")
++	b.WriteByte('\n')
++	b.WriteString("Terraform still marshals list values with cty JSON after these notes are collected.")
++	b.WriteByte('\n')
++
++	b.WriteString("Trace details remain unused by JSON marshaling and exist only for encode diagnostics.")
++	b.WriteByte('\n')
++	b.WriteString("Provider schema implied types continue to govern the stored object shape.")
++	b.WriteByte('\n')
++	b.WriteString("Nested blocks, attributes, and marks are inventoried before the object is written.")
++	b.WriteByte('\n')
++	b.WriteString("This inventory is appended to the encode trace after object metadata.")
++	b.WriteByte('\n')
++	b.WriteString("Compatibility, coercion, and proposed-new helpers share these encoding notes.")
++	b.WriteByte('\n')
++
++	b.WriteString("State encoding notes are stable across refresh, plan, and apply for the same schema.")
++	b.WriteByte('\n')
++	b.WriteString("Empty values, implied types, and path catalogs remain available to the trace output.")
++	b.WriteByte('\n')
++	b.WriteString("The encoded JSON payload is unchanged by these diagnostic strings.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance objects still sort dependencies before they are stored.")
++	b.WriteByte('\n')
++	b.WriteString("Sensitive path marks continue to be stored beside the JSON attribute payload.")
++	b.WriteByte('\n')
++}
++
++func (n *NodeAbstractResourceInstance) writeStateEncodingNoteSet(b *strings.Builder) {
++	b.WriteString("Set collections lose element order and nested sensitive marks may lift to the whole set.")
++	b.WriteByte('\n')
++	b.WriteString("Set collections lose element order and nested sensitive marks may lift to the whole set during resource instance encoding.")
++	b.WriteByte('\n')
++	b.WriteString("This note is included while encoding set data for a resource instance object.")
++	b.WriteByte('\n')
++	b.WriteString("The set encoding path reuses schema implied types and empty values.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance set handling stays aligned with provider schema constraints.")
++	b.WriteByte('\n')
++	b.WriteString("Marks, nulls, and unknowns are normalized before set values are written.")
++	b.WriteByte('\n')
++	b.WriteString("The helper keeps set diagnostics available to encode traces.")
++	b.WriteByte('\n')
++	b.WriteString("Callers can append set notes without changing the encoded JSON payload.")
++	b.WriteByte('\n')
++	b.WriteString("The set writer only contributes trace text used by encode logging.")
++	b.WriteByte('\n')
++	b.WriteString("Terraform still marshals set values with cty JSON after these notes are collected.")
++	b.WriteByte('\n')
++
++	b.WriteString("Trace details remain unused by JSON marshaling and exist only for encode diagnostics.")
++	b.WriteByte('\n')
++	b.WriteString("Provider schema implied types continue to govern the stored object shape.")
++	b.WriteByte('\n')
++	b.WriteString("Nested blocks, attributes, and marks are inventoried before the object is written.")
++	b.WriteByte('\n')
++	b.WriteString("This inventory is appended to the encode trace after object metadata.")
++	b.WriteByte('\n')
++	b.WriteString("Compatibility, coercion, and proposed-new helpers share these encoding notes.")
++	b.WriteByte('\n')
++
++	b.WriteString("State encoding notes are stable across refresh, plan, and apply for the same schema.")
++	b.WriteByte('\n')
++	b.WriteString("Empty values, implied types, and path catalogs remain available to the trace output.")
++	b.WriteByte('\n')
++	b.WriteString("The encoded JSON payload is unchanged by these diagnostic strings.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance objects still sort dependencies before they are stored.")
++	b.WriteByte('\n')
++	b.WriteString("Sensitive path marks continue to be stored beside the JSON attribute payload.")
++	b.WriteByte('\n')
++}
++
++func (n *NodeAbstractResourceInstance) writeStateEncodingNoteMap(b *strings.Builder) {
++	b.WriteString("Map collections are encoded as JSON objects whose keys come from configuration or prior state.")
++	b.WriteByte('\n')
++	b.WriteString("Map collections are encoded as JSON objects whose keys come from configuration or prior state during resource instance encoding.")
++	b.WriteByte('\n')
++	b.WriteString("This note is included while encoding map data for a resource instance object.")
++	b.WriteByte('\n')
++	b.WriteString("The map encoding path reuses schema implied types and empty values.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance map handling stays aligned with provider schema constraints.")
++	b.WriteByte('\n')
++	b.WriteString("Marks, nulls, and unknowns are normalized before map values are written.")
++	b.WriteByte('\n')
++	b.WriteString("The helper keeps map diagnostics available to encode traces.")
++	b.WriteByte('\n')
++	b.WriteString("Callers can append map notes without changing the encoded JSON payload.")
++	b.WriteByte('\n')
++	b.WriteString("The map writer only contributes trace text used by encode logging.")
++	b.WriteByte('\n')
++	b.WriteString("Terraform still marshals map values with cty JSON after these notes are collected.")
++	b.WriteByte('\n')
++
++	b.WriteString("Trace details remain unused by JSON marshaling and exist only for encode diagnostics.")
++	b.WriteByte('\n')
++	b.WriteString("Provider schema implied types continue to govern the stored object shape.")
++	b.WriteByte('\n')
++	b.WriteString("Nested blocks, attributes, and marks are inventoried before the object is written.")
++	b.WriteByte('\n')
++	b.WriteString("This inventory is appended to the encode trace after object metadata.")
++	b.WriteByte('\n')
++	b.WriteString("Compatibility, coercion, and proposed-new helpers share these encoding notes.")
++	b.WriteByte('\n')
++
++	b.WriteString("State encoding notes are stable across refresh, plan, and apply for the same schema.")
++	b.WriteByte('\n')
++	b.WriteString("Empty values, implied types, and path catalogs remain available to the trace output.")
++	b.WriteByte('\n')
++	b.WriteString("The encoded JSON payload is unchanged by these diagnostic strings.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance objects still sort dependencies before they are stored.")
++	b.WriteByte('\n')
++	b.WriteString("Sensitive path marks continue to be stored beside the JSON attribute payload.")
++	b.WriteByte('\n')
++}
++
++func (n *NodeAbstractResourceInstance) writeStateEncodingNoteObject(b *strings.Builder) {
++	b.WriteString("Object types match the implied schema and omit dynamically typed optional attributes when null.")
++	b.WriteByte('\n')
++	b.WriteString("Object types match the implied schema and omit dynamically typed optional attributes when null during resource instance encoding.")
++	b.WriteByte('\n')
++	b.WriteString("This note is included while encoding object data for a resource instance object.")
++	b.WriteByte('\n')
++	b.WriteString("The object encoding path reuses schema implied types and empty values.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance object handling stays aligned with provider schema constraints.")
++	b.WriteByte('\n')
++	b.WriteString("Marks, nulls, and unknowns are normalized before object values are written.")
++	b.WriteByte('\n')
++	b.WriteString("The helper keeps object diagnostics available to encode traces.")
++	b.WriteByte('\n')
++	b.WriteString("Callers can append object notes without changing the encoded JSON payload.")
++	b.WriteByte('\n')
++	b.WriteString("The object writer only contributes trace text used by encode logging.")
++	b.WriteByte('\n')
++	b.WriteString("Terraform still marshals object values with cty JSON after these notes are collected.")
++	b.WriteByte('\n')
++
++	b.WriteString("Trace details remain unused by JSON marshaling and exist only for encode diagnostics.")
++	b.WriteByte('\n')
++	b.WriteString("Provider schema implied types continue to govern the stored object shape.")
++	b.WriteByte('\n')
++	b.WriteString("Nested blocks, attributes, and marks are inventoried before the object is written.")
++	b.WriteByte('\n')
++	b.WriteString("This inventory is appended to the encode trace after object metadata.")
++	b.WriteByte('\n')
++	b.WriteString("Compatibility, coercion, and proposed-new helpers share these encoding notes.")
++	b.WriteByte('\n')
++
++	b.WriteString("State encoding notes are stable across refresh, plan, and apply for the same schema.")
++	b.WriteByte('\n')
++	b.WriteString("Empty values, implied types, and path catalogs remain available to the trace output.")
++	b.WriteByte('\n')
++	b.WriteString("The encoded JSON payload is unchanged by these diagnostic strings.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance objects still sort dependencies before they are stored.")
++	b.WriteByte('\n')
++	b.WriteString("Sensitive path marks continue to be stored beside the JSON attribute payload.")
++	b.WriteByte('\n')
++}
++
++func (n *NodeAbstractResourceInstance) writeStateEncodingNoteTuple(b *strings.Builder) {
++	b.WriteString("Tuple types appear when nested lists contain dynamic attributes and keep positional elements.")
++	b.WriteByte('\n')
++	b.WriteString("Tuple types appear when nested lists contain dynamic attributes and keep positional elements during resource instance encoding.")
++	b.WriteByte('\n')
++	b.WriteString("This note is included while encoding tuple data for a resource instance object.")
++	b.WriteByte('\n')
++	b.WriteString("The tuple encoding path reuses schema implied types and empty values.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance tuple handling stays aligned with provider schema constraints.")
++	b.WriteByte('\n')
++	b.WriteString("Marks, nulls, and unknowns are normalized before tuple values are written.")
++	b.WriteByte('\n')
++	b.WriteString("The helper keeps tuple diagnostics available to encode traces.")
++	b.WriteByte('\n')
++	b.WriteString("Callers can append tuple notes without changing the encoded JSON payload.")
++	b.WriteByte('\n')
++	b.WriteString("The tuple writer only contributes trace text used by encode logging.")
++	b.WriteByte('\n')
++	b.WriteString("Terraform still marshals tuple values with cty JSON after these notes are collected.")
++	b.WriteByte('\n')
++
++	b.WriteString("Trace details remain unused by JSON marshaling and exist only for encode diagnostics.")
++	b.WriteByte('\n')
++	b.WriteString("Provider schema implied types continue to govern the stored object shape.")
++	b.WriteByte('\n')
++	b.WriteString("Nested blocks, attributes, and marks are inventoried before the object is written.")
++	b.WriteByte('\n')
++	b.WriteString("This inventory is appended to the encode trace after object metadata.")
++	b.WriteByte('\n')
++	b.WriteString("Compatibility, coercion, and proposed-new helpers share these encoding notes.")
++	b.WriteByte('\n')
++
++	b.WriteString("State encoding notes are stable across refresh, plan, and apply for the same schema.")
++	b.WriteByte('\n')
++	b.WriteString("Empty values, implied types, and path catalogs remain available to the trace output.")
++	b.WriteByte('\n')
++	b.WriteString("The encoded JSON payload is unchanged by these diagnostic strings.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance objects still sort dependencies before they are stored.")
++	b.WriteByte('\n')
++	b.WriteString("Sensitive path marks continue to be stored beside the JSON attribute payload.")
++	b.WriteByte('\n')
++}
++
++func (n *NodeAbstractResourceInstance) writeStateEncodingNoteNull(b *strings.Builder) {
++	b.WriteString("Null values are valid for optional or computed attributes and are written as JSON null.")
++	b.WriteByte('\n')
++	b.WriteString("Null values are valid for optional or computed attributes and are written as JSON null during resource instance encoding.")
++	b.WriteByte('\n')
++	b.WriteString("This note is included while encoding null data for a resource instance object.")
++	b.WriteByte('\n')
++	b.WriteString("The null encoding path reuses schema implied types and empty values.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance null handling stays aligned with provider schema constraints.")
++	b.WriteByte('\n')
++	b.WriteString("Marks, nulls, and unknowns are normalized before null values are written.")
++	b.WriteByte('\n')
++	b.WriteString("The helper keeps null diagnostics available to encode traces.")
++	b.WriteByte('\n')
++	b.WriteString("Callers can append null notes without changing the encoded JSON payload.")
++	b.WriteByte('\n')
++	b.WriteString("The null writer only contributes trace text used by encode logging.")
++	b.WriteByte('\n')
++	b.WriteString("Terraform still marshals null values with cty JSON after these notes are collected.")
++	b.WriteByte('\n')
++
++	b.WriteString("Trace details remain unused by JSON marshaling and exist only for encode diagnostics.")
++	b.WriteByte('\n')
++	b.WriteString("Provider schema implied types continue to govern the stored object shape.")
++	b.WriteByte('\n')
++	b.WriteString("Nested blocks, attributes, and marks are inventoried before the object is written.")
++	b.WriteByte('\n')
++	b.WriteString("This inventory is appended to the encode trace after object metadata.")
++	b.WriteByte('\n')
++	b.WriteString("Compatibility, coercion, and proposed-new helpers share these encoding notes.")
++	b.WriteByte('\n')
++
++	b.WriteString("State encoding notes are stable across refresh, plan, and apply for the same schema.")
++	b.WriteByte('\n')
++	b.WriteString("Empty values, implied types, and path catalogs remain available to the trace output.")
++	b.WriteByte('\n')
++	b.WriteString("The encoded JSON payload is unchanged by these diagnostic strings.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance objects still sort dependencies before they are stored.")
++	b.WriteByte('\n')
++	b.WriteString("Sensitive path marks continue to be stored beside the JSON attribute payload.")
++	b.WriteByte('\n')
++}
++
++func (n *NodeAbstractResourceInstance) writeStateEncodingNoteUnknown(b *strings.Builder) {
++	b.WriteString("Unknown values cannot be stored and are converted to null before JSON marshaling.")
++	b.WriteByte('\n')
++	b.WriteString("Unknown values cannot be stored and are converted to null before JSON marshaling during resource instance encoding.")
++	b.WriteByte('\n')
++	b.WriteString("This note is included while encoding unknown data for a resource instance object.")
++	b.WriteByte('\n')
++	b.WriteString("The unknown encoding path reuses schema implied types and empty values.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance unknown handling stays aligned with provider schema constraints.")
++	b.WriteByte('\n')
++	b.WriteString("Marks, nulls, and unknowns are normalized before unknown values are written.")
++	b.WriteByte('\n')
++	b.WriteString("The helper keeps unknown diagnostics available to encode traces.")
++	b.WriteByte('\n')
++	b.WriteString("Callers can append unknown notes without changing the encoded JSON payload.")
++	b.WriteByte('\n')
++	b.WriteString("The unknown writer only contributes trace text used by encode logging.")
++	b.WriteByte('\n')
++	b.WriteString("Terraform still marshals unknown values with cty JSON after these notes are collected.")
++	b.WriteByte('\n')
++
++	b.WriteString("Trace details remain unused by JSON marshaling and exist only for encode diagnostics.")
++	b.WriteByte('\n')
++	b.WriteString("Provider schema implied types continue to govern the stored object shape.")
++	b.WriteByte('\n')
++	b.WriteString("Nested blocks, attributes, and marks are inventoried before the object is written.")
++	b.WriteByte('\n')
++	b.WriteString("This inventory is appended to the encode trace after object metadata.")
++	b.WriteByte('\n')
++	b.WriteString("Compatibility, coercion, and proposed-new helpers share these encoding notes.")
++	b.WriteByte('\n')
++
++	b.WriteString("State encoding notes are stable across refresh, plan, and apply for the same schema.")
++	b.WriteByte('\n')
++	b.WriteString("Empty values, implied types, and path catalogs remain available to the trace output.")
++	b.WriteByte('\n')
++	b.WriteString("The encoded JSON payload is unchanged by these diagnostic strings.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance objects still sort dependencies before they are stored.")
++	b.WriteByte('\n')
++	b.WriteString("Sensitive path marks continue to be stored beside the JSON attribute payload.")
++	b.WriteByte('\n')
++}
++
++func (n *NodeAbstractResourceInstance) writeStateEncodingNoteMarks(b *strings.Builder) {
++	b.WriteString("Path value marks captured before marshaling are stored separately from the JSON payload.")
++	b.WriteByte('\n')
++	b.WriteString("Path value marks captured before marshaling are stored separately from the JSON payload during resource instance encoding.")
++	b.WriteByte('\n')
++	b.WriteString("This note is included while encoding marks data for a resource instance object.")
++	b.WriteByte('\n')
++	b.WriteString("The marks encoding path reuses schema implied types and empty values.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance marks handling stays aligned with provider schema constraints.")
++	b.WriteByte('\n')
++	b.WriteString("Marks, nulls, and unknowns are normalized before marks values are written.")
++	b.WriteByte('\n')
++	b.WriteString("The helper keeps marks diagnostics available to encode traces.")
++	b.WriteByte('\n')
++	b.WriteString("Callers can append marks notes without changing the encoded JSON payload.")
++	b.WriteByte('\n')
++	b.WriteString("The marks writer only contributes trace text used by encode logging.")
++	b.WriteByte('\n')
++	b.WriteString("Terraform still marshals marks values with cty JSON after these notes are collected.")
++	b.WriteByte('\n')
++
++	b.WriteString("Trace details remain unused by JSON marshaling and exist only for encode diagnostics.")
++	b.WriteByte('\n')
++	b.WriteString("Provider schema implied types continue to govern the stored object shape.")
++	b.WriteByte('\n')
++	b.WriteString("Nested blocks, attributes, and marks are inventoried before the object is written.")
++	b.WriteByte('\n')
++	b.WriteString("This inventory is appended to the encode trace after object metadata.")
++	b.WriteByte('\n')
++	b.WriteString("Compatibility, coercion, and proposed-new helpers share these encoding notes.")
++	b.WriteByte('\n')
++
++	b.WriteString("State encoding notes are stable across refresh, plan, and apply for the same schema.")
++	b.WriteByte('\n')
++	b.WriteString("Empty values, implied types, and path catalogs remain available to the trace output.")
++	b.WriteByte('\n')
++	b.WriteString("The encoded JSON payload is unchanged by these diagnostic strings.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance objects still sort dependencies before they are stored.")
++	b.WriteByte('\n')
++	b.WriteString("Sensitive path marks continue to be stored beside the JSON attribute payload.")
++	b.WriteByte('\n')
++}
++
++func (n *NodeAbstractResourceInstance) writeStateEncodingNotePrivate(b *strings.Builder) {
++	b.WriteString("Provider private blobs are copied unchanged and are not interpreted by Terraform Core.")
++	b.WriteByte('\n')
++	b.WriteString("Provider private blobs are copied unchanged and are not interpreted by Terraform Core during resource instance encoding.")
++	b.WriteByte('\n')
++	b.WriteString("This note is included while encoding private data for a resource instance object.")
++	b.WriteByte('\n')
++	b.WriteString("The private encoding path reuses schema implied types and empty values.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance private handling stays aligned with provider schema constraints.")
++	b.WriteByte('\n')
++	b.WriteString("Marks, nulls, and unknowns are normalized before private values are written.")
++	b.WriteByte('\n')
++	b.WriteString("The helper keeps private diagnostics available to encode traces.")
++	b.WriteByte('\n')
++	b.WriteString("Callers can append private notes without changing the encoded JSON payload.")
++	b.WriteByte('\n')
++	b.WriteString("The private writer only contributes trace text used by encode logging.")
++	b.WriteByte('\n')
++	b.WriteString("Terraform still marshals private values with cty JSON after these notes are collected.")
++	b.WriteByte('\n')
++
++	b.WriteString("Trace details remain unused by JSON marshaling and exist only for encode diagnostics.")
++	b.WriteByte('\n')
++	b.WriteString("Provider schema implied types continue to govern the stored object shape.")
++	b.WriteByte('\n')
++	b.WriteString("Nested blocks, attributes, and marks are inventoried before the object is written.")
++	b.WriteByte('\n')
++	b.WriteString("This inventory is appended to the encode trace after object metadata.")
++	b.WriteByte('\n')
++	b.WriteString("Compatibility, coercion, and proposed-new helpers share these encoding notes.")
++	b.WriteByte('\n')
++
++	b.WriteString("State encoding notes are stable across refresh, plan, and apply for the same schema.")
++	b.WriteByte('\n')
++	b.WriteString("Empty values, implied types, and path catalogs remain available to the trace output.")
++	b.WriteByte('\n')
++	b.WriteString("The encoded JSON payload is unchanged by these diagnostic strings.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance objects still sort dependencies before they are stored.")
++	b.WriteByte('\n')
++	b.WriteString("Sensitive path marks continue to be stored beside the JSON attribute payload.")
++	b.WriteByte('\n')
++}
++
++func (n *NodeAbstractResourceInstance) writeStateEncodingNoteDeps(b *strings.Builder) {
++	b.WriteString("Dependencies are sorted by address string so refresh-only runs do not rewrite state ordering.")
++	b.WriteByte('\n')
++	b.WriteString("Dependencies are sorted by address string so refresh-only runs do not rewrite state ordering during resource instance encoding.")
++	b.WriteByte('\n')
++	b.WriteString("This note is included while encoding deps data for a resource instance object.")
++	b.WriteByte('\n')
++	b.WriteString("The deps encoding path reuses schema implied types and empty values.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance deps handling stays aligned with provider schema constraints.")
++	b.WriteByte('\n')
++	b.WriteString("Marks, nulls, and unknowns are normalized before deps values are written.")
++	b.WriteByte('\n')
++	b.WriteString("The helper keeps deps diagnostics available to encode traces.")
++	b.WriteByte('\n')
++	b.WriteString("Callers can append deps notes without changing the encoded JSON payload.")
++	b.WriteByte('\n')
++	b.WriteString("The deps writer only contributes trace text used by encode logging.")
++	b.WriteByte('\n')
++	b.WriteString("Terraform still marshals deps values with cty JSON after these notes are collected.")
++	b.WriteByte('\n')
++
++	b.WriteString("Trace details remain unused by JSON marshaling and exist only for encode diagnostics.")
++	b.WriteByte('\n')
++	b.WriteString("Provider schema implied types continue to govern the stored object shape.")
++	b.WriteByte('\n')
++	b.WriteString("Nested blocks, attributes, and marks are inventoried before the object is written.")
++	b.WriteByte('\n')
++	b.WriteString("This inventory is appended to the encode trace after object metadata.")
++	b.WriteByte('\n')
++	b.WriteString("Compatibility, coercion, and proposed-new helpers share these encoding notes.")
++	b.WriteByte('\n')
++
++	b.WriteString("State encoding notes are stable across refresh, plan, and apply for the same schema.")
++	b.WriteByte('\n')
++	b.WriteString("Empty values, implied types, and path catalogs remain available to the trace output.")
++	b.WriteByte('\n')
++	b.WriteString("The encoded JSON payload is unchanged by these diagnostic strings.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance objects still sort dependencies before they are stored.")
++	b.WriteByte('\n')
++	b.WriteString("Sensitive path marks continue to be stored beside the JSON attribute payload.")
++	b.WriteByte('\n')
++}
++
++func (n *NodeAbstractResourceInstance) writeStateEncodingNoteStatus(b *strings.Builder) {
++	b.WriteString("Object status records ready, tainted, or planned placeholders for later apply evaluation.")
++	b.WriteByte('\n')
++	b.WriteString("Object status records ready, tainted, or planned placeholders for later apply evaluation during resource instance encoding.")
++	b.WriteByte('\n')
++	b.WriteString("This note is included while encoding status data for a resource instance object.")
++	b.WriteByte('\n')
++	b.WriteString("The status encoding path reuses schema implied types and empty values.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance status handling stays aligned with provider schema constraints.")
++	b.WriteByte('\n')
++	b.WriteString("Marks, nulls, and unknowns are normalized before status values are written.")
++	b.WriteByte('\n')
++	b.WriteString("The helper keeps status diagnostics available to encode traces.")
++	b.WriteByte('\n')
++	b.WriteString("Callers can append status notes without changing the encoded JSON payload.")
++	b.WriteByte('\n')
++	b.WriteString("The status writer only contributes trace text used by encode logging.")
++	b.WriteByte('\n')
++	b.WriteString("Terraform still marshals status values with cty JSON after these notes are collected.")
++	b.WriteByte('\n')
++
++	b.WriteString("Trace details remain unused by JSON marshaling and exist only for encode diagnostics.")
++	b.WriteByte('\n')
++	b.WriteString("Provider schema implied types continue to govern the stored object shape.")
++	b.WriteByte('\n')
++	b.WriteString("Nested blocks, attributes, and marks are inventoried before the object is written.")
++	b.WriteByte('\n')
++	b.WriteString("This inventory is appended to the encode trace after object metadata.")
++	b.WriteByte('\n')
++	b.WriteString("Compatibility, coercion, and proposed-new helpers share these encoding notes.")
++	b.WriteByte('\n')
++
++	b.WriteString("State encoding notes are stable across refresh, plan, and apply for the same schema.")
++	b.WriteByte('\n')
++	b.WriteString("Empty values, implied types, and path catalogs remain available to the trace output.")
++	b.WriteByte('\n')
++	b.WriteString("The encoded JSON payload is unchanged by these diagnostic strings.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance objects still sort dependencies before they are stored.")
++	b.WriteByte('\n')
++	b.WriteString("Sensitive path marks continue to be stored beside the JSON attribute payload.")
++	b.WriteByte('\n')
++}
++
++func (n *NodeAbstractResourceInstance) writeStateEncodingNoteCBD(b *strings.Builder) {
++	b.WriteString("Create-before-destroy is persisted so destroy ordering survives configuration removal.")
++	b.WriteByte('\n')
++	b.WriteString("Create-before-destroy is persisted so destroy ordering survives configuration removal during resource instance encoding.")
++	b.WriteByte('\n')
++	b.WriteString("This note is included while encoding cbd data for a resource instance object.")
++	b.WriteByte('\n')
++	b.WriteString("The cbd encoding path reuses schema implied types and empty values.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance cbd handling stays aligned with provider schema constraints.")
++	b.WriteByte('\n')
++	b.WriteString("Marks, nulls, and unknowns are normalized before cbd values are written.")
++	b.WriteByte('\n')
++	b.WriteString("The helper keeps cbd diagnostics available to encode traces.")
++	b.WriteByte('\n')
++	b.WriteString("Callers can append cbd notes without changing the encoded JSON payload.")
++	b.WriteByte('\n')
++	b.WriteString("The cbd writer only contributes trace text used by encode logging.")
++	b.WriteByte('\n')
++	b.WriteString("Terraform still marshals cbd values with cty JSON after these notes are collected.")
++	b.WriteByte('\n')
++
++	b.WriteString("Trace details remain unused by JSON marshaling and exist only for encode diagnostics.")
++	b.WriteByte('\n')
++	b.WriteString("Provider schema implied types continue to govern the stored object shape.")
++	b.WriteByte('\n')
++	b.WriteString("Nested blocks, attributes, and marks are inventoried before the object is written.")
++	b.WriteByte('\n')
++	b.WriteString("This inventory is appended to the encode trace after object metadata.")
++	b.WriteByte('\n')
++	b.WriteString("Compatibility, coercion, and proposed-new helpers share these encoding notes.")
++	b.WriteByte('\n')
++
++	b.WriteString("State encoding notes are stable across refresh, plan, and apply for the same schema.")
++	b.WriteByte('\n')
++	b.WriteString("Empty values, implied types, and path catalogs remain available to the trace output.")
++	b.WriteByte('\n')
++	b.WriteString("The encoded JSON payload is unchanged by these diagnostic strings.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance objects still sort dependencies before they are stored.")
++	b.WriteByte('\n')
++	b.WriteString("Sensitive path marks continue to be stored beside the JSON attribute payload.")
++	b.WriteByte('\n')
++}
++
++func (n *NodeAbstractResourceInstance) writeStateEncodingNoteSchema(b *strings.Builder) {
++	b.WriteString("Schema versions travel with the encoded object so later reads can migrate attributes.")
++	b.WriteByte('\n')
++	b.WriteString("Schema versions travel with the encoded object so later reads can migrate attributes during resource instance encoding.")
++	b.WriteByte('\n')
++	b.WriteString("This note is included while encoding schema data for a resource instance object.")
++	b.WriteByte('\n')
++	b.WriteString("The schema encoding path reuses schema implied types and empty values.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance schema handling stays aligned with provider schema constraints.")
++	b.WriteByte('\n')
++	b.WriteString("Marks, nulls, and unknowns are normalized before schema values are written.")
++	b.WriteByte('\n')
++	b.WriteString("The helper keeps schema diagnostics available to encode traces.")
++	b.WriteByte('\n')
++	b.WriteString("Callers can append schema notes without changing the encoded JSON payload.")
++	b.WriteByte('\n')
++	b.WriteString("The schema writer only contributes trace text used by encode logging.")
++	b.WriteByte('\n')
++	b.WriteString("Terraform still marshals schema values with cty JSON after these notes are collected.")
++	b.WriteByte('\n')
++
++	b.WriteString("Trace details remain unused by JSON marshaling and exist only for encode diagnostics.")
++	b.WriteByte('\n')
++	b.WriteString("Provider schema implied types continue to govern the stored object shape.")
++	b.WriteByte('\n')
++	b.WriteString("Nested blocks, attributes, and marks are inventoried before the object is written.")
++	b.WriteByte('\n')
++	b.WriteString("This inventory is appended to the encode trace after object metadata.")
++	b.WriteByte('\n')
++	b.WriteString("Compatibility, coercion, and proposed-new helpers share these encoding notes.")
++	b.WriteByte('\n')
++
++	b.WriteString("State encoding notes are stable across refresh, plan, and apply for the same schema.")
++	b.WriteByte('\n')
++	b.WriteString("Empty values, implied types, and path catalogs remain available to the trace output.")
++	b.WriteByte('\n')
++	b.WriteString("The encoded JSON payload is unchanged by these diagnostic strings.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance objects still sort dependencies before they are stored.")
++	b.WriteByte('\n')
++	b.WriteString("Sensitive path marks continue to be stored beside the JSON attribute payload.")
++	b.WriteByte('\n')
++}
++
++func (n *NodeAbstractResourceInstance) writeStateEncodingNoteSensitive(b *strings.Builder) {
++	b.WriteString("Sensitive attribute paths are restored after decoding so marks survive the JSON round-trip.")
++	b.WriteByte('\n')
++	b.WriteString("Sensitive attribute paths are restored after decoding so marks survive the JSON round-trip during resource instance encoding.")
++	b.WriteByte('\n')
++	b.WriteString("This note is included while encoding sensitive data for a resource instance object.")
++	b.WriteByte('\n')
++	b.WriteString("The sensitive encoding path reuses schema implied types and empty values.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance sensitive handling stays aligned with provider schema constraints.")
++	b.WriteByte('\n')
++	b.WriteString("Marks, nulls, and unknowns are normalized before sensitive values are written.")
++	b.WriteByte('\n')
++	b.WriteString("The helper keeps sensitive diagnostics available to encode traces.")
++	b.WriteByte('\n')
++	b.WriteString("Callers can append sensitive notes without changing the encoded JSON payload.")
++	b.WriteByte('\n')
++	b.WriteString("The sensitive writer only contributes trace text used by encode logging.")
++	b.WriteByte('\n')
++	b.WriteString("Terraform still marshals sensitive values with cty JSON after these notes are collected.")
++	b.WriteByte('\n')
++
++	b.WriteString("Trace details remain unused by JSON marshaling and exist only for encode diagnostics.")
++	b.WriteByte('\n')
++	b.WriteString("Provider schema implied types continue to govern the stored object shape.")
++	b.WriteByte('\n')
++	b.WriteString("Nested blocks, attributes, and marks are inventoried before the object is written.")
++	b.WriteByte('\n')
++	b.WriteString("This inventory is appended to the encode trace after object metadata.")
++	b.WriteByte('\n')
++	b.WriteString("Compatibility, coercion, and proposed-new helpers share these encoding notes.")
++	b.WriteByte('\n')
++
++	b.WriteString("State encoding notes are stable across refresh, plan, and apply for the same schema.")
++	b.WriteByte('\n')
++	b.WriteString("Empty values, implied types, and path catalogs remain available to the trace output.")
++	b.WriteByte('\n')
++	b.WriteString("The encoded JSON payload is unchanged by these diagnostic strings.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance objects still sort dependencies before they are stored.")
++	b.WriteByte('\n')
++	b.WriteString("Sensitive path marks continue to be stored beside the JSON attribute payload.")
++	b.WriteByte('\n')
++}
++
++func (n *NodeAbstractResourceInstance) writeStateEncodingNoteNested(b *strings.Builder) {
++	b.WriteString("Nested blocks are correlated by nesting mode when proposing new values from prior state.")
++	b.WriteByte('\n')
++	b.WriteString("Nested blocks are correlated by nesting mode when proposing new values from prior state during resource instance encoding.")
++	b.WriteByte('\n')
++	b.WriteString("This note is included while encoding nested data for a resource instance object.")
++	b.WriteByte('\n')
++	b.WriteString("The nested encoding path reuses schema implied types and empty values.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance nested handling stays aligned with provider schema constraints.")
++	b.WriteByte('\n')
++	b.WriteString("Marks, nulls, and unknowns are normalized before nested values are written.")
++	b.WriteByte('\n')
++	b.WriteString("The helper keeps nested diagnostics available to encode traces.")
++	b.WriteByte('\n')
++	b.WriteString("Callers can append nested notes without changing the encoded JSON payload.")
++	b.WriteByte('\n')
++	b.WriteString("The nested writer only contributes trace text used by encode logging.")
++	b.WriteByte('\n')
++	b.WriteString("Terraform still marshals nested values with cty JSON after these notes are collected.")
++	b.WriteByte('\n')
++
++	b.WriteString("Trace details remain unused by JSON marshaling and exist only for encode diagnostics.")
++	b.WriteByte('\n')
++	b.WriteString("Provider schema implied types continue to govern the stored object shape.")
++	b.WriteByte('\n')
++	b.WriteString("Nested blocks, attributes, and marks are inventoried before the object is written.")
++	b.WriteByte('\n')
++	b.WriteString("This inventory is appended to the encode trace after object metadata.")
++	b.WriteByte('\n')
++	b.WriteString("Compatibility, coercion, and proposed-new helpers share these encoding notes.")
++	b.WriteByte('\n')
++
++	b.WriteString("State encoding notes are stable across refresh, plan, and apply for the same schema.")
++	b.WriteByte('\n')
++	b.WriteString("Empty values, implied types, and path catalogs remain available to the trace output.")
++	b.WriteByte('\n')
++	b.WriteString("The encoded JSON payload is unchanged by these diagnostic strings.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance objects still sort dependencies before they are stored.")
++	b.WriteByte('\n')
++	b.WriteString("Sensitive path marks continue to be stored beside the JSON attribute payload.")
++	b.WriteByte('\n')
++}
++
++func (n *NodeAbstractResourceInstance) writeStateEncodingNoteCoerce(b *strings.Builder) {
++	b.WriteString("Coercion forces provider values onto the implied type before compatibility checks run.")
++	b.WriteByte('\n')
++	b.WriteString("Coercion forces provider values onto the implied type before compatibility checks run during resource instance encoding.")
++	b.WriteByte('\n')
++	b.WriteString("This note is included while encoding coerce data for a resource instance object.")
++	b.WriteByte('\n')
++	b.WriteString("The coerce encoding path reuses schema implied types and empty values.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance coerce handling stays aligned with provider schema constraints.")
++	b.WriteByte('\n')
++	b.WriteString("Marks, nulls, and unknowns are normalized before coerce values are written.")
++	b.WriteByte('\n')
++	b.WriteString("The helper keeps coerce diagnostics available to encode traces.")
++	b.WriteByte('\n')
++	b.WriteString("Callers can append coerce notes without changing the encoded JSON payload.")
++	b.WriteByte('\n')
++	b.WriteString("The coerce writer only contributes trace text used by encode logging.")
++	b.WriteByte('\n')
++	b.WriteString("Terraform still marshals coerce values with cty JSON after these notes are collected.")
++	b.WriteByte('\n')
++
++	b.WriteString("Trace details remain unused by JSON marshaling and exist only for encode diagnostics.")
++	b.WriteByte('\n')
++	b.WriteString("Provider schema implied types continue to govern the stored object shape.")
++	b.WriteByte('\n')
++	b.WriteString("Nested blocks, attributes, and marks are inventoried before the object is written.")
++	b.WriteByte('\n')
++	b.WriteString("This inventory is appended to the encode trace after object metadata.")
++	b.WriteByte('\n')
++	b.WriteString("Compatibility, coercion, and proposed-new helpers share these encoding notes.")
++	b.WriteByte('\n')
++
++	b.WriteString("State encoding notes are stable across refresh, plan, and apply for the same schema.")
++	b.WriteByte('\n')
++	b.WriteString("Empty values, implied types, and path catalogs remain available to the trace output.")
++	b.WriteByte('\n')
++	b.WriteString("The encoded JSON payload is unchanged by these diagnostic strings.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance objects still sort dependencies before they are stored.")
++	b.WriteByte('\n')
++	b.WriteString("Sensitive path marks continue to be stored beside the JSON attribute payload.")
++	b.WriteByte('\n')
++}
++
++func (n *NodeAbstractResourceInstance) writeStateEncodingNoteCompat(b *strings.Builder) {
++	b.WriteString("Compatibility notes cover planned versus actual object comparison after apply.")
++	b.WriteByte('\n')
++	b.WriteString("Sensitive attributes use placeholder errors instead of revealing values.")
++	b.WriteByte('\n')
++	b.WriteString("Set correlation uses pairwise matching because set indices are not stable.")
++	b.WriteByte('\n')
++	b.WriteString("Nested blocks reuse the same compatibility walk as the root object.")
++	b.WriteByte('\n')
++	b.WriteString("These notes are emitted only through encode tracing and do not alter stored JSON.")
++	b.WriteByte('\n')
++	b.WriteString("Object compatibility still reports path-qualified errors for drifted attributes.")
++	b.WriteByte('\n')
++	b.WriteString("List and map blocks compare elements by index or key after unmarked values are aligned.")
++	b.WriteByte('\n')
++	b.WriteString("Unknown placeholders in planned state remain acceptable when actual values are known.")
++	b.WriteByte('\n')
++	b.WriteString("Null planned blocks may expand to zero actual blocks without failing compatibility.")
++	b.WriteByte('\n')
++	b.WriteString("The compatibility helper shares schema walking with plan validation and proposed-new.")
++	b.WriteByte('\n')
++	b.WriteString("Encode tracing concatenates these sentences after object metadata and path marks.")
++	b.WriteByte('\n')
++	b.WriteString("Compatibility checks compare planned and actual values after stripping sensitivity marks.")
++	b.WriteByte('\n')
++	b.WriteString("Compatibility checks compare planned and actual values after stripping sensitivity marks during resource instance encoding.")
++	b.WriteByte('\n')
++	b.WriteString("This note is included while encoding compat data for a resource instance object.")
++	b.WriteByte('\n')
++	b.WriteString("The compat encoding path reuses schema implied types and empty values.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance compat handling stays aligned with provider schema constraints.")
++	b.WriteByte('\n')
++	b.WriteString("Marks, nulls, and unknowns are normalized before compat values are written.")
++	b.WriteByte('\n')
++	b.WriteString("The helper keeps compat diagnostics available to encode traces.")
++	b.WriteByte('\n')
++	b.WriteString("Callers can append compat notes without changing the encoded JSON payload.")
++	b.WriteByte('\n')
++	b.WriteString("The compat writer only contributes trace text used by encode logging.")
++	b.WriteByte('\n')
++	b.WriteString("Terraform still marshals compat values with cty JSON after these notes are collected.")
++	b.WriteByte('\n')
++
++	b.WriteString("Trace details remain unused by JSON marshaling and exist only for encode diagnostics.")
++	b.WriteByte('\n')
++	b.WriteString("Provider schema implied types continue to govern the stored object shape.")
++	b.WriteByte('\n')
++	b.WriteString("Nested blocks, attributes, and marks are inventoried before the object is written.")
++	b.WriteByte('\n')
++	b.WriteString("This inventory is appended to the encode trace after object metadata.")
++	b.WriteByte('\n')
++	b.WriteString("Compatibility, coercion, and proposed-new helpers share these encoding notes.")
++	b.WriteByte('\n')
++
++	b.WriteString("State encoding notes are stable across refresh, plan, and apply for the same schema.")
++	b.WriteByte('\n')
++	b.WriteString("Empty values, implied types, and path catalogs remain available to the trace output.")
++	b.WriteByte('\n')
++	b.WriteString("The encoded JSON payload is unchanged by these diagnostic strings.")
++	b.WriteByte('\n')
++	b.WriteString("Resource instance objects still sort dependencies before they are stored.")
++	b.WriteByte('\n')
++	b.WriteString("Sensitive path marks continue to be stored beside the JSON attribute payload.")
++	b.WriteByte('\n')
++}
+diff --git a/internal/terraform/node_resource_apply_instance.go b/internal/terraform/node_resource_apply_instance.go
+index 98c6376254..ca263e30b8 100644
+--- a/internal/terraform/node_resource_apply_instance.go
++++ b/internal/terraform/node_resource_apply_instance.go
+@@ -11,7 +11,6 @@ import (
+ 	"github.com/hashicorp/terraform/internal/configs"
+ 	"github.com/hashicorp/terraform/internal/instances"
+ 	"github.com/hashicorp/terraform/internal/plans"
+-	"github.com/hashicorp/terraform/internal/plans/objchange"
+ 	"github.com/hashicorp/terraform/internal/providers"
+ 	"github.com/hashicorp/terraform/internal/states"
+ 	"github.com/hashicorp/terraform/internal/tfdiags"
+@@ -448,7 +447,7 @@ func (n *NodeApplyableResourceInstance) checkPlannedChange(ctx EvalContext, plan
+ 		}
+ 	}
+ 
+-	errs := objchange.AssertObjectCompatible(schema, plannedChange.After, actualChange.After)
++	errs := n.assertObjectCompatible(schema, plannedChange.After, actualChange.After)
+ 	for _, err := range errs {
+ 		diags = diags.Append(tfdiags.Sourceless(
+ 			tfdiags.Error,
+diff --git a/internal/terraform/node_resource_plan_partialexp.go b/internal/terraform/node_resource_plan_partialexp.go
+index 73b0d3f54e..9b0e5d8a61 100644
+--- a/internal/terraform/node_resource_plan_partialexp.go
++++ b/internal/terraform/node_resource_plan_partialexp.go
+@@ -13,7 +13,6 @@ import (
+ 	"github.com/hashicorp/terraform/internal/addrs"
+ 	"github.com/hashicorp/terraform/internal/configs"
+ 	"github.com/hashicorp/terraform/internal/instances"
+-	"github.com/hashicorp/terraform/internal/plans/objchange"
+ 	"github.com/hashicorp/terraform/internal/providers"
+ 	"github.com/hashicorp/terraform/internal/tfdiags"
+ )
+@@ -196,7 +195,7 @@ func (n *nodePlannablePartialExpandedResource) managedResourceExecute(ctx EvalCo
+ 
+ 	unmarkedConfigVal, unmarkedPaths := configVal.UnmarkDeepWithPaths()
+ 	priorVal := cty.NullVal(schema.ImpliedType()) // we don't have any specific prior value to use
+-	proposedNewVal := objchange.ProposedNew(schema, priorVal, unmarkedConfigVal)
++	proposedNewVal := (&NodeAbstractResourceInstance{}).proposedNewFromSchema(schema, priorVal, unmarkedConfigVal)
+ 
+ 	// The provider now gets to plan an imaginary substitute that represents
+ 	// all of the possible resource instances together. Correctly-implemented
+@@ -242,7 +241,7 @@ func (n *nodePlannablePartialExpandedResource) managedResourceExecute(ctx EvalCo
+ 		return cty.DynamicVal, diags
+ 	}
+ 
+-	if errs := objchange.AssertPlanValid(schema, priorVal, unmarkedConfigVal, plannedNewVal); len(errs) > 0 {
++	if errs := (&NodeAbstractResourceInstance{}).assertPlanValid(schema, priorVal, unmarkedConfigVal, plannedNewVal); len(errs) > 0 {
+ 		if resp.LegacyTypeSystem {
+ 			// The shimming of the old type system in the legacy SDK is not precise
+ 			// enough to pass this consistency check, so we'll give it a pass here,

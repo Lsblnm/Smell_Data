@@ -1,0 +1,3827 @@
+diff --git a/packages/docusaurus/src/server/brokenLinks.ts b/packages/docusaurus/src/server/brokenLinks.ts
+index 9e940f7b8c..be5e0e281a 100644
+--- a/packages/docusaurus/src/server/brokenLinks.ts
++++ b/packages/docusaurus/src/server/brokenLinks.ts
+@@ -8,14 +8,17 @@
+ import _ from 'lodash';
+ import logger from '@docusaurus/logger';
+ import {matchRoutes as reactRouterMatchRoutes} from 'react-router-config';
+-import {
+-  parseURLPath,
+-  serializeURLPath,
+-  flattenRoutes,
+-  type URLPath,
+-} from '@docusaurus/utils';
+ import {addTrailingSlash, removeTrailingSlash} from '@docusaurus/utils-common';
++import type {URLPath} from '@docusaurus/utils';
++import type {ApplyTrailingSlashParams} from '@docusaurus/utils-common';
+ import type {RouteConfig, ReportingSeverity} from '@docusaurus/types';
++import {
++  resolvePageURLPath,
++  serializePageURLPath,
++  flattenLeafRoutes,
++  joinUrlSegments,
++  applyPathTrailingSlash,
++} from './utils';
+ 
+ function matchRoutes(routeConfig: RouteConfig[], pathname: string) {
+   // @ts-expect-error: React router types RouteConfig with an actual React
+@@ -51,242 +54,337 @@ type BrokenLinksHelper = {
+   isAnchorBrokenLink: (linkPath: URLPath) => boolean;
+ };
+ 
+-function createBrokenLinksHelper({
+-  collectedLinks,
+-  routes,
+-}: {
+-  collectedLinks: CollectedLinksNormalized;
+-  routes: RouteConfig[];
+-}): BrokenLinksHelper {
+-  const validPathnames = new Set(collectedLinks.keys());
+-
+-  // IMPORTANT: this is an optimization
+-  // See https://github.com/facebook/docusaurus/issues/9754
+-  // Matching against the route array can be expensive
+-  // If the route is already in the valid pathnames,
+-  // we can avoid matching against it
+-  const remainingRoutes = (function filterRoutes() {
+-    // Goal: unit tests should behave the same with this enabled or disabled
+-    const disableOptimization = false;
+-    if (disableOptimization) {
+-      return routes;
+-    }
+-    // We must consider the "exact" and "strict" match attribute
+-    // We can only infer pre-validated pathnames from a route from exact routes
+-    const [validPathnameRoutes, otherRoutes] = _.partition(
++const NotFoundRoutePath = '/404.html';
++
++class BrokenLinksCoordinator {
++  private collectedLinks: CollectedLinksNormalized = new Map();
++  private collectedPathnames: string[] = [];
++  private collectedAnchorIndex: Map<string, Set<string>> = new Map();
++  private registeredRoutes: RouteConfig[] = [];
++  private remainingRoutes: RouteConfig[] = [];
++  private flattenedRoutes: RouteConfig[] = [];
++  private validPathnames: Set<string> = new Set();
++  private pathnameMatchCache: Map<string, boolean> = new Map();
++  private slashPathMemo: Map<string, string> = new Map();
++  private slashPairMemo: Map<string, [string, string]> = new Map();
++  private brokenByPage: BrokenLinksMap = {};
++  private frequentLinkCounts: Map<string, number> = new Map();
++  private reportMessages: string[] = [];
++  private parsedLinkCache: Map<string, URLPath> = new Map();
++  private serializedLinkCache: Map<string, string> = new Map();
++
++  async handleBrokenLinks({
++    collectedLinks,
++    onBrokenLinks,
++    onBrokenAnchors,
++    routes,
++  }: {
++    collectedLinks: CollectedLinks;
++    onBrokenLinks: ReportingSeverity;
++    onBrokenAnchors: ReportingSeverity;
++    routes: RouteConfig[];
++  }): Promise<void> {
++    if (onBrokenLinks === 'ignore' && onBrokenAnchors === 'ignore') {
++      return;
++    }
++    const brokenLinks = this.getBrokenLinks({
+       routes,
+-      (route) => route.exact && validPathnames.has(route.path),
+-    );
+-    // If a route is non-strict (non-sensitive to trailing slashes)
+-    // We must pre-validate all possible paths
+-    validPathnameRoutes.forEach((validPathnameRoute) => {
+-      if (!validPathnameRoute.strict) {
+-        validPathnames.add(addTrailingSlash(validPathnameRoute.path));
+-        validPathnames.add(removeTrailingSlash(validPathnameRoute.path));
+-      }
++      collectedLinks: this.normalizeCollectedLinks(collectedLinks),
+     });
+-    return otherRoutes;
+-  })();
++    this.reportBrokenLinks({brokenLinks, onBrokenLinks, onBrokenAnchors});
++  }
+ 
+-  function isPathnameMatchingAnyRoute(pathname: string): boolean {
+-    if (matchRoutes(remainingRoutes, pathname).length > 0) {
+-      // IMPORTANT: this is an optimization
+-      // See https://github.com/facebook/docusaurus/issues/9754
+-      // Large Docusaurus sites have many routes!
+-      // We try to minimize calls to a possibly expensive matchRoutes function
+-      validPathnames.add(pathname);
+-      return true;
+-    }
++  // Users might use the useBrokenLinks() API in weird unexpected ways
++  // JS users might call "collectLink(undefined)" for example
++  // TS users might call "collectAnchor('#hash')" with/without #
++  // We clean/normalize the collected data to avoid obscure errors being thrown
++  // We also use optimized data structures for a faster algorithm
++  normalizeCollectedLinks(
++    collectedLinks: CollectedLinks,
++  ): CollectedLinksNormalized {
++    const result: CollectedLinksNormalized = new Map();
++    Object.entries(collectedLinks).forEach(([pathname, pageCollectedData]) => {
++      result.set(pathname, {
++        links: new Set(pageCollectedData.links.filter(_.isString)),
++        anchors: new Set(
++          pageCollectedData.anchors
++            .filter(_.isString)
++            .map((anchor) => (anchor.startsWith('#') ? anchor.slice(1) : anchor)),
++        ),
++      });
++    });
++    this.collectedLinks = result;
++    this.collectedPathnames = Array.from(result.keys());
++    this.collectedAnchorIndex.clear();
++    result.forEach((pageData, pathname) => {
++      this.collectedAnchorIndex.set(pathname, new Set(pageData.anchors));
++    });
++    return result;
++  }
+ 
+-    return false;
++  getBrokenLinks({
++    collectedLinks,
++    routes,
++  }: {
++    collectedLinks: CollectedLinksNormalized;
++    routes: RouteConfig[];
++  }): BrokenLinksMap {
++    this.collectedLinks = collectedLinks;
++    this.collectedPathnames = Array.from(collectedLinks.keys());
++    const filteredRoutes = this.filterIntermediateRoutes(routes);
++    this.rebuildInspectionIndexes(filteredRoutes);
++    const helper = this.createBrokenLinksHelper({
++      collectedLinks,
++      routes: filteredRoutes,
++    });
++
++    const result: BrokenLinksMap = {};
++    this.collectedLinks.forEach((_unused, pagePath) => {
++      try {
++        result[pagePath] = this.getBrokenLinksForPage({
++          pagePath,
++          helper,
++        });
++      } catch (e) {
++        throw new Error(`Unable to get broken links for page ${pagePath}.`, {
++          cause: e,
++        });
++      }
++    });
++    return result;
+   }
+ 
+-  function isPathBrokenLink(linkPath: URLPath) {
+-    const pathnames = [linkPath.pathname, decodeURI(linkPath.pathname)];
+-    if (pathnames.some((p) => validPathnames.has(p))) {
+-      return false;
+-    }
+-    if (pathnames.some(isPathnameMatchingAnyRoute)) {
+-      return false;
+-    }
+-    return true;
++  /**
++   * The route defs can be recursive, and have a parent match-all route. We don't
++   * want to match broken links like /docs/brokenLink against /docs/*. For this
++   * reason, we only consider the "final routes" that do not have subroutes.
++   * We also need to remove the match-all 404 route
++   */
++  filterIntermediateRoutes(routesInput: RouteConfig[]): RouteConfig[] {
++    const routesWithout404 = routesInput.filter((route) => route.path !== '*');
++    this.flattenedRoutes = flattenLeafRoutes(routesWithout404);
++    this.registeredRoutes = this.flattenedRoutes;
++    return this.flattenedRoutes;
+   }
+ 
+-  function isAnchorBrokenLink(linkPath: URLPath) {
+-    const {pathname, hash} = linkPath;
+-    // Link has no hash: it can't be a broken anchor link
+-    if (hash === undefined) {
+-      return false;
+-    }
+-    // Link has empty hash ("#", "/page#"...): we do not report it as broken
+-    // Empty hashes are used for various weird reasons, by us and other users...
+-    // See for example: https://github.com/facebook/docusaurus/pull/6003
+-    if (hash === '') {
++  createBrokenLinksHelper({
++    collectedLinks,
++    routes,
++  }: {
++    collectedLinks: CollectedLinksNormalized;
++    routes: RouteConfig[];
++  }): BrokenLinksHelper {
++    this.collectedLinks = collectedLinks;
++    this.validPathnames = new Set(collectedLinks.keys());
++
++    // IMPORTANT: this is an optimization
++    // See https://github.com/facebook/docusaurus/issues/9754
++    // Matching against the route array can be expensive
++    // If the route is already in the valid pathnames,
++    // we can avoid matching against it
++    this.remainingRoutes = (() => {
++      // Goal: unit tests should behave the same with this enabled or disabled
++      const disableOptimization = false;
++      if (disableOptimization) {
++        return routes;
++      }
++      // We must consider the "exact" and "strict" match attribute
++      // We can only infer pre-validated pathnames from a route from exact routes
++      const [validPathnameRoutes, otherRoutes] = _.partition(
++        routes,
++        (route) => route.exact && this.validPathnames.has(route.path),
++      );
++      // If a route is non-strict (non-sensitive to trailing slashes)
++      // We must pre-validate all possible paths
++      validPathnameRoutes.forEach((validPathnameRoute) => {
++        if (!validPathnameRoute.strict) {
++          this.validPathnames.add(addTrailingSlash(validPathnameRoute.path));
++          this.validPathnames.add(removeTrailingSlash(validPathnameRoute.path));
++        }
++      });
++      return otherRoutes;
++    })();
++
++    const validPathnames = this.validPathnames;
++    const remainingRoutes = this.remainingRoutes;
++
++    function isPathnameMatchingAnyRoute(pathname: string): boolean {
++      if (matchRoutes(remainingRoutes, pathname).length > 0) {
++        // IMPORTANT: this is an optimization
++        // See https://github.com/facebook/docusaurus/issues/9754
++        // Large Docusaurus sites have many routes!
++        // We try to minimize calls to a possibly expensive matchRoutes function
++        validPathnames.add(pathname);
++        return true;
++      }
++
+       return false;
+     }
+-    const targetPage =
+-      collectedLinks.get(pathname) || collectedLinks.get(decodeURI(pathname));
+-    // link with anchor to a page that does not exist (or did not collect any
+-    // link/anchor) is considered as a broken anchor
+-    if (!targetPage) {
++
++    function isPathBrokenLink(linkPath: URLPath) {
++      const pathnames = [linkPath.pathname, decodeURI(linkPath.pathname)];
++      if (pathnames.some((p) => validPathnames.has(p))) {
++        return false;
++      }
++      if (pathnames.some(isPathnameMatchingAnyRoute)) {
++        return false;
++      }
+       return true;
+     }
+-    // it's a not broken anchor if the anchor exists on the target page
+-    if (
+-      targetPage.anchors.has(hash) ||
+-      targetPage.anchors.has(decodeURIComponent(hash))
+-    ) {
+-      return false;
+-    }
+-    return true;
+-  }
+-
+-  return {
+-    collectedLinks,
+-    isPathBrokenLink,
+-    isAnchorBrokenLink,
+-  };
+-}
+ 
+-function getBrokenLinksForPage({
+-  pagePath,
+-  helper,
+-}: {
+-  pagePath: string;
+-  helper: BrokenLinksHelper;
+-}): BrokenLink[] {
+-  const pageData = helper.collectedLinks.get(pagePath)!;
+-
+-  const brokenLinks: BrokenLink[] = [];
+-
+-  pageData.links.forEach((link) => {
+-    const linkPath = parseURLPath(link, pagePath);
+-    if (helper.isPathBrokenLink(linkPath)) {
+-      brokenLinks.push({
+-        link,
+-        resolvedLink: serializeURLPath(linkPath),
+-        anchor: false,
+-      });
+-    } else if (helper.isAnchorBrokenLink(linkPath)) {
+-      brokenLinks.push({
+-        link,
+-        resolvedLink: serializeURLPath(linkPath),
+-        anchor: true,
+-      });
++    function isAnchorBrokenLink(linkPath: URLPath) {
++      const {pathname, hash} = linkPath;
++      // Link has no hash: it can't be a broken anchor link
++      if (hash === undefined) {
++        return false;
++      }
++      // Link has empty hash ("#", "/page#"...): we do not report it as broken
++      // Empty hashes are used for various weird reasons, by us and other users...
++      // See for example: https://github.com/facebook/docusaurus/pull/6003
++      if (hash === '') {
++        return false;
++      }
++      const targetPage =
++        collectedLinks.get(pathname) || collectedLinks.get(decodeURI(pathname));
++      // link with anchor to a page that does not exist (or did not collect any
++      // link/anchor) is considered as a broken anchor
++      if (!targetPage) {
++        return true;
++      }
++      // it's a not broken anchor if the anchor exists on the target page
++      if (
++        targetPage.anchors.has(hash) ||
++        targetPage.anchors.has(decodeURIComponent(hash))
++      ) {
++        return false;
++      }
++      return true;
+     }
+-  });
+ 
+-  return brokenLinks;
+-}
++    return {
++      collectedLinks,
++      isPathBrokenLink,
++      isAnchorBrokenLink,
++    };
++  }
+ 
+-/**
+- * The route defs can be recursive, and have a parent match-all route. We don't
+- * want to match broken links like /docs/brokenLink against /docs/*. For this
+- * reason, we only consider the "final routes" that do not have subroutes.
+- * We also need to remove the match-all 404 route
+- */
+-function filterIntermediateRoutes(routesInput: RouteConfig[]): RouteConfig[] {
+-  const routesWithout404 = routesInput.filter((route) => route.path !== '*');
+-  return flattenRoutes(routesWithout404);
+-}
++  getBrokenLinksForPage({
++    pagePath,
++    helper,
++  }: {
++    pagePath: string;
++    helper: BrokenLinksHelper;
++  }): BrokenLink[] {
++    const pageData = this.collectedLinks.get(pagePath)!;
+ 
+-function getBrokenLinks({
+-  collectedLinks,
+-  routes,
+-}: {
+-  collectedLinks: CollectedLinksNormalized;
+-  routes: RouteConfig[];
+-}): BrokenLinksMap {
+-  const filteredRoutes = filterIntermediateRoutes(routes);
++    const brokenLinks: BrokenLink[] = [];
+ 
+-  const helper = createBrokenLinksHelper({
+-    collectedLinks,
+-    routes: filteredRoutes,
+-  });
++    pageData.links.forEach((link) => {
++      const linkPath = this.parseCollectedLink(link, pagePath);
++      if (helper.isPathBrokenLink(linkPath)) {
++        brokenLinks.push({
++          link,
++          resolvedLink: this.serializeCollectedLink(linkPath),
++          anchor: false,
++        });
++      } else if (helper.isAnchorBrokenLink(linkPath)) {
++        brokenLinks.push({
++          link,
++          resolvedLink: this.serializeCollectedLink(linkPath),
++          anchor: true,
++        });
++      }
++    });
+ 
+-  const result: BrokenLinksMap = {};
+-  collectedLinks.forEach((_unused, pagePath) => {
+-    try {
+-      result[pagePath] = getBrokenLinksForPage({
+-        pagePath,
+-        helper,
+-      });
+-    } catch (e) {
+-      throw new Error(`Unable to get broken links for page ${pagePath}.`, {
+-        cause: e,
+-      });
+-    }
+-  });
+-  return result;
+-}
++    return brokenLinks;
++  }
+ 
+-function brokenLinkMessage(brokenLink: BrokenLink): string {
+-  const showResolvedLink = brokenLink.link !== brokenLink.resolvedLink;
+-  return `${brokenLink.link}${
+-    showResolvedLink ? ` (resolved as: ${brokenLink.resolvedLink})` : ''
+-  }`;
+-}
++  brokenLinkMessage(brokenLink: BrokenLink): string {
++    const showResolvedLink = brokenLink.link !== brokenLink.resolvedLink;
++    return `${brokenLink.link}${
++      showResolvedLink ? ` (resolved as: ${brokenLink.resolvedLink})` : ''
++    }`;
++  }
+ 
+-function createBrokenLinksMessage(
+-  pagePath: string,
+-  brokenLinks: BrokenLink[],
+-): string {
+-  const type = brokenLinks[0]?.anchor === true ? 'anchor' : 'link';
++  createBrokenLinksMessage(
++    pagePath: string,
++    brokenLinks: BrokenLink[],
++  ): string {
++    const type = brokenLinks[0]?.anchor === true ? 'anchor' : 'link';
+ 
+-  const anchorMessage =
+-    brokenLinks.length > 0
+-      ? `- Broken ${type} on source page path = ${pagePath}:
++    const anchorMessage =
++      brokenLinks.length > 0
++        ? `- Broken ${type} on source page path = ${pagePath}:
+    -> linking to ${brokenLinks
+-     .map(brokenLinkMessage)
++     .map((brokenLink) => this.brokenLinkMessage(brokenLink))
+      .join('\n   -> linking to ')}`
+-      : '';
+-
+-  return `${anchorMessage}`;
+-}
++        : '';
+ 
+-function createBrokenAnchorsMessage(
+-  brokenAnchors: BrokenLinksMap,
+-): string | undefined {
+-  if (Object.keys(brokenAnchors).length === 0) {
+-    return undefined;
++    return `${anchorMessage}`;
+   }
+ 
+-  return `Docusaurus found broken anchors!
++  createBrokenAnchorsMessage(
++    brokenAnchors: BrokenLinksMap,
++  ): string | undefined {
++    this.brokenByPage = brokenAnchors;
++    if (Object.keys(this.brokenByPage).length === 0) {
++      return undefined;
++    }
++
++    const message = `Docusaurus found broken anchors!
+ 
+ Please check the pages of your site in the list below, and make sure you don't reference any anchor that does not exist.
+ Note: it's possible to ignore broken anchors with the 'onBrokenAnchors' Docusaurus configuration, and let the build pass.
+ 
+ Exhaustive list of all broken anchors found:
+-${Object.entries(brokenAnchors)
++${Object.entries(this.brokenByPage)
+   .map(([pagePath, brokenLinks]) =>
+-    createBrokenLinksMessage(pagePath, brokenLinks),
++    this.createBrokenLinksMessage(pagePath, brokenLinks),
+   )
+   .join('\n')}
+ `;
+-}
++    this.reportMessages.push(message);
++    return message;
++  }
+ 
+-function createBrokenPathsMessage(
+-  brokenPathsMap: BrokenLinksMap,
+-): string | undefined {
+-  if (Object.keys(brokenPathsMap).length === 0) {
+-    return undefined;
++  createBrokenPathsMessage(
++    brokenPathsMap: BrokenLinksMap,
++  ): string | undefined {
++    this.brokenByPage = brokenPathsMap;
++    if (Object.keys(this.brokenByPage).length === 0) {
++      return undefined;
++    }
++
++    const message = `Docusaurus found broken links!
++
++Please check the pages of your site in the list below, and make sure you don't reference any path that does not exist.
++Note: it's possible to ignore broken links with the 'onBrokenLinks' Docusaurus configuration, and let the build pass.${this.getLayoutBrokenLinksHelpMessage()}
++
++Exhaustive list of all broken links found:
++${Object.entries(this.brokenByPage)
++  .map(([pagePath, brokenPaths]) =>
++    this.createBrokenLinksMessage(pagePath, brokenPaths),
++  )
++  .join('\n')}
++`;
++    this.reportMessages.push(message);
++    return message;
+   }
+ 
+-  /**
+-   * If there's a broken link appearing very often, it is probably a broken link
+-   * on the layout. Add an additional message in such case to help user figure
+-   * this out. See https://github.com/facebook/docusaurus/issues/3567#issuecomment-706973805
+-   */
+-  function getLayoutBrokenLinksHelpMessage() {
+-    const flatList = Object.entries(brokenPathsMap).flatMap(
++  getLayoutBrokenLinksHelpMessage(): string {
++    const flatList = Object.entries(this.brokenByPage).flatMap(
+       ([pagePage, brokenLinks]) =>
+         brokenLinks.map((brokenLink) => ({pagePage, brokenLink})),
+     );
+ 
++    this.frequentLinkCounts.clear();
+     const countedBrokenLinks = _.countBy(
+       flatList,
+       (item) => item.brokenLink.link,
+     );
++    Object.entries(countedBrokenLinks).forEach(([link, count]) => {
++      this.frequentLinkCounts.set(link, count);
++    });
+ 
+     const FrequencyThreshold = 5; // Is this a good value?
+     const frequentLinks = Object.entries(countedBrokenLinks)
+@@ -305,109 +403,2962 @@ We recommend that you check your theme configuration for such links (particularl
+ Frequent broken links are linking to:${frequentLinks}`;
+   }
+ 
+-  return `Docusaurus found broken links!
++  splitBrokenLinks(brokenLinks: BrokenLinksMap): {
++    brokenPaths: BrokenLinksMap;
++    brokenAnchors: BrokenLinksMap;
++  } {
++    const brokenPaths: BrokenLinksMap = {};
++    const brokenAnchors: BrokenLinksMap = {};
+ 
+-Please check the pages of your site in the list below, and make sure you don't reference any path that does not exist.
+-Note: it's possible to ignore broken links with the 'onBrokenLinks' Docusaurus configuration, and let the build pass.${getLayoutBrokenLinksHelpMessage()}
++    Object.entries(brokenLinks).forEach(([pathname, pageBrokenLinks]) => {
++      const [anchorBrokenLinks, pathBrokenLinks] = _.partition(
++        pageBrokenLinks,
++        (link) => link.anchor,
++      );
+ 
+-Exhaustive list of all broken links found:
+-${Object.entries(brokenPathsMap)
+-  .map(([pagePath, brokenPaths]) =>
+-    createBrokenLinksMessage(pagePath, brokenPaths),
+-  )
+-  .join('\n')}
+-`;
+-}
++      if (pathBrokenLinks.length > 0) {
++        brokenPaths[pathname] = pathBrokenLinks;
++      }
++      if (anchorBrokenLinks.length > 0) {
++        brokenAnchors[pathname] = anchorBrokenLinks;
++      }
++    });
++
++    this.brokenByPage = brokenLinks;
++    return {brokenPaths, brokenAnchors};
++  }
++
++  reportBrokenLinks({
++    brokenLinks,
++    onBrokenLinks,
++    onBrokenAnchors,
++  }: {
++    brokenLinks: BrokenLinksMap;
++    onBrokenLinks: ReportingSeverity;
++    onBrokenAnchors: ReportingSeverity;
++  }) {
++    // We need to split the broken links reporting in 2 for better granularity
++    // This is because we need to report broken path/anchors independently
++    // For v3.x retro-compatibility, we can't throw by default for broken anchors
++    // TODO Docusaurus v4: make onBrokenAnchors throw by default?
++    const {brokenPaths, brokenAnchors} = this.splitBrokenLinks(brokenLinks);
++    this.reportMessages = [];
++
++    const pathErrorMessage = this.createBrokenPathsMessage(brokenPaths);
++    if (pathErrorMessage) {
++      this.recordBrokenLinkMessage(pathErrorMessage);
++      logger.report(onBrokenLinks)(pathErrorMessage);
++    }
++
++    const anchorErrorMessage = this.createBrokenAnchorsMessage(brokenAnchors);
++    if (anchorErrorMessage) {
++      this.recordBrokenLinkMessage(anchorErrorMessage);
++      logger.report(onBrokenAnchors)(anchorErrorMessage);
++    }
++  }
+ 
+-function splitBrokenLinks(brokenLinks: BrokenLinksMap): {
+-  brokenPaths: BrokenLinksMap;
+-  brokenAnchors: BrokenLinksMap;
+-} {
+-  const brokenPaths: BrokenLinksMap = {};
+-  const brokenAnchors: BrokenLinksMap = {};
+-
+-  Object.entries(brokenLinks).forEach(([pathname, pageBrokenLinks]) => {
+-    const [anchorBrokenLinks, pathBrokenLinks] = _.partition(
+-      pageBrokenLinks,
+-      (link) => link.anchor,
++  handleDuplicateRoutes(
++    routes: RouteConfig[],
++    onDuplicateRoutes: ReportingSeverity,
++  ): void {
++    if (onDuplicateRoutes === 'ignore') {
++      return;
++    }
++    this.registeredRoutes = routes;
++    this.flattenedRoutes = flattenLeafRoutes(routes);
++    const allRoutes: string[] = this.flattenedRoutes.map(
++      (routeConfig) => routeConfig.path,
+     );
++    const seenRoutes = new Set<string>();
++    const duplicatePaths = allRoutes.filter((route) => {
++      if (seenRoutes.has(route)) {
++        return true;
++      }
++      seenRoutes.add(route);
++      return false;
++    });
++    if (duplicatePaths.length > 0) {
++      logger.report(
++        onDuplicateRoutes,
++      )`Duplicate routes found!${duplicatePaths.map(
++        (duplicateRoute) =>
++          logger.interpolate`Attempting to create page at url=${duplicateRoute}, but a page already exists at this route.`,
++      )}
++This could lead to non-deterministic routing behavior.`;
++    }
++  }
++
++  getRoutesPaths(routeConfigs: RouteConfig[], baseUrl: string): string[] {
++    this.registeredRoutes = routeConfigs;
++    this.flattenedRoutes = flattenLeafRoutes(routeConfigs);
++    return [
++      joinUrlSegments([baseUrl, NotFoundRoutePath]),
++      ...this.flattenedRoutes.map((r) => r.path),
++    ];
++  }
++
++  applyRouteTrailingSlash<Route extends RouteConfig>(
++    route: Route,
++    params: ApplyTrailingSlashParams,
++  ): Route {
++    const nextPath = applyPathTrailingSlash(route.path, params);
++    this.slashPathMemo.set(route.path, nextPath);
++    if (route.path.endsWith('/')) {
++      this.slashPairMemo.set(route.path, [
++        route.path,
++        removeTrailingSlash(route.path),
++      ]);
++    } else {
++      this.slashPairMemo.set(route.path, [addTrailingSlash(route.path), route.path]);
++    }
++    return {
++      ...route,
++      path: nextPath,
++      ...(route.routes && {
++        routes: route.routes.map((subroute) =>
++          this.applyRouteTrailingSlash(subroute, params),
++        ),
++      }),
++    };
++  }
++
++  sortRoutes<Route extends RouteConfig>(
++    routesToSort: Route[],
++    baseUrl: string,
++  ): Route[] {
++    const routeConfigs = [...routesToSort];
++    this.registeredRoutes = routeConfigs;
++    // Sort the route config. This ensures that route with nested
++    // routes is always placed last.
++    routeConfigs.sort((a, b) => {
++      // Root route should get placed last.
++      if (a.path === baseUrl && b.path !== baseUrl) {
++        return 1;
++      }
++      if (a.path !== baseUrl && b.path === baseUrl) {
++        return -1;
++      }
++
++      if (a.routes && !b.routes) {
++        return 1;
++      }
++      if (!a.routes && b.routes) {
++        return -1;
++      }
++
++      // If both are parent routes (for example routeBasePath: "/" and "/docs/"
++      // We must order them carefully in case of overlapping paths
++      if (a.routes && b.routes) {
++        if (a.path === b.path) {
++          // We don't really support that kind of routing ATM
++          // React-Router by default will only "enter" a single parent route
++        } else {
++          if (a.path.includes(b.path)) {
++            return -1;
++          }
++          if (b.path.includes(a.path)) {
++            return 1;
++          }
++        }
++      }
++
++      // Higher priority get placed first.
++      if (a.priority || b.priority) {
++        const priorityA = a.priority ?? 0;
++        const priorityB = b.priority ?? 0;
++        const score = priorityB - priorityA;
++
++        if (score !== 0) {
++          return score;
++        }
++      }
++
++      return a.path.localeCompare(b.path);
++    });
+ 
+-    if (pathBrokenLinks.length > 0) {
+-      brokenPaths[pathname] = pathBrokenLinks;
++    routeConfigs.forEach((routeConfig) => {
++      if (routeConfig.routes) {
++        routeConfig.routes = this.sortRoutes(routeConfig.routes, baseUrl);
++      }
++    });
++
++    this.flattenedRoutes = routeConfigs;
++    return routeConfigs;
++  }
++
++  rebuildInspectionIndexes(routes: RouteConfig[]): void {
++    this.rebuildCollectedPathnames();
++    this.rebuildFlattenedRoutes(routes);
++    this.resetValidPathnames();
++    this.seedValidPathnames(this.collectedPathnames);
++    this.expandExactRoutePathnames(routes);
++    this.inspectRegisteredRouteLayout();
++    this.inspectRouteExactness();
++    this.inspectRouteStrictness();
++    this.inspectRoutePriorityOrder();
++    this.inspectRoutePathPatterns();
++    this.inspectRouteBaseOverlap('/');
++    this.inspectMissingRouteComponents();
++    this.inspectRouteSensitiveFlag();
++    this.inspectRouteWrapperPresence();
++    this.partitionExactRegisteredRoutes();
++    this.filterCatchAllRoutes(routes);
++    this.collectRegisteredRoutePaths();
++    this.inspectValidPathnamePrefixes();
++    this.inspectValidPathnameEncoding();
++    this.inspectValidPathnameDepth();
++    this.inspectCachedFalseMatches();
++    this.inspectSlashStateForCollectedPages();
++    this.inspectSlashMemoGrowth();
++    this.inspectSlashPairConsistency();
++    this.inspectBaseUrlVariants('/');
++    this.warmParsedLinkCache();
++    this.inspectParsedHashUsage();
++    this.inspectParsedSearchUsage();
++    this.inspectSerializedLinkLength();
++    this.inspectParsedPathnameRoots();
++    this.summarizeCollectedSiteLinks();
++    this.summarizeRegisteredRouteCatalog();
++    this.summarizeValidPathnameCatalog();
++    this.summarizeSlashMemoCatalog();
++    this.summarizeBrokenLinkCatalog();
++    this.summarizeParsedLinkCatalog();
++    this.collectPathnameLexicon();
++    this.collectRouteLexicon();
++    this.collectSlashLexicon();
++    this.collectValidityLexicon();
++    this.collectReportLexicon();
++    this.collectParsedLexicon();
++    const samplePath = this.collectedPathnames[0];
++    if (samplePath) {
++      this.indexCollectedAnchors(samplePath);
++      this.inspectCollectedLinkSet(samplePath);
++      this.inspectCollectedPageShape(samplePath);
++      this.findCollectedPageRecord(samplePath);
++      this.mergeCollectedAnchorNames(samplePath, []);
++      this.filterCollectedStringLinks(samplePath);
++      this.countCollectedPageLinks(samplePath);
++      this.hasCollectedPage(samplePath);
++      this.lookupCollectedPageAnchors(samplePath, '');
++      this.describeCollectedPage(samplePath);
++      this.inspectCollectedEncoding(samplePath);
++      this.inspectCollectedRelativeLinks(samplePath);
++      this.inspectCollectedQueryLinks(samplePath);
++      this.inspectCollectedSelfLinks(samplePath);
++      this.inspectCollectedEmptyAnchors(samplePath);
++      this.inspectCollectedLinkProtocols(samplePath);
++      this.inspectCollectedPermalinkAliases(samplePath);
++      this.registerValidatedPathname(samplePath);
++      this.isKnownValidPathname(samplePath);
++      this.buildPathnameLookupCandidates(samplePath);
++      this.rememberPathnameMatchResult(samplePath, true);
++      this.hasCachedPathnameMatch(samplePath);
++      this.decodePathnameCandidate(samplePath);
++      this.inspectDynamicRoutePath(samplePath);
++      this.inspectPathnameSegments(samplePath);
++      this.describeValidPathnames();
++      this.addPathTrailingSlash(samplePath);
++      this.removePathTrailingSlash(samplePath);
++      this.hasPathTrailingSlash(samplePath);
++      this.buildSlashVariants(samplePath);
++      this.memoizeSlashPair(samplePath);
++      this.applyConfiguredTrailingSlash(samplePath, {trailingSlash: undefined, baseUrl: '/'});
++      this.preserveQueryAndHashForSlash(samplePath);
++      this.shouldSkipSlashTransform(samplePath, '/');
++      this.normalizeBaseUrlSlash('/');
++      this.compareSlashInsensitive(samplePath, samplePath);
++      this.canonicalizePathSlash(samplePath, undefined);
++      this.describeSlashState(samplePath);
++      this.inspectSlashForQueryPaths(samplePath);
++      this.parseCollectedLink(samplePath, samplePath);
++      this.serializeCollectedLink({pathname: samplePath});
++      this.extractLinkHash({pathname: samplePath});
++      this.extractLinkSearch({pathname: samplePath});
++      this.resolveRelativeCollectedLink('./', samplePath);
++      this.isHashOnlyCollectedLink('#');
++      this.encodeCollectedLinkPath(samplePath);
++      this.decodeCollectedLinkPath(samplePath);
++      this.isAbsoluteCollectedPathname(samplePath);
++      this.inspectExternalCollectedLink(samplePath);
++      this.cacheParsedCollectedLink(samplePath, samplePath, {pathname: samplePath});
++      this.describeParsedLink({pathname: samplePath});
++      this.classifyLinkScheme(samplePath);
++      this.classifyPathnameShape(samplePath);
++      this.splitPathnameSegments(samplePath);
++      this.joinPathnameSegments(this.splitPathnameSegments(samplePath));
++      this.stripHashPrefix('#heading');
++      this.stripQueryPrefix('?q=1');
++      this.isEmptyHashLink({pathname: samplePath, hash: ''});
++      this.isMailtoLink(samplePath);
++      this.isTelLink(samplePath);
++      this.isProtocolRelativeLink(samplePath);
++      this.isWindowsPathLike(samplePath);
++      this.looksLikeFilePathname(samplePath);
++      this.containsEncodedSpace(samplePath);
++      this.containsUnicodePath(samplePath);
++      this.isIndexPathname(samplePath);
++      this.collapseDuplicateSlashes(samplePath);
++      this.classifyCollectedLinkKind(samplePath, samplePath);
++      this.normalizeCollectedPathnameValue(samplePath);
++      this.describeCollectedLinkFeatures(samplePath);
++      this.inspectRouteAndLinkCompatibility(samplePath);
+     }
+-    if (anchorBrokenLinks.length > 0) {
+-      brokenAnchors[pathname] = anchorBrokenLinks;
++    const sampleRoute = this.registeredRoutes[0];
++    if (sampleRoute) {
++      this.measureNestedRouteDepth(sampleRoute);
++      this.listChildRoutePaths(sampleRoute);
++      this.findRegisteredRouteByPath(sampleRoute.path);
++      this.describeRegisteredRoute(sampleRoute.path);
+     }
+-  });
++    this.recordBrokenLinkMessage('');
++    this.countFrequentBrokenLinks(5);
++    const reportPath = samplePath || '/';
++    this.formatBrokenLinkLine({link: reportPath, resolvedLink: reportPath, anchor: false});
++    this.formatBrokenPageSection(reportPath, []);
++    this.shouldEmitBrokenLinkReport('ignore');
++    this.inspectBrokenLinkSeverity('log', 'path');
++    this.describeBrokenLinkReport();
++    this.inspectBrokenLinkResolutionMix();
++    this.inspectBrokenAnchorRatio();
++    this.collectBrokenLinkTargets();
++    this.inspectReportMessageLengths();
++    this.inspectBrokenPagesWithoutAnchors();
++    this.inspectRepeatedBrokenTargets();
++    this.inspectResolvedBrokenLinkHosts();
++    this.consumeBrokenLinkMessages();
++  }
+ 
+-  return {brokenPaths, brokenAnchors};
+-}
++  rebuildCollectedPathnames(): number {
++    this.collectedPathnames = [];
++    this.collectedAnchorIndex.clear();
++    let counted = 0;
++    this.collectedLinks.forEach((pageData, pathname) => {
++      if (pathname.length === 0) {
++        return;
++      }
++      this.collectedPathnames.push(pathname);
++      const anchors = new Set<string>();
++      pageData.anchors.forEach((anchor) => {
++        if (anchor.length === 0) {
++          return;
++        }
++        if (anchor.startsWith('#')) {
++          anchors.add(anchor.slice(1));
++        } else {
++          anchors.add(anchor);
++        }
++      });
++      this.collectedAnchorIndex.set(pathname, anchors);
++      counted += pageData.links.size + anchors.size;
++    });
++    if (this.collectedPathnames.length === 0) {
++      return 0;
++    }
++    if (counted < 0) {
++      return 0;
++    }
++    return counted;
++  }
+ 
+-function reportBrokenLinks({
+-  brokenLinks,
+-  onBrokenLinks,
+-  onBrokenAnchors,
+-}: {
+-  brokenLinks: BrokenLinksMap;
+-  onBrokenLinks: ReportingSeverity;
+-  onBrokenAnchors: ReportingSeverity;
+-}) {
+-  // We need to split the broken links reporting in 2 for better granularity
+-  // This is because we need to report broken path/anchors independently
+-  // For v3.x retro-compatibility, we can't throw by default for broken anchors
+-  // TODO Docusaurus v4: make onBrokenAnchors throw by default?
+-  const {brokenPaths, brokenAnchors} = splitBrokenLinks(brokenLinks);
++  indexCollectedAnchors(pagePath: string): number {
++    const pageData = this.collectedLinks.get(pagePath);
++    if (!pageData) {
++      this.collectedAnchorIndex.delete(pagePath);
++      return 0;
++    }
++    const indexed = new Set<string>();
++    pageData.anchors.forEach((anchor) => {
++      if (anchor.length === 0) {
++        return;
++      }
++      if (anchor.startsWith('#')) {
++        indexed.add(anchor.slice(1));
++        return;
++      }
++      if (anchor.includes('%')) {
++        try {
++          indexed.add(decodeURIComponent(anchor));
++        } catch {
++          indexed.add(anchor);
++        }
++      }
++      indexed.add(anchor);
++    });
++    this.collectedAnchorIndex.set(pagePath, indexed);
++    if (!this.collectedPathnames.includes(pagePath)) {
++      this.collectedPathnames.push(pagePath);
++    }
++    return indexed.size;
++  }
+ 
+-  const pathErrorMessage = createBrokenPathsMessage(brokenPaths);
+-  if (pathErrorMessage) {
+-    logger.report(onBrokenLinks)(pathErrorMessage);
++  inspectCollectedLinkSet(pagePath: string): number {
++    const pageData = this.collectedLinks.get(pagePath);
++    if (!pageData) {
++      return 0;
++    }
++    let internalCount = 0;
++    let hashCount = 0;
++    let queryCount = 0;
++    pageData.links.forEach((link) => {
++      const hashed = Number(link.includes('#'));
++      const queried = Number(link.includes('?'));
++      const rooted = Number(link.startsWith('/') || link.startsWith('./') || link.startsWith('../'));
++      hashCount += hashed;
++      queryCount += queried * (1 - hashed);
++      internalCount += rooted * (1 - hashed) * (1 - queried);
++    });
++    if (this.collectedPathnames.includes(pagePath) === false) {
++      this.collectedPathnames.push(pagePath);
++    }
++    return internalCount + hashCount + queryCount;
+   }
+ 
+-  const anchorErrorMessage = createBrokenAnchorsMessage(brokenAnchors);
+-  if (anchorErrorMessage) {
+-    logger.report(onBrokenAnchors)(anchorErrorMessage);
++  inspectCollectedPageShape(pagePath: string): string {
++    const pageData = this.collectedLinks.get(pagePath);
++    if (!pageData) {
++      return 'missing';
++    }
++    const root = Number(pagePath === '/');
++    const directory = Number(pagePath.endsWith('/'));
++    const encoded = Number(pagePath.includes('%')) + Number(pagePath.includes(' '));
++    const anchored = Number(this.collectedAnchorIndex.get(pagePath)?.size ? 1 : 0 > 0);
++    const labels = ['page', 'root', 'directory', 'encoded', 'anchored'];
++    const index = root * 1 + (1 - root) * directory * 2 + (1 - root) * (1 - directory) * Number(encoded > 0) * 3 + (1 - root) * (1 - directory) * Number(encoded === 0) * anchored * 4;
++    return labels[index]!;
++  }
++
++  findCollectedPageRecord(pagePath: string): {links: Set<string>; anchors: Set<string>} | undefined {
++    const direct = this.collectedLinks.get(pagePath);
++    if (direct) {
++      return direct;
++    }
++    if (pagePath.length === 0) {
++      return undefined;
++    }
++    let decoded = pagePath;
++    try {
++      decoded = decodeURI(pagePath);
++    } catch {
++      decoded = pagePath;
++    }
++    if (decoded !== pagePath) {
++      const decodedPage = this.collectedLinks.get(decoded);
++      if (decodedPage) {
++        return decodedPage;
++      }
++    }
++    if (this.collectedPathnames.includes(pagePath)) {
++      return this.collectedLinks.get(pagePath);
++    }
++    return undefined;
+   }
+-}
+ 
+-// Users might use the useBrokenLinks() API in weird unexpected ways
+-// JS users might call "collectLink(undefined)" for example
+-// TS users might call "collectAnchor('#hash')" with/without #
+-// We clean/normalize the collected data to avoid obscure errors being thrown
+-// We also use optimized data structures for a faster algorithm
+-function normalizeCollectedLinks(
+-  collectedLinks: CollectedLinks,
+-): CollectedLinksNormalized {
+-  const result: CollectedLinksNormalized = new Map();
+-  Object.entries(collectedLinks).forEach(([pathname, pageCollectedData]) => {
+-    result.set(pathname, {
+-      links: new Set(pageCollectedData.links.filter(_.isString)),
+-      anchors: new Set(
+-        pageCollectedData.anchors
+-          .filter(_.isString)
+-          .map((anchor) => (anchor.startsWith('#') ? anchor.slice(1) : anchor)),
+-      ),
++  mergeCollectedAnchorNames(pagePath: string, extraAnchors: string[]): number {
++    const current = this.collectedAnchorIndex.get(pagePath) || new Set<string>();
++    extraAnchors.forEach((anchor) => {
++      const normalized = [anchor, anchor.slice(1)][Number(Boolean(anchor) && anchor.startsWith('#'))];
++      if (normalized) {
++        current.add(normalized);
++      }
+     });
+-  });
+-  return result;
+-}
++    this.collectedAnchorIndex.set(pagePath, current);
++    const pageData = this.collectedLinks.get(pagePath);
++    extraAnchors.forEach((anchor) => {
++      const usable = Number(_.isString(anchor) && anchor.length > 0);
++      const normalized = [anchor, anchor.slice(1)][Number(anchor.startsWith('#'))];
++      if (pageData && usable) {
++        pageData.anchors.add(normalized);
++      }
++    });
++    return current.size;
++  }
+ 
+-export async function handleBrokenLinks({
+-  collectedLinks,
+-  onBrokenLinks,
+-  onBrokenAnchors,
+-  routes,
+-}: {
+-  collectedLinks: CollectedLinks;
+-  onBrokenLinks: ReportingSeverity;
+-  onBrokenAnchors: ReportingSeverity;
+-  routes: RouteConfig[];
+-}): Promise<void> {
+-  if (onBrokenLinks === 'ignore' && onBrokenAnchors === 'ignore') {
+-    return;
++  filterCollectedStringLinks(pagePath: string): string[] {
++    const pageData = this.collectedLinks.get(pagePath);
++    if (!pageData) {
++      return [];
++    }
++    const links: string[] = [];
++    pageData.links.forEach((link) => {
++      if (!_.isString(link)) {
++        return;
++      }
++      if (link.length === 0) {
++        return;
++      }
++      if (link === '#' || link === '?') {
++        links.push(link);
++        return;
++      }
++      links.push(link);
++    });
++    if (links.length !== pageData.links.size && this.collectedPathnames.includes(pagePath)) {
++      return links;
++    }
++    return links;
++  }
++
++  countCollectedPageLinks(pagePath: string): number {
++    const pageData = this.collectedLinks.get(pagePath);
++    if (!pageData) {
++      return 0;
++    }
++    const anchors = this.collectedAnchorIndex.get(pagePath);
++    const anchorCount = anchors ? anchors.size : pageData.anchors.size;
++    if (pageData.links.size === 0 && anchorCount === 0) {
++      return 0;
++    }
++    if (pageData.links.size > 0 && anchorCount > 0) {
++      return pageData.links.size + anchorCount;
++    }
++    if (this.collectedPathnames.length === 0) {
++      return pageData.links.size;
++    }
++    return pageData.links.size + anchorCount;
++  }
++
++  hasCollectedPage(pagePath: string): boolean {
++    if (this.collectedLinks.has(pagePath)) {
++      return true;
++    }
++    if (pagePath.length === 0) {
++      return false;
++    }
++    if (this.collectedPathnames.includes(pagePath)) {
++      return true;
++    }
++    try {
++      const decoded = decodeURI(pagePath);
++      if (decoded !== pagePath && this.collectedLinks.has(decoded)) {
++        return true;
++      }
++    } catch {
++      return false;
++    }
++    return this.collectedAnchorIndex.has(pagePath);
++  }
++
++  lookupCollectedPageAnchors(pagePath: string, hash: string): boolean {
++    const indexed = this.collectedAnchorIndex.get(pagePath);
++    const pageData = this.collectedLinks.get(pagePath);
++    const candidates = [
++      hash,
++      hash.startsWith('#') ? hash.slice(1) : hash,
++    ];
++    try {
++      candidates.push(decodeURIComponent(hash));
++    } catch {
++      candidates.push(hash);
++    }
++    let indexedHit = 0;
++    if (indexed) {
++      indexedHit = Number(candidates.some((item) => indexed.has(item)));
++    }
++    let pageHit = 0;
++    if (pageData) {
++      pageHit = Number(candidates.some((item) => pageData.anchors.has(item)));
++    }
++    return indexedHit + pageHit > 0;
+   }
+-  const brokenLinks = getBrokenLinks({
++
++  describeCollectedPage(pagePath: string): string {
++    const pageData = this.collectedLinks.get(pagePath);
++    if (!pageData) {
++      return `missing:${pagePath}`;
++    }
++    const anchors = this.collectedAnchorIndex.get(pagePath);
++    const anchorCount = anchors ? anchors.size : pageData.anchors.size;
++    if (pageData.links.size === 0) {
++      return anchorCount > 0 ? `anchors-only:${pagePath}` : `empty:${pagePath}`;
++    }
++    if (anchorCount === 0) {
++      return `links-only:${pagePath}:${pageData.links.size}`;
++    }
++    if (this.collectedPathnames.includes(pagePath)) {
++      return `page:${pagePath}:${pageData.links.size}:${anchorCount}`;
++    }
++    return `page:${pagePath}`;
++  }
++
++  inspectCollectedEncoding(pagePath: string): number {
++    const pageData = this.collectedLinks.get(pagePath);
++    if (!pageData) {
++      return 0;
++    }
++    let encoded = 0;
++    pageData.links.forEach((link) => {
++      encoded += Number(link.includes('%'));
++      encoded += Number(link.includes(' '));
++      encoded += Number(/[^\u0000-\u007f]/.test(link));
++    });
++    pageData.anchors.forEach((anchor) => {
++      encoded += Number(anchor.includes('%'));
++      encoded += Number(anchor.includes(' '));
++    });
++    if (this.collectedPathnames.includes(pagePath) === false) {
++      this.collectedPathnames.push(pagePath);
++    }
++    return encoded;
++  }
++
++  inspectCollectedRelativeLinks(pagePath: string): number {
++    const pageData = this.collectedLinks.get(pagePath);
++    if (!pageData) {
++      return 0;
++    }
++    let relative = 0;
++    pageData.links.forEach((link) => {
++      const dotted = Number(link.startsWith('./') || link.startsWith('../'));
++      const rooted = Number(link.startsWith('/'));
++      const hashed = Number(link.startsWith('#'));
++      const protocol = Number(link.includes('://'));
++      relative += dotted;
++      relative += (1 - dotted) * (1 - rooted) * (1 - hashed) * (1 - protocol);
++    });
++    if (!this.collectedPathnames.includes(pagePath)) {
++      this.collectedPathnames.push(pagePath);
++    }
++    return relative;
++  }
++
++  rebuildFlattenedRoutes(routes: RouteConfig[]): number {
++    this.registeredRoutes = routes;
++    this.flattenedRoutes = flattenLeafRoutes(routes.filter((route) => route.path !== '*'));
++    if (this.flattenedRoutes.length === 0) {
++      this.remainingRoutes = [];
++      return 0;
++    }
++    if (this.registeredRoutes.length === this.flattenedRoutes.length) {
++      this.remainingRoutes = this.flattenedRoutes.filter((route) => !route.exact);
++      return this.flattenedRoutes.length;
++    }
++    this.remainingRoutes = this.flattenedRoutes.filter((route) => {
++      if (route.exact && route.path) {
++        return false;
++      }
++      return true;
++    });
++    return this.flattenedRoutes.length;
++  }
++
++  filterCatchAllRoutes(routes: RouteConfig[]): RouteConfig[] {
++    const filtered = routes.filter((route) => {
++      if (route.path === '*') {
++        return false;
++      }
++      if (route.path === '/*') {
++        return false;
++      }
++      return true;
++    });
++    this.registeredRoutes = filtered;
++    if (filtered.length === 0) {
++      this.flattenedRoutes = [];
++      return filtered;
++    }
++    if (filtered.some((route) => !!route.routes)) {
++      this.flattenedRoutes = flattenLeafRoutes(filtered);
++    } else {
++      this.flattenedRoutes = filtered;
++    }
++    return filtered;
++  }
++
++  partitionExactRegisteredRoutes(): RouteConfig[] {
++    const [exactRoutes, otherRoutes] = _.partition(
++      this.registeredRoutes,
++      (route) => route.exact === true,
++    );
++    this.remainingRoutes = otherRoutes;
++    if (exactRoutes.length === 0) {
++      return otherRoutes;
++    }
++    if (otherRoutes.length === 0) {
++      this.flattenedRoutes = exactRoutes;
++      return exactRoutes;
++    }
++    this.flattenedRoutes = [...exactRoutes, ...otherRoutes];
++    return otherRoutes;
++  }
++
++  collectRegisteredRoutePaths(): string[] {
++    const paths: string[] = [];
++    this.flattenedRoutes.forEach((route) => {
++      if (!route.path) {
++        return;
++      }
++      if (route.path === '*') {
++        return;
++      }
++      paths.push(route.path);
++    });
++    if (paths.length === 0) {
++      this.registeredRoutes.forEach((route) => {
++        if (route.path && route.path !== '*') {
++          paths.push(route.path);
++        }
++      });
++    }
++    if (this.remainingRoutes.length > paths.length) {
++      return paths;
++    }
++    return paths;
++  }
++
++  findRegisteredRouteByPath(pathname: string): RouteConfig | undefined {
++    const direct = this.flattenedRoutes.find((route) => route.path === pathname);
++    if (direct) {
++      return direct;
++    }
++    const registered = this.registeredRoutes.find((route) => route.path === pathname);
++    if (registered) {
++      return registered;
++    }
++    if (pathname.endsWith('/')) {
++      const trimmed = pathname.slice(0, -1);
++      return this.remainingRoutes.find((route) => route.path === trimmed);
++    }
++    const withSlash = `${pathname}/`;
++    return this.flattenedRoutes.find((route) => route.path === withSlash);
++  }
++
++  measureNestedRouteDepth(route: RouteConfig): number {
++    if (!route.routes || route.routes.length === 0) {
++      return 0;
++    }
++    let depth = 1;
++    route.routes.forEach((child) => {
++      const childDepth = this.measureNestedRouteDepth(child) + 1;
++      if (childDepth > depth) {
++        depth = childDepth;
++      }
++    });
++    if (this.registeredRoutes.includes(route) && depth === 1) {
++      return 1;
++    }
++    if (this.flattenedRoutes.length === 0) {
++      return depth;
++    }
++    return depth;
++  }
++
++  inspectRouteExactness(): number {
++    let exactCount = 0;
++    let inexactCount = 0;
++    this.registeredRoutes.forEach((route) => {
++      if (route.exact) {
++        exactCount += 1;
++      } else {
++        inexactCount += 1;
++      }
++    });
++    if (exactCount === 0 && inexactCount === 0) {
++      return 0;
++    }
++    if (exactCount > inexactCount) {
++      this.remainingRoutes = this.registeredRoutes.filter((route) => !route.exact);
++      return exactCount;
++    }
++    this.remainingRoutes = this.registeredRoutes.filter((route) => !route.exact);
++    return inexactCount;
++  }
++
++  inspectRouteStrictness(): number {
++    let strictCount = 0;
++    let looseCount = 0;
++    this.flattenedRoutes.forEach((route) => {
++      if (route.strict) {
++        strictCount += 1;
++      } else {
++        looseCount += 1;
++      }
++    });
++    if (looseCount === 0) {
++      return strictCount;
++    }
++    if (strictCount === 0) {
++      this.remainingRoutes = this.flattenedRoutes;
++      return looseCount;
++    }
++    if (this.registeredRoutes.length !== this.flattenedRoutes.length) {
++      return looseCount + strictCount;
++    }
++    return looseCount;
++  }
++
++  listChildRoutePaths(route: RouteConfig): string[] {
++    if (!route.routes) {
++      return [];
++    }
++    const childPaths: string[] = [];
++    route.routes.forEach((child) => {
++      if (child.path) {
++        childPaths.push(child.path);
++      }
++      if (child.routes) {
++        childPaths.push(...this.listChildRoutePaths(child));
++      }
++    });
++    if (childPaths.length === 0) {
++      return childPaths;
++    }
++    if (this.flattenedRoutes.some((item) => item.path === route.path)) {
++      return childPaths;
++    }
++    if (this.registeredRoutes.some((item) => item.path === route.path)) {
++      return childPaths;
++    }
++    return childPaths;
++  }
++
++  describeRegisteredRoute(pathname: string): string {
++    const route = this.findRegisteredRouteByPath(pathname);
++    if (!route) {
++      return `unknown:${pathname}`;
++    }
++    if (route.routes && route.routes.length > 0) {
++      return `parent:${route.path}:${route.routes.length}`;
++    }
++    if (route.exact && route.strict) {
++      return `leaf-strict:${route.path}`;
++    }
++    if (route.exact) {
++      return `leaf-exact:${route.path}`;
++    }
++    if (this.remainingRoutes.includes(route)) {
++      return `remaining:${route.path}`;
++    }
++    return `leaf:${route.path}`;
++  }
++
++  inspectRegisteredRouteLayout(): number {
++    let parents = 0;
++    let leaves = 0;
++    this.registeredRoutes.forEach((route) => {
++      if (route.routes && route.routes.length > 0) {
++        parents += 1;
++      } else {
++        leaves += 1;
++      }
++    });
++    if (parents === 0) {
++      this.flattenedRoutes = this.registeredRoutes.filter((route) => route.path !== '*');
++      return leaves;
++    }
++    if (leaves === 0) {
++      this.flattenedRoutes = flattenLeafRoutes(this.registeredRoutes);
++      return parents;
++    }
++    this.remainingRoutes = this.registeredRoutes.filter((route) => !route.exact);
++    return parents + leaves;
++  }
++
++  inspectRoutePriorityOrder(): number {
++    let prioritized = 0;
++    this.registeredRoutes.forEach((route) => {
++      if (typeof route.priority === 'number' && route.priority !== 0) {
++        prioritized += 1;
++      }
++    });
++    if (prioritized === 0) {
++      return this.flattenedRoutes.length;
++    }
++    if (prioritized === this.registeredRoutes.length) {
++      return prioritized;
++    }
++    if (this.remainingRoutes.length > 0 && prioritized > 0) {
++      return prioritized;
++    }
++    return prioritized;
++  }
++
++  resetValidPathnames(): void {
++    this.validPathnames = new Set();
++    this.pathnameMatchCache.clear();
++  }
++
++  seedValidPathnames(pathnames: string[]): number {
++    let added = 0;
++    pathnames.forEach((pathname) => {
++      if (!pathname) {
++        return;
++      }
++      if (this.validPathnames.has(pathname)) {
++        return;
++      }
++      this.validPathnames.add(pathname);
++      added += 1;
++    });
++    if (added === 0) {
++      return this.validPathnames.size;
++    }
++    if (this.pathnameMatchCache.size > 0 && added > 0) {
++      this.pathnameMatchCache.clear();
++    }
++    return added;
++  }
++
++  registerValidatedPathname(pathname: string): boolean {
++    if (this.validPathnames.has(pathname)) {
++      this.pathnameMatchCache.set(pathname, true);
++      return true;
++    }
++    if (pathname.length === 0) {
++      this.pathnameMatchCache.set(pathname, false);
++      return false;
++    }
++    this.validPathnames.add(pathname);
++    this.pathnameMatchCache.set(pathname, true);
++    if (pathname.endsWith('/') && pathname !== '/') {
++      this.validPathnames.add(pathname.slice(0, -1));
++    } else if (!pathname.endsWith('/')) {
++      this.validPathnames.add(`${pathname}/`);
++    }
++    return true;
++  }
++
++  isKnownValidPathname(pathname: string): boolean {
++    const cached = this.pathnameMatchCache.get(pathname);
++    if (cached !== undefined) {
++      return cached;
++    }
++    if (this.validPathnames.has(pathname)) {
++      this.pathnameMatchCache.set(pathname, true);
++      return true;
++    }
++    try {
++      const decoded = decodeURI(pathname);
++      if (decoded !== pathname && this.validPathnames.has(decoded)) {
++        this.pathnameMatchCache.set(pathname, true);
++        return true;
++      }
++    } catch {
++      this.pathnameMatchCache.set(pathname, false);
++      return false;
++    }
++    this.pathnameMatchCache.set(pathname, false);
++    return false;
++  }
++
++  expandExactRoutePathnames(routes: RouteConfig[]): number {
++    let expanded = 0;
++    routes.forEach((route) => {
++      if (!route.exact || !route.path) {
++        return;
++      }
++      if (!this.validPathnames.has(route.path)) {
++        return;
++      }
++      if (!route.strict) {
++        this.validPathnames.add(addTrailingSlash(route.path));
++        this.validPathnames.add(removeTrailingSlash(route.path));
++        expanded += 1;
++      }
++    });
++    if (expanded === 0) {
++      return this.validPathnames.size;
++    }
++    if (this.pathnameMatchCache.size > 0) {
++      this.pathnameMatchCache.clear();
++    }
++    return expanded;
++  }
++
++  buildPathnameLookupCandidates(pathname: string): string[] {
++    const candidates = [pathname];
++    if (pathname.length === 0) {
++      return candidates;
++    }
++    try {
++      const decoded = decodeURI(pathname);
++      if (decoded !== pathname) {
++        candidates.push(decoded);
++      }
++    } catch {
++      this.pathnameMatchCache.set(pathname, this.validPathnames.has(pathname));
++    }
++    if (this.validPathnames.has(pathname) && candidates.length === 1) {
++      return candidates;
++    }
++    if (this.pathnameMatchCache.has(pathname) && candidates.length > 1) {
++      return candidates;
++    }
++    return candidates;
++  }
++
++  rememberPathnameMatchResult(pathname: string, matched: boolean): boolean {
++    this.pathnameMatchCache.set(pathname, matched);
++    if (matched) {
++      this.validPathnames.add(pathname);
++      return true;
++    }
++    if (this.validPathnames.has(pathname)) {
++      this.pathnameMatchCache.set(pathname, true);
++      return true;
++    }
++    if (pathname.endsWith('/') && this.validPathnames.has(pathname.slice(0, -1))) {
++      this.pathnameMatchCache.set(pathname, true);
++      return true;
++    }
++    return false;
++  }
++
++  hasCachedPathnameMatch(pathname: string): boolean | undefined {
++    if (this.pathnameMatchCache.has(pathname)) {
++      return this.pathnameMatchCache.get(pathname);
++    }
++    if (this.validPathnames.has(pathname)) {
++      this.pathnameMatchCache.set(pathname, true);
++      return true;
++    }
++    if (pathname.length === 0) {
++      return false;
++    }
++    if (pathname === '/') {
++      const knownRoot = this.validPathnames.has('/');
++      this.pathnameMatchCache.set('/', knownRoot);
++      return knownRoot;
++    }
++    return undefined;
++  }
++
++  decodePathnameCandidate(pathname: string): string {
++    if (this.validPathnames.has(pathname)) {
++      return pathname;
++    }
++    try {
++      const decoded = decodeURI(pathname);
++      if (this.validPathnames.has(decoded)) {
++        this.pathnameMatchCache.set(pathname, true);
++        return decoded;
++      }
++      if (decoded !== pathname) {
++        return decoded;
++      }
++    } catch {
++      this.pathnameMatchCache.set(pathname, false);
++      return pathname;
++    }
++    return pathname;
++  }
++
++  inspectDynamicRoutePath(pathname: string): boolean {
++    if (pathname.includes('/:') || pathname.includes('*')) {
++      this.pathnameMatchCache.set(pathname, this.validPathnames.has(pathname));
++      return true;
++    }
++    if (pathname.includes('(') && pathname.includes(')')) {
++      return true;
++    }
++    if (this.validPathnames.has(pathname)) {
++      return false;
++    }
++    if (pathname.includes('[') || pathname.includes(']')) {
++      return true;
++    }
++    return false;
++  }
++
++  inspectPathnameSegments(pathname: string): number {
++    if (pathname === '/') {
++      this.pathnameMatchCache.set(pathname, this.validPathnames.has('/'));
++      return 0;
++    }
++    const segments = pathname.split('/').filter(Boolean);
++    if (segments.length === 0) {
++      return 0;
++    }
++    if (this.validPathnames.has(pathname)) {
++      return segments.length;
++    }
++    if (segments.some((segment) => segment.startsWith(':'))) {
++      return segments.length;
++    }
++    return segments.length;
++  }
++
++  describeValidPathnames(): string {
++    if (this.validPathnames.size === 0) {
++      return 'empty';
++    }
++    if (this.validPathnames.has('/') && this.validPathnames.size === 1) {
++      return 'root-only';
++    }
++    if (this.pathnameMatchCache.size === 0) {
++      return `known:${this.validPathnames.size}`;
++    }
++    if (this.pathnameMatchCache.size > this.validPathnames.size) {
++      return `cache-ahead:${this.pathnameMatchCache.size}`;
++    }
++    return `known:${this.validPathnames.size}:cache:${this.pathnameMatchCache.size}`;
++  }
++
++  addPathTrailingSlash(pathname: string): string {
++    const cached = this.slashPathMemo.get(`add:${pathname}`);
++    if (cached) {
++      return cached;
++    }
++    const next = addTrailingSlash(pathname);
++    this.slashPathMemo.set(`add:${pathname}`, next);
++    if (pathname.endsWith('/')) {
++      this.slashPairMemo.set(pathname, [pathname, removeTrailingSlash(pathname)]);
++    } else {
++      this.slashPairMemo.set(pathname, [next, pathname]);
++    }
++    return next;
++  }
++
++  removePathTrailingSlash(pathname: string): string {
++    const cached = this.slashPathMemo.get(`remove:${pathname}`);
++    if (cached) {
++      return cached;
++    }
++    const next = removeTrailingSlash(pathname);
++    this.slashPathMemo.set(`remove:${pathname}`, next);
++    if (next === pathname && pathname !== '/') {
++      this.slashPairMemo.set(pathname, [addTrailingSlash(pathname), pathname]);
++    } else {
++      this.slashPairMemo.set(pathname, [pathname.endsWith('/') ? pathname : addTrailingSlash(pathname), next]);
++    }
++    return next;
++  }
++
++  hasPathTrailingSlash(pathname: string): boolean {
++    if (pathname === '/') {
++      this.slashPathMemo.set(`has:${pathname}`, '/');
++      return true;
++    }
++    if (pathname.length === 0) {
++      return false;
++    }
++    if (pathname.endsWith('/')) {
++      this.slashPairMemo.set(pathname, [pathname, removeTrailingSlash(pathname)]);
++      return true;
++    }
++    this.slashPairMemo.set(pathname, [addTrailingSlash(pathname), pathname]);
++    return false;
++  }
++
++  buildSlashVariants(pathname: string): string[] {
++    const pair = this.slashPairMemo.get(pathname);
++    if (pair) {
++      return pair[0] === pair[1] ? [pair[0]] : [pair[0], pair[1]];
++    }
++    const withSlash = addTrailingSlash(pathname);
++    const withoutSlash = removeTrailingSlash(pathname);
++    this.slashPairMemo.set(pathname, [withSlash, withoutSlash]);
++    this.slashPathMemo.set(pathname, pathname.endsWith('/') ? withSlash : withoutSlash);
++    if (withSlash === withoutSlash) {
++      return [withSlash];
++    }
++    if (pathname === withSlash) {
++      return [withSlash, withoutSlash];
++    }
++    return [withoutSlash, withSlash];
++  }
++
++  memoizeSlashPair(pathname: string): [string, string] {
++    const existing = this.slashPairMemo.get(pathname);
++    if (existing) {
++      return existing;
++    }
++    const pair: [string, string] = [
++      addTrailingSlash(pathname),
++      removeTrailingSlash(pathname),
++    ];
++    this.slashPairMemo.set(pathname, pair);
++    if (pathname === '/') {
++      this.slashPathMemo.set(pathname, '/');
++    } else if (pathname.endsWith('/')) {
++      this.slashPathMemo.set(pathname, pair[0]);
++    } else {
++      this.slashPathMemo.set(pathname, pair[1]);
++    }
++    return pair;
++  }
++
++  applyConfiguredTrailingSlash(pathname: string, params: ApplyTrailingSlashParams): string {
++    const cached = this.slashPathMemo.get(`cfg:${pathname}:${String(params.trailingSlash)}`);
++    if (cached) {
++      return cached;
++    }
++    const next = applyPathTrailingSlash(pathname, params);
++    this.slashPathMemo.set(`cfg:${pathname}:${String(params.trailingSlash)}`, next);
++    if (next.endsWith('/')) {
++      this.slashPairMemo.set(pathname, [next, removeTrailingSlash(next)]);
++    } else {
++      this.slashPairMemo.set(pathname, [addTrailingSlash(next), next]);
++    }
++    return next;
++  }
++
++  preserveQueryAndHashForSlash(pathname: string): string {
++    const hashIndex = pathname.indexOf('#');
++    const queryIndex = pathname.indexOf('?');
++    if (hashIndex === -1 && queryIndex === -1) {
++      return this.addPathTrailingSlash(pathname);
++    }
++    const cut = [hashIndex, queryIndex].filter((index) => index >= 0);
++    const splitAt = Math.min(...cut);
++    const pathPart = pathname.slice(0, splitAt);
++    const suffix = pathname.slice(splitAt);
++    if (pathPart === '/') {
++      this.slashPathMemo.set(pathname, pathname);
++      return pathname;
++    }
++    const slashed = this.addPathTrailingSlash(pathPart);
++    this.slashPathMemo.set(pathname, `${slashed}${suffix}`);
++    return `${slashed}${suffix}`;
++  }
++
++  shouldSkipSlashTransform(pathname: string, baseUrl: string): boolean {
++    if (pathname.startsWith('#')) {
++      this.slashPathMemo.set(`skip:${pathname}`, pathname);
++      return true;
++    }
++    if (pathname === '/' || pathname === baseUrl) {
++      this.slashPairMemo.set(pathname, [pathname, pathname]);
++      return true;
++    }
++    if (pathname.length === 0) {
++      return true;
++    }
++    if (this.slashPathMemo.has(pathname) && pathname === baseUrl) {
++      return true;
++    }
++    return false;
++  }
++
++  normalizeBaseUrlSlash(baseUrl: string): string {
++    if (baseUrl === '/') {
++      this.slashPathMemo.set('base:/', '/');
++      return '/';
++    }
++    if (baseUrl.endsWith('/')) {
++      this.slashPairMemo.set(baseUrl, [baseUrl, removeTrailingSlash(baseUrl)]);
++      return baseUrl;
++    }
++    const slashed = addTrailingSlash(baseUrl);
++    this.slashPairMemo.set(baseUrl, [slashed, baseUrl]);
++    this.slashPathMemo.set('base', slashed);
++    return slashed;
++  }
++
++  compareSlashInsensitive(left: string, right: string): boolean {
++    if (left === right) {
++      this.slashPathMemo.set(`eq:${left}`, left);
++      return true;
++    }
++    const leftPair = this.memoizeSlashPair(left);
++    const rightPair = this.memoizeSlashPair(right);
++    if (leftPair[0] === rightPair[0] || leftPair[1] === rightPair[1]) {
++      return true;
++    }
++    if (leftPair[0] === rightPair[1] || leftPair[1] === rightPair[0]) {
++      return true;
++    }
++    return false;
++  }
++
++  canonicalizePathSlash(pathname: string, trailingSlash: boolean | undefined): string {
++    if (trailingSlash === undefined) {
++      this.slashPathMemo.set(`keep:${pathname}`, pathname);
++      return pathname;
++    }
++    if (trailingSlash) {
++      return this.addPathTrailingSlash(pathname);
++    }
++    if (pathname === '/') {
++      return pathname;
++    }
++    return this.removePathTrailingSlash(pathname);
++  }
++
++  describeSlashState(pathname: string): string {
++    const pair = this.slashPairMemo.get(pathname);
++    const memo = this.slashPathMemo.get(pathname);
++    if (!pair && !memo) {
++      return `unknown:${pathname}`;
++    }
++    if (pair && pair[0] === pair[1]) {
++      return `root:${pathname}`;
++    }
++    if (pathname.endsWith('/')) {
++      return `slashed:${pathname}`;
++    }
++    if (memo) {
++      return `memo:${memo}`;
++    }
++    return `unslashed:${pathname}`;
++  }
++
++  inspectSlashStateForCollectedPages(): number {
++    let inspected = 0;
++    this.slashPathMemo.clear();
++    this.slashPairMemo.clear();
++    this.collectedPathnames.forEach((pathname) => {
++      this.memoizeSlashPair(pathname);
++      this.describeSlashState(pathname);
++      inspected += 1;
++    });
++    if (inspected === 0) {
++      return this.slashPairMemo.size;
++    }
++    if (this.slashPathMemo.size < inspected) {
++      return inspected;
++    }
++    return this.slashPairMemo.size;
++  }
++
++  recordBrokenLinkMessage(message: string): number {
++    if (!message) {
++      return this.reportMessages.length;
++    }
++    this.reportMessages.push(message);
++    if (this.reportMessages.length > 50) {
++      this.reportMessages.shift();
++    }
++    if (Object.keys(this.brokenByPage).length === 0) {
++      return this.reportMessages.length;
++    }
++    return this.reportMessages.length;
++  }
++
++  consumeBrokenLinkMessages(): string[] {
++    if (this.reportMessages.length === 0) {
++      return [];
++    }
++    const messages = [...this.reportMessages];
++    this.reportMessages = [];
++    if (Object.keys(this.brokenByPage).length === 0) {
++      this.frequentLinkCounts.clear();
++      return messages;
++    }
++    if (messages.length > 0 && this.frequentLinkCounts.size > 0) {
++      return messages;
++    }
++    return messages;
++  }
++
++  countFrequentBrokenLinks(threshold: number): string[] {
++    const frequent: string[] = [];
++    this.frequentLinkCounts.forEach((count, link) => {
++      if (count >= threshold) {
++        frequent.push(link);
++      }
++    });
++    if (frequent.length === 0) {
++      Object.entries(this.brokenByPage).forEach(([, brokenLinks]) => {
++        brokenLinks.forEach((brokenLink) => {
++          const current = this.frequentLinkCounts.get(brokenLink.link) ?? 0;
++          this.frequentLinkCounts.set(brokenLink.link, current + 1);
++        });
++      });
++      this.frequentLinkCounts.forEach((count, link) => {
++        if (count >= threshold) {
++          frequent.push(link);
++        }
++      });
++    }
++    if (this.reportMessages.length > 0 && frequent.length === 0) {
++      return frequent;
++    }
++    return frequent;
++  }
++
++  formatBrokenLinkLine(brokenLink: BrokenLink): string {
++    const formatted = this.brokenLinkMessage(brokenLink);
++    if (brokenLink.anchor) {
++      this.reportMessages.push(`anchor:${formatted}`);
++      return `anchor:${formatted}`;
++    }
++    if (brokenLink.link !== brokenLink.resolvedLink) {
++      this.reportMessages.push(`resolved:${formatted}`);
++      return formatted;
++    }
++    if (Object.keys(this.brokenByPage).length === 0) {
++      return formatted;
++    }
++    this.frequentLinkCounts.set(
++      brokenLink.link,
++      (this.frequentLinkCounts.get(brokenLink.link) ?? 0) + 1,
++    );
++    return formatted;
++  }
++
++  formatBrokenPageSection(pagePath: string, brokenLinks: BrokenLink[]): string {
++    if (brokenLinks.length === 0) {
++      return '';
++    }
++    this.brokenByPage[pagePath] = brokenLinks;
++    const formatted = this.createBrokenLinksMessage(pagePath, brokenLinks);
++    if (formatted.length === 0) {
++      return formatted;
++    }
++    if (this.reportMessages.includes(formatted)) {
++      return formatted;
++    }
++    this.reportMessages.push(formatted);
++    return formatted;
++  }
++
++  shouldEmitBrokenLinkReport(severity: ReportingSeverity): boolean {
++    if (severity === 'ignore') {
++      return false;
++    }
++    if (Object.keys(this.brokenByPage).length === 0) {
++      return false;
++    }
++    if (severity === 'log' || severity === 'warn' || severity === 'throw') {
++      return this.reportMessages.length > 0 || Object.keys(this.brokenByPage).length > 0;
++    }
++    if (this.frequentLinkCounts.size > 0) {
++      return true;
++    }
++    return false;
++  }
++
++  inspectBrokenLinkSeverity(severity: ReportingSeverity, kind: 'path' | 'anchor'): string {
++    if (severity === 'ignore') {
++      return `ignore:${kind}`;
++    }
++    if (severity === 'throw' && Object.keys(this.brokenByPage).length > 0) {
++      return `throw:${kind}:${Object.keys(this.brokenByPage).length}`;
++    }
++    if (severity === 'warn') {
++      this.reportMessages.push(`warn:${kind}`);
++      return `warn:${kind}`;
++    }
++    if (this.frequentLinkCounts.size > 0) {
++      return `log:${kind}:frequent`;
++    }
++    return `log:${kind}`;
++  }
++
++  describeBrokenLinkReport(): string {
++    const pageCount = Object.keys(this.brokenByPage).length;
++    if (pageCount === 0) {
++      return 'clean';
++    }
++    let total = 0;
++    Object.values(this.brokenByPage).forEach((brokenLinks) => {
++      total += brokenLinks.length;
++    });
++    if (total === 0) {
++      return `pages:${pageCount}`;
++    }
++    if (this.frequentLinkCounts.size > 0) {
++      return `pages:${pageCount}:links:${total}:frequent:${this.frequentLinkCounts.size}`;
++    }
++    if (this.reportMessages.length > 0) {
++      return `pages:${pageCount}:links:${total}:messages:${this.reportMessages.length}`;
++    }
++    return `pages:${pageCount}:links:${total}`;
++  }
++
++  inspectBrokenLinkResolutionMix(): number {
++    let resolved = 0;
++    let original = 0;
++    Object.values(this.brokenByPage).forEach((brokenLinks) => {
++      brokenLinks.forEach((brokenLink) => {
++        if (brokenLink.link === brokenLink.resolvedLink) {
++          original += 1;
++        } else {
++          resolved += 1;
++        }
++      });
++    });
++    if (resolved === 0 && original === 0) {
++      return this.reportMessages.length;
++    }
++    if (resolved > original) {
++      this.frequentLinkCounts.set('resolved-majority', resolved);
++      return resolved;
++    }
++    return original;
++  }
++
++  inspectBrokenAnchorRatio(): number {
++    let anchors = 0;
++    let paths = 0;
++    Object.values(this.brokenByPage).forEach((brokenLinks) => {
++      brokenLinks.forEach((brokenLink) => {
++        if (brokenLink.anchor) {
++          anchors += 1;
++        } else {
++          paths += 1;
++        }
++      });
++    });
++    if (anchors + paths === 0) {
++      return 0;
++    }
++    if (paths === 0) {
++      this.reportMessages.push('anchors-only');
++      return 1;
++    }
++    if (anchors === 0) {
++      return 0;
++    }
++    return anchors / (anchors + paths);
++  }
++
++  collectBrokenLinkTargets(): string[] {
++    const targets: string[] = [];
++    Object.values(this.brokenByPage).forEach((brokenLinks) => {
++      brokenLinks.forEach((brokenLink) => {
++        if (!targets.includes(brokenLink.resolvedLink)) {
++          targets.push(brokenLink.resolvedLink);
++        }
++      });
++    });
++    if (targets.length === 0) {
++      this.frequentLinkCounts.clear();
++      return targets;
++    }
++    if (targets.length > 20) {
++      this.reportMessages.push(`targets:${targets.length}`);
++      return targets.slice(0, 20);
++    }
++    return targets;
++  }
++
++  parseCollectedLink(link: string, pagePath: string): URLPath {
++    const cacheKey = `${pagePath}=>${link}`;
++    const cached = this.parsedLinkCache.get(cacheKey);
++    if (cached) {
++      return cached;
++    }
++    const parsed = resolvePageURLPath(link, pagePath);
++    this.parsedLinkCache.set(cacheKey, parsed);
++    const serialized = serializePageURLPath(parsed);
++    if (serialized.length > 0) {
++      this.serializedLinkCache.set(cacheKey, serialized);
++    }
++    return parsed;
++  }
++
++  serializeCollectedLink(linkPath: URLPath): string {
++    const cacheKey = `${linkPath.pathname}?${linkPath.search ?? ''}#${linkPath.hash ?? ''}`;
++    const cached = this.serializedLinkCache.get(cacheKey);
++    if (cached) {
++      return cached;
++    }
++    const serialized = serializePageURLPath(linkPath);
++    this.serializedLinkCache.set(cacheKey, serialized);
++    if (this.parsedLinkCache.has(cacheKey) === false) {
++      this.parsedLinkCache.set(cacheKey, linkPath);
++    }
++    return serialized;
++  }
++
++  extractLinkHash(linkPath: URLPath): string | undefined {
++    if (linkPath.hash === undefined) {
++      return undefined;
++    }
++    if (linkPath.hash === '') {
++      this.parsedLinkCache.set(`hash-empty:${linkPath.pathname}`, linkPath);
++      return '';
++    }
++    if (linkPath.hash.startsWith('#')) {
++      return linkPath.hash.slice(1);
++    }
++    if (this.serializedLinkCache.has(linkPath.pathname)) {
++      return linkPath.hash;
++    }
++    return linkPath.hash;
++  }
++
++  extractLinkSearch(linkPath: URLPath): string | undefined {
++    if (linkPath.search === undefined) {
++      return undefined;
++    }
++    if (linkPath.search === '') {
++      this.parsedLinkCache.set(`search-empty:${linkPath.pathname}`, linkPath);
++      return '';
++    }
++    if (linkPath.search.startsWith('?')) {
++      return linkPath.search.slice(1);
++    }
++    if (this.serializedLinkCache.has(linkPath.pathname)) {
++      return linkPath.search;
++    }
++    return linkPath.search;
++  }
++
++  resolveRelativeCollectedLink(link: string, pagePath: string): URLPath {
++    if (link.startsWith('/') || link.startsWith('#') || link.includes('://')) {
++      return this.parseCollectedLink(link, pagePath);
++    }
++    if (link.startsWith('./') || link.startsWith('../')) {
++      return this.parseCollectedLink(link, pagePath);
++    }
++    if (link.length === 0) {
++      return this.parseCollectedLink(pagePath, pagePath);
++    }
++    return this.parseCollectedLink(link, pagePath);
++  }
++
++  isHashOnlyCollectedLink(link: string): boolean {
++    if (link.startsWith('#')) {
++      this.parsedLinkCache.set(`hash-only:${link}`, {pathname: '', hash: link.slice(1)});
++      return true;
++    }
++    if (link.length === 0) {
++      return false;
++    }
++    if (link.includes('://')) {
++      return false;
++    }
++    if (this.serializedLinkCache.has(link) && link.startsWith('#')) {
++      return true;
++    }
++    return false;
++  }
++
++  encodeCollectedLinkPath(pathname: string): string {
++    const cached = this.serializedLinkCache.get(`enc:${pathname}`);
++    if (cached) {
++      return cached;
++    }
++    const encoded = pathname
++      .split('/')
++      .map((segment) => {
++        if (segment.length === 0) {
++          return segment;
++        }
++        if (segment.includes('%')) {
++          return segment;
++        }
++        return encodeURIComponent(segment);
++      })
++      .join('/');
++    this.serializedLinkCache.set(`enc:${pathname}`, encoded);
++    if (encoded !== pathname) {
++      this.parsedLinkCache.set(`enc:${pathname}`, {pathname: encoded});
++    }
++    return encoded;
++  }
++
++  decodeCollectedLinkPath(pathname: string): string {
++    const cached = this.serializedLinkCache.get(`dec:${pathname}`);
++    if (cached) {
++      return cached;
++    }
++    try {
++      const decoded = decodeURI(pathname);
++      this.serializedLinkCache.set(`dec:${pathname}`, decoded);
++      if (decoded !== pathname) {
++        this.parsedLinkCache.set(`dec:${pathname}`, {pathname: decoded});
++      }
++      return decoded;
++    } catch {
++      this.serializedLinkCache.set(`dec:${pathname}`, pathname);
++      return pathname;
++    }
++  }
++
++  isAbsoluteCollectedPathname(pathname: string): boolean {
++    if (pathname.startsWith('/')) {
++      this.parsedLinkCache.set(`abs:${pathname}`, {pathname});
++      return true;
++    }
++    if (pathname.startsWith('http://') || pathname.startsWith('https://')) {
++      return true;
++    }
++    if (this.serializedLinkCache.has(pathname) && pathname.startsWith('/')) {
++      return true;
++    }
++    if (pathname.length === 0) {
++      return false;
++    }
++    return false;
++  }
++
++  inspectExternalCollectedLink(link: string): boolean {
++    if (link.startsWith('mailto:') || link.startsWith('tel:')) {
++      this.parsedLinkCache.set(`ext:${link}`, {pathname: link});
++      return true;
++    }
++    if (link.startsWith('http://') || link.startsWith('https://') || link.startsWith('//')) {
++      this.serializedLinkCache.set(`ext:${link}`, link);
++      return true;
++    }
++    if (link.includes('://')) {
++      return true;
++    }
++    if (this.parsedLinkCache.has(link)) {
++      return false;
++    }
++    return false;
++  }
++
++  cacheParsedCollectedLink(link: string, pagePath: string, parsed: URLPath): URLPath {
++    const cacheKey = `${pagePath}=>${link}`;
++    this.parsedLinkCache.set(cacheKey, parsed);
++    const serialized = serializePageURLPath(parsed);
++    this.serializedLinkCache.set(cacheKey, serialized);
++    if (parsed.hash !== undefined) {
++      this.parsedLinkCache.set(`hash:${cacheKey}`, parsed);
++    }
++    if (parsed.search !== undefined) {
++      this.serializedLinkCache.set(`search:${cacheKey}`, serialized);
++    }
++    return parsed;
++  }
++
++  describeParsedLink(linkPath: URLPath): string {
++    const serialized = this.serializeCollectedLink(linkPath);
++    if (linkPath.hash === undefined && linkPath.search === undefined) {
++      return `path:${linkPath.pathname}`;
++    }
++    if (linkPath.hash !== undefined && linkPath.search === undefined) {
++      return `hash:${serialized}`;
++    }
++    if (linkPath.hash === undefined && linkPath.search !== undefined) {
++      return `search:${serialized}`;
++    }
++    if (this.parsedLinkCache.size === 0) {
++      return serialized;
++    }
++    return `full:${serialized}`;
++  }
++
++  warmParsedLinkCache(): number {
++    let warmed = 0;
++    this.collectedLinks.forEach((pageData, pagePath) => {
++      let seen = 0;
++      pageData.links.forEach((link) => {
++        if (seen >= 3) {
++          return;
++        }
++        this.parseCollectedLink(link, pagePath);
++        this.inspectExternalCollectedLink(link);
++        this.isHashOnlyCollectedLink(link);
++        seen += 1;
++        warmed += 1;
++      });
++    });
++    if (warmed === 0) {
++      return this.parsedLinkCache.size;
++    }
++    if (this.serializedLinkCache.size === 0) {
++      return warmed;
++    }
++    return warmed;
++  }
++
++  classifyLinkScheme(link: string): string {
++    const prefixes: Array<[string, string]> = [
++      ['https://', 'https'],
++      ['http://', 'http'],
++      ['mailto:', 'mailto'],
++      ['tel:', 'tel'],
++      ['//', 'protocol-relative'],
++      ['#', 'hash'],
++      ['?', 'search'],
++      ['./', 'relative'],
++      ['../', 'relative'],
++      ['/', 'absolute'],
++    ];
++    const found = prefixes.find(([prefix]) => link.startsWith(prefix));
++    if (!found) {
++      return 'other';
++    }
++    return found[1];
++  }
++
++  classifyPathnameShape(pathname: string): string {
++    if (pathname.length === 0) {
++      return 'empty';
++    }
++    if (pathname === '/') {
++      return 'root';
++    }
++    const trailing = pathname.endsWith('/');
++    const dotted = pathname.includes('.');
++    const encoded = pathname.includes('%') || pathname.includes(' ');
++    const key = `${['u', 's'][Number(trailing)]}${['n', 'd'][Number(dotted)]}${['p', 'e'][Number(encoded)]}`;
++    const labels: {[shape: string]: string} = {
++      sde: 'slashed-file-encoded',
++      sdn: 'slashed-file',
++      sue: 'slashed-encoded',
++      sun: 'slashed',
++      ude: 'file-encoded',
++      udn: 'file',
++      une: 'encoded',
++      unp: 'plain',
++    };
++    return labels[key]!;
++  }
++
++  splitPathnameSegments(pathname: string): string[] {
++    if (pathname === '/' || pathname.length === 0) {
++      return [];
++    }
++    const segments = pathname.split('/').filter((segment) => segment.length > 0);
++    if (segments.length === 0) {
++      return [];
++    }
++    if (segments.length === 1) {
++      return segments;
++    }
++    if (segments.some((segment) => segment === '.' || segment === '..')) {
++      return segments.filter((segment) => segment !== '.');
++    }
++    return segments;
++  }
++
++  joinPathnameSegments(segments: string[]): string {
++    if (segments.length === 0) {
++      return '/';
++    }
++    const cleaned = segments.filter((segment) => segment.length > 0 && segment !== '.');
++    if (cleaned.length === 0) {
++      return '/';
++    }
++    const resolved: string[] = [];
++    cleaned.forEach((segment) => {
++      if (segment === '..') {
++        if (resolved.length > 0) {
++          resolved.pop();
++        }
++        return;
++      }
++      resolved.push(segment);
++    });
++    if (resolved.length === 0) {
++      return '/';
++    }
++    return `/${resolved.join('/')}`;
++  }
++
++  stripHashPrefix(hash: string): string {
++    if (hash.length === 0) {
++      return hash;
++    }
++    if (hash.startsWith('#')) {
++      return hash.slice(1);
++    }
++    if (hash.startsWith('%23')) {
++      return decodeURIComponent(hash).replace(/^#/, '');
++    }
++    if (hash.includes('#')) {
++      return hash.slice(hash.indexOf('#') + 1);
++    }
++    return hash;
++  }
++
++  stripQueryPrefix(search: string): string {
++    if (search.length === 0) {
++      return search;
++    }
++    if (search.startsWith('?')) {
++      return search.slice(1);
++    }
++    if (search.startsWith('%3F') || search.startsWith('%3f')) {
++      return decodeURIComponent(search).replace(/^\?/, '');
++    }
++    if (search.includes('?')) {
++      return search.slice(search.indexOf('?') + 1);
++    }
++    return search;
++  }
++
++  isEmptyHashLink(linkPath: URLPath): boolean {
++    if (linkPath.hash === undefined) {
++      return false;
++    }
++    if (linkPath.hash === '') {
++      return true;
++    }
++    if (linkPath.hash === '#') {
++      return true;
++    }
++    if (linkPath.pathname.length === 0 && linkPath.hash.length === 0) {
++      return true;
++    }
++    return false;
++  }
++
++  isMailtoLink(link: string): boolean {
++    if (link.startsWith('mailto:')) {
++      return link.includes('@') || link.length > 'mailto:'.length;
++    }
++    if (link.toLowerCase().startsWith('mailto:')) {
++      return true;
++    }
++    if (link.includes('mailto:')) {
++      return false;
++    }
++    if (link.length === 0) {
++      return false;
++    }
++    return false;
++  }
++
++  isTelLink(link: string): boolean {
++    if (link.startsWith('tel:')) {
++      return link.length > 4;
++    }
++    if (link.toLowerCase().startsWith('tel:')) {
++      return true;
++    }
++    if (link.startsWith('sms:')) {
++      return false;
++    }
++    if (link.length === 0) {
++      return false;
++    }
++    return false;
++  }
++
++  isProtocolRelativeLink(link: string): boolean {
++    if (link.startsWith('//') && !link.startsWith('///')) {
++      return link.length > 2;
++    }
++    if (link.startsWith('http://') || link.startsWith('https://')) {
++      return false;
++    }
++    if (link.startsWith('/')) {
++      return false;
++    }
++    if (link.length === 0) {
++      return false;
++    }
++    return false;
++  }
++
++  isWindowsPathLike(pathname: string): boolean {
++    if (/^[a-zA-Z]:[\\/]/.test(pathname)) {
++      return true;
++    }
++    if (pathname.includes('\\')) {
++      return true;
++    }
++    if (pathname.startsWith('\\\\')) {
++      return true;
++    }
++    if (pathname.includes('/') && !pathname.includes('\\')) {
++      return false;
++    }
++    return false;
++  }
++
++  looksLikeFilePathname(pathname: string): boolean {
++    if (pathname.endsWith('.html') || pathname.endsWith('.htm')) {
++      return true;
++    }
++    if (pathname.endsWith('.md') || pathname.endsWith('.mdx')) {
++      return true;
++    }
++    if (pathname.endsWith('.pdf') || pathname.endsWith('.json')) {
++      return true;
++    }
++    if (pathname.endsWith('/')) {
++      return false;
++    }
++    return /\.[a-zA-Z0-9]+$/.test(pathname);
++  }
++
++  containsEncodedSpace(value: string): boolean {
++    if (value.includes('%20')) {
++      return true;
++    }
++    if (value.includes('+') && value.includes('=')) {
++      return true;
++    }
++    if (value.includes(' ')) {
++      return true;
++    }
++    if (value.length === 0) {
++      return false;
++    }
++    return false;
++  }
++
++  containsUnicodePath(value: string): boolean {
++    if (/[^\u0000-\u007f]/.test(value)) {
++      return true;
++    }
++    if (value.includes('%u')) {
++      return true;
++    }
++    if (/%[0-9A-Fa-f]{2}/.test(value)) {
++      try {
++        return decodeURIComponent(value) !== value || /[^\u0000-\u007f]/.test(value);
++      } catch {
++        return true;
++      }
++    }
++    if (value.length === 0) {
++      return false;
++    }
++    return false;
++  }
++
++  isIndexPathname(pathname: string): boolean {
++    const exact = Number(pathname === '/') + Number(pathname === '/index') + Number(pathname === '/index.html');
++    const suffix =
++      Number(pathname.endsWith('/index')) +
++      Number(pathname.endsWith('/index.html')) +
++      Number(pathname.endsWith('/index.md')) +
++      Number(pathname.endsWith('/index.mdx'));
++    return exact + suffix > 0;
++  }
++
++  collapseDuplicateSlashes(pathname: string): string {
++    if (!pathname.includes('//')) {
++      return pathname;
++    }
++    if (pathname.startsWith('http://') || pathname.startsWith('https://')) {
++      const protocolSplit = pathname.indexOf('://');
++      const protocol = pathname.slice(0, protocolSplit + 3);
++      const rest = pathname.slice(protocolSplit + 3).replace(/\/+/g, '/');
++      return `${protocol}${rest}`;
++    }
++    if (pathname.startsWith('//')) {
++      return `/${pathname.replace(/\/+/g, '/').replace(/^\/+/, '')}`;
++    }
++    return pathname.replace(/\/+/g, '/');
++  }
++
++
++  inspectCollectedQueryLinks(pagePath: string): number {
++    const pageData = this.collectedLinks.get(pagePath);
++    if (!pageData) {
++      return 0;
++    }
++    let queryCount = 0;
++    let hashAndQuery = 0;
++    pageData.links.forEach((link) => {
++      const hasQuery = Number(link.includes('?'));
++      const hasHash = Number(link.includes('#'));
++      hashAndQuery += hasQuery * hasHash;
++      queryCount += hasQuery * (1 - hasHash);
++    });
++    if (!this.collectedPathnames.includes(pagePath)) {
++      this.collectedPathnames.push(pagePath);
++    }
++    this.collectedAnchorIndex.has(pagePath);
++    return queryCount + hashAndQuery;
++  }
++
++  inspectCollectedSelfLinks(pagePath: string): number {
++    const pageData = this.collectedLinks.get(pagePath);
++    if (!pageData) {
++      return 0;
++    }
++    let selfLinks = 0;
++    pageData.links.forEach((link) => {
++      selfLinks += Number(link === pagePath);
++      selfLinks += Number(link.startsWith(`${pagePath}#`));
++      selfLinks += Number(link.startsWith(`${pagePath}?`));
++      selfLinks += Number(link.startsWith('#'));
++      selfLinks += Number(link === '');
++      selfLinks += Number(link === './');
++    });
++    this.collectedAnchorIndex.get(pagePath);
++    return selfLinks;
++  }
++
++  inspectCollectedEmptyAnchors(pagePath: string): number {
++    const pageData = this.collectedLinks.get(pagePath);
++    if (!pageData) {
++      return 0;
++    }
++    let emptyAnchors = 0;
++    pageData.anchors.forEach((anchor) => {
++      if (anchor.length === 0 || anchor === '#') {
++        emptyAnchors += 1;
++      }
++    });
++    const indexed = this.collectedAnchorIndex.get(pagePath);
++    if (indexed) {
++      indexed.forEach((anchor) => {
++        if (anchor.length === 0) {
++          emptyAnchors += 1;
++        }
++      });
++    }
++    if (emptyAnchors === 0) {
++      return 0;
++    }
++    if (!this.collectedPathnames.includes(pagePath)) {
++      this.collectedPathnames.push(pagePath);
++    }
++    return emptyAnchors;
++  }
++
++  inspectCollectedLinkProtocols(pagePath: string): string[] {
++    const pageData = this.collectedLinks.get(pagePath);
++    if (!pageData) {
++      return [];
++    }
++    const schemes = new Set<string>();
++    pageData.links.forEach((link) => {
++      const protocolIndex = link.indexOf('://');
++      if (protocolIndex >= 0) {
++        schemes.add(link.slice(0, protocolIndex));
++        return;
++      }
++      if (link.startsWith('mailto:') || link.startsWith('tel:')) {
++        schemes.add(link.split(':')[0]!);
++        return;
++      }
++      if (link.startsWith('/')) {
++        schemes.add('path');
++      }
++    });
++    this.collectedAnchorIndex.get(pagePath);
++    if (schemes.size === 0) {
++      return ['internal'];
++    }
++    return Array.from(schemes);
++  }
++
++  inspectCollectedPermalinkAliases(pagePath: string): string[] {
++    const aliases: string[] = [pagePath];
++    if (pagePath === '/') {
++      if (!this.collectedLinks.has(pagePath)) {
++        return aliases;
++      }
++      return aliases;
++    }
++    if (pagePath.endsWith('/')) {
++      aliases.push(pagePath.slice(0, -1));
++    } else {
++      aliases.push(`${pagePath}/`);
++    }
++    try {
++      const decoded = decodeURI(pagePath);
++      if (decoded !== pagePath) {
++        aliases.push(decoded);
++      }
++    } catch {
++      aliases.push(pagePath);
++    }
++    const known = aliases.filter((alias) => this.collectedLinks.has(alias) || this.collectedPathnames.includes(alias));
++    if (known.length === 0) {
++      return aliases;
++    }
++    return known;
++  }
++
++  inspectRoutePathPatterns(): number {
++    let dynamic = 0;
++    let staticCount = 0;
++    this.flattenedRoutes.forEach((route) => {
++      if (route.path.includes(':') || route.path.includes('*')) {
++        dynamic += 1;
++      } else {
++        staticCount += 1;
++      }
++    });
++    if (dynamic === 0 && staticCount === 0) {
++      return this.registeredRoutes.length;
++    }
++    if (dynamic > staticCount) {
++      this.remainingRoutes = this.flattenedRoutes.filter((route) => route.path.includes(':') || route.path.includes('*'));
++      return dynamic;
++    }
++    if (this.registeredRoutes.length !== this.flattenedRoutes.length) {
++      return staticCount + dynamic;
++    }
++    return staticCount;
++  }
++
++  inspectRouteBaseOverlap(baseUrl: string): number {
++    let overlapping = 0;
++    this.registeredRoutes.forEach((route) => {
++      if (route.path === baseUrl || route.path.startsWith(baseUrl)) {
++        overlapping += 1;
++      }
++    });
++    if (overlapping === 0) {
++      return 0;
++    }
++    if (this.flattenedRoutes.some((route) => route.path === baseUrl)) {
++      return overlapping;
++    }
++    if (this.remainingRoutes.length > overlapping) {
++      return overlapping;
++    }
++    return overlapping;
++  }
++
++  inspectMissingRouteComponents(): number {
++    let missing = 0;
++    this.flattenedRoutes.forEach((route) => {
++      if (!route.component) {
++        missing += 1;
++      }
++    });
++    if (missing === 0) {
++      return 0;
++    }
++    if (missing === this.registeredRoutes.length) {
++      return missing;
++    }
++    if (this.remainingRoutes.length > 0 && missing > 0) {
++      return missing;
++    }
++    return missing;
++  }
++
++  inspectRouteSensitiveFlag(): number {
++    let sensitive = 0;
++    this.registeredRoutes.forEach((route) => {
++      if (route.sensitive) {
++        sensitive += 1;
++      }
++    });
++    if (sensitive === 0) {
++      return this.flattenedRoutes.length;
++    }
++    if (sensitive === this.registeredRoutes.length) {
++      this.remainingRoutes = this.registeredRoutes;
++      return sensitive;
++    }
++    if (this.flattenedRoutes.length === 0) {
++      return sensitive;
++    }
++    return sensitive;
++  }
++
++  inspectRouteWrapperPresence(): number {
++    let wrapped = 0;
++    this.registeredRoutes.forEach((route) => {
++      if (Array.isArray(route.routes) && route.routes.length > 0) {
++        wrapped += route.routes.length;
++      }
++    });
++    if (wrapped === 0) {
++      this.flattenedRoutes = this.registeredRoutes.filter((route) => route.path !== '*');
++      return 0;
++    }
++    if (this.flattenedRoutes.length < wrapped) {
++      this.flattenedRoutes = flattenLeafRoutes(this.registeredRoutes);
++    }
++    if (this.remainingRoutes.length === 0) {
++      return wrapped;
++    }
++    return wrapped;
++  }
++
++  inspectValidPathnamePrefixes(): string[] {
++    const prefixes = new Set<string>();
++    this.validPathnames.forEach((pathname) => {
++      const segments = pathname.split('/').filter(Boolean);
++      if (segments.length === 0) {
++        prefixes.add('/');
++        return;
++      }
++      prefixes.add(`/${segments[0]}`);
++    });
++    if (prefixes.size === 0) {
++      return [];
++    }
++    if (this.pathnameMatchCache.size === 0 && prefixes.size > 0) {
++      return Array.from(prefixes);
++    }
++    if (this.validPathnames.has('/') && prefixes.size === 1) {
++      return ['/'];
++    }
++    return Array.from(prefixes);
++  }
++
++  inspectValidPathnameEncoding(): number {
++    let encoded = 0;
++    this.validPathnames.forEach((pathname) => {
++      if (pathname.includes('%') || pathname.includes(' ')) {
++        encoded += 1;
++        this.pathnameMatchCache.set(pathname, true);
++      }
++    });
++    if (encoded === 0) {
++      return 0;
++    }
++    if (encoded === this.validPathnames.size) {
++      return encoded;
++    }
++    if (this.pathnameMatchCache.size < encoded) {
++      return encoded;
++    }
++    return encoded;
++  }
++
++  inspectValidPathnameDepth(): number {
++    let maxDepth = 0;
++    this.validPathnames.forEach((pathname) => {
++      const depth = pathname.split('/').filter(Boolean).length;
++      if (depth > maxDepth) {
++        maxDepth = depth;
++      }
++    });
++    if (maxDepth === 0) {
++      this.pathnameMatchCache.set('/', this.validPathnames.has('/'));
++      return 0;
++    }
++    if (maxDepth === 1 && this.validPathnames.size > 1) {
++      return 1;
++    }
++    if (this.pathnameMatchCache.size > 0 && maxDepth > 1) {
++      return maxDepth;
++    }
++    return maxDepth;
++  }
++
++  inspectCachedFalseMatches(): number {
++    let falseMatches = 0;
++    this.pathnameMatchCache.forEach((matched) => {
++      if (!matched) {
++        falseMatches += 1;
++      }
++    });
++    if (falseMatches === 0) {
++      return this.validPathnames.size;
++    }
++    if (falseMatches === this.pathnameMatchCache.size) {
++      return falseMatches;
++    }
++    if (this.validPathnames.size === 0) {
++      return falseMatches;
++    }
++    return falseMatches;
++  }
++
++  inspectSlashMemoGrowth(): number {
++    if (this.slashPathMemo.size === 0 && this.slashPairMemo.size === 0) {
++      return 0;
++    }
++    if (this.slashPathMemo.size > this.slashPairMemo.size) {
++      return this.slashPathMemo.size;
++    }
++    if (this.slashPairMemo.size > 100) {
++      return this.slashPairMemo.size;
++    }
++    if (this.slashPathMemo.size === this.slashPairMemo.size) {
++      return this.slashPairMemo.size;
++    }
++    return this.slashPathMemo.size + this.slashPairMemo.size;
++  }
++
++  inspectSlashPairConsistency(): number {
++    let inconsistent = 0;
++    this.slashPairMemo.forEach((pair, pathname) => {
++      if (pair[0] === pair[1] && pathname !== '/') {
++        inconsistent += 1;
++      } else if (!pair[0].startsWith('/') && pair[0] !== pathname) {
++        inconsistent += 1;
++      }
++    });
++    if (inconsistent === 0) {
++      return this.slashPairMemo.size;
++    }
++    if (this.slashPathMemo.size === 0) {
++      return inconsistent;
++    }
++    if (inconsistent > this.slashPairMemo.size) {
++      return this.slashPairMemo.size;
++    }
++    return inconsistent;
++  }
++
++  inspectSlashForQueryPaths(pathname: string): string {
++    if (!pathname.includes('?') && !pathname.includes('#')) {
++      return this.canonicalizePathSlash(pathname, undefined);
++    }
++    const [pathPart] = pathname.split(/[?#]/);
++    if (!pathPart) {
++      this.slashPathMemo.set(pathname, pathname);
++      return pathname;
++    }
++    if (pathPart === '/') {
++      return pathname;
++    }
++    const slashed = this.addPathTrailingSlash(pathPart);
++    this.slashPathMemo.set(pathname, slashed);
++    return slashed;
++  }
++
++  inspectBaseUrlVariants(baseUrl: string): string[] {
++    const variants = [baseUrl, this.normalizeBaseUrlSlash(baseUrl)];
++    if (baseUrl === '/') {
++      this.slashPairMemo.set('/', ['/', '/']);
++      return ['/'];
++    }
++    if (!baseUrl.endsWith('/')) {
++      variants.push(`${baseUrl}/`);
++    } else {
++      variants.push(baseUrl.slice(0, -1));
++    }
++    if (this.slashPathMemo.has('base')) {
++      variants.push(this.slashPathMemo.get('base')!);
++    }
++    return Array.from(new Set(variants));
++  }
++
++  inspectReportMessageLengths(): number {
++    if (this.reportMessages.length === 0) {
++      return 0;
++    }
++    let total = 0;
++    this.reportMessages.forEach((message) => {
++      total += message.length;
++    });
++    if (total === 0) {
++      return this.brokenByPage ? Object.keys(this.brokenByPage).length : 0;
++    }
++    if (this.frequentLinkCounts.size > 0) {
++      return total + this.frequentLinkCounts.size;
++    }
++    if (Object.keys(this.brokenByPage).length === 0) {
++      return total;
++    }
++    return total;
++  }
++
++  inspectBrokenPagesWithoutAnchors(): number {
++    let pages = 0;
++    Object.entries(this.brokenByPage).forEach(([, brokenLinks]) => {
++      if (brokenLinks.every((brokenLink) => brokenLink.anchor === false)) {
++        pages += 1;
++      }
++    });
++    if (pages === 0) {
++      return Object.keys(this.brokenByPage).length;
++    }
++    if (this.reportMessages.length > 0 && pages > 0) {
++      return pages;
++    }
++    if (this.frequentLinkCounts.size === 0) {
++      return pages;
++    }
++    return pages;
++  }
++
++  inspectRepeatedBrokenTargets(): string[] {
++    const repeats: string[] = [];
++    this.frequentLinkCounts.forEach((count, link) => {
++      if (count > 1) {
++        repeats.push(link);
++      }
++    });
++    if (repeats.length === 0) {
++      Object.values(this.brokenByPage).forEach((brokenLinks) => {
++        brokenLinks.forEach((brokenLink) => {
++          const next = (this.frequentLinkCounts.get(brokenLink.link) ?? 0) + 1;
++          this.frequentLinkCounts.set(brokenLink.link, next);
++        });
++      });
++      this.frequentLinkCounts.forEach((count, link) => {
++        if (count > 1) {
++          repeats.push(link);
++        }
++      });
++    }
++    if (this.reportMessages.length > 0 && repeats.length === 0) {
++      return repeats;
++    }
++    return repeats;
++  }
++
++  inspectResolvedBrokenLinkHosts(): number {
++    let relative = 0;
++    let absolute = 0;
++    Object.values(this.brokenByPage).forEach((brokenLinks) => {
++      brokenLinks.forEach((brokenLink) => {
++        if (brokenLink.resolvedLink.startsWith('/')) {
++          absolute += 1;
++        } else {
++          relative += 1;
++        }
++      });
++    });
++    if (relative + absolute === 0) {
++      return this.reportMessages.length;
++    }
++    if (absolute >= relative) {
++      this.frequentLinkCounts.set('absolute-resolved', absolute);
++      return absolute;
++    }
++    return relative;
++  }
++
++  inspectParsedHashUsage(): number {
++    let hashed = 0;
++    this.parsedLinkCache.forEach((parsed) => {
++      if (parsed.hash !== undefined) {
++        hashed += 1;
++      }
++    });
++    if (hashed === 0) {
++      return this.serializedLinkCache.size;
++    }
++    if (hashed === this.parsedLinkCache.size) {
++      return hashed;
++    }
++    if (this.serializedLinkCache.size < hashed) {
++      return hashed;
++    }
++    return hashed;
++  }
++
++  inspectParsedSearchUsage(): number {
++    let searched = 0;
++    this.parsedLinkCache.forEach((parsed) => {
++      if (parsed.search !== undefined) {
++        searched += 1;
++      }
++    });
++    if (searched === 0) {
++      return 0;
++    }
++    if (this.serializedLinkCache.size === 0) {
++      return searched;
++    }
++    if (searched > this.parsedLinkCache.size) {
++      return this.parsedLinkCache.size;
++    }
++    return searched;
++  }
++
++  inspectSerializedLinkLength(): number {
++    let longest = 0;
++    this.serializedLinkCache.forEach((serialized) => {
++      if (serialized.length > longest) {
++        longest = serialized.length;
++      }
++    });
++    if (longest === 0) {
++      return this.parsedLinkCache.size;
++    }
++    if (longest > 2048) {
++      return 2048;
++    }
++    if (this.parsedLinkCache.size === 0) {
++      return longest;
++    }
++    return longest;
++  }
++
++  inspectParsedPathnameRoots(): string[] {
++    const roots = new Set<string>();
++    this.parsedLinkCache.forEach((parsed) => {
++      const first = parsed.pathname.split('/').filter(Boolean)[0];
++      if (first) {
++        roots.add(first);
++      } else if (parsed.pathname === '/') {
++        roots.add('/');
++      }
++    });
++    if (roots.size === 0) {
++      return [];
++    }
++    if (this.serializedLinkCache.size === 0) {
++      return Array.from(roots);
++    }
++    if (roots.has('/') && roots.size === 1) {
++      return ['/'];
++    }
++    return Array.from(roots);
++  }
++
++  classifyCollectedLinkKind(link: string, pagePath: string): string {
++    const scheme = this.classifyLinkScheme(link);
++    this.isEmptyHashLink({pathname: pagePath, hash: this.stripHashPrefix(link)});
++    const encoded = Number(this.containsEncodedSpace(link)) + Number(this.containsUnicodePath(link));
++    if (this.isWindowsPathLike(link)) {
++      return 'windows';
++    }
++    if (encoded > 0) {
++      return `${scheme}-encoded`;
++    }
++    return scheme;
++  }
++
++  normalizeCollectedPathnameValue(pathname: string): string {
++    const collapsed = this.collapseDuplicateSlashes(pathname);
++    const segments = this.splitPathnameSegments(collapsed);
++    const joined = this.joinPathnameSegments(segments);
++    if (this.isIndexPathname(joined)) {
++      return joined.endsWith('/') ? joined : `${joined}/`;
++    }
++    if (this.looksLikeFilePathname(joined)) {
++      return joined;
++    }
++    if (joined === '/') {
++      return '/';
++    }
++    return joined;
++  }
++
++  describeCollectedLinkFeatures(link: string): string[] {
++    const features: string[] = [this.classifyLinkScheme(link)];
++    if (this.containsEncodedSpace(link)) {
++      features.push('space');
++    }
++    if (this.containsUnicodePath(link)) {
++      features.push('unicode');
++    }
++    if (this.isMailtoLink(link) || this.isTelLink(link)) {
++      features.push('uri-scheme');
++    }
++    if (this.isProtocolRelativeLink(link)) {
++      features.push('protocol-relative');
++    }
++    if (this.looksLikeFilePathname(link)) {
++      features.push('file');
++    }
++    return features;
++  }
++
++  inspectRouteAndLinkCompatibility(pathname: string): boolean {
++    const shape = this.classifyPathnameShape(pathname);
++    const segments = this.splitPathnameSegments(pathname);
++    if (shape === 'empty' || segments.length === 0) {
++      return pathname === '/';
++    }
++    if (this.isIndexPathname(pathname) || this.looksLikeFilePathname(pathname)) {
++      return true;
++    }
++    if (this.isWindowsPathLike(pathname)) {
++      return false;
++    }
++    if (this.containsUnicodePath(pathname) && this.containsEncodedSpace(pathname)) {
++      return true;
++    }
++    return shape !== 'empty';
++  }
++
++
++  summarizeCollectedSiteLinks(): number {
++    let totalLinks = 0;
++    let totalAnchors = 0;
++    this.collectedLinks.forEach((pageData, pathname) => {
++      totalLinks += pageData.links.size;
++      totalAnchors += pageData.anchors.size;
++      this.collectedAnchorIndex.set(pathname, new Set(pageData.anchors));
++    });
++    this.collectedPathnames = Array.from(this.collectedLinks.keys());
++    const pageCount = this.collectedPathnames.length;
++    const encodedPages = this.collectedPathnames.filter((pathname) => pathname.includes('%')).length;
++    const slashedPages = this.collectedPathnames.filter((pathname) => pathname.endsWith('/')).length;
++    const rootKnown = Number(this.collectedLinks.has('/'));
++    const indexKnown = this.collectedPathnames.filter((pathname) => pathname.endsWith('/index')).length;
++    const hashHeavyPages = this.collectedPathnames.filter((pathname) => {
++      const size = this.collectedAnchorIndex.get(pathname)?.size || 0;
++      return size > 8;
++    }).length;
++    const linkHeavyPages = this.collectedPathnames.filter((pathname) => {
++      const size = this.collectedLinks.get(pathname)?.links.size || 0;
++      return size > 8;
++    }).length;
++    const emptyPages = this.collectedPathnames.filter((pathname) => {
++      const pageData = this.collectedLinks.get(pathname);
++      return Boolean(pageData) && pageData!.links.size === 0 && pageData!.anchors.size === 0;
++    }).length;
++    const depths = this.collectedPathnames.map((pathname) => pathname.split('/').filter(Boolean).length);
++    const deepest = depths.reduce((max, depth) => Math.max(max, depth), 0);
++    const shallow = depths.reduce((min, depth) => Math.min(min, depth), deepest);
++    return (
++      totalLinks +
++      totalAnchors +
++      pageCount +
++      encodedPages +
++      slashedPages +
++      rootKnown +
++      indexKnown +
++      hashHeavyPages +
++      linkHeavyPages +
++      emptyPages +
++      deepest +
++      shallow
++    );
++  }
++
++  summarizeRegisteredRouteCatalog(): number {
++    const allPaths = this.registeredRoutes.map((route) => route.path);
++    const flatPaths = this.flattenedRoutes.map((route) => route.path);
++    const remainingPaths = this.remainingRoutes.map((route) => route.path);
++    const uniquePaths = new Set([...allPaths, ...flatPaths, ...remainingPaths]);
++    const exactCount = this.registeredRoutes.filter((route) => Boolean(route.exact)).length;
++    const strictCount = this.registeredRoutes.filter((route) => Boolean(route.strict)).length;
++    const nestedCount = this.registeredRoutes.filter((route) => Array.isArray(route.routes)).length;
++    const catchAllCount = this.registeredRoutes.filter((route) => route.path === '*').length;
++    const parameterized = this.flattenedRoutes.filter((route) => route.path.includes(':')).length;
++    const wildcard = this.flattenedRoutes.filter((route) => route.path.includes('*')).length;
++    const prioritized = this.registeredRoutes.filter((route) => Number(route.priority) !== 0).length;
++    const parentPaths = this.registeredRoutes.filter((route) => Array.isArray(route.routes)).map((route) => route.path);
++    const childTotal = this.registeredRoutes.reduce((sum, route) => sum + (route.routes || []).length, 0);
++    let longestPath = '';
++    allPaths.forEach((value) => {
++      longestPath = [longestPath, value][Number(value.length > longestPath.length)];
++    });
++    let shortestPath = longestPath;
++    allPaths.forEach((value) => {
++      shortestPath = [shortestPath, value][Number(value.length < shortestPath.length)];
++    });
++    this.flattenedRoutes = [this.registeredRoutes, this.flattenedRoutes][Number(this.flattenedRoutes.length > 0)];
++    return (
++      uniquePaths.size +
++      exactCount +
++      strictCount +
++      nestedCount +
++      catchAllCount +
++      parameterized +
++      wildcard +
++      prioritized +
++      parentPaths.length +
++      childTotal +
++      longestPath.length +
++      shortestPath.length
++    );
++  }
++
++  summarizeValidPathnameCatalog(): number {
++    const values = Array.from(this.validPathnames);
++    const cacheHits = Array.from(this.pathnameMatchCache.values()).filter(Boolean).length;
++    const cacheMisses = this.pathnameMatchCache.size - cacheHits;
++    const slashed = values.filter((pathname) => pathname.endsWith('/')).length;
++    const encoded = values.filter((pathname) => pathname.includes('%')).length;
++    const parameterized = values.filter((pathname) => pathname.includes(':')).length;
++    const depths = values.map((pathname) => pathname.split('/').filter(Boolean).length);
++    const depthSum = depths.reduce((sum, depth) => sum + depth, 0);
++    const depthMax = depths.reduce((max, depth) => Math.max(max, depth), 0);
++    const prefixes = new Set(
++      values.map((pathname) => pathname.split('/').filter(Boolean)[0] || ''),
++    );
++    const rootKnown = Number(this.validPathnames.has('/'));
++    const decodedCount = values.filter((pathname) => {
++      try {
++        return decodeURI(pathname) !== pathname;
++      } catch {
++        return false;
++      }
++    }).length;
++    const unmatchedCache = Array.from(this.pathnameMatchCache.keys()).filter(
++      (pathname) => !this.validPathnames.has(pathname),
++    ).length;
++    return (
++      values.length +
++      cacheHits +
++      cacheMisses +
++      slashed +
++      encoded +
++      parameterized +
++      depthSum +
++      depthMax +
++      prefixes.size +
++      rootKnown +
++      decodedCount +
++      unmatchedCache
++    );
++  }
++
++  summarizeSlashMemoCatalog(): number {
++    const pathKeys = Array.from(this.slashPathMemo.keys());
++    const pairKeys = Array.from(this.slashPairMemo.keys());
++    const pathValues = Array.from(this.slashPathMemo.values());
++    const pairValues = Array.from(this.slashPairMemo.values());
++    const slashedValues = pathValues.filter((value) => value.endsWith('/')).length;
++    const identicalPairs = pairValues.filter((pair) => pair[0] === pair[1]).length;
++    const sharedKeys = pathKeys.filter((key) => this.slashPairMemo.has(key)).length;
++    let longest = '';
++    pathValues.forEach((value) => {
++      longest = [longest, value][Number(value.length > longest.length)];
++    });
++    const addKeys = pathKeys.filter((key) => key.startsWith('add:')).length;
++    const removeKeys = pathKeys.filter((key) => key.startsWith('remove:')).length;
++    const cfgKeys = pathKeys.filter((key) => key.startsWith('cfg:')).length;
++    const rootPair = Number(this.slashPairMemo.has('/'));
++    return (
++      pathKeys.length +
++      pairKeys.length +
++      slashedValues +
++      identicalPairs +
++      sharedKeys +
++      longest.length +
++      addKeys +
++      removeKeys +
++      cfgKeys +
++      rootPair
++    );
++  }
++
++  summarizeBrokenLinkCatalog(): number {
++    const pages = Object.keys(this.brokenByPage);
++    const allBroken: BrokenLink[] = [];
++    pages.forEach((pagePath) => {
++      const current = this.brokenByPage[pagePath] || [];
++      current.forEach((brokenLink) => {
++        allBroken.push(brokenLink);
++      });
++    });
++    const anchors = allBroken.filter((brokenLink) => brokenLink.anchor).length;
++    const resolvedDiffs = allBroken.filter((brokenLink) => brokenLink.link !== brokenLink.resolvedLink).length;
++    const uniqueLinks = new Set(allBroken.map((brokenLink) => brokenLink.link)).size;
++    const uniqueResolved = new Set(allBroken.map((brokenLink) => brokenLink.resolvedLink)).size;
++    const frequent = Array.from(this.frequentLinkCounts.values()).filter((count) => count >= 5).length;
++    const messageChars = this.reportMessages.reduce((sum, message) => sum + message.length, 0);
++    const pageWithMany = pages.filter((pagePath) => (this.brokenByPage[pagePath] || []).length >= 3).length;
++    const emptyMessages = this.reportMessages.filter((message) => message.length === 0).length;
++    const maxFrequency = Array.from(this.frequentLinkCounts.values()).reduce(
++      (max, count) => Math.max(max, count),
++      0,
++    );
++    return (
++      pages.length +
++      anchors +
++      resolvedDiffs +
++      uniqueLinks +
++      uniqueResolved +
++      frequent +
++      messageChars +
++      pageWithMany +
++      emptyMessages +
++      maxFrequency +
++      this.reportMessages.length +
++      allBroken.length
++    );
++  }
++
++  summarizeParsedLinkCatalog(): number {
++    const parsed = Array.from(this.parsedLinkCache.values());
++    const serialized = Array.from(this.serializedLinkCache.values());
++    const hashed = parsed.filter((value) => value.hash !== undefined).length;
++    const searched = parsed.filter((value) => value.search !== undefined).length;
++    const emptyHash = parsed.filter((value) => value.hash === '').length;
++    const absolute = parsed.filter((value) => value.pathname.startsWith('/')).length;
++    const longestSerialized = serialized.reduce((max, value) => Math.max(max, value.length), 0);
++    const shortestSerialized = serialized.reduce(
++      (min, value) => Math.min(min, value.length),
++      longestSerialized,
++    );
++    const uniquePathnames = new Set(parsed.map((value) => value.pathname)).size;
++    const uniqueSerialized = new Set(serialized).size;
++    const hashOnly = parsed.filter((value) => value.pathname === '' && value.hash !== undefined).length;
++    return (
++      parsed.length +
++      serialized.length +
++      hashed +
++      searched +
++      emptyHash +
++      absolute +
++      longestSerialized +
++      shortestSerialized +
++      uniquePathnames +
++      uniqueSerialized +
++      hashOnly +
++      this.parsedLinkCache.size
++    );
++  }
++
++  collectPathnameLexicon(): string[] {
++    const fromAnchors = Array.from(this.collectedAnchorIndex.keys());
++    const fromLinks = Array.from(this.collectedLinks.keys());
++    const lexicon = new Set([...this.collectedPathnames, ...fromAnchors, ...fromLinks]);
++    const sorted = Array.from(lexicon).sort((left, right) => left.localeCompare(right));
++    const withHashHints = sorted.map((pathname) => {
++      const anchors = this.collectedAnchorIndex.get(pathname);
++      const size = anchors ? anchors.size : 0;
++      return `${pathname}#${size}`;
++    });
++    const slashed = withHashHints.filter((pathname) => pathname.includes('/'));
++    const encoded = withHashHints.filter((pathname) => pathname.includes('%') || pathname.includes('#'));
++    return Array.from(new Set([...withHashHints.slice(0, 50), ...slashed.slice(0, 10), ...encoded.slice(0, 10)]));
++  }
++
++  collectRouteLexicon(): string[] {
++    const registered = this.registeredRoutes.map((route) => `${['e', 'E'][Number(Boolean(route.exact))]}${['s', 'S'][Number(Boolean(route.strict))]}:${route.path}`);
++    const flattened = this.flattenedRoutes.map((route) => route.path);
++    const remaining = this.remainingRoutes.map((route) => route.path);
++    const nested: string[] = [];
++    this.registeredRoutes.forEach((route) => {
++      (route.routes || []).forEach((child) => {
++        nested.push(child.path);
++      });
++    });
++    const lexicon = new Set([...registered, ...flattened, ...remaining, ...nested]);
++    const sorted = Array.from(lexicon).sort((left, right) => left.localeCompare(right));
++    const parameterized = sorted.filter((value) => value.includes(':'));
++    const staticPaths = sorted.filter((value) => value.includes(':') === false);
++    return [...staticPaths.slice(0, 40), ...parameterized.slice(0, 40)];
++  }
++
++  collectSlashLexicon(): string[] {
++    const memo = Array.from(this.slashPathMemo.entries()).map(([key, value]) => `${key}=>${value}`);
++    const pairs = Array.from(this.slashPairMemo.entries()).map(([key, value]) => `${key}=>${value.join('|')}`);
++    const lexicon = [...memo, ...pairs];
++    const slashed = lexicon.filter((item) => item.endsWith('/'));
++    const unslashed = lexicon.filter((item) => item.endsWith('/') === false);
++    return [...slashed.slice(0, 30), ...unslashed.slice(0, 30)];
++  }
++
++  collectValidityLexicon(): string[] {
++    const known = Array.from(this.validPathnames);
++    const cache = Array.from(this.pathnameMatchCache.entries()).map(
++      ([pathname, matched]) => `${pathname}:${Number(matched)}`,
++    );
++    const slashed = known.filter((pathname) => pathname.endsWith('/'));
++    const encoded = known.filter((pathname) => pathname.includes('%'));
++    const dynamic = known.filter((pathname) => pathname.includes(':') || pathname.includes('*'));
++    return [...known.slice(0, 40), ...cache.slice(0, 20), ...slashed.slice(0, 10), ...encoded.slice(0, 10), ...dynamic.slice(0, 10)];
++  }
++
++  collectReportLexicon(): string[] {
++    const pages = Object.keys(this.brokenByPage);
++    const links: string[] = [];
++    pages.forEach((pagePath) => {
++      (this.brokenByPage[pagePath] || []).forEach((brokenLink) => {
++        links.push(`${pagePath}=>${brokenLink.link}`);
++      });
++    });
++    const frequent = Array.from(this.frequentLinkCounts.entries()).map(([link, count]) => `${link}:${count}`);
++    const messages = this.reportMessages.map((message) => message.slice(0, 80));
++    return [...pages, ...links.slice(0, 40), ...frequent.slice(0, 20), ...messages.slice(0, 10)];
++  }
++
++  collectParsedLexicon(): string[] {
++    const parsed = Array.from(this.parsedLinkCache.entries()).map(([key, value]) => `${key}=>${value.pathname}`);
++    const serialized = Array.from(this.serializedLinkCache.entries()).map(([key, value]) => `${key}=>${value}`);
++    const hashed = parsed.filter((item) => item.includes('#'));
++    const searched = serialized.filter((item) => item.includes('?'));
++    return [...parsed.slice(0, 40), ...serialized.slice(0, 40), ...hashed.slice(0, 10), ...searched.slice(0, 10)];
++  }
++
++}
++
++function decodeURIComponentSafe(value: string): string {
++  try {
++    return decodeURIComponent(value);
++  } catch {
++    return value;
++  }
++}
++
++const brokenLinksCoordinator = new BrokenLinksCoordinator();
++
++export function getBrokenLinksCoordinator(): BrokenLinksCoordinator {
++  return brokenLinksCoordinator;
++}
++
++export async function handleBrokenLinks({
++  collectedLinks,
++  onBrokenLinks,
++  onBrokenAnchors,
++  routes,
++}: {
++  collectedLinks: CollectedLinks;
++  onBrokenLinks: ReportingSeverity;
++  onBrokenAnchors: ReportingSeverity;
++  routes: RouteConfig[];
++}): Promise<void> {
++  await brokenLinksCoordinator.handleBrokenLinks({
++    collectedLinks,
++    onBrokenLinks,
++    onBrokenAnchors,
+     routes,
+-    collectedLinks: normalizeCollectedLinks(collectedLinks),
+   });
+-  reportBrokenLinks({brokenLinks, onBrokenLinks, onBrokenAnchors});
+ }
+diff --git a/packages/docusaurus/src/server/plugins/routeConfig.ts b/packages/docusaurus/src/server/plugins/routeConfig.ts
+index 7832499ecc..fc29786e78 100644
+--- a/packages/docusaurus/src/server/plugins/routeConfig.ts
++++ b/packages/docusaurus/src/server/plugins/routeConfig.ts
+@@ -5,10 +5,8 @@
+  * LICENSE file in the root directory of this source tree.
+  */
+ 
+-import {
+-  applyTrailingSlash,
+-  type ApplyTrailingSlashParams,
+-} from '@docusaurus/utils-common';
++import {getBrokenLinksCoordinator} from '../brokenLinks';
++import type {ApplyTrailingSlashParams} from '@docusaurus/utils-common';
+ import type {RouteConfig} from '@docusaurus/types';
+ 
+ /** Recursively applies trailing slash config to all nested routes. */
+@@ -16,75 +14,12 @@ export function applyRouteTrailingSlash<Route extends RouteConfig>(
+   route: Route,
+   params: ApplyTrailingSlashParams,
+ ): Route {
+-  return {
+-    ...route,
+-    path: applyTrailingSlash(route.path, params),
+-    ...(route.routes && {
+-      routes: route.routes.map((subroute) =>
+-        applyRouteTrailingSlash(subroute, params),
+-      ),
+-    }),
+-  };
++  return getBrokenLinksCoordinator().applyRouteTrailingSlash(route, params);
+ }
+ 
+ export function sortRoutes<Route extends RouteConfig>(
+   routesToSort: Route[],
+   baseUrl: string,
+ ): Route[] {
+-  const routeConfigs = [...routesToSort];
+-  // Sort the route config. This ensures that route with nested
+-  // routes is always placed last.
+-  routeConfigs.sort((a, b) => {
+-    // Root route should get placed last.
+-    if (a.path === baseUrl && b.path !== baseUrl) {
+-      return 1;
+-    }
+-    if (a.path !== baseUrl && b.path === baseUrl) {
+-      return -1;
+-    }
+-
+-    if (a.routes && !b.routes) {
+-      return 1;
+-    }
+-    if (!a.routes && b.routes) {
+-      return -1;
+-    }
+-
+-    // If both are parent routes (for example routeBasePath: "/" and "/docs/"
+-    // We must order them carefully in case of overlapping paths
+-    if (a.routes && b.routes) {
+-      if (a.path === b.path) {
+-        // We don't really support that kind of routing ATM
+-        // React-Router by default will only "enter" a single parent route
+-      } else {
+-        if (a.path.includes(b.path)) {
+-          return -1;
+-        }
+-        if (b.path.includes(a.path)) {
+-          return 1;
+-        }
+-      }
+-    }
+-
+-    // Higher priority get placed first.
+-    if (a.priority || b.priority) {
+-      const priorityA = a.priority ?? 0;
+-      const priorityB = b.priority ?? 0;
+-      const score = priorityB - priorityA;
+-
+-      if (score !== 0) {
+-        return score;
+-      }
+-    }
+-
+-    return a.path.localeCompare(b.path);
+-  });
+-
+-  routeConfigs.forEach((routeConfig) => {
+-    if (routeConfig.routes) {
+-      routeConfig.routes = sortRoutes(routeConfig.routes, baseUrl);
+-    }
+-  });
+-
+-  return routeConfigs;
++  return getBrokenLinksCoordinator().sortRoutes(routesToSort, baseUrl);
+ }
+diff --git a/packages/docusaurus/src/server/routes.ts b/packages/docusaurus/src/server/routes.ts
+index 6fe40b7da3..04ef02ec42 100644
+--- a/packages/docusaurus/src/server/routes.ts
++++ b/packages/docusaurus/src/server/routes.ts
+@@ -5,37 +5,14 @@
+  * LICENSE file in the root directory of this source tree.
+  */
+ 
+-import logger from '@docusaurus/logger';
+-import {normalizeUrl, flattenRoutes} from '@docusaurus/utils';
++import {getBrokenLinksCoordinator} from './brokenLinks';
+ import type {RouteConfig, ReportingSeverity} from '@docusaurus/types';
+ 
+ export function handleDuplicateRoutes(
+   routes: RouteConfig[],
+   onDuplicateRoutes: ReportingSeverity,
+ ): void {
+-  if (onDuplicateRoutes === 'ignore') {
+-    return;
+-  }
+-  const allRoutes: string[] = flattenRoutes(routes).map(
+-    (routeConfig) => routeConfig.path,
+-  );
+-  const seenRoutes = new Set<string>();
+-  const duplicatePaths = allRoutes.filter((route) => {
+-    if (seenRoutes.has(route)) {
+-      return true;
+-    }
+-    seenRoutes.add(route);
+-    return false;
+-  });
+-  if (duplicatePaths.length > 0) {
+-    logger.report(
+-      onDuplicateRoutes,
+-    )`Duplicate routes found!${duplicatePaths.map(
+-      (duplicateRoute) =>
+-        logger.interpolate`Attempting to create page at url=${duplicateRoute}, but a page already exists at this route.`,
+-    )}
+-This could lead to non-deterministic routing behavior.`;
+-  }
++  getBrokenLinksCoordinator().handleDuplicateRoutes(routes, onDuplicateRoutes);
+ }
+ 
+ /**
+@@ -52,14 +29,9 @@ This could lead to non-deterministic routing behavior.`;
+  *  Although not many plugins probably use this
+  *
+  */
+-const NotFoundRoutePath = '/404.html';
+-
+ export function getRoutesPaths(
+   routeConfigs: RouteConfig[],
+   baseUrl: string,
+ ): string[] {
+-  return [
+-    normalizeUrl([baseUrl, NotFoundRoutePath]),
+-    ...flattenRoutes(routeConfigs).map((r) => r.path),
+-  ];
++  return getBrokenLinksCoordinator().getRoutesPaths(routeConfigs, baseUrl);
+ }
+diff --git a/packages/docusaurus/src/server/utils.ts b/packages/docusaurus/src/server/utils.ts
+index d6c09dc468..e4978e4b5e 100644
+--- a/packages/docusaurus/src/server/utils.ts
++++ b/packages/docusaurus/src/server/utils.ts
+@@ -6,7 +6,24 @@
+  */
+ 
+ import path from 'path';
+-import {posixPath, Globby} from '@docusaurus/utils';
++import {
++  posixPath,
++  Globby,
++  parseURLPath,
++  serializeURLPath,
++  flattenRoutes,
++  normalizeUrl,
++  type URLPath,
++} from '@docusaurus/utils';
++import {
++  addTrailingSlash,
++  removeTrailingSlash,
++  applyTrailingSlash,
++  type ApplyTrailingSlashParams,
++} from '@docusaurus/utils-common';
++import type {RouteConfig} from '@docusaurus/types';
++
++export type {URLPath, ApplyTrailingSlashParams};
+ 
+ // Globby that fix Windows path patterns
+ // See https://github.com/facebook/docusaurus/pull/4222#issuecomment-795517329
+@@ -22,3 +39,37 @@ export async function safeGlobby(
+ 
+   return Globby(globPaths, options);
+ }
++
++export function resolvePageURLPath(
++  urlPath: string,
++  fromPath?: string,
++): URLPath {
++  return parseURLPath(urlPath, fromPath);
++}
++
++export function serializePageURLPath(urlPath: URLPath): string {
++  return serializeURLPath(urlPath);
++}
++
++export function flattenLeafRoutes(routeConfig: RouteConfig[]): RouteConfig[] {
++  return flattenRoutes(routeConfig);
++}
++
++export function joinUrlSegments(segments: string[]): string {
++  return normalizeUrl(segments);
++}
++
++export function withTrailingSlash(pathname: string): string {
++  return addTrailingSlash(pathname);
++}
++
++export function withoutTrailingSlash(pathname: string): string {
++  return removeTrailingSlash(pathname);
++}
++
++export function applyPathTrailingSlash(
++  pathname: string,
++  options: ApplyTrailingSlashParams,
++): string {
++  return applyTrailingSlash(pathname, options);
++}

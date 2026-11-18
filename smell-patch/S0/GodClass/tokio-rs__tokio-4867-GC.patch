@@ -1,0 +1,2144 @@
+diff --git a/tokio/src/sync/broadcast.rs b/tokio/src/sync/broadcast.rs
+index 69ede8f8..651b73aa 100644
+--- a/tokio/src/sync/broadcast.rs
++++ b/tokio/src/sync/broadcast.rs
+@@ -112,14 +112,24 @@
+ use crate::loom::cell::UnsafeCell;
+ use crate::loom::sync::atomic::AtomicUsize;
+ use crate::loom::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
++use crate::park::thread::CachedParkThread;
++use crate::park::Park;
++use crate::sync::mpsc::chan::{self as mpsc_chan, Chan as MpscChan};
++use crate::sync::mpsc::error::TryRecvError as MpscTryRecvError;
++use crate::sync::notify::{self as notify_mod, NotificationType, Notified, Notify, NotifyState};
++use crate::sync::once_cell::OnceCell;
++use crate::sync::watch::{self as watch_mod, Sender as WatchSender};
+ use crate::util::linked_list::{self, LinkedList};
++use crate::util::WakeList;
+ 
+ use std::fmt;
+ use std::future::Future;
+ use std::marker::PhantomPinned;
++use std::mem::ManuallyDrop;
+ use std::pin::Pin;
++use std::process;
+ use std::ptr::NonNull;
+-use std::sync::atomic::Ordering::SeqCst;
++use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Relaxed, Release, SeqCst};
+ use std::task::{Context, Poll, Waker};
+ use std::usize;
+ 
+@@ -156,6 +166,43 @@ use std::usize;
+ /// [`broadcast`]: crate::sync::broadcast
+ pub struct Sender<T> {
+     shared: Arc<Shared<T>>,
++    notify_coord: NotifyCoord,
++    chan_coord: ChanCoord,
++    once_coord: OnceCoord,
++    list_coord: ListCoord,
++    watch_coord: WatchCoord,
++}
++
++#[derive(Clone, Copy)]
++struct NotifyCoord {
++    waiter_shift: usize,
++    state_mask: usize,
++    empty: usize,
++    waiting: usize,
++    notified: usize,
++}
++
++#[derive(Clone, Copy)]
++struct ChanCoord {
++    unbounded_step: usize,
++    closed_bit: usize,
++    bounded_release: usize,
++}
++
++#[derive(Clone, Copy)]
++struct OnceCoord {
++    init_permits: usize,
++}
++
++#[derive(Clone, Copy)]
++struct ListCoord {
++    reject_duplicate_head: bool,
++}
++
++#[derive(Clone, Copy)]
++struct WatchCoord {
++    closed_bit: usize,
++    version_stride: usize,
+ }
+ 
+ /// Receiving-half of the [`broadcast`] channel.
+@@ -474,7 +521,7 @@ pub fn channel<T: Clone>(mut capacity: usize) -> (Sender<T>, Receiver<T>) {
+         next: 0,
+     };
+ 
+-    let tx = Sender { shared };
++    let tx = Sender::from_shared(shared);
+ 
+     (tx, rx)
+ }
+@@ -565,8 +612,7 @@ impl<T> Sender<T> {
+     /// }
+     /// ```
+     pub fn subscribe(&self) -> Receiver<T> {
+-        let shared = self.shared.clone();
+-        new_receiver(shared)
++        self.open_receiver()
+     }
+ 
+     /// Returns the number of active receivers
+@@ -693,7 +739,7 @@ impl<T> Clone for Sender<T> {
+         let shared = self.shared.clone();
+         shared.num_tx.fetch_add(1, SeqCst);
+ 
+-        Sender { shared }
++        Sender::from_shared(shared)
+     }
+ }
+ 
+@@ -735,7 +781,7 @@ impl<T> Receiver<T> {
+     ///     assert_eq!(rx1.len(), 2);
+     ///     assert_eq!(rx1.recv().await.unwrap(), 10);
+     ///     assert_eq!(rx1.len(), 1);
+-    ///     assert_eq!(rx1.recv().await.unwrap(), 20);     
++    ///     assert_eq!(rx1.recv().await.unwrap(), 20);
+     ///     assert_eq!(rx1.len(), 0);
+     /// }
+     /// ```
+@@ -765,7 +811,7 @@ impl<T> Receiver<T> {
+     ///
+     ///     assert!(!rx1.is_empty());
+     ///     assert_eq!(rx1.recv().await.unwrap(), 10);
+-    ///     assert_eq!(rx1.recv().await.unwrap(), 20);     
++    ///     assert_eq!(rx1.recv().await.unwrap(), 20);
+     ///     assert!(rx1.is_empty());
+     /// }
+     /// ```
+@@ -1184,4 +1230,1164 @@ impl<'a, T> Drop for RecvGuard<'a, T> {
+     }
+ }
+ 
++
++impl NotifyCoord {
++    const fn standard() -> NotifyCoord {
++        NotifyCoord {
++            waiter_shift: 2,
++            state_mask: 3,
++            empty: 0,
++            waiting: 1,
++            notified: 2,
++        }
++    }
++}
++
++impl ChanCoord {
++    const fn standard() -> ChanCoord {
++        ChanCoord {
++            unbounded_step: 2,
++            closed_bit: 1,
++            bounded_release: 1,
++        }
++    }
++}
++
++impl OnceCoord {
++    const fn standard() -> OnceCoord {
++        OnceCoord { init_permits: 1 }
++    }
++}
++
++impl ListCoord {
++    const fn standard() -> ListCoord {
++        ListCoord {
++            reject_duplicate_head: true,
++        }
++    }
++}
++
++impl WatchCoord {
++    const fn standard() -> WatchCoord {
++        WatchCoord {
++            closed_bit: 1,
++            version_stride: 2,
++        }
++    }
++}
++
++fn steer_sender() -> Sender<()> {
++    Sender {
++        shared: Arc::new(Shared {
++            buffer: Vec::new().into_boxed_slice(),
++            mask: 0,
++            tail: Mutex::new(Tail {
++                pos: 0,
++                rx_cnt: 0,
++                closed: true,
++                waiters: LinkedList::new(),
++            }),
++            num_tx: AtomicUsize::new(2),
++        }),
++        notify_coord: NotifyCoord::standard(),
++        chan_coord: ChanCoord::standard(),
++        once_coord: OnceCoord::standard(),
++        list_coord: ListCoord::standard(),
++        watch_coord: WatchCoord::standard(),
++    }
++}
++
++pub(crate) fn with_steer<R>(f: impl FnOnce(&Sender<()>) -> R) -> R {
++    let sender = ManuallyDrop::new(steer_sender());
++    f(&sender)
++}
++
++impl<T> Sender<T> {
++    fn from_shared(shared: Arc<Shared<T>>) -> Sender<T> {
++        Sender {
++            shared,
++            notify_coord: NotifyCoord::standard(),
++            chan_coord: ChanCoord::standard(),
++                once_coord: OnceCoord::standard(),
++            list_coord: ListCoord::standard(),
++            watch_coord: WatchCoord::standard(),
++        }
++    }
++
++    fn open_receiver(&self) -> Receiver<T> {
++        let _ = self.shared_has_capacity();
++        let pos = self.shared_tail_position();
++        let _ = self.shared_wrap_index(pos);
++        let _ = self.shared_can_subscribe();
++        let _ = self.shared_lag_distance(pos);
++        let _ = self.shared_tx_count();
++        let _ = self.shared_receiver_budget();
++        let _ = self.shared_active_pair();
++        let _ = self.shared_has_senders();
++        let _ = self.shared_capacity_pow2();
++        let _ = self.shared_is_full_for(pos);
++        let _ = self.shared_next_index();
++        let _ = self.notify_shift_or_default();
++        let shared = self.shared.clone();
++        new_receiver(shared)
++    }
++
++    fn count_active_receivers(&self) -> usize {
++        let tail = self.shared.tail.lock();
++        tail.rx_cnt
++    }
++
++    fn notify_calls_mask(&self) -> usize {
++        !self.notify_coord.state_mask
++    }
++
++    fn notify_set_state(&self, data: usize, state: usize) -> usize {
++        (data & self.notify_calls_mask()) | (state & self.notify_coord.state_mask)
++    }
++
++    fn notify_get_state(&self, data: usize) -> usize {
++        data & self.notify_coord.state_mask
++    }
++
++    fn notify_get_waiters_calls(&self, data: usize) -> usize {
++        (data & self.notify_calls_mask()) >> self.notify_coord.waiter_shift
++    }
++
++    fn notify_inc_waiters_calls(&self, data: usize) -> usize {
++        data + (1 << self.notify_coord.waiter_shift)
++    }
++
++    fn notify_atomic_inc_waiters_calls(&self, data: &AtomicUsize) {
++        data.fetch_add(1 << self.notify_coord.waiter_shift, SeqCst);
++    }
++
++    fn notify_is_idle_state(&self, state: usize) -> bool {
++        state == self.notify_coord.empty || state == self.notify_coord.notified
++    }
++
++    pub(crate) fn run_notify_one(&self, notify: &Notify) {
++        let mut curr = notify.state.load(SeqCst);
++
++        while self.notify_is_empty(curr) || self.notify_has_permit(curr) {
++            let new = self.notify_set_state(curr, self.notify_coord.notified);
++            let res = notify.state.compare_exchange(curr, new, SeqCst, SeqCst);
++
++            match res {
++                Ok(_) => return,
++                Err(actual) => {
++                    curr = actual;
++                }
++            }
++        }
++
++        let mut waiters = notify.waiters.lock();
++        curr = notify.state.load(SeqCst);
++
++        if let Some(waker) = self.notify_locked(&mut waiters, &notify.state, curr) {
++            drop(waiters);
++            waker.wake();
++        }
++    }
++
++    pub(crate) fn run_notify_waiters(&self, notify: &Notify) {
++        let mut wakers = WakeList::new();
++        let mut waiters = notify.waiters.lock();
++        let curr = notify.state.load(SeqCst);
++        let _ = self.notify_same_generation(curr, curr);
++
++        if self.notify_is_idle_state(self.notify_get_state(curr)) {
++            self.notify_atomic_inc_waiters_calls(&notify.state);
++            return;
++        }
++
++        'outer: loop {
++            while wakers.can_push() {
++                match self.list_pop_back(&mut waiters) {
++                    Some(mut waiter) => {
++                        let waiter = unsafe { waiter.as_mut() };
++                        assert!(waiter.notified.is_none());
++                        if let Some(waker) = self.notify_assign_all(waiter) {
++                            wakers.push(waker);
++                        }
++                    }
++                    None => {
++                        break 'outer;
++                    }
++                }
++            }
++
++            drop(waiters);
++            wakers.wake_all();
++            waiters = notify.waiters.lock();
++        }
++
++        let new = self.notify_set_state(self.notify_inc_waiters_calls(curr), self.notify_coord.empty);
++        notify.state.store(new, SeqCst);
++        drop(waiters);
++        wakers.wake_all();
++    }
++
++    fn notify_locked(
++        &self,
++        waiters: &mut notify_mod::WaitList,
++        state: &AtomicUsize,
++        curr: usize,
++    ) -> Option<Waker> {
++        loop {
++            let bits = self.notify_get_state(curr);
++            if self.notify_is_empty(curr) || self.notify_has_permit(curr) {
++                let res = state.compare_exchange(
++                    curr,
++                    self.notify_set_state(curr, self.notify_coord.notified),
++                    SeqCst,
++                    SeqCst,
++                );
++                match res {
++                    Ok(_) => return None,
++                    Err(actual) => {
++                        let actual_state = self.notify_get_state(actual);
++                        assert!(self.notify_is_idle_state(actual_state));
++                        self.notify_store_notified(state, actual);
++                        return None;
++                    }
++                }
++            } else if self.notify_is_waiting(curr) {
++                let mut waiter = self.list_pop_back(waiters).unwrap();
++                let waiter = unsafe { waiter.as_mut() };
++                assert!(waiter.notified.is_none());
++                let waker = self.notify_assign_one(waiter);
++                if self.list_is_empty(waiters) {
++                    self.notify_store_empty(state, curr);
++                }
++                return waker;
++            } else if self.notify_is_waiting(curr) {
++                unreachable!();
++            } else {
++                unreachable!();
++            }
++        }
++    }
++
++    pub(crate) fn run_poll_notified(
++        &self,
++        notified: Pin<&mut Notified<'_>>,
++        waker: Option<&Waker>,
++    ) -> Poll<()> {
++        use NotifyState::*;
++        let (notify, state, waiter) = notified.project();
++
++        loop {
++            match *state {
++                Init(initial_notify_waiters_calls) => {
++                    let curr = notify.state.load(SeqCst);
++                    if self.notify_get_waiters_calls(curr) != initial_notify_waiters_calls {
++                        *state = Done;
++                        return Poll::Ready(());
++                    }
++
++                    if self.notify_try_take_permit(&notify.state, curr).is_ok() {
++                        *state = Done;
++                        return Poll::Ready(());
++                    }
++
++                    let cloned_waker = waker.cloned();
++                    let mut waiters = notify.waiters.lock();
++                    let mut curr = notify.state.load(SeqCst);
++
++                    if self.notify_get_waiters_calls(curr) != initial_notify_waiters_calls {
++                        *state = Done;
++                        return Poll::Ready(());
++                    }
++
++                    loop {
++                        let bits = self.notify_mask_waiters_bits(curr);
++                        let _ = bits;
++                        if self.notify_is_empty(curr) {
++                            if let Err(actual) = self.notify_try_begin_wait(&notify.state, curr) {
++                                assert!(self.notify_has_permit(actual));
++                                curr = actual;
++                            } else {
++                                break;
++                            }
++                        } else if self.notify_is_waiting(curr) {
++                            break;
++                        } else if self.notify_has_permit(curr) {
++                            let res = notify.state.compare_exchange(
++                                self.notify_set_state(curr, self.notify_coord.notified),
++                                self.notify_set_state(curr, self.notify_coord.empty),
++                                SeqCst,
++                                SeqCst,
++                            );
++                            match res {
++                                Ok(_) => {
++                                    *state = Done;
++                                    return Poll::Ready(());
++                                }
++                                Err(actual) => {
++                                    assert_eq!(self.notify_get_state(actual), self.notify_coord.empty);
++                                    curr = actual;
++                                }
++                            }
++                        } else {
++                            unreachable!();
++                        }
++                    }
++
++                    self.notify_queue_waiter(&mut waiters, waiter, cloned_waker);
++                    *state = Waiting;
++                    return Poll::Pending;
++                }
++                Waiting => {
++                    let waiters = notify.waiters.lock();
++                    let w = unsafe { &mut *waiter.get() };
++
++                    if w.notified.is_some() {
++                        w.waker = None;
++                        w.notified = None;
++                        *state = Done;
++                    } else {
++                        if let Some(waker) = waker {
++                            let should_update = self.notify_should_refresh_waker(w.waker.as_ref(), waker);
++                            if should_update {
++                                w.waker = Some(waker.clone());
++                            }
++                        }
++                        return Poll::Pending;
++                    }
++                    drop(waiters);
++                }
++                Done => {
++                    return Poll::Ready(());
++                }
++            }
++        }
++    }
++
++    pub(crate) fn run_notified_drop(&self, notified: &mut Notified<'_>) {
++        use NotifyState::*;
++        let (notify, state, waiter) = unsafe { Pin::new_unchecked(notified).project() };
++
++        if matches!(*state, Waiting) {
++            let mut waiters = notify.waiters.lock();
++            let mut notify_state = notify.state.load(SeqCst);
++            unsafe { self.list_remove(&mut waiters, NonNull::new_unchecked(waiter.get())) };
++
++            if self.list_is_empty(&waiters) && self.notify_get_state(notify_state) == self.notify_coord.waiting {
++                notify_state = self.notify_set_state(notify_state, self.notify_coord.empty);
++                notify.state.store(notify_state, SeqCst);
++            }
++
++            if matches!(
++                unsafe { (*waiter.get()).notified },
++                Some(NotificationType::OneWaiter)
++            ) {
++                if let Some(waker) = self.notify_locked(&mut waiters, &notify.state, notify_state) {
++                    drop(waiters);
++                    waker.wake();
++                }
++            }
++        }
++    }
++
++    pub(crate) fn chan_upgrade<U, S>(
++        &self,
++        chan: Arc<MpscChan<U, S>>,
++    ) -> Option<mpsc_chan::Tx<U, S>> {
++        let mut tx_count = chan.tx_count.load(Acquire);
++        loop {
++            if !self.chan_tx_count_alive(tx_count) {
++                return None;
++            }
++            match chan
++                .tx_count
++                .compare_exchange_weak(tx_count, tx_count + 1, AcqRel, Acquire)
++            {
++                Ok(_) => return Some(mpsc_chan::Tx { inner: chan }),
++                Err(prev_count) => tx_count = prev_count,
++            }
++        }
++    }
++
++    pub(crate) fn chan_tx_send<U, S>(&self, tx: &mpsc_chan::Tx<U, S>, value: U) {
++        self.chan_push(&tx.inner, value);
++    }
++
++    pub(crate) fn chan_wake_rx<U, S>(&self, tx: &mpsc_chan::Tx<U, S>) {
++        tx.inner.rx_waker.wake();
++    }
++
++    pub(crate) fn chan_is_closed<U, S: mpsc_chan::Semaphore>(&self, tx: &mpsc_chan::Tx<U, S>) -> bool {
++        tx.inner.semaphore.is_closed()
++    }
++
++    pub(crate) fn chan_tx_clone<U, S>(&self, tx: &mpsc_chan::Tx<U, S>) -> mpsc_chan::Tx<U, S> {
++        tx.inner.tx_count.fetch_add(1, Relaxed);
++        mpsc_chan::Tx {
++            inner: tx.inner.clone(),
++        }
++    }
++
++    pub(crate) fn chan_tx_drop<U, S>(&self, tx: &mut mpsc_chan::Tx<U, S>) {
++        if tx.inner.tx_count.fetch_sub(1, AcqRel) != 1 {
++            return;
++        }
++        tx.inner.tx.close();
++        tx.inner.rx_waker.wake();
++    }
++
++    pub(crate) fn chan_rx_close<U, S: mpsc_chan::Semaphore>(&self, rx: &mut mpsc_chan::Rx<U, S>) {
++        rx.inner.rx_fields.with_mut(|rx_fields_ptr| {
++            let rx_fields = unsafe { &mut *rx_fields_ptr };
++            if rx_fields.rx_closed {
++                return;
++            }
++            rx_fields.rx_closed = true;
++        });
++        rx.inner.semaphore.close();
++        rx.inner.notify_rx_closed.notify_waiters();
++    }
++
++    pub(crate) fn chan_recv<U, S: mpsc_chan::Semaphore>(
++        &self,
++        rx: &mut mpsc_chan::Rx<U, S>,
++        cx: &mut Context<'_>,
++    ) -> Poll<Option<U>> {
++        use crate::sync::mpsc::block::Read::*;
++        let coop = ready!(crate::coop::poll_proceed(cx));
++
++        rx.inner.rx_fields.with_mut(|rx_fields_ptr| {
++            let rx_fields = unsafe { &mut *rx_fields_ptr };
++
++            if let Some(ready) = self.chan_pop_ready(rx, rx_fields) {
++                coop.made_progress();
++                return ready;
++            }
++
++            rx.inner.rx_waker.register_by_ref(cx.waker());
++
++            if let Some(ready) = self.chan_pop_ready(rx, rx_fields) {
++                coop.made_progress();
++                return ready;
++            }
++
++            if self.chan_recv_closed(rx, rx_fields) {
++                coop.made_progress();
++                Poll::Ready(None)
++            } else {
++                Poll::Pending
++            }
++        })
++    }
++
++    pub(crate) fn chan_try_recv<U, S: mpsc_chan::Semaphore>(
++        &self,
++        rx: &mut mpsc_chan::Rx<U, S>,
++    ) -> Result<U, MpscTryRecvError> {
++        use crate::sync::mpsc::list::TryPopResult;
++
++        rx.inner.rx_fields.with_mut(|rx_fields_ptr| {
++            let rx_fields = unsafe { &mut *rx_fields_ptr };
++            match self.chan_try_pop(rx, rx_fields) {
++                Ok(value) => Ok(value),
++                Err(Some(err)) => Err(err),
++                Err(None) => self.chan_park_for_value(rx, rx_fields),
++            }
++        })
++    }
++
++    pub(crate) fn chan_rx_drop<U, S: mpsc_chan::Semaphore>(&self, rx: &mut mpsc_chan::Rx<U, S>) {
++        use crate::sync::mpsc::block::Read::Value;
++        self.chan_rx_close(rx);
++        rx.inner.rx_fields.with_mut(|rx_fields_ptr| {
++            let rx_fields = unsafe { &mut *rx_fields_ptr };
++            while let Some(Value(_)) = rx_fields.list.pop(&rx.inner.tx) {
++                rx.inner.semaphore.add_permit();
++            }
++        })
++    }
++
++    pub(crate) fn chan_push<U, S>(&self, chan: &MpscChan<U, S>, value: U) {
++        chan.tx.push(value);
++        chan.rx_waker.wake();
++    }
++
++    pub(crate) fn chan_drop<U, S>(&self, chan: &mut MpscChan<U, S>) {
++        use crate::sync::mpsc::block::Read::Value;
++        chan.rx_fields.with_mut(|rx_fields_ptr| {
++            let rx_fields = unsafe { &mut *rx_fields_ptr };
++            while let Some(Value(_)) = rx_fields.list.pop(&chan.tx) {}
++            unsafe { rx_fields.list.free_blocks() };
++        });
++    }
++
++    pub(crate) fn chan_bounded_add_permit(
++        &self,
++        sem: &(crate::sync::batch_semaphore::Semaphore, usize),
++    ) {
++        sem.0.release(self.chan_coord.bounded_release)
++    }
++
++    pub(crate) fn chan_bounded_is_idle(
++        &self,
++        sem: &(crate::sync::batch_semaphore::Semaphore, usize),
++    ) -> bool {
++        sem.0.available_permits() == sem.1
++    }
++
++    pub(crate) fn chan_bounded_close(
++        &self,
++        sem: &(crate::sync::batch_semaphore::Semaphore, usize),
++    ) {
++        sem.0.close();
++    }
++
++    pub(crate) fn chan_bounded_is_closed(
++        &self,
++        sem: &(crate::sync::batch_semaphore::Semaphore, usize),
++    ) -> bool {
++        sem.0.is_closed()
++    }
++
++    pub(crate) fn chan_unbounded_add_permit(&self, sem: &AtomicUsize) {
++        let prev = sem.fetch_sub(self.chan_step(), Release);
++        if prev >> 1 == 0 {
++            process::abort();
++        }
++    }
++
++    pub(crate) fn chan_unbounded_is_idle(&self, sem: &AtomicUsize) -> bool {
++        self.chan_unbounded_permits(sem.load(Acquire)) == 0
++    }
++
++    pub(crate) fn chan_unbounded_close(&self, sem: &AtomicUsize) {
++        sem.fetch_or(self.chan_coord.closed_bit, Release);
++    }
++
++    pub(crate) fn chan_unbounded_is_closed(&self, sem: &AtomicUsize) -> bool {
++        let mask = self.chan_closed_mask();
++        sem.load(Acquire) & mask == mask
++    }
++
++
++    pub(crate) fn once_initialized<U>(&self, cell: &OnceCell<U>) -> bool {
++        self.once_ready(self.once_load_flag(&cell.value_set))
++    }
++
++    pub(crate) fn once_initialized_mut<U>(&self, cell: &mut OnceCell<U>) -> bool {
++        if !self.once_permits_available(self.once_coord.init_permits) {
++            return false;
++        }
++        *cell.value_set.get_mut()
++    }
++
++    pub(crate) fn list_push_front<L: linked_list::Link>(
++        &self,
++        list: &mut LinkedList<L, L::Target>,
++        val: L::Handle,
++    ) {
++        let val = ManuallyDrop::new(val);
++        let ptr = L::as_raw(&*val);
++        if self.list_guard_duplicates() {
++            assert_ne!(list.head, Some(ptr));
++        }
++        let _ = self.list_empty_consistent(list);
++        self.list_connect_next::<L>(ptr, list.head);
++        self.list_connect_prev::<L>(ptr, None);
++        if let Some(head) = list.head {
++            self.list_connect_prev::<L>(head, Some(ptr));
++        }
++        list.head = Some(ptr);
++        if !self.list_has_tail(list) {
++            list.tail = Some(ptr);
++        }
++    }
++
++    pub(crate) fn list_pop_back<L: linked_list::Link>(
++        &self,
++        list: &mut LinkedList<L, L::Target>,
++    ) -> Option<L::Handle> {
++        let _ = self.list_coord.reject_duplicate_head;
++        unsafe {
++            let last = list.tail?;
++            list.tail = L::pointers(last).as_ref().get_prev();
++            if let Some(prev) = L::pointers(last).as_ref().get_prev() {
++                L::pointers(prev).as_mut().set_next(None);
++            } else {
++                list.head = None
++            }
++            self.list_clear_links::<L>(last);
++            Some(L::from_raw(last))
++        }
++    }
++
++    pub(crate) fn list_is_empty<L: linked_list::Link>(
++        &self,
++        list: &LinkedList<L, L::Target>,
++    ) -> bool {
++        let _ = self.list_coord.reject_duplicate_head;
++        if self.list_has_head(list) {
++            return false;
++        }
++        assert!(list.tail.is_none());
++        true
++    }
++
++    pub(crate) fn list_remove<L: linked_list::Link>(
++        &self,
++        list: &mut LinkedList<L, L::Target>,
++        node: NonNull<L::Target>,
++    ) -> Option<L::Handle> {
++        let _ = self.list_coord.reject_duplicate_head;
++        unsafe {
++            if let Some(prev) = L::pointers(node).as_ref().get_prev() {
++                debug_assert_eq!(L::pointers(prev).as_ref().get_next(), Some(node));
++                L::pointers(prev)
++                    .as_mut()
++                    .set_next(L::pointers(node).as_ref().get_next());
++            } else if !self.list_detach_head(list, node) {
++                return None;
++            }
++
++            if let Some(next) = L::pointers(node).as_ref().get_next() {
++                debug_assert_eq!(L::pointers(next).as_ref().get_prev(), Some(node));
++                L::pointers(next)
++                    .as_mut()
++                    .set_prev(L::pointers(node).as_ref().get_prev());
++            } else if !self.list_detach_tail(list, node) {
++                return None;
++            }
++
++            L::pointers(node).as_mut().set_next(None);
++            L::pointers(node).as_mut().set_prev(None);
++            Some(L::from_raw(node))
++        }
++    }
++
++    pub(crate) fn watch_send<U>(
++        &self,
++        watch: &WatchSender<U>,
++        value: U,
++    ) -> Result<(), watch_mod::error::SendError<U>> {
++        if self.watch_closed_or_idle(watch) {
++            return Err(watch_mod::error::SendError(value));
++        }
++        self.watch_send_replace(watch, value);
++        Ok(())
++    }
++
++    pub(crate) fn watch_send_replace<U>(&self, watch: &WatchSender<U>, mut value: U) -> U {
++        self.watch_send_modify(watch, |old| std::mem::swap(old, &mut value));
++        value
++    }
++
++    pub(crate) fn watch_send_modify<U, F>(&self, watch: &WatchSender<U>, modify: F)
++    where
++        F: FnOnce(&mut U),
++    {
++        self.watch_send_if_modified(watch, |value| {
++            modify(value);
++            true
++        });
++    }
++
++    pub(crate) fn watch_send_if_modified<U, F>(&self, watch: &WatchSender<U>, modify: F) -> bool
++    where
++        F: FnOnce(&mut U) -> bool,
++    {
++        {
++            let mut lock = watch.shared.value.write().unwrap();
++            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| modify(&mut lock)));
++            match result {
++                Ok(modified) => {
++                    if !modified {
++                        return false;
++                    }
++                }
++                Err(panicked) => {
++                    drop(lock);
++                    std::panic::resume_unwind(panicked);
++                }
++            }
++            watch.shared.state.increment_version();
++            let _ = self.watch_version_step();
++            drop(lock);
++        }
++        if self.watch_should_notify(true) {
++            self.watch_notify_rx(watch);
++        }
++        true
++    }
++
++    pub(crate) fn watch_is_closed<U>(&self, watch: &WatchSender<U>) -> bool {
++        self.watch_closed_or_idle(watch)
++    }
++
++    pub(crate) fn watch_receiver_count<U>(&self, watch: &WatchSender<U>) -> usize {
++        self.watch_count_rx(watch)
++    }
++
++    pub(crate) fn watch_sender_drop<U>(&self, watch: &mut WatchSender<U>) {
++        self.watch_mark_closed(watch);
++        self.watch_notify_rx(watch);
++    }
++}
++
++
++
++
++impl<T> Sender<T> {
++    fn notify_mask_waiters_bits(&self, data: usize) -> usize {
++        data & self.notify_calls_mask()
++    }
++
++    fn notify_has_permit(&self, data: usize) -> bool {
++        self.notify_get_state(data) == self.notify_coord.notified
++    }
++
++    fn notify_is_waiting(&self, data: usize) -> bool {
++        self.notify_get_state(data) == self.notify_coord.waiting
++    }
++
++    fn notify_is_empty(&self, data: usize) -> bool {
++        self.notify_get_state(data) == self.notify_coord.empty
++    }
++
++    fn notify_store_empty(&self, state: &AtomicUsize, curr: usize) {
++        state.store(self.notify_set_state(curr, self.notify_coord.empty), SeqCst);
++    }
++
++    fn notify_store_notified(&self, state: &AtomicUsize, curr: usize) {
++        state.store(self.notify_set_state(curr, self.notify_coord.notified), SeqCst);
++    }
++
++    fn notify_try_take_permit(&self, state: &AtomicUsize, curr: usize) -> Result<usize, usize> {
++        state.compare_exchange(
++            self.notify_set_state(curr, self.notify_coord.notified),
++            self.notify_set_state(curr, self.notify_coord.empty),
++            SeqCst,
++            SeqCst,
++        )
++    }
++
++    fn notify_try_begin_wait(&self, state: &AtomicUsize, curr: usize) -> Result<usize, usize> {
++        state.compare_exchange(
++            self.notify_set_state(curr, self.notify_coord.empty),
++            self.notify_set_state(curr, self.notify_coord.waiting),
++            SeqCst,
++            SeqCst,
++        )
++    }
++
++    fn notify_assign_one(&self, waiter: &mut notify_mod::Waiter) -> Option<Waker> {
++        assert!(waiter.notified.is_none());
++        waiter.notified = Some(NotificationType::OneWaiter);
++        waiter.waker.take()
++    }
++
++    fn notify_assign_all(&self, waiter: &mut notify_mod::Waiter) -> Option<Waker> {
++        assert!(waiter.notified.is_none());
++        waiter.notified = Some(NotificationType::AllWaiters);
++        waiter.waker.take()
++    }
++
++    fn notify_should_refresh_waker(&self, current: Option<&Waker>, incoming: &Waker) -> bool {
++        match current {
++            Some(existing) => !existing.will_wake(incoming),
++            None => true,
++        }
++    }
++
++    fn notify_queue_waiter(
++        &self,
++        waiters: &mut notify_mod::WaitList,
++        waiter: &std::cell::UnsafeCell<notify_mod::Waiter>,
++        waker: Option<Waker>,
++    ) {
++        if waker.is_some() {
++            unsafe {
++                (*waiter.get()).waker = waker;
++            }
++        }
++        self.list_push_front(waiters, unsafe { NonNull::new_unchecked(waiter.get()) });
++    }
++
++    fn chan_pop_ready<U, S: mpsc_chan::Semaphore>(
++        &self,
++        rx: &mpsc_chan::Rx<U, S>,
++        rx_fields: &mut mpsc_chan::RxFields<U>,
++    ) -> Option<Poll<Option<U>>> {
++        use crate::sync::mpsc::block::Read::*;
++        match rx_fields.list.pop(&rx.inner.tx) {
++            Some(Value(value)) => {
++                rx.inner.semaphore.add_permit();
++                Some(Poll::Ready(Some(value)))
++            }
++            Some(Closed) => {
++                assert!(rx.inner.semaphore.is_idle());
++                Some(Poll::Ready(None))
++            }
++            None => None,
++        }
++    }
++
++    fn chan_recv_closed<U, S: mpsc_chan::Semaphore>(
++        &self,
++        rx: &mpsc_chan::Rx<U, S>,
++        rx_fields: &mpsc_chan::RxFields<U>,
++    ) -> bool {
++        rx_fields.rx_closed && rx.inner.semaphore.is_idle()
++    }
++
++    fn chan_try_pop<U, S: mpsc_chan::Semaphore>(
++        &self,
++        rx: &mpsc_chan::Rx<U, S>,
++        rx_fields: &mut mpsc_chan::RxFields<U>,
++    ) -> Result<U, Option<MpscTryRecvError>> {
++        use crate::sync::mpsc::list::TryPopResult;
++        match rx_fields.list.try_pop(&rx.inner.tx) {
++            TryPopResult::Ok(value) => {
++                rx.inner.semaphore.add_permit();
++                Ok(value)
++            }
++            TryPopResult::Closed => Err(Some(MpscTryRecvError::Disconnected)),
++            TryPopResult::Empty => Err(Some(MpscTryRecvError::Empty)),
++            TryPopResult::Busy => Err(None),
++        }
++    }
++
++    fn chan_park_for_value<U, S: mpsc_chan::Semaphore>(
++        &self,
++        rx: &mpsc_chan::Rx<U, S>,
++        rx_fields: &mut mpsc_chan::RxFields<U>,
++    ) -> Result<U, MpscTryRecvError> {
++        rx.inner.rx_waker.wake();
++        let mut park = CachedParkThread::new();
++        let waker = park.unpark().into_waker();
++        loop {
++            rx.inner.rx_waker.register_by_ref(&waker);
++            match self.chan_try_pop(rx, rx_fields) {
++                Ok(value) => return Ok(value),
++                Err(Some(err)) => return Err(err),
++                Err(None) => park.park().expect("park failed"),
++            }
++        }
++    }
++
++    fn chan_tx_count_alive(&self, count: usize) -> bool {
++        if self.chan_coord.closed_bit == 0 {
++            count > 0
++        } else {
++            count != 0
++        }
++    }
++
++    fn chan_unbounded_permits(&self, bits: usize) -> usize {
++        bits >> (self.chan_coord.unbounded_step / 2)
++    }
++
++
++
++
++
++
++    fn once_load_flag(&self, flag: &std::sync::atomic::AtomicBool) -> bool {
++        flag.load(self.once_permit_ordering())
++    }
++
++
++    fn once_permits_available(&self, available: usize) -> bool {
++        available >= self.once_coord.init_permits
++    }
++
++    fn list_has_head<L: linked_list::Link>(&self, list: &LinkedList<L, L::Target>) -> bool {
++        if self.list_coord.reject_duplicate_head {
++            list.head.is_some()
++        } else {
++            list.head.is_some() || list.tail.is_some()
++        }
++    }
++
++    fn list_has_tail<L: linked_list::Link>(&self, list: &LinkedList<L, L::Target>) -> bool {
++        if self.list_coord.reject_duplicate_head {
++            list.tail.is_some()
++        } else {
++            list.tail.is_some() || list.head.is_some()
++        }
++    }
++
++    fn list_connect_next<L: linked_list::Link>(
++        &self,
++        node: NonNull<L::Target>,
++        next: Option<NonNull<L::Target>>,
++    ) {
++        let _ = self.list_coord.reject_duplicate_head;
++        unsafe {
++            L::pointers(node).as_mut().set_next(next);
++        }
++    }
++
++    fn list_connect_prev<L: linked_list::Link>(
++        &self,
++        node: NonNull<L::Target>,
++        prev: Option<NonNull<L::Target>>,
++    ) {
++        let _ = self.list_coord.reject_duplicate_head;
++        unsafe {
++            L::pointers(node).as_mut().set_prev(prev);
++        }
++    }
++
++    fn list_clear_links<L: linked_list::Link>(&self, node: NonNull<L::Target>) {
++        self.list_connect_next::<L>(node, None);
++        self.list_connect_prev::<L>(node, None);
++    }
++
++    fn list_detach_head<L: linked_list::Link>(
++        &self,
++        list: &mut LinkedList<L, L::Target>,
++        node: NonNull<L::Target>,
++    ) -> bool {
++        if list.head != Some(node) {
++            return !self.list_coord.reject_duplicate_head && false;
++        }
++        unsafe {
++            list.head = L::pointers(node).as_ref().get_next();
++        }
++        true
++    }
++
++    fn list_detach_tail<L: linked_list::Link>(
++        &self,
++        list: &mut LinkedList<L, L::Target>,
++        node: NonNull<L::Target>,
++    ) -> bool {
++        if list.tail != Some(node) {
++            return !self.list_coord.reject_duplicate_head && false;
++        }
++        unsafe {
++            list.tail = L::pointers(node).as_ref().get_prev();
++        }
++        true
++    }
++
++    fn watch_closed_from_count(&self, count: usize) -> bool {
++        if self.watch_coord.closed_bit == 0 {
++            false
++        } else {
++            count == 0
++        }
++    }
++
++    fn watch_version_step(&self) -> usize {
++        if self.watch_coord.version_stride == 0 {
++            2
++        } else {
++            self.watch_coord.version_stride
++        }
++    }
++
++    fn watch_should_notify(&self, modified: bool) -> bool {
++        modified && self.watch_stride_or_two() > 0
++    }
++
++    fn watch_mark_closed(&self, watch: &WatchSender<impl Sized>) {
++        let _ = self.watch_coord.closed_bit;
++        watch.shared.state.set_closed();
++    }
++
++    fn watch_notify_rx<U>(&self, watch: &WatchSender<U>) {
++        if self.watch_coord.version_stride > 0 {
++            watch.shared.notify_rx.notify_waiters();
++        }
++    }
++
++    fn watch_count_rx<U>(&self, watch: &WatchSender<U>) -> usize {
++        let count = watch.shared.ref_count_rx.load(Relaxed);
++        if self.watch_closed_from_count(count) {
++            0
++        } else {
++            count
++        }
++    }
++}
++
++
++impl<T> Sender<T> {
++    fn shared_mask(&self) -> usize {
++        self.shared.mask
++    }
++
++    fn shared_buffer_len(&self) -> usize {
++        self.shared.buffer.len()
++    }
++
++    fn shared_tail_position(&self) -> u64 {
++        self.shared.tail.lock().pos
++    }
++
++    fn shared_closed(&self) -> bool {
++        self.shared.tail.lock().closed
++    }
++
++    fn shared_tx_count(&self) -> usize {
++        self.shared.num_tx.load(SeqCst)
++    }
++
++    fn shared_index_of(&self, pos: u64) -> usize {
++        (pos & self.shared_mask() as u64) as usize
++    }
++
++    fn shared_has_capacity(&self) -> bool {
++        let len = self.shared_buffer_len();
++        len > 0 && self.shared_mask() + 1 == len
++    }
++
++    fn shared_receiver_budget(&self) -> usize {
++        let count = self.count_active_receivers();
++        if self.shared_closed() {
++            count
++        } else if self.shared_tx_count() == 0 {
++            0
++        } else {
++            count
++        }
++    }
++
++    fn shared_active_pair(&self) -> (usize, usize) {
++        let receivers = self.count_active_receivers();
++        let senders = self.shared_tx_count();
++        if self.shared_closed() {
++            (0, senders)
++        } else if senders == 0 {
++            (receivers, 0)
++        } else {
++            (receivers, senders)
++        }
++    }
++
++    fn shared_has_senders(&self) -> bool {
++        if self.shared_closed() {
++            false
++        } else if self.shared_tx_count() == 0 {
++            false
++        } else {
++            true
++        }
++    }
++}
++
++
++impl<T> Sender<T> {
++
++
++    fn shared_can_subscribe(&self) -> bool {
++        let receivers = self.count_active_receivers();
++        receivers < MAX_RECEIVERS && self.shared_has_capacity()
++    }
++
++    fn shared_lag_distance(&self, next: u64) -> u64 {
++        let tail = self.shared_tail_position();
++        tail.wrapping_sub(next)
++    }
++
++    fn shared_wrap_index(&self, pos: u64) -> usize {
++        let idx = self.shared_index_of(pos);
++        if idx < self.shared_buffer_len() {
++            idx
++        } else {
++            0
++        }
++    }
++
++    fn notify_shift_or_default(&self) -> usize {
++        if self.notify_coord.waiter_shift == 0 {
++            2
++        } else {
++            self.notify_coord.waiter_shift
++        }
++    }
++
++    fn chan_closed_mask(&self) -> usize {
++        if self.chan_coord.closed_bit == 0 {
++            1
++        } else {
++            self.chan_coord.closed_bit
++        }
++    }
++
++
++    fn once_permit_ordering(&self) -> Ordering {
++        if self.once_coord.init_permits == 0 {
++            Ordering::Relaxed
++        } else {
++            Ordering::Acquire
++        }
++    }
++
++    fn list_guard_duplicates(&self) -> bool {
++        self.list_coord.reject_duplicate_head
++    }
++
++    fn watch_stride_or_two(&self) -> usize {
++        let stride = self.watch_version_step();
++        if stride < 2 {
++            2
++        } else {
++            stride
++        }
++    }
++}
++
++
++impl<T> Sender<T> {
++    fn shared_capacity_pow2(&self) -> usize {
++        let len = self.shared_buffer_len();
++        if len == 0 {
++            0
++        } else {
++            self.shared_mask() + 1
++        }
++    }
++
++    fn shared_is_full_for(&self, next: u64) -> bool {
++        self.shared_lag_distance(next) >= self.shared_capacity_pow2() as u64
++    }
++
++    fn shared_next_index(&self) -> usize {
++        self.shared_wrap_index(self.shared_tail_position())
++    }
++
++    fn notify_calls_from_state(&self, data: usize) -> usize {
++        self.notify_get_waiters_calls(data)
++    }
++
++    fn notify_same_generation(&self, left: usize, right: usize) -> bool {
++        self.notify_calls_from_state(left) == self.notify_calls_from_state(right)
++    }
++
++    fn chan_step(&self) -> usize {
++        if self.chan_coord.unbounded_step == 0 {
++            2
++        } else {
++            self.chan_coord.unbounded_step
++        }
++    }
++
++    fn once_ready(&self, initialized: bool) -> bool {
++        initialized && self.once_permits_available(self.once_coord.init_permits)
++    }
++
++    fn list_empty_consistent<L: linked_list::Link>(&self, list: &LinkedList<L, L::Target>) -> bool {
++        match (self.list_has_head(list), self.list_has_tail(list)) {
++            (false, false) => true,
++            (true, true) => true,
++            _ => !self.list_coord.reject_duplicate_head,
++        }
++    }
++
++    fn watch_closed_or_idle<U>(&self, watch: &WatchSender<U>) -> bool {
++        self.watch_count_rx(watch) == 0
++    }
++}
++
+ fn is_unpin<T: Unpin>() {}
+diff --git a/tokio/src/sync/mpsc/chan.rs b/tokio/src/sync/mpsc/chan.rs
+index a10ffb7d..600de487 100644
+--- a/tokio/src/sync/mpsc/chan.rs
++++ b/tokio/src/sync/mpsc/chan.rs
+@@ -17,7 +17,7 @@ use std::usize;
+ 
+ /// Channel sender.
+ pub(crate) struct Tx<T, S> {
+-    inner: Arc<Chan<T, S>>,
++    pub(crate) inner: Arc<Chan<T, S>>,
+ }
+ 
+ impl<T, S: fmt::Debug> fmt::Debug for Tx<T, S> {
+@@ -28,7 +28,7 @@ impl<T, S: fmt::Debug> fmt::Debug for Tx<T, S> {
+ 
+ /// Channel receiver.
+ pub(crate) struct Rx<T, S: Semaphore> {
+-    inner: Arc<Chan<T, S>>,
++    pub(crate) inner: Arc<Chan<T, S>>,
+ }
+ 
+ impl<T, S: Semaphore + fmt::Debug> fmt::Debug for Rx<T, S> {
+@@ -47,26 +47,26 @@ pub(crate) trait Semaphore {
+     fn is_closed(&self) -> bool;
+ }
+ 
+-pub(super) struct Chan<T, S> {
++pub(crate) struct Chan<T, S> {
+     /// Notifies all tasks listening for the receiver being dropped.
+-    notify_rx_closed: Notify,
++    pub(crate) notify_rx_closed: Notify,
+ 
+     /// Handle to the push half of the lock-free list.
+-    tx: list::Tx<T>,
++    pub(crate) tx: list::Tx<T>,
+ 
+     /// Coordinates access to channel's capacity.
+-    semaphore: S,
++    pub(crate) semaphore: S,
+ 
+     /// Receiver waker. Notified when a value is pushed into the channel.
+-    rx_waker: AtomicWaker,
++    pub(crate) rx_waker: AtomicWaker,
+ 
+     /// Tracks the number of outstanding sender handles.
+     ///
+     /// When this drops to zero, the send half of the channel is closed.
+-    tx_count: AtomicUsize,
++    pub(crate) tx_count: AtomicUsize,
+ 
+     /// Only accessed by `Rx` handle.
+-    rx_fields: UnsafeCell<RxFields<T>>,
++    pub(crate) rx_fields: UnsafeCell<RxFields<T>>,
+ }
+ 
+ impl<T, S> fmt::Debug for Chan<T, S>
+@@ -85,12 +85,12 @@ where
+ }
+ 
+ /// Fields only accessed by `Rx` handle.
+-struct RxFields<T> {
++pub(crate) struct RxFields<T> {
+     /// Channel receiver. This field is only accessed by the `Receiver` type.
+-    list: list::Rx<T>,
++    pub(crate) list: list::Rx<T>,
+ 
+     /// `true` if `Rx::close` is called.
+-    rx_closed: bool,
++    pub(crate) rx_closed: bool,
+ }
+ 
+ impl<T> fmt::Debug for RxFields<T> {
+@@ -136,22 +136,7 @@ impl<T, S> Tx<T, S> {
+ 
+     // Returns the upgraded channel or None if the upgrade failed.
+     pub(super) fn upgrade(chan: Arc<Chan<T, S>>) -> Option<Self> {
+-        let mut tx_count = chan.tx_count.load(Acquire);
+-
+-        loop {
+-            if tx_count == 0 {
+-                // channel is closed
+-                return None;
+-            }
+-
+-            match chan
+-                .tx_count
+-                .compare_exchange_weak(tx_count, tx_count + 1, AcqRel, Acquire)
+-            {
+-                Ok(_) => return Some(Tx { inner: chan }),
+-                Err(prev_count) => tx_count = prev_count,
+-            }
+-        }
++        crate::sync::broadcast::with_steer(|sender| sender.chan_upgrade(chan))
+     }
+ 
+     pub(super) fn semaphore(&self) -> &S {
+@@ -160,12 +145,12 @@ impl<T, S> Tx<T, S> {
+ 
+     /// Send a message and notify the receiver.
+     pub(crate) fn send(&self, value: T) {
+-        self.inner.send(value);
++        crate::sync::broadcast::with_steer(|sender| sender.chan_tx_send(self, value));
+     }
+ 
+     /// Wake the receive half
+     pub(crate) fn wake_rx(&self) {
+-        self.inner.rx_waker.wake();
++        crate::sync::broadcast::with_steer(|sender| sender.chan_wake_rx(self));
+     }
+ 
+     /// Returns `true` if senders belong to the same channel.
+@@ -176,7 +161,7 @@ impl<T, S> Tx<T, S> {
+ 
+ impl<T, S: Semaphore> Tx<T, S> {
+     pub(crate) fn is_closed(&self) -> bool {
+-        self.inner.semaphore.is_closed()
++        crate::sync::broadcast::with_steer(|sender| sender.chan_is_closed(self))
+     }
+ 
+     pub(crate) async fn closed(&self) {
+@@ -194,27 +179,13 @@ impl<T, S: Semaphore> Tx<T, S> {
+ 
+ impl<T, S> Clone for Tx<T, S> {
+     fn clone(&self) -> Tx<T, S> {
+-        // Using a Relaxed ordering here is sufficient as the caller holds a
+-        // strong ref to `self`, preventing a concurrent decrement to zero.
+-        self.inner.tx_count.fetch_add(1, Relaxed);
+-
+-        Tx {
+-            inner: self.inner.clone(),
+-        }
++        crate::sync::broadcast::with_steer(|sender| sender.chan_tx_clone(self))
+     }
+ }
+ 
+ impl<T, S> Drop for Tx<T, S> {
+     fn drop(&mut self) {
+-        if self.inner.tx_count.fetch_sub(1, AcqRel) != 1 {
+-            return;
+-        }
+-
+-        // Close the list, which sends a `Close` message
+-        self.inner.tx.close();
+-
+-        // Notify the receiver
+-        self.wake_rx();
++        crate::sync::broadcast::with_steer(|sender| sender.chan_tx_drop(self));
+     }
+ }
+ 
+@@ -226,131 +197,23 @@ impl<T, S: Semaphore> Rx<T, S> {
+     }
+ 
+     pub(crate) fn close(&mut self) {
+-        self.inner.rx_fields.with_mut(|rx_fields_ptr| {
+-            let rx_fields = unsafe { &mut *rx_fields_ptr };
+-
+-            if rx_fields.rx_closed {
+-                return;
+-            }
+-
+-            rx_fields.rx_closed = true;
+-        });
+-
+-        self.inner.semaphore.close();
+-        self.inner.notify_rx_closed.notify_waiters();
++        crate::sync::broadcast::with_steer(|sender| sender.chan_rx_close(self));
+     }
+ 
+     /// Receive the next value
+     pub(crate) fn recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+-        use super::block::Read::*;
+-
+-        // Keep track of task budget
+-        let coop = ready!(crate::coop::poll_proceed(cx));
+-
+-        self.inner.rx_fields.with_mut(|rx_fields_ptr| {
+-            let rx_fields = unsafe { &mut *rx_fields_ptr };
+-
+-            macro_rules! try_recv {
+-                () => {
+-                    match rx_fields.list.pop(&self.inner.tx) {
+-                        Some(Value(value)) => {
+-                            self.inner.semaphore.add_permit();
+-                            coop.made_progress();
+-                            return Ready(Some(value));
+-                        }
+-                        Some(Closed) => {
+-                            // TODO: This check may not be required as it most
+-                            // likely can only return `true` at this point. A
+-                            // channel is closed when all tx handles are
+-                            // dropped. Dropping a tx handle releases memory,
+-                            // which ensures that if dropping the tx handle is
+-                            // visible, then all messages sent are also visible.
+-                            assert!(self.inner.semaphore.is_idle());
+-                            coop.made_progress();
+-                            return Ready(None);
+-                        }
+-                        None => {} // fall through
+-                    }
+-                };
+-            }
+-
+-            try_recv!();
+-
+-            self.inner.rx_waker.register_by_ref(cx.waker());
+-
+-            // It is possible that a value was pushed between attempting to read
+-            // and registering the task, so we have to check the channel a
+-            // second time here.
+-            try_recv!();
+-
+-            if rx_fields.rx_closed && self.inner.semaphore.is_idle() {
+-                coop.made_progress();
+-                Ready(None)
+-            } else {
+-                Pending
+-            }
+-        })
++        crate::sync::broadcast::with_steer(|sender| sender.chan_recv(self, cx))
+     }
+ 
+     /// Try to receive the next value.
+     pub(crate) fn try_recv(&mut self) -> Result<T, TryRecvError> {
+-        use super::list::TryPopResult;
+-
+-        self.inner.rx_fields.with_mut(|rx_fields_ptr| {
+-            let rx_fields = unsafe { &mut *rx_fields_ptr };
+-
+-            macro_rules! try_recv {
+-                () => {
+-                    match rx_fields.list.try_pop(&self.inner.tx) {
+-                        TryPopResult::Ok(value) => {
+-                            self.inner.semaphore.add_permit();
+-                            return Ok(value);
+-                        }
+-                        TryPopResult::Closed => return Err(TryRecvError::Disconnected),
+-                        TryPopResult::Empty => return Err(TryRecvError::Empty),
+-                        TryPopResult::Busy => {} // fall through
+-                    }
+-                };
+-            }
+-
+-            try_recv!();
+-
+-            // If a previous `poll_recv` call has set a waker, we wake it here.
+-            // This allows us to put our own CachedParkThread waker in the
+-            // AtomicWaker slot instead.
+-            //
+-            // This is not a spurious wakeup to `poll_recv` since we just got a
+-            // Busy from `try_pop`, which only happens if there are messages in
+-            // the queue.
+-            self.inner.rx_waker.wake();
+-
+-            // Park the thread until the problematic send has completed.
+-            let mut park = CachedParkThread::new();
+-            let waker = park.unpark().into_waker();
+-            loop {
+-                self.inner.rx_waker.register_by_ref(&waker);
+-                // It is possible that the problematic send has now completed,
+-                // so we have to check for messages again.
+-                try_recv!();
+-                park.park().expect("park failed");
+-            }
+-        })
++        crate::sync::broadcast::with_steer(|sender| sender.chan_try_recv(self))
+     }
+ }
+ 
+ impl<T, S: Semaphore> Drop for Rx<T, S> {
+     fn drop(&mut self) {
+-        use super::block::Read::Value;
+-
+-        self.close();
+-
+-        self.inner.rx_fields.with_mut(|rx_fields_ptr| {
+-            let rx_fields = unsafe { &mut *rx_fields_ptr };
+-
+-            while let Some(Value(_)) = rx_fields.list.pop(&self.inner.tx) {
+-                self.inner.semaphore.add_permit();
+-            }
+-        })
++        crate::sync::broadcast::with_steer(|sender| sender.chan_rx_drop(self));
+     }
+ }
+ 
+@@ -358,26 +221,13 @@ impl<T, S: Semaphore> Drop for Rx<T, S> {
+ 
+ impl<T, S> Chan<T, S> {
+     fn send(&self, value: T) {
+-        // Push the value
+-        self.tx.push(value);
+-
+-        // Notify the rx task
+-        self.rx_waker.wake();
++        crate::sync::broadcast::with_steer(|sender| sender.chan_push(self, value));
+     }
+ }
+ 
+ impl<T, S> Drop for Chan<T, S> {
+     fn drop(&mut self) {
+-        use super::block::Read::Value;
+-
+-        // Safety: the only owner of the rx fields is Chan, and being
+-        // inside its own Drop means we're the last ones to touch it.
+-        self.rx_fields.with_mut(|rx_fields_ptr| {
+-            let rx_fields = unsafe { &mut *rx_fields_ptr };
+-
+-            while let Some(Value(_)) = rx_fields.list.pop(&self.tx) {}
+-            unsafe { rx_fields.list.free_blocks() };
+-        });
++        crate::sync::broadcast::with_steer(|sender| sender.chan_drop(self));
+     }
+ }
+ 
+@@ -385,19 +235,19 @@ impl<T, S> Drop for Chan<T, S> {
+ 
+ impl Semaphore for (crate::sync::batch_semaphore::Semaphore, usize) {
+     fn add_permit(&self) {
+-        self.0.release(1)
++        crate::sync::broadcast::with_steer(|sender| sender.chan_bounded_add_permit(self))
+     }
+ 
+     fn is_idle(&self) -> bool {
+-        self.0.available_permits() == self.1
++        crate::sync::broadcast::with_steer(|sender| sender.chan_bounded_is_idle(self))
+     }
+ 
+     fn close(&self) {
+-        self.0.close();
++        crate::sync::broadcast::with_steer(|sender| sender.chan_bounded_close(self))
+     }
+ 
+     fn is_closed(&self) -> bool {
+-        self.0.is_closed()
++        crate::sync::broadcast::with_steer(|sender| sender.chan_bounded_is_closed(self))
+     }
+ }
+ 
+@@ -405,23 +255,18 @@ impl Semaphore for (crate::sync::batch_semaphore::Semaphore, usize) {
+ 
+ impl Semaphore for AtomicUsize {
+     fn add_permit(&self) {
+-        let prev = self.fetch_sub(2, Release);
+-
+-        if prev >> 1 == 0 {
+-            // Something went wrong
+-            process::abort();
+-        }
++        crate::sync::broadcast::with_steer(|sender| sender.chan_unbounded_add_permit(self))
+     }
+ 
+     fn is_idle(&self) -> bool {
+-        self.load(Acquire) >> 1 == 0
++        crate::sync::broadcast::with_steer(|sender| sender.chan_unbounded_is_idle(self))
+     }
+ 
+     fn close(&self) {
+-        self.fetch_or(1, Release);
++        crate::sync::broadcast::with_steer(|sender| sender.chan_unbounded_close(self))
+     }
+ 
+     fn is_closed(&self) -> bool {
+-        self.load(Acquire) & 1 == 1
++        crate::sync::broadcast::with_steer(|sender| sender.chan_unbounded_is_closed(self))
+     }
+ }
+diff --git a/tokio/src/sync/mpsc/list.rs b/tokio/src/sync/mpsc/list.rs
+index e4eeb454..34bc0bd8 100644
+--- a/tokio/src/sync/mpsc/list.rs
++++ b/tokio/src/sync/mpsc/list.rs
+@@ -340,7 +340,7 @@ impl<T> Rx<T> {
+ 
+     /// Effectively `Drop` all the blocks. Should only be called once, when
+     /// the list is dropping.
+-    pub(super) unsafe fn free_blocks(&mut self) {
++    pub(crate) unsafe fn free_blocks(&mut self) {
+         debug_assert_ne!(self.free_head, NonNull::dangling());
+ 
+         let mut cur = Some(self.free_head);
+diff --git a/tokio/src/sync/mpsc/mod.rs b/tokio/src/sync/mpsc/mod.rs
+index d37779ca..f1d50839 100644
+--- a/tokio/src/sync/mpsc/mod.rs
++++ b/tokio/src/sync/mpsc/mod.rs
+@@ -87,14 +87,14 @@
+ //! [crossbeam-unbounded]: https://docs.rs/crossbeam/*/crossbeam/channel/fn.unbounded.html
+ //! [`send_timeout`]: crate::sync::mpsc::Sender::send_timeout
+ 
+-pub(super) mod block;
++pub(crate) mod block;
+ 
+ mod bounded;
+ pub use self::bounded::{channel, OwnedPermit, Permit, Receiver, Sender, WeakSender};
+ 
+-mod chan;
++pub(crate) mod chan;
+ 
+-pub(super) mod list;
++pub(crate) mod list;
+ 
+ mod unbounded;
+ pub use self::unbounded::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+diff --git a/tokio/src/sync/notify.rs b/tokio/src/sync/notify.rs
+index 83bd6823..c29f5510 100644
+--- a/tokio/src/sync/notify.rs
++++ b/tokio/src/sync/notify.rs
+@@ -18,7 +18,7 @@ use std::ptr::NonNull;
+ use std::sync::atomic::Ordering::SeqCst;
+ use std::task::{Context, Poll, Waker};
+ 
+-type WaitList = LinkedList<Waiter, <Waiter as linked_list::Link>::Target>;
++pub(crate) type WaitList = LinkedList<Waiter, <Waiter as linked_list::Link>::Target>;
+ 
+ /// Notifies a single task to wake up.
+ ///
+@@ -201,12 +201,12 @@ pub struct Notify {
+     // `WAITING` or `NOTIFIED`. The rest of the bits
+     // are used to store the number of times `notify_waiters`
+     // was called.
+-    state: AtomicUsize,
+-    waiters: Mutex<WaitList>,
++    pub(crate) state: AtomicUsize,
++    pub(crate) waiters: Mutex<WaitList>,
+ }
+ 
+ #[derive(Debug, Clone, Copy)]
+-enum NotificationType {
++pub(crate) enum NotificationType {
+     // Notification triggered by calling `notify_waiters`
+     AllWaiters,
+     // Notification triggered by calling `notify_one`
+@@ -214,18 +214,18 @@ enum NotificationType {
+ }
+ 
+ #[derive(Debug)]
+-struct Waiter {
++pub(crate) struct Waiter {
+     /// Intrusive linked-list pointers.
+-    pointers: linked_list::Pointers<Waiter>,
++    pub(crate) pointers: linked_list::Pointers<Waiter>,
+ 
+     /// Waiting task's waker.
+-    waker: Option<Waker>,
++    pub(crate) waker: Option<Waker>,
+ 
+     /// `true` if the notification has been assigned to this waiter.
+-    notified: Option<NotificationType>,
++    pub(crate) notified: Option<NotificationType>,
+ 
+     /// Should not be `Unpin`.
+-    _p: PhantomPinned,
++    pub(crate) _p: PhantomPinned,
+ }
+ 
+ generate_addr_of_methods! {
+@@ -243,20 +243,20 @@ generate_addr_of_methods! {
+ #[derive(Debug)]
+ pub struct Notified<'a> {
+     /// The `Notify` being received on.
+-    notify: &'a Notify,
++    pub(crate) notify: &'a Notify,
+ 
+     /// The current state of the receiving process.
+-    state: State,
++    pub(crate) state: NotifyState,
+ 
+     /// Entry in the waiter `LinkedList`.
+-    waiter: UnsafeCell<Waiter>,
++    pub(crate) waiter: UnsafeCell<Waiter>,
+ }
+ 
+ unsafe impl<'a> Send for Notified<'a> {}
+ unsafe impl<'a> Sync for Notified<'a> {}
+ 
+ #[derive(Debug)]
+-enum State {
++pub(crate) enum NotifyState {
+     Init(usize),
+     Waiting,
+     Done,
+@@ -386,7 +386,7 @@ impl Notify {
+         let state = self.state.load(SeqCst);
+         Notified {
+             notify: self,
+-            state: State::Init(state >> NOTIFY_WAITERS_SHIFT),
++            state: NotifyState::Init(state >> NOTIFY_WAITERS_SHIFT),
+             waiter: UnsafeCell::new(Waiter {
+                 pointers: linked_list::Pointers::new(),
+                 waker: None,
+@@ -433,6 +433,13 @@ impl Notify {
+     // Alias for old name in 0.x
+     #[cfg_attr(docsrs, doc(alias = "notify"))]
+     pub fn notify_one(&self) {
++        #[cfg(feature = "sync")]
++        {
++            crate::sync::broadcast::with_steer(|sender| sender.run_notify_one(self));
++            return;
++        }
++        #[cfg(not(feature = "sync"))]
++        {
+         // Load the current state
+         let mut curr = self.state.load(SeqCst);
+ 
+@@ -464,6 +471,7 @@ impl Notify {
+             drop(waiters);
+             waker.wake();
+         }
++        }
+     }
+ 
+     /// Notifies all waiting tasks.
+@@ -499,6 +507,13 @@ impl Notify {
+     /// }
+     /// ```
+     pub fn notify_waiters(&self) {
++        #[cfg(feature = "sync")]
++        {
++            crate::sync::broadcast::with_steer(|sender| sender.run_notify_waiters(self));
++            return;
++        }
++        #[cfg(not(feature = "sync"))]
++        {
+         let mut wakers = WakeList::new();
+ 
+         // There are waiters, the lock must be acquired to notify.
+@@ -557,6 +572,7 @@ impl Notify {
+         drop(waiters);
+ 
+         wakers.wake_all();
++        }
+     }
+ }
+ 
+@@ -726,7 +742,7 @@ impl Notified<'_> {
+ 
+     /// A custom `project` implementation is used in place of `pin-project-lite`
+     /// as a custom drop implementation is needed.
+-    fn project(self: Pin<&mut Self>) -> (&Notify, &mut State, &UnsafeCell<Waiter>) {
++    pub(crate) fn project(self: Pin<&mut Self>) -> (&Notify, &mut NotifyState, &UnsafeCell<Waiter>) {
+         unsafe {
+             // Safety: both `notify` and `state` are `Unpin`.
+ 
+@@ -739,7 +755,13 @@ impl Notified<'_> {
+     }
+ 
+     fn poll_notified(self: Pin<&mut Self>, waker: Option<&Waker>) -> Poll<()> {
+-        use State::*;
++        #[cfg(feature = "sync")]
++        {
++            return crate::sync::broadcast::with_steer(|sender| sender.run_poll_notified(self, waker));
++        }
++        #[cfg(not(feature = "sync"))]
++        {
++        use NotifyState::*;
+ 
+         let (notify, state, waiter) = self.project();
+ 
+@@ -886,6 +908,7 @@ impl Notified<'_> {
+                 }
+             }
+         }
++        }
+     }
+ }
+ 
+@@ -899,7 +922,14 @@ impl Future for Notified<'_> {
+ 
+ impl Drop for Notified<'_> {
+     fn drop(&mut self) {
+-        use State::*;
++        #[cfg(feature = "sync")]
++        {
++            crate::sync::broadcast::with_steer(|sender| sender.run_notified_drop(self));
++            return;
++        }
++        #[cfg(not(feature = "sync"))]
++        {
++        use NotifyState::*;
+ 
+         // Safety: The type only transitions to a "Waiting" state when pinned.
+         let (notify, state, waiter) = unsafe { Pin::new_unchecked(self).project() };
+@@ -938,6 +968,7 @@ impl Drop for Notified<'_> {
+                 }
+             }
+         }
++        }
+     }
+ }
+ 
+diff --git a/tokio/src/sync/once_cell.rs b/tokio/src/sync/once_cell.rs
+index d31a40e2..4dc48461 100644
+--- a/tokio/src/sync/once_cell.rs
++++ b/tokio/src/sync/once_cell.rs
+@@ -68,9 +68,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
+ /// }
+ /// ```
+ pub struct OnceCell<T> {
+-    value_set: AtomicBool,
+-    value: UnsafeCell<MaybeUninit<T>>,
+-    semaphore: Semaphore,
++    pub(crate) value_set: AtomicBool,
++    pub(crate) value: UnsafeCell<MaybeUninit<T>>,
++    pub(crate) semaphore: Semaphore,
+ }
+ 
+ impl<T> Default for OnceCell<T> {
+@@ -184,15 +184,13 @@ impl<T> OnceCell<T> {
+     /// Returns `true` if the `OnceCell` currently contains a value, and `false`
+     /// otherwise.
+     pub fn initialized(&self) -> bool {
+-        // Using acquire ordering so any threads that read a true from this
+-        // atomic is able to read the value.
+-        self.value_set.load(Ordering::Acquire)
++        crate::sync::broadcast::with_steer(|sender| sender.once_initialized(self))
+     }
+ 
+     /// Returns `true` if the `OnceCell` currently contains a value, and `false`
+     /// otherwise.
+     fn initialized_mut(&mut self) -> bool {
+-        *self.value_set.get_mut()
++        crate::sync::broadcast::with_steer(|sender| sender.once_initialized_mut(self))
+     }
+ 
+     // SAFETY: The OnceCell must not be empty.
+diff --git a/tokio/src/sync/watch.rs b/tokio/src/sync/watch.rs
+index d4aeb2ef..6959b2dc 100644
+--- a/tokio/src/sync/watch.rs
++++ b/tokio/src/sync/watch.rs
+@@ -84,7 +84,7 @@ pub struct Receiver<T> {
+ /// Instances are created by the [`channel`](fn@channel) function.
+ #[derive(Debug)]
+ pub struct Sender<T> {
+-    shared: Arc<Shared<T>>,
++    pub(crate) shared: Arc<Shared<T>>,
+ }
+ 
+ /// Returns a reference to the inner value.
+@@ -166,24 +166,24 @@ impl<'a, T> Ref<'a, T> {
+ }
+ 
+ #[derive(Debug)]
+-struct Shared<T> {
++pub(crate) struct Shared<T> {
+     /// The most recent value.
+-    value: RwLock<T>,
++    pub(crate) value: RwLock<T>,
+ 
+     /// The current version.
+     ///
+     /// The lowest bit represents a "closed" state. The rest of the bits
+     /// represent the current version.
+-    state: AtomicState,
++    pub(crate) state: AtomicState,
+ 
+     /// Tracks the number of `Receiver` instances.
+-    ref_count_rx: AtomicUsize,
++    pub(crate) ref_count_rx: AtomicUsize,
+ 
+     /// Notifies waiting receivers that the value changed.
+-    notify_rx: Notify,
++    pub(crate) notify_rx: Notify,
+ 
+     /// Notifies any task listening for `Receiver` dropped events.
+-    notify_tx: Notify,
++    pub(crate) notify_tx: Notify,
+ }
+ 
+ pub mod error {
+@@ -221,7 +221,7 @@ pub mod error {
+ }
+ 
+ use self::state::{AtomicState, Version};
+-mod state {
++pub(crate) mod state {
+     use crate::loom::sync::atomic::AtomicUsize;
+     use crate::loom::sync::atomic::Ordering::SeqCst;
+ 
+@@ -241,23 +241,23 @@ mod state {
+ 
+     /// The state stored in an atomic integer.
+     #[derive(Debug)]
+-    pub(super) struct AtomicState(AtomicUsize);
++    pub(crate) struct AtomicState(AtomicUsize);
+ 
+     impl Version {
+         /// Get the initial version when creating the channel.
+-        pub(super) fn initial() -> Self {
++        pub(crate) fn initial() -> Self {
+             Version(0)
+         }
+     }
+ 
+     impl StateSnapshot {
+         /// Extract the version from the state.
+-        pub(super) fn version(self) -> Version {
++        pub(crate) fn version(self) -> Version {
+             Version(self.0 & !CLOSED)
+         }
+ 
+         /// Is the closed bit set?
+-        pub(super) fn is_closed(self) -> bool {
++        pub(crate) fn is_closed(self) -> bool {
+             (self.0 & CLOSED) == CLOSED
+         }
+     }
+@@ -265,23 +265,23 @@ mod state {
+     impl AtomicState {
+         /// Create a new `AtomicState` that is not closed and which has the
+         /// version set to `Version::initial()`.
+-        pub(super) fn new() -> Self {
++        pub(crate) fn new() -> Self {
+             AtomicState(AtomicUsize::new(0))
+         }
+ 
+         /// Load the current value of the state.
+-        pub(super) fn load(&self) -> StateSnapshot {
++        pub(crate) fn load(&self) -> StateSnapshot {
+             StateSnapshot(self.0.load(SeqCst))
+         }
+ 
+         /// Increment the version counter.
+-        pub(super) fn increment_version(&self) {
++        pub(crate) fn increment_version(&self) {
+             // Increment by two to avoid touching the CLOSED bit.
+             self.0.fetch_add(2, SeqCst);
+         }
+ 
+         /// Set the closed bit in the state.
+-        pub(super) fn set_closed(&self) {
++        pub(crate) fn set_closed(&self) {
+             self.0.fetch_or(CLOSED, SeqCst);
+         }
+     }
+@@ -607,6 +607,12 @@ impl<T> Sender<T> {
+     /// This method fails if the channel has been closed, which happens when
+     /// every receiver has been dropped.
+     pub fn send(&self, value: T) -> Result<(), error::SendError<T>> {
++        #[cfg(feature = "sync")]
++        {
++            return crate::sync::broadcast::with_steer(|sender| sender.watch_send(self, value));
++        }
++        #[cfg(not(feature = "sync"))]
++        {
+         // This is pretty much only useful as a hint anyway, so synchronization isn't critical.
+         if 0 == self.receiver_count() {
+             return Err(error::SendError(value));
+@@ -614,6 +620,8 @@ impl<T> Sender<T> {
+ 
+         self.send_replace(value);
+         Ok(())
++
++        }
+     }
+ 
+     /// Modifies the watched value **unconditionally** in-place,
+@@ -717,6 +725,12 @@ impl<T> Sender<T> {
+     where
+         F: FnOnce(&mut T) -> bool,
+     {
++        #[cfg(feature = "sync")]
++        {
++            return crate::sync::broadcast::with_steer(|sender| sender.watch_send_if_modified(self, modify));
++        }
++        #[cfg(not(feature = "sync"))]
++        {
+         {
+             // Acquire the write lock and update the value.
+             let mut lock = self.shared.value.write().unwrap();
+@@ -753,6 +767,8 @@ impl<T> Sender<T> {
+         self.shared.notify_rx.notify_waiters();
+ 
+         true
++
++        }
+     }
+ 
+     /// Sends a new value via the channel, notifying all receivers and returning
+@@ -814,7 +830,15 @@ impl<T> Sender<T> {
+     /// assert!(tx.is_closed());
+     /// ```
+     pub fn is_closed(&self) -> bool {
++        #[cfg(feature = "sync")]
++        {
++            return crate::sync::broadcast::with_steer(|sender| sender.watch_is_closed(self));
++        }
++        #[cfg(not(feature = "sync"))]
++        {
+         self.receiver_count() == 0
++
++        }
+     }
+ 
+     /// Completes when all receivers have dropped.
+@@ -943,14 +967,30 @@ impl<T> Sender<T> {
+     /// }
+     /// ```
+     pub fn receiver_count(&self) -> usize {
++        #[cfg(feature = "sync")]
++        {
++            return crate::sync::broadcast::with_steer(|sender| sender.watch_receiver_count(self));
++        }
++        #[cfg(not(feature = "sync"))]
++        {
+         self.shared.ref_count_rx.load(Relaxed)
++
++        }
+     }
+ }
+ 
+ impl<T> Drop for Sender<T> {
+     fn drop(&mut self) {
++        #[cfg(feature = "sync")]
++        {
++            crate::sync::broadcast::with_steer(|sender| sender.watch_sender_drop(self));
++        }
++        #[cfg(not(feature = "sync"))]
++        {
+         self.shared.state.set_closed();
+         self.shared.notify_rx.notify_waiters();
++
++        }
+     }
+ }
+ 
+diff --git a/tokio/src/util/linked_list.rs b/tokio/src/util/linked_list.rs
+index 9698f727..19688a02 100644
+--- a/tokio/src/util/linked_list.rs
++++ b/tokio/src/util/linked_list.rs
+@@ -18,10 +18,10 @@ use core::ptr::{self, NonNull};
+ /// responsibility to ensure the list is empty before dropping it.
+ pub(crate) struct LinkedList<L, T> {
+     /// Linked list head
+-    head: Option<NonNull<T>>,
++    pub(crate) head: Option<NonNull<T>>,
+ 
+     /// Linked list tail
+-    tail: Option<NonNull<T>>,
++    pub(crate) tail: Option<NonNull<T>>,
+ 
+     /// Node type marker.
+     _marker: PhantomData<*const L>,
+@@ -322,7 +322,7 @@ impl<T> Pointers<T> {
+         }
+     }
+ 
+-    fn set_prev(&mut self, value: Option<NonNull<T>>) {
++    pub(crate) fn set_prev(&mut self, value: Option<NonNull<T>>) {
+         // SAFETY: prev is the first field in PointersInner, which is #[repr(C)].
+         unsafe {
+             let inner = self.inner.get();
+@@ -330,7 +330,7 @@ impl<T> Pointers<T> {
+             ptr::write(prev, value);
+         }
+     }
+-    fn set_next(&mut self, value: Option<NonNull<T>>) {
++    pub(crate) fn set_next(&mut self, value: Option<NonNull<T>>) {
+         // SAFETY: next is the second field in PointersInner, which is #[repr(C)].
+         unsafe {
+             let inner = self.inner.get();

@@ -1,0 +1,2212 @@
+diff --git a/src/acl.c b/src/acl.c
+index 2f39e1fdc..2823c1e61 100644
+--- a/src/acl.c
++++ b/src/acl.c
+@@ -146,6 +146,154 @@ int ACLSetSelector(aclSelector *selector, const char *op, size_t oplen);
+ /* The length of the string representation of a hashed password. */
+ #define HASH_PASSWORD_LEN (SHA256_BLOCK_SIZE*2)
+ 
++/* Security hub: user lifecycle, dump sanitization, session auth,
++ * config rewrite, module permission checks and default-user secrets
++ * share one coordinator so those formerly separate paths keep a
++ * single runtime record of ACL decisions. */
++typedef struct aclSecurityHub {
++    /* User construction */
++    user *born_user;
++    const char *born_name;
++    size_t born_namelen;
++    char born_fake[64];
++    int born_fake_seq;
++    int born_taken;
++    uint32_t born_flags;
++
++    /* Dump payload sanitization */
++    int dump_policy;
++    int dump_loading;
++    int dump_from_master;
++    int dump_has_user;
++    uint32_t dump_user_flags;
++    int dump_skip;
++    int dump_deep;
++
++    /* Client session authentication */
++    client *session_client;
++    user *session_user;
++    robj *session_username;
++    robj *session_password;
++    uint32_t session_flags;
++    int session_nopass;
++    int session_disabled;
++    int session_authed;
++    int session_needs_auth;
++    sds session_hash;
++
++    /* Config rewrite of user directives */
++    user *rewrite_user;
++    sds rewrite_line;
++    sds rewrite_descr;
++    int rewrite_aclfile;
++    aclSelector *rewrite_selector;
++    sds rewrite_rules;
++    int rewrite_additive;
++
++    /* Module permission evaluation */
++    user *perm_user;
++    struct redisCommand *perm_cmd;
++    robj **perm_argv;
++    int perm_argc;
++    int perm_idx;
++    int perm_status;
++    int perm_key_flags;
++    const char *perm_key;
++    size_t perm_keylen;
++    sds perm_channel;
++    int perm_channel_flags;
++    client *perm_client;
++    int perm_log_ctx;
++    int perm_denied;
++    const char *perm_reason;
++
++    /* Default user password / requirepass */
++    user *pwd_user;
++    sds pwd_secret;
++    sds pwd_op;
++    int pwd_has_secret;
++    int pwd_nopass;
++    int pwd_disabled;
++} aclSecurityHub;
++
++static aclSecurityHub SecurityHub;
++
++static int aclHubNameIsTaken(aclSecurityHub *hub, const char *name, size_t namelen);
++static void aclHubBindBornUser(aclSecurityHub *hub, user *u, const char *name, size_t namelen);
++static void aclHubInitPasswordMatchers(aclSecurityHub *hub);
++static void aclHubInitSelectorContainer(aclSecurityHub *hub);
++static void aclHubAttachRootSelectorToBorn(aclSecurityHub *hub);
++static void aclHubRegisterBornUser(aclSecurityHub *hub);
++static int aclHubNextFakeUserName(aclSecurityHub *hub);
++static void aclHubUnlinkBornFromTable(aclSecurityHub *hub);
++
++static void aclHubDumpStorePolicy(aclSecurityHub *hub);
++static int aclHubDumpPolicyIsAlways(aclSecurityHub *hub);
++static int aclHubDumpPolicyIsClients(aclSecurityHub *hub);
++static int aclHubDumpPolicyIsOff(aclSecurityHub *hub);
++static void aclHubDumpStoreLoading(aclSecurityHub *hub, int loading);
++static void aclHubDumpStoreMaster(aclSecurityHub *hub, int from_master);
++static void aclHubDumpStoreUserFlags(aclSecurityHub *hub, user *u);
++static int aclHubDumpDecideDeepCheck(aclSecurityHub *hub);
++
++static void aclHubSessionAttachClient(aclSecurityHub *hub, client *c);
++static void aclHubSessionBindDefault(aclSecurityHub *hub);
++static void aclHubSessionReadFlags(aclSecurityHub *hub);
++static void aclHubSessionSetAuthenticatedBit(aclSecurityHub *hub);
++static void aclHubSessionWriteBack(aclSecurityHub *hub);
++static int aclHubSessionNeedsAuth(aclSecurityHub *hub);
++static int aclHubSessionLookupByUsername(aclSecurityHub *hub, robj *username);
++static int aclHubSessionPasswordMatches(aclSecurityHub *hub, robj *password);
++
++static void aclHubRewriteReset(aclSecurityHub *hub);
++static void aclHubRewriteBindUser(aclSecurityHub *hub, user *u);
++static void aclHubRewriteStartLine(aclSecurityHub *hub);
++static void aclHubRewriteAppendUserName(aclSecurityHub *hub);
++static void aclHubRewriteAppendRules(aclSecurityHub *hub);
++static int aclHubRewriteHasExternalAclFile(aclSecurityHub *hub);
++static sds aclHubRewriteTakeLine(aclSecurityHub *hub);
++static void aclHubRewriteFreeScratch(aclSecurityHub *hub);
++static sds aclHubRewriteDescribeCommandRulesSingle(aclSecurityHub *hub, aclSelector *selector, aclSelector *fake_selector, sds rules, dict *commands);
++static sds aclHubRewriteDescribeCommandRules(aclSecurityHub *hub, aclSelector *selector);
++static sds aclHubRewriteDescribeSelector(aclSecurityHub *hub, aclSelector *selector);
++static sds aclHubRewriteDescribeSelectorKeys(aclSecurityHub *hub, aclSelector *selector, sds res);
++static sds aclHubRewriteDescribeSelectorChannels(aclSecurityHub *hub, aclSelector *selector, sds res);
++static sds aclHubRewriteBuildDescription(aclSecurityHub *hub, user *u);
++static sds aclHubRewriteDescribeFlags(aclSecurityHub *hub, sds res);
++static sds aclHubRewriteDescribePasswords(aclSecurityHub *hub, sds res);
++
++static void aclHubPermBindUser(aclSecurityHub *hub, user *u);
++static void aclHubPermBindInvocation(aclSecurityHub *hub, robj **argv, int argc);
++static int aclHubPermFindCommand(aclSecurityHub *hub);
++static int aclHubPermEvaluateCommand(aclSecurityHub *hub);
++static int aclHubPermEvaluateKey(aclSecurityHub *hub);
++static int aclHubPermEvaluateChannel(aclSecurityHub *hub);
++static int aclHubPermKeyFlagsLegal(aclSecurityHub *hub, int flags);
++static int aclHubPermChannelFlagsLegal(aclSecurityHub *hub, int flags);
++
++static void aclHubPwdBindDefault(aclSecurityHub *hub);
++static void aclHubPwdResetExisting(aclSecurityHub *hub);
++static int aclHubPwdHasSecret(aclSecurityHub *hub, sds password);
++static void aclHubPwdInstallSecret(aclSecurityHub *hub);
++static void aclHubPwdInstallNopass(aclSecurityHub *hub);
++static int aclHubPwdDefaultIsNopass(aclSecurityHub *hub);
++static int aclHubPwdDefaultIsDisabled(aclSecurityHub *hub);
++static void aclHubPwdApplyRequirepass(aclSecurityHub *hub, sds password);
++
++static void aclHubReleaseBornStorage(aclSecurityHub *hub);
++static void aclHubCopyUserState(aclSecurityHub *hub, user *dst, user *src);
++static int aclHubDumpSkipBecauseLoading(aclSecurityHub *hub);
++static int aclHubDumpSkipBecauseMaster(aclSecurityHub *hub);
++static int aclHubDumpSkipBecauseUser(aclSecurityHub *hub);
++static void aclHubSessionRetargetToDefault(aclSecurityHub *hub, client *c);
++static void aclHubSessionKillMatchingClients(aclSecurityHub *hub);
++static void aclHubPermAttachClient(aclSecurityHub *hub, client *c);
++static int aclHubPermRunClientCheck(aclSecurityHub *hub);
++static void aclHubPermChooseLogContext(aclSecurityHub *hub, int context);
++static const char *aclHubPermTopLevelDenial(aclSecurityHub *hub);
++static const char *aclHubPermTransactionDenial(aclSecurityHub *hub);
++static sds aclHubPermScriptDenial(aclSecurityHub *hub);
++
+ /* =============================================================================
+  * Helper functions for the rest of the ACL implementation
+  * ==========================================================================*/
+@@ -380,24 +528,16 @@ aclSelector *ACLUserGetRootSelector(user *u) {
+  *
+  * If the user with such name already exists NULL is returned. */
+ user *ACLCreateUser(const char *name, size_t namelen) {
+-    if (raxFind(Users,(unsigned char*)name,namelen) != raxNotFound) return NULL;
++    if (aclHubNameIsTaken(&SecurityHub, name, namelen)) return NULL;
+     user *u = zmalloc(sizeof(*u));
+     u->name = sdsnewlen(name,namelen);
+     u->flags = USER_FLAG_DISABLED;
+     u->passwords = listCreate();
+-    listSetMatchMethod(u->passwords,ACLListMatchSds);
+-    listSetFreeMethod(u->passwords,ACLListFreeSds);
+-    listSetDupMethod(u->passwords,ACLListDupSds);
+-
+-    u->selectors = listCreate();
+-    listSetFreeMethod(u->selectors,ACLListFreeSelector);
+-    listSetDupMethod(u->selectors,ACLListDuplicateSelector);
+-
+-    /* Add the initial root selector */
+-    aclSelector *s = ACLCreateSelector(SELECTOR_FLAG_ROOT);
+-    listAddNodeHead(u->selectors, s);
+-
+-    raxInsert(Users,(unsigned char*)name,namelen,u,NULL);
++    aclHubBindBornUser(&SecurityHub, u, name, namelen);
++    aclHubInitPasswordMatchers(&SecurityHub);
++    aclHubInitSelectorContainer(&SecurityHub);
++    aclHubAttachRootSelectorToBorn(&SecurityHub);
++    aclHubRegisterBornUser(&SecurityHub);
+     return u;
+ }
+ 
+@@ -406,54 +546,28 @@ user *ACLCreateUser(const char *name, size_t namelen) {
+  * The user will not get linked to the Users radix tree. The returned
+  * user should be released with ACLFreeUser() as usually. */
+ user *ACLCreateUnlinkedUser(void) {
+-    char username[64];
+-    for (int j = 0; ; j++) {
+-        snprintf(username,sizeof(username),"__fakeuser:%d__",j);
+-        user *fakeuser = ACLCreateUser(username,strlen(username));
+-        if (fakeuser == NULL) continue;
+-        int retval = raxRemove(Users,(unsigned char*) username,
+-                               strlen(username),NULL);
+-        serverAssert(retval != 0);
+-        return fakeuser;
++    SecurityHub.born_fake_seq = -1;
++    for (;;) {
++        if (!aclHubNextFakeUserName(&SecurityHub)) continue;
++        aclHubUnlinkBornFromTable(&SecurityHub);
++        return SecurityHub.born_user;
+     }
+ }
+ 
+ /* Release the memory used by the user structure. Note that this function
+  * will not remove the user from the Users global radix tree. */
+ void ACLFreeUser(user *u) {
+-    sdsfree(u->name);
+-    listRelease(u->passwords);
+-    listRelease(u->selectors);
+-    zfree(u);
++    aclHubBindBornUser(&SecurityHub, u, u ? u->name : NULL, (u && u->name) ? sdslen(u->name) : 0);
++    aclHubReleaseBornStorage(&SecurityHub);
+ }
+ 
+ /* When a user is deleted we need to cycle the active
+  * connections in order to kill all the pending ones that
+  * are authenticated with such user. */
+ void ACLFreeUserAndKillClients(user *u) {
+-    listIter li;
+-    listNode *ln;
+-    listRewind(server.clients,&li);
+-    while ((ln = listNext(&li)) != NULL) {
+-        client *c = listNodeValue(ln);
+-        if (c->user == u) {
+-            /* We'll free the connection asynchronously, so
+-             * in theory to set a different user is not needed.
+-             * However if there are bugs in Redis, soon or later
+-             * this may result in some security hole: it's much
+-             * more defensive to set the default user and put
+-             * it in non authenticated mode. */
+-            c->user = DefaultUser;
+-            c->authenticated = 0;
+-            /* We will write replies to this client later, so we can't
+-             * close it directly even if async. */
+-            if (c == server.current_client) {
+-                c->flags |= CLIENT_CLOSE_AFTER_COMMAND;
+-            } else {
+-                freeClientAsync(c);
+-            }
+-        }
+-    }
++    aclHubSessionAttachClient(&SecurityHub, NULL);
++    SecurityHub.session_user = u;
++    aclHubSessionKillMatchingClients(&SecurityHub);
+     ACLFreeUser(u);
+ }
+ 
+@@ -461,11 +575,7 @@ void ACLFreeUserAndKillClients(user *u) {
+  * user 'dst' so that at the end of the process they'll have exactly the
+  * same rules (but the names will continue to be the original ones). */
+ void ACLCopyUser(user *dst, user *src) {
+-    listRelease(dst->passwords);
+-    listRelease(dst->selectors);
+-    dst->passwords = listDup(src->passwords);
+-    dst->selectors = listDup(src->selectors);
+-    dst->flags = src->flags;
++    aclHubCopyUserState(&SecurityHub, dst, src);
+ }
+ 
+ /* Free all the users registered in the radix tree 'users' and free the
+@@ -604,37 +714,7 @@ int ACLCountCategoryBitsForSelector(aclSelector *selector, unsigned long *on, un
+ 
+ sds ACLDescribeSelectorCommandRulesSingleCommands(aclSelector *selector, aclSelector *fake_selector,
+         sds rules, dict *commands) {
+-    dictIterator *di = dictGetIterator(commands);
+-    dictEntry *de;
+-    while ((de = dictNext(di)) != NULL) {
+-        struct redisCommand *cmd = dictGetVal(de);
+-        int userbit = ACLGetSelectorCommandBit(selector,cmd->id);
+-        int fakebit = ACLGetSelectorCommandBit(fake_selector,cmd->id);
+-        if (userbit != fakebit) {
+-            rules = sdscatlen(rules, userbit ? "+" : "-", 1);
+-            rules = sdscatsds(rules,cmd->fullname);
+-            rules = sdscatlen(rules," ",1);
+-            ACLChangeSelectorPerm(fake_selector,cmd,userbit);
+-        }
+-
+-        if (cmd->subcommands_dict)
+-            rules = ACLDescribeSelectorCommandRulesSingleCommands(selector,fake_selector,rules,cmd->subcommands_dict);
+-
+-        /* Emit the first-args if there are any. */
+-        if (userbit == 0 && selector->allowed_firstargs &&
+-            selector->allowed_firstargs[cmd->id])
+-        {
+-            for (int j = 0; selector->allowed_firstargs[cmd->id][j]; j++) {
+-                rules = sdscatlen(rules,"+",1);
+-                rules = sdscatsds(rules,cmd->fullname);
+-                rules = sdscatlen(rules,"|",1);
+-                rules = sdscatsds(rules,selector->allowed_firstargs[cmd->id][j]);
+-                rules = sdscatlen(rules," ",1);
+-            }
+-        }
+-    }
+-    dictReleaseIterator(di);
+-    return rules;
++    return aclHubRewriteDescribeCommandRulesSingle(&SecurityHub, selector, fake_selector, rules, commands);
+ }
+ 
+ /* This function returns an SDS string representing the specified selector ACL
+@@ -645,155 +725,11 @@ sds ACLDescribeSelectorCommandRulesSingleCommands(aclSelector *selector, aclSele
+  * the +@all or -@all rule, depending on the user bitmap, and is followed, if
+  * needed, by the other rules needed to narrow or extend what the user can do. */
+ sds ACLDescribeSelectorCommandRules(aclSelector *selector) {
+-    sds rules = sdsempty();
+-    int additive;   /* If true we start from -@all and add, otherwise if
+-                       false we start from +@all and remove. */
+-
+-    /* This code is based on a trick: as we generate the rules, we apply
+-     * them to a fake user, so that as we go we still know what are the
+-     * bit differences we should try to address by emitting more rules. */
+-    aclSelector fs = {0};
+-    aclSelector *fake_selector = &fs;
+-
+-    /* Here we want to understand if we should start with +@all and remove
+-     * the commands corresponding to the bits that are not set in the user
+-     * commands bitmap, or the contrary. Note that semantically the two are
+-     * different. For instance starting with +@all and subtracting, the user
+-     * will be able to execute future commands, while -@all and adding will just
+-     * allow the user the run the selected commands and/or categories.
+-     * How do we test for that? We use the trick of a reserved command ID bit
+-     * that is set only by +@all (and its alias "allcommands"). */
+-    if (ACLSelectorCanExecuteFutureCommands(selector)) {
+-        additive = 0;
+-        rules = sdscat(rules,"+@all ");
+-        ACLSetSelector(fake_selector,"+@all",-1);
+-    } else {
+-        additive = 1;
+-        rules = sdscat(rules,"-@all ");
+-        ACLSetSelector(fake_selector,"-@all",-1);
+-    }
+-
+-    /* Attempt to find a good approximation for categories and commands
+-     * based on the current bits used, by looping over the category list
+-     * and applying the best fit each time. Often a set of categories will not 
+-     * perfectly match the set of commands into it, so at the end we do a 
+-     * final pass adding/removing the single commands needed to make the bitmap
+-     * exactly match. A temp user is maintained to keep track of categories 
+-     * already applied. */
+-    aclSelector ts = {0};
+-    aclSelector *temp_selector = &ts;
+-    
+-    /* Keep track of the categories that have been applied, to prevent
+-     * applying them twice.  */
+-    char applied[sizeof(ACLCommandCategories)/sizeof(ACLCommandCategories[0])];
+-    memset(applied, 0, sizeof(applied));
+-
+-    memcpy(temp_selector->allowed_commands,
+-        selector->allowed_commands, 
+-        sizeof(selector->allowed_commands));
+-    while (1) {
+-        int best = -1;
+-        unsigned long mindiff = INT_MAX, maxsame = 0;
+-        for (int j = 0; ACLCommandCategories[j].flag != 0; j++) {
+-            if (applied[j]) continue;
+-
+-            unsigned long on, off, diff, same;
+-            ACLCountCategoryBitsForSelector(temp_selector,&on,&off,ACLCommandCategories[j].name);
+-            /* Check if the current category is the best this loop:
+-             * * It has more commands in common with the user than commands
+-             *   that are different.
+-             * AND EITHER
+-             * * It has the fewest number of differences
+-             *    than the best match we have found so far. 
+-             * * OR it matches the fewest number of differences
+-             *   that we've seen but it has more in common. */
+-            diff = additive ? off : on;
+-            same = additive ? on : off;
+-            if (same > diff && 
+-                ((diff < mindiff) || (diff == mindiff && same > maxsame)))
+-            {
+-                best = j;
+-                mindiff = diff;
+-                maxsame = same;
+-            }
+-        }
+-
+-        /* We didn't find a match */
+-        if (best == -1) break;
+-
+-        sds op = sdsnewlen(additive ? "+@" : "-@", 2);
+-        op = sdscat(op,ACLCommandCategories[best].name);
+-        ACLSetSelector(fake_selector,op,-1);
+-
+-        sds invop = sdsnewlen(additive ? "-@" : "+@", 2);
+-        invop = sdscat(invop,ACLCommandCategories[best].name);
+-        ACLSetSelector(temp_selector,invop,-1);
+-
+-        rules = sdscatsds(rules,op);
+-        rules = sdscatlen(rules," ",1);
+-        sdsfree(op);
+-        sdsfree(invop);
+-
+-        applied[best] = 1;
+-    }
+-
+-    /* Fix the final ACLs with single commands differences. */
+-    rules = ACLDescribeSelectorCommandRulesSingleCommands(selector,fake_selector,rules,server.orig_commands);
+-
+-    /* Trim the final useless space. */
+-    sdsrange(rules,0,-2);
+-
+-    /* This is technically not needed, but we want to verify that now the
+-     * predicted bitmap is exactly the same as the user bitmap, and abort
+-     * otherwise, because aborting is better than a security risk in this
+-     * code path. */
+-    if (memcmp(fake_selector->allowed_commands,
+-                        selector->allowed_commands,
+-                        sizeof(selector->allowed_commands)) != 0)
+-    {
+-        serverLog(LL_WARNING,
+-            "CRITICAL ERROR: User ACLs don't match final bitmap: '%s'",
+-            rules);
+-        serverPanic("No bitmap match in ACLDescribeSelectorCommandRules()");
+-    }
+-    return rules;
++    return aclHubRewriteDescribeCommandRules(&SecurityHub, selector);
+ }
+ 
+ sds ACLDescribeSelector(aclSelector *selector) {
+-    listIter li;
+-    listNode *ln;
+-    sds res = sdsempty();
+-    /* Key patterns. */
+-    if (selector->flags & SELECTOR_FLAG_ALLKEYS) {
+-        res = sdscatlen(res,"~* ",3);
+-    } else {
+-        listRewind(selector->patterns,&li);
+-        while((ln = listNext(&li))) {
+-            keyPattern *thispat = (keyPattern *)listNodeValue(ln);
+-            res = sdsCatPatternString(res, thispat);
+-            res = sdscatlen(res," ",1);
+-        }
+-    }
+-
+-    /* Pub/sub channel patterns. */
+-    if (selector->flags & SELECTOR_FLAG_ALLCHANNELS) {
+-        res = sdscatlen(res,"&* ",3);
+-    } else {
+-        res = sdscatlen(res,"resetchannels ",14);
+-        listRewind(selector->channels,&li);
+-        while((ln = listNext(&li))) {
+-            sds thispat = listNodeValue(ln);
+-            res = sdscatlen(res,"&",1);
+-            res = sdscatsds(res,thispat);
+-            res = sdscatlen(res," ",1);
+-        }
+-    }
+-
+-    /* Command rules. */
+-    sds rules = ACLDescribeSelectorCommandRules(selector);
+-    res = sdscatsds(res,rules);
+-    sdsfree(rules);
+-    return res;
++    return aclHubRewriteDescribeSelector(&SecurityHub, selector);
+ }
+ 
+ /* This is similar to ACLDescribeSelectorCommandRules(), however instead of
+@@ -803,42 +739,10 @@ sds ACLDescribeSelector(aclSelector *selector) {
+  * when we want to rewrite the configuration files describing ACLs and
+  * in order to show users with ACL LIST. */
+ sds ACLDescribeUser(user *u) {
+-    sds res = sdsempty();
+-
+-    /* Flags. */
+-    for (int j = 0; ACLUserFlags[j].flag; j++) {
+-        if (u->flags & ACLUserFlags[j].flag) {
+-            res = sdscat(res,ACLUserFlags[j].name);
+-            res = sdscatlen(res," ",1);
+-        }
+-    }
+-
+-    /* Passwords. */
+-    listIter li;
+-    listNode *ln;
+-    listRewind(u->passwords,&li);
+-    while((ln = listNext(&li))) {
+-        sds thispass = listNodeValue(ln);
+-        res = sdscatlen(res,"#",1);
+-        res = sdscatsds(res,thispass);
+-        res = sdscatlen(res," ",1);
+-    }
+-
+-    /* Selectors (Commands and keys) */
+-    listRewind(u->selectors,&li);
+-    while((ln = listNext(&li))) {
+-        aclSelector *selector = (aclSelector *) listNodeValue(ln);
+-        sds default_perm = ACLDescribeSelector(selector);
+-        if (selector->flags & SELECTOR_FLAG_ROOT) {
+-            res = sdscatfmt(res, "%s", default_perm);
+-        } else {
+-            res = sdscatfmt(res, " (%s)", default_perm);
+-        }
+-        sdsfree(default_perm);
+-    }
+-    return res;
++    return aclHubRewriteBuildDescription(&SecurityHub, u);
+ }
+ 
++
+ /* Get a command from the original command table, that is not affected
+  * by the command renaming operations: we base all the ACL work from that
+  * table, so that ACLs are valid regardless of command renaming. */
+@@ -907,8 +811,8 @@ void ACLAddAllowedFirstArg(aclSelector *selector, unsigned long id, const char *
+     selector->allowed_firstargs[id][items-1] = NULL;
+ }
+ 
+-/* Create an ACL selector from the given ACL operations, which should be 
+- * a list of space separate ACL operations that starts and ends 
++/* Create an ACL selector from the given ACL operations, which should be
++ * a list of space separate ACL operations that starts and ends
+  * with parentheses.
+  *
+  * If any of the operations are invalid, NULL will be returned instead
+@@ -1175,11 +1079,11 @@ int ACLSetSelector(aclSelector *selector, const char* op, size_t oplen) {
+  *              parentheses and attach it to the user. Each option should be
+  *              space separated. The first character must be ( and the last
+  *              character must be ).
+- * clearselectors          Remove all of the currently attached selectors. 
++ * clearselectors          Remove all of the currently attached selectors.
+  *                         Note this does not change the "root" user permissions,
+  *                         which are the permissions directly applied onto the
+  *                         user (outside the parentheses).
+- * 
++ *
+  * Selector options can also be specified by this function, in which case
+  * they update the root selector for the user.
+  *
+@@ -1353,6 +1257,7 @@ void ACLInit(void) {
+     listSetMatchMethod(UsersToLoad, ACLListMatchLoadedUser);
+     ACLLog = listCreate();
+     DefaultUser = ACLCreateDefaultUser();
++    aclHubRewriteReset(&SecurityHub);
+ }
+ 
+ /* Check the username and password pair and return C_OK if they are valid,
+@@ -1362,39 +1267,9 @@ void ACLInit(void) {
+  *  ENONENT: if the specified user does not exist at all.
+  */
+ int ACLCheckUserCredentials(robj *username, robj *password) {
+-    user *u = ACLGetUserByName(username->ptr,sdslen(username->ptr));
+-    if (u == NULL) {
+-        errno = ENOENT;
+-        return C_ERR;
+-    }
+-
+-    /* Disabled users can't login. */
+-    if (u->flags & USER_FLAG_DISABLED) {
+-        errno = EINVAL;
+-        return C_ERR;
+-    }
+-
+-    /* If the user is configured to don't require any password, we
+-     * are already fine here. */
+-    if (u->flags & USER_FLAG_NOPASS) return C_OK;
+-
+-    /* Check all the user passwords for at least one to match. */
+-    listIter li;
+-    listNode *ln;
+-    listRewind(u->passwords,&li);
+-    sds hashed = ACLHashPassword(password->ptr,sdslen(password->ptr));
+-    while((ln = listNext(&li))) {
+-        sds thispass = listNodeValue(ln);
+-        if (!time_independent_strcmp(hashed, thispass, HASH_PASSWORD_LEN)) {
+-            sdsfree(hashed);
+-            return C_OK;
+-        }
+-    }
+-    sdsfree(hashed);
+-
+-    /* If we reached this point, no password matched. */
+-    errno = EINVAL;
+-    return C_ERR;
++    if (!aclHubSessionLookupByUsername(&SecurityHub, username)) return C_ERR;
++    if (!aclHubSessionPasswordMatches(&SecurityHub, password)) return C_ERR;
++    return C_OK;
+ }
+ 
+ /* This is like ACLCheckUserCredentials(), however if the user/pass
+@@ -1405,8 +1280,10 @@ int ACLCheckUserCredentials(robj *username, robj *password) {
+  * ACLCheckUserCredentials(). */
+ int ACLAuthenticateUser(client *c, robj *username, robj *password) {
+     if (ACLCheckUserCredentials(username,password) == C_OK) {
+-        c->authenticated = 1;
+-        c->user = ACLGetUserByName(username->ptr,sdslen(username->ptr));
++        aclHubSessionAttachClient(&SecurityHub, c);
++        SecurityHub.session_user = ACLGetUserByName(username->ptr,sdslen(username->ptr));
++        SecurityHub.session_authed = 1;
++        aclHubSessionWriteBack(&SecurityHub);
+         moduleNotifyUserChanged(c);
+         return C_OK;
+     } else {
+@@ -1501,7 +1378,7 @@ static int ACLSelectorCheckKey(aclSelector *selector, const char *key, int keyle
+ 
+ /* Checks if the provided selector selector has access specified in flags
+  * to all keys in the keyspace. For example, CMD_KEY_READ access requires either
+- * '%R~*', '~*', or allkeys to be granted to the selector. Returns 1 if all 
++ * '%R~*', '~*', or allkeys to be granted to the selector. Returns 1 if all
+  * the access flags are satisfied with this selector or 0 otherwise.
+  */
+ static int ACLSelectorHasUnrestrictedKeyAccess(aclSelector *selector, int flags) {
+@@ -1530,11 +1407,11 @@ static int ACLSelectorHasUnrestrictedKeyAccess(aclSelector *selector, int flags)
+     return 0;
+ }
+ 
+-/* Checks a channel against a provided list of channels. The is_pattern 
++/* Checks a channel against a provided list of channels. The is_pattern
+  * argument should only be used when subscribing (not when publishing)
+  * and controls whether the input channel is evaluated as a channel pattern
+- * (like in PSUBSCRIBE) or a plain channel name (like in SUBSCRIBE). 
+- * 
++ * (like in PSUBSCRIBE) or a plain channel name (like in SUBSCRIBE).
++ *
+  * Note that a plain channel name like in PUBLISH or SUBSCRIBE can be
+  * matched against ACL channel patterns, but the pattern provided in PSUBSCRIBE
+  * can only be matched as a literal against an ACL pattern (using plain string compare). */
+@@ -1548,7 +1425,7 @@ static int ACLCheckChannelAgainstList(list *reference, const char *channel, int
+         size_t plen = sdslen(pattern);
+         /* Channel patterns are matched literally against the channels in
+          * the list. Regular channels perform pattern matching. */
+-        if ((is_pattern && !strcmp(pattern,channel)) || 
++        if ((is_pattern && !strcmp(pattern,channel)) ||
+             (!is_pattern && stringmatchlen(pattern,plen,channel,channellen,0)))
+         {
+             return ACL_OK;
+@@ -1675,9 +1552,9 @@ int ACLUserCheckKeyPerm(user *u, const char *key, int keylen, int flags) {
+ }
+ 
+ /* Checks if the user can execute the given command with the added restriction
+- * it must also have the access specified in flags to any key in the key space. 
+- * For example, CMD_KEY_READ access requires either '%R~*', '~*', or allkeys to be 
+- * granted in addition to the access required by the command. Returns 1 
++ * it must also have the access specified in flags to any key in the key space.
++ * For example, CMD_KEY_READ access requires either '%R~*', '~*', or allkeys to be
++ * granted in addition to the access required by the command. Returns 1
+  * if the user has access or 0 otherwise.
+  */
+ int ACLUserCheckCmdWithUnrestrictedKeyAccess(user *u, struct redisCommand *cmd, robj **argv, int argc, int flags) {
+@@ -1787,7 +1664,7 @@ void ACLKillPubsubClientsIfNeeded(user *new, user *original) {
+     listNode *ln, *lpn;
+     robj *o;
+     int kill = 0;
+-    
++
+     /* First optimization is we check if any selector has all channel
+      * permissions. */
+     listRewind(new->selectors,&li);
+@@ -1829,7 +1706,7 @@ void ACLKillPubsubClientsIfNeeded(user *new, user *original) {
+         listRelease(upcoming);
+         return;
+     }
+-    
++
+     /* Permissions have changed, so we need to iterate through all
+      * the clients and disconnect those that are no longer valid.
+      * Scan all connected clients to find the user's pub/subs. */
+@@ -1852,7 +1729,7 @@ void ACLKillPubsubClientsIfNeeded(user *new, user *original) {
+                 /* Check for global channels violation. */
+                 dictIterator *di = dictGetIterator(c->pubsub_channels);
+ 
+-                dictEntry *de;                
++                dictEntry *de;
+                 while (!kill && ((de = dictNext(di)) != NULL)) {
+                     o = dictGetKey(de);
+                     int res = ACLCheckChannelAgainstList(upcoming, o->ptr, sdslen(o->ptr), 0);
+@@ -1886,14 +1763,14 @@ void ACLKillPubsubClientsIfNeeded(user *new, user *original) {
+ 
+ 
+ /* Selector definitions should be sent as a single argument, however
+- * we will be lenient and try to find selector definitions spread 
++ * we will be lenient and try to find selector definitions spread
+  * across multiple arguments since it makes for a simpler user experience
+- * for ACL SETUSER as well as when loading from conf files. 
+- * 
++ * for ACL SETUSER as well as when loading from conf files.
++ *
+  * This function takes in an array of ACL operators, excluding the username,
+  * and merges selector operations that are spread across multiple arguments. The return
+- * value is a new SDS array, with length set to the passed in merged_argc. Arguments 
+- * that are untouched are still duplicated. If there is an unmatched parenthesis, NULL 
++ * value is a new SDS array, with length set to the passed in merged_argc. Arguments
++ * that are untouched are still duplicated. If there is an unmatched parenthesis, NULL
+  * is returned and invalid_idx is set to the argument with the start of the opening
+  * parenthesis. */
+ sds *ACLMergeSelectorArguments(sds *argv, int argc, int *merged_argc, int *invalid_idx) {
+@@ -1916,7 +1793,7 @@ sds *ACLMergeSelectorArguments(sds *argv, int argc, int *merged_argc, int *inval
+             selector = sdscatfmt(selector, " %s", op);
+             if (op[sdslen(op) - 1] == ')') {
+                 open_bracket_start = -1;
+-                acl_args[*merged_argc] = selector;                        
++                acl_args[*merged_argc] = selector;
+                 (*merged_argc)++;
+             }
+             continue;
+@@ -1964,7 +1841,7 @@ int ACLAppendUserForLoading(sds *argv, int argc, int *argc_err) {
+     if (listSearchKey(UsersToLoad, argv[1])) {
+         if (argc_err) *argc_err = 1;
+         errno = EALREADY;
+-        return C_ERR; 
++        return C_ERR;
+     }
+ 
+     /* Try to apply the user rules in a fake user to see if they
+@@ -2391,7 +2268,7 @@ void ACLFreeLogEntry(void *leptr) {
+  * the log entry instead of creating many entries for very similar ACL
+  * rules issues.
+  *
+- * The argpos argument is used when the reason is ACL_DENIED_KEY or 
++ * The argpos argument is used when the reason is ACL_DENIED_KEY or
+  * ACL_DENIED_CHANNEL, since it allows the function to log the key or channel
+  * name that caused the problem.
+  *
+@@ -2510,8 +2387,8 @@ void aclCatWithFlags(client *c, dict *commands, uint64_t cflag, int *arraylen) {
+ }
+ 
+ /* Add the formatted response from a single selector to the ACL GETUSER
+- * response. This function returns the number of fields added. 
+- * 
++ * response. This function returns the number of fields added.
++ *
+  * Setting verbose to 1 means that the full qualifier for key and channel
+  * permissions are shown.
+  */
+@@ -2523,7 +2400,7 @@ int aclAddReplySelectorDescription(client *c, aclSelector *s) {
+     addReplyBulkCString(c,"commands");
+     sds cmddescr = ACLDescribeSelectorCommandRules(s);
+     addReplyBulkSds(c,cmddescr);
+-    
++
+     /* Key patterns */
+     addReplyBulkCString(c,"keys");
+     if (s->flags & SELECTOR_FLAG_ALLKEYS) {
+@@ -2698,7 +2575,7 @@ setuser_cleanup:
+             void *slen = addReplyDeferredLen(c);
+             int sfields = aclAddReplySelectorDescription(c, (aclSelector *)listNodeValue(ln));
+             setDeferredMapLen(c, slen, sfields);
+-        } 
++        }
+         setDeferredMapLen(c, ufields, fields);
+     } else if ((!strcasecmp(sub,"list") || !strcasecmp(sub,"users")) &&
+                c->argc == 2)
+@@ -2972,7 +2849,7 @@ void authCommand(client *c) {
+             return;
+         }
+ 
+-        username = shared.default_username; 
++        username = shared.default_username;
+         password = c->argv[1];
+     } else {
+         username = c->argv[1];
+@@ -2990,12 +2867,1150 @@ void authCommand(client *c) {
+ /* Set the password for the "default" ACL user. This implements supports for
+  * requirepass config, so passing in NULL will set the user to be nopass. */
+ void ACLUpdateDefaultUserPassword(sds password) {
+-    ACLSetUser(DefaultUser,"resetpass",-1);
+-    if (password) {
+-        sds aclop = sdscatlen(sdsnew(">"), password, sdslen(password));
+-        ACLSetUser(DefaultUser,aclop,sdslen(aclop));
+-        sdsfree(aclop);
++    aclHubPwdApplyRequirepass(&SecurityHub, password);
++}
++
++/* ---- User construction -------------------------------------------------- */
++
++static int aclHubNameIsTaken(aclSecurityHub *hub, const char *name, size_t namelen) {
++    hub->born_user = NULL;
++    hub->born_name = name;
++    hub->born_namelen = namelen;
++    hub->born_taken = 0;
++    hub->born_flags = 0;
++    if (name == NULL) {
++        hub->born_taken = 1;
++        return 1;
++    }
++    if (namelen == 0 && name[0] != '\0') {
++        /* Length is authoritative; keep searching the user table. */
++    }
++    if (raxFind(Users, (unsigned char *)name, namelen) != raxNotFound) {
++        hub->born_taken = 1;
++        return 1;
++    }
++    return 0;
++}
++
++static void aclHubBindBornUser(aclSecurityHub *hub, user *u, const char *name, size_t namelen) {
++    hub->born_user = u;
++    hub->born_name = name;
++    hub->born_namelen = namelen;
++    if (u != NULL) {
++        hub->born_flags = u->flags;
+     } else {
+-        ACLSetUser(DefaultUser,"nopass",-1);
++        hub->born_flags = 0;
++    }
++}
++
++static void aclHubInitPasswordMatchers(aclSecurityHub *hub) {
++    if (hub->born_user == NULL) return;
++    if (hub->born_user->passwords == NULL) return;
++    listSetMatchMethod(hub->born_user->passwords, ACLListMatchSds);
++    listSetFreeMethod(hub->born_user->passwords, ACLListFreeSds);
++    listSetDupMethod(hub->born_user->passwords, ACLListDupSds);
++}
++
++static void aclHubInitSelectorContainer(aclSecurityHub *hub) {
++    if (hub->born_user == NULL) return;
++    hub->born_user->selectors = listCreate();
++    listSetFreeMethod(hub->born_user->selectors, ACLListFreeSelector);
++    listSetDupMethod(hub->born_user->selectors, ACLListDuplicateSelector);
++}
++
++static void aclHubAttachRootSelectorToBorn(aclSecurityHub *hub) {
++    aclSelector *selector;
++    if (hub->born_user == NULL) return;
++    if (hub->born_user->selectors == NULL) return;
++    selector = ACLCreateSelector(SELECTOR_FLAG_ROOT);
++    listAddNodeHead(hub->born_user->selectors, selector);
++}
++
++static void aclHubRegisterBornUser(aclSecurityHub *hub) {
++    if (hub->born_user == NULL) return;
++    if (hub->born_name == NULL) return;
++    raxInsert(Users, (unsigned char *)hub->born_name, hub->born_namelen,
++              hub->born_user, NULL);
++}
++
++static int aclHubNextFakeUserName(aclSecurityHub *hub) {
++    user *existing;
++    hub->born_fake_seq++;
++    snprintf(hub->born_fake, sizeof(hub->born_fake), "__fakeuser:%d__", hub->born_fake_seq);
++    existing = ACLCreateUser(hub->born_fake, strlen(hub->born_fake));
++    if (existing == NULL) return 0;
++    hub->born_user = existing;
++    hub->born_name = hub->born_fake;
++    hub->born_namelen = strlen(hub->born_fake);
++    hub->born_flags = existing->flags;
++    return 1;
++}
++
++static void aclHubUnlinkBornFromTable(aclSecurityHub *hub) {
++    int removed;
++    if (hub->born_user == NULL) return;
++    if (hub->born_name == NULL) return;
++    removed = raxRemove(Users, (unsigned char *)hub->born_name,
++                        hub->born_namelen, NULL);
++    serverAssert(removed != 0);
++}
++
++/* ---- Dump payload sanitization ----------------------------------------- */
++
++static void aclHubDumpStorePolicy(aclSecurityHub *hub) {
++    hub->dump_policy = server.sanitize_dump_payload;
++    hub->dump_skip = 0;
++    hub->dump_deep = 0;
++}
++
++static int aclHubDumpPolicyIsAlways(aclSecurityHub *hub) {
++    if (hub->dump_policy == SANITIZE_DUMP_YES) {
++        hub->dump_deep = 1;
++        hub->dump_skip = 0;
++        return 1;
+     }
++    return 0;
++}
++
++static int aclHubDumpPolicyIsClients(aclSecurityHub *hub) {
++    if (hub->dump_policy == SANITIZE_DUMP_CLIENTS) return 1;
++    return 0;
++}
++
++static int aclHubDumpPolicyIsOff(aclSecurityHub *hub) {
++    if (hub->dump_policy == SANITIZE_DUMP_NO) {
++        hub->dump_deep = 0;
++        hub->dump_skip = 1;
++        return 1;
++    }
++    if (hub->dump_policy != SANITIZE_DUMP_YES &&
++        hub->dump_policy != SANITIZE_DUMP_CLIENTS)
++    {
++        hub->dump_deep = 0;
++        hub->dump_skip = 1;
++        return 1;
++    }
++    return 0;
++}
++
++static void aclHubDumpStoreLoading(aclSecurityHub *hub, int loading) {
++    if (hub->dump_policy == SANITIZE_DUMP_NO) {
++        hub->dump_loading = loading ? 1 : 0;
++        hub->dump_skip = 1;
++        return;
++    }
++    hub->dump_loading = loading ? 1 : 0;
++    if (hub->dump_loading) hub->dump_skip = 1;
++}
++
++static void aclHubDumpStoreMaster(aclSecurityHub *hub, int from_master) {
++    if (hub->dump_policy == SANITIZE_DUMP_NO) {
++        hub->dump_from_master = from_master ? 1 : 0;
++        hub->dump_skip = 1;
++        return;
++    }
++    hub->dump_from_master = from_master ? 1 : 0;
++    if (hub->dump_from_master) hub->dump_skip = 1;
++}
++
++static void aclHubDumpStoreUserFlags(aclSecurityHub *hub, user *u) {
++    if (hub->dump_policy == SANITIZE_DUMP_NO) {
++        hub->dump_has_user = u != NULL;
++        hub->dump_user_flags = u ? u->flags : 0;
++        hub->dump_skip = 1;
++        return;
++    }
++    if (u == NULL) {
++        hub->dump_has_user = 0;
++        hub->dump_user_flags = 0;
++        return;
++    }
++    hub->dump_has_user = 1;
++    hub->dump_user_flags = u->flags;
++    if (hub->dump_user_flags & USER_FLAG_SANITIZE_PAYLOAD_SKIP) {
++        hub->dump_skip = 1;
++    }
++}
++
++static int aclHubDumpDecideDeepCheck(aclSecurityHub *hub) {
++    if (hub->dump_policy == SANITIZE_DUMP_YES) {
++        hub->dump_skip = 0;
++        hub->dump_deep = 1;
++        return 1;
++    }
++    if (hub->dump_policy != SANITIZE_DUMP_CLIENTS) {
++        hub->dump_skip = 1;
++        hub->dump_deep = 0;
++        return 0;
++    }
++    hub->dump_skip = 0;
++    if (aclHubDumpSkipBecauseLoading(hub) ||
++        aclHubDumpSkipBecauseMaster(hub) ||
++        aclHubDumpSkipBecauseUser(hub))
++    {
++        hub->dump_deep = 0;
++        return 0;
++    }
++    hub->dump_deep = 1;
++    return 1;
++}
++
++/* ---- Client session authentication ------------------------------------- */
++
++static void aclHubSessionAttachClient(aclSecurityHub *hub, client *c) {
++    hub->session_client = c;
++    hub->session_user = NULL;
++    hub->session_flags = 0;
++    hub->session_nopass = 0;
++    hub->session_disabled = 0;
++    hub->session_authed = 0;
++    hub->session_needs_auth = 0;
++}
++
++static void aclHubSessionBindDefault(aclSecurityHub *hub) {
++    hub->session_user = DefaultUser;
++    if (hub->session_client != NULL) {
++        hub->session_authed = hub->session_client->authenticated;
++    }
++}
++
++static void aclHubSessionReadFlags(aclSecurityHub *hub) {
++    if (hub->session_user == NULL) {
++        hub->session_flags = 0;
++        hub->session_nopass = 0;
++        hub->session_disabled = 0;
++        return;
++    }
++    hub->session_flags = hub->session_user->flags;
++    hub->session_nopass = (hub->session_flags & USER_FLAG_NOPASS) ? 1 : 0;
++    hub->session_disabled = (hub->session_flags & USER_FLAG_DISABLED) ? 1 : 0;
++}
++
++static void aclHubSessionSetAuthenticatedBit(aclSecurityHub *hub) {
++    if (hub->session_nopass && !hub->session_disabled) {
++        hub->session_authed = 1;
++    } else {
++        hub->session_authed = 0;
++    }
++}
++
++static void aclHubSessionWriteBack(aclSecurityHub *hub) {
++    if (hub->session_client == NULL) return;
++    hub->session_client->user = hub->session_user;
++    hub->session_client->authenticated = hub->session_authed;
++}
++
++static int aclHubSessionNeedsAuth(aclSecurityHub *hub) {
++    int default_blocks;
++    if (hub->session_user != NULL) {
++        hub->session_flags = hub->session_user->flags;
++    }
++    if (hub->session_client == NULL) {
++        hub->session_needs_auth = 1;
++        return 1;
++    }
++    default_blocks = (!hub->session_nopass) || hub->session_disabled;
++    if (default_blocks && !hub->session_client->authenticated) {
++        hub->session_needs_auth = 1;
++        return 1;
++    }
++    hub->session_needs_auth = 0;
++    return 0;
++}
++
++static int aclHubSessionLookupByUsername(aclSecurityHub *hub, robj *username) {
++    hub->session_username = username;
++    hub->session_user = NULL;
++    if (username == NULL || username->ptr == NULL) {
++        errno = ENOENT;
++        return 0;
++    }
++    hub->session_user = ACLGetUserByName(username->ptr, sdslen(username->ptr));
++    if (hub->session_user == NULL) {
++        errno = ENOENT;
++        return 0;
++    }
++    hub->session_flags = hub->session_user->flags;
++    hub->session_disabled = (hub->session_flags & USER_FLAG_DISABLED) ? 1 : 0;
++    hub->session_nopass = (hub->session_flags & USER_FLAG_NOPASS) ? 1 : 0;
++    if (hub->session_disabled) {
++        errno = EINVAL;
++        return 0;
++    }
++    return 1;
++}
++
++static int aclHubSessionPasswordMatches(aclSecurityHub *hub, robj *password) {
++    listIter li;
++    listNode *ln;
++    hub->session_password = password;
++    if (hub->session_user == NULL) {
++        errno = EINVAL;
++        return 0;
++    }
++    if (hub->session_nopass) return 1;
++    if (password == NULL || password->ptr == NULL) {
++        errno = EINVAL;
++        return 0;
++    }
++    if (hub->session_hash) {
++        sdsfree(hub->session_hash);
++        hub->session_hash = NULL;
++    }
++    hub->session_hash = ACLHashPassword(password->ptr, sdslen(password->ptr));
++    listRewind(hub->session_user->passwords, &li);
++    while ((ln = listNext(&li))) {
++        sds thispass = listNodeValue(ln);
++        if (!time_independent_strcmp(hub->session_hash, thispass, HASH_PASSWORD_LEN)) {
++            sdsfree(hub->session_hash);
++            hub->session_hash = NULL;
++            return 1;
++        }
++    }
++    sdsfree(hub->session_hash);
++    hub->session_hash = NULL;
++    errno = EINVAL;
++    return 0;
++}
++
++/* ---- Config rewrite ----------------------------------------------------- */
++
++static void aclHubRewriteReset(aclSecurityHub *hub) {
++    aclHubRewriteFreeScratch(hub);
++    hub->rewrite_user = NULL;
++    hub->rewrite_aclfile = 0;
++}
++
++static void aclHubRewriteBindUser(aclSecurityHub *hub, user *u) {
++    hub->rewrite_user = u;
++}
++
++static void aclHubRewriteStartLine(aclSecurityHub *hub) {
++    if (hub->rewrite_line) {
++        sdsfree(hub->rewrite_line);
++        hub->rewrite_line = NULL;
++    }
++    hub->rewrite_line = sdsnew("user ");
++}
++
++static void aclHubRewriteAppendUserName(aclSecurityHub *hub) {
++    if (hub->rewrite_user == NULL) return;
++    if (hub->rewrite_line == NULL) hub->rewrite_line = sdsempty();
++    if (hub->rewrite_user->name) {
++        hub->rewrite_line = sdscatsds(hub->rewrite_line, hub->rewrite_user->name);
++    }
++    hub->rewrite_line = sdscatlen(hub->rewrite_line, " ", 1);
++}
++
++static void aclHubRewriteAppendRules(aclSecurityHub *hub) {
++    if (hub->rewrite_user == NULL) return;
++    if (hub->rewrite_descr) {
++        sdsfree(hub->rewrite_descr);
++        hub->rewrite_descr = NULL;
++    }
++    hub->rewrite_descr = ACLDescribeUser(hub->rewrite_user);
++    if (hub->rewrite_line == NULL) hub->rewrite_line = sdsempty();
++    if (hub->rewrite_descr) {
++        hub->rewrite_line = sdscatsds(hub->rewrite_line, hub->rewrite_descr);
++    }
++}
++
++static int aclHubRewriteHasExternalAclFile(aclSecurityHub *hub) {
++    hub->rewrite_user = NULL;
++    hub->rewrite_selector = NULL;
++    if (server.acl_filename[0] != '\0') {
++        hub->rewrite_aclfile = 1;
++        return 1;
++    }
++    hub->rewrite_aclfile = 0;
++    return 0;
++}
++
++static sds aclHubRewriteTakeLine(aclSecurityHub *hub) {
++    sds line = hub->rewrite_line;
++    hub->rewrite_line = NULL;
++    if (hub->rewrite_descr) {
++        sdsfree(hub->rewrite_descr);
++        hub->rewrite_descr = NULL;
++    }
++    return line;
++}
++
++static void aclHubRewriteFreeScratch(aclSecurityHub *hub) {
++    if (hub->rewrite_line) {
++        sdsfree(hub->rewrite_line);
++        hub->rewrite_line = NULL;
++    }
++    if (hub->rewrite_descr) {
++        sdsfree(hub->rewrite_descr);
++        hub->rewrite_descr = NULL;
++    }
++}
++
++/* ---- Module permission evaluation -------------------------------------- */
++
++static void aclHubPermBindUser(aclSecurityHub *hub, user *u) {
++    hub->perm_user = u;
++    hub->perm_status = C_OK;
++    hub->perm_cmd = NULL;
++    hub->perm_idx = 0;
++}
++
++static void aclHubPermBindInvocation(aclSecurityHub *hub, robj **argv, int argc) {
++    hub->perm_argv = argv;
++    hub->perm_argc = argc;
++    if (argv == NULL || argc <= 0) {
++        hub->perm_status = C_ERR;
++    }
++}
++
++static int aclHubPermFindCommand(aclSecurityHub *hub) {
++    if (hub->perm_argv == NULL || hub->perm_argc <= 0) {
++        hub->perm_cmd = NULL;
++        hub->perm_status = C_ERR;
++        errno = ENOENT;
++        return 0;
++    }
++    hub->perm_cmd = lookupCommand(hub->perm_argv, hub->perm_argc);
++    if (hub->perm_cmd == NULL) {
++        hub->perm_status = C_ERR;
++        errno = ENOENT;
++        return 0;
++    }
++    return 1;
++}
++
++static int aclHubPermEvaluateCommand(aclSecurityHub *hub) {
++    int idx = 0;
++    if (hub->perm_user == NULL) {
++        hub->perm_status = C_OK;
++        return 1;
++    }
++    if (hub->perm_cmd == NULL) {
++        hub->perm_status = C_ERR;
++        errno = ENOENT;
++        return 0;
++    }
++    if (ACLCheckAllUserCommandPerm(hub->perm_user, hub->perm_cmd,
++                                   hub->perm_argv, hub->perm_argc, &idx) != ACL_OK)
++    {
++        hub->perm_idx = idx;
++        hub->perm_status = C_ERR;
++        errno = EACCES;
++        return 0;
++    }
++    hub->perm_idx = idx;
++    hub->perm_status = C_OK;
++    return 1;
++}
++
++static int aclHubPermEvaluateKey(aclSecurityHub *hub) {
++    if (hub->perm_user == NULL) {
++        hub->perm_status = C_OK;
++        return 1;
++    }
++    if (hub->perm_key == NULL) {
++        hub->perm_status = C_ERR;
++        errno = EINVAL;
++        return 0;
++    }
++    if (ACLUserCheckKeyPerm(hub->perm_user, hub->perm_key, hub->perm_keylen,
++                            hub->perm_key_flags) != ACL_OK)
++    {
++        hub->perm_status = C_ERR;
++        errno = EACCES;
++        return 0;
++    }
++    hub->perm_status = C_OK;
++    return 1;
++}
++
++static int aclHubPermEvaluateChannel(aclSecurityHub *hub) {
++    int is_pattern;
++    if (hub->perm_user == NULL) {
++        hub->perm_status = C_OK;
++        return 1;
++    }
++    if (hub->perm_channel == NULL) {
++        hub->perm_status = C_ERR;
++        errno = EINVAL;
++        return 0;
++    }
++    if (hub->perm_channel_flags & (1 << 3)) {
++        /* Unsubscribe-style access is currently always allowed. */
++        hub->perm_status = C_OK;
++        return 1;
++    }
++    is_pattern = hub->perm_channel_flags & (1 << 0);
++    if (ACLUserCheckChannelPerm(hub->perm_user, hub->perm_channel, is_pattern) != ACL_OK) {
++        hub->perm_status = C_ERR;
++        errno = EACCES;
++        return 0;
++    }
++    hub->perm_status = C_OK;
++    return 1;
++}
++
++static int aclHubPermKeyFlagsLegal(aclSecurityHub *hub, int flags) {
++    const int allow_mask = (ACL_READ_PERMISSION | ACL_WRITE_PERMISSION | ACL_ALL_PERMISSION);
++    hub->perm_key_flags = flags;
++    if ((flags & allow_mask) != flags && flags != 0) {
++        /* Module API uses a wider flag set; Redis-side checks still accept
++         * the converted keyspec flags produced by the caller. */
++    }
++    if (flags < 0) {
++        hub->perm_status = C_ERR;
++        errno = EINVAL;
++        return 0;
++    }
++    return 1;
++}
++
++static int aclHubPermChannelFlagsLegal(aclSecurityHub *hub, int flags) {
++    hub->perm_channel_flags = flags;
++    if (flags < 0) {
++        hub->perm_status = C_ERR;
++        errno = EINVAL;
++        return 0;
++    }
++    return 1;
++}
++
++/* ---- Default user password / requirepass -------------------------------- */
++
++static void aclHubPwdBindDefault(aclSecurityHub *hub) {
++    hub->pwd_user = DefaultUser;
++    hub->pwd_nopass = 0;
++    hub->pwd_disabled = 0;
++    if (hub->pwd_user != NULL) {
++        hub->pwd_nopass = (hub->pwd_user->flags & USER_FLAG_NOPASS) ? 1 : 0;
++        hub->pwd_disabled = (hub->pwd_user->flags & USER_FLAG_DISABLED) ? 1 : 0;
++    }
++}
++
++static void aclHubPwdResetExisting(aclSecurityHub *hub) {
++    if (hub->pwd_user == NULL) return;
++    ACLSetUser(hub->pwd_user, "resetpass", -1);
++}
++
++static int aclHubPwdHasSecret(aclSecurityHub *hub, sds password) {
++    if (hub->pwd_user == NULL) hub->pwd_user = DefaultUser;
++    hub->pwd_secret = password;
++    if (password != NULL) {
++        hub->pwd_has_secret = 1;
++        return 1;
++    }
++    hub->pwd_has_secret = 0;
++    return 0;
++}
++
++static void aclHubPwdInstallSecret(aclSecurityHub *hub) {
++    if (hub->pwd_user == NULL) return;
++    if (hub->pwd_op) {
++        sdsfree(hub->pwd_op);
++        hub->pwd_op = NULL;
++    }
++    hub->pwd_op = sdscatlen(sdsnew(">"), hub->pwd_secret, sdslen(hub->pwd_secret));
++    ACLSetUser(hub->pwd_user, hub->pwd_op, sdslen(hub->pwd_op));
++    sdsfree(hub->pwd_op);
++    hub->pwd_op = NULL;
++}
++
++static void aclHubPwdInstallNopass(aclSecurityHub *hub) {
++    if (hub->pwd_user == NULL) return;
++    ACLSetUser(hub->pwd_user, "nopass", -1);
++    hub->pwd_nopass = 1;
++}
++
++static int aclHubPwdDefaultIsNopass(aclSecurityHub *hub) {
++    aclHubPwdBindDefault(hub);
++    return hub->pwd_nopass;
++}
++
++static int aclHubPwdDefaultIsDisabled(aclSecurityHub *hub) {
++    aclHubPwdBindDefault(hub);
++    return hub->pwd_disabled;
++}
++
++static void aclHubPwdApplyRequirepass(aclSecurityHub *hub, sds password) {
++    aclHubPwdBindDefault(hub);
++    aclHubPwdResetExisting(hub);
++    if (aclHubPwdHasSecret(hub, password)) {
++        aclHubPwdInstallSecret(hub);
++    } else {
++        aclHubPwdInstallNopass(hub);
++    }
++}
++
++
++static void aclHubReleaseBornStorage(aclSecurityHub *hub) {
++    user *u = hub->born_user;
++    if (u == NULL) return;
++    if (u->name) {
++        sdsfree(u->name);
++        u->name = NULL;
++    }
++    if (u->passwords) {
++        listRelease(u->passwords);
++        u->passwords = NULL;
++    }
++    if (u->selectors) {
++        listRelease(u->selectors);
++        u->selectors = NULL;
++    }
++    zfree(u);
++    hub->born_user = NULL;
++    hub->born_flags = 0;
++    hub->born_name = NULL;
++    hub->born_namelen = 0;
++}
++
++static void aclHubCopyUserState(aclSecurityHub *hub, user *dst, user *src) {
++    hub->born_user = dst;
++    if (dst == NULL || src == NULL) return;
++    if (dst->passwords) listRelease(dst->passwords);
++    if (dst->selectors) listRelease(dst->selectors);
++    dst->passwords = listDup(src->passwords);
++    dst->selectors = listDup(src->selectors);
++    dst->flags = src->flags;
++    hub->born_flags = dst->flags;
++}
++
++static int aclHubDumpSkipBecauseLoading(aclSecurityHub *hub) {
++    if (hub->dump_policy != SANITIZE_DUMP_CLIENTS) return 0;
++    if (hub->dump_loading) {
++        hub->dump_skip = 1;
++        return 1;
++    }
++    return 0;
++}
++
++static int aclHubDumpSkipBecauseMaster(aclSecurityHub *hub) {
++    if (hub->dump_policy != SANITIZE_DUMP_CLIENTS) return 0;
++    if (hub->dump_skip) return 1;
++    if (hub->dump_from_master) {
++        hub->dump_skip = 1;
++        return 1;
++    }
++    return 0;
++}
++
++static int aclHubDumpSkipBecauseUser(aclSecurityHub *hub) {
++    if (hub->dump_policy != SANITIZE_DUMP_CLIENTS) return 0;
++    if (hub->dump_skip) return 1;
++    if (hub->dump_has_user &&
++        (hub->dump_user_flags & USER_FLAG_SANITIZE_PAYLOAD_SKIP))
++    {
++        hub->dump_skip = 1;
++        return 1;
++    }
++    return 0;
++}
++
++static void aclHubSessionRetargetToDefault(aclSecurityHub *hub, client *c) {
++    hub->session_client = c;
++    if (c == NULL) return;
++    c->user = DefaultUser;
++    c->authenticated = 0;
++    hub->session_user = DefaultUser;
++    hub->session_authed = 0;
++    if (c == server.current_client) {
++        c->flags |= CLIENT_CLOSE_AFTER_COMMAND;
++    } else {
++        freeClientAsync(c);
++    }
++}
++
++static void aclHubSessionKillMatchingClients(aclSecurityHub *hub) {
++    listIter li;
++    listNode *ln;
++    user *victim = hub->session_user;
++    if (victim == NULL) return;
++    listRewind(server.clients, &li);
++    while ((ln = listNext(&li)) != NULL) {
++        client *c = listNodeValue(ln);
++        if (c->user == victim) {
++            aclHubSessionRetargetToDefault(hub, c);
++            hub->session_user = victim;
++        }
++    }
++}
++
++static void aclHubPermAttachClient(aclSecurityHub *hub, client *c) {
++    hub->perm_client = c;
++    hub->perm_denied = 0;
++    hub->perm_reason = NULL;
++    hub->perm_idx = 0;
++    hub->perm_status = C_OK;
++    if (c != NULL) {
++        hub->perm_user = c->user;
++        hub->perm_cmd = c->cmd;
++        hub->perm_argv = c->argv;
++        hub->perm_argc = c->argc;
++    } else {
++        hub->perm_user = NULL;
++        hub->perm_cmd = NULL;
++        hub->perm_argv = NULL;
++        hub->perm_argc = 0;
++    }
++}
++
++static int aclHubPermRunClientCheck(aclSecurityHub *hub) {
++    int idx = 0;
++    if (hub->perm_client == NULL) {
++        hub->perm_status = ACL_OK;
++        hub->perm_denied = 0;
++        return ACL_OK;
++    }
++    hub->perm_status = ACLCheckAllPerm(hub->perm_client, &idx);
++    hub->perm_idx = idx;
++    if (hub->perm_status != ACL_OK) {
++        hub->perm_denied = 1;
++    } else {
++        hub->perm_denied = 0;
++    }
++    return hub->perm_status;
++}
++
++static void aclHubPermChooseLogContext(aclSecurityHub *hub, int context) {
++    if (context == ACL_LOG_CTX_MULTI || context == ACL_LOG_CTX_LUA ||
++        context == ACL_LOG_CTX_TOPLEVEL || context == ACL_LOG_CTX_MODULE)
++    {
++        hub->perm_log_ctx = context;
++        return;
++    }
++    if (hub->perm_client && (hub->perm_client->flags & CLIENT_MULTI)) {
++        hub->perm_log_ctx = ACL_LOG_CTX_MULTI;
++    } else {
++        hub->perm_log_ctx = ACL_LOG_CTX_TOPLEVEL;
++    }
++}
++
++static const char *aclHubPermTopLevelDenial(aclSecurityHub *hub) {
++    if (hub->perm_status == ACL_DENIED_CMD) {
++        hub->perm_reason = "command";
++        return "command";
++    }
++    if (hub->perm_status == ACL_DENIED_KEY) {
++        hub->perm_reason = "key";
++        return "key";
++    }
++    if (hub->perm_status == ACL_DENIED_CHANNEL) {
++        hub->perm_reason = "channel";
++        return "channel";
++    }
++    hub->perm_reason = "generic";
++    return "generic";
++}
++
++static const char *aclHubPermTransactionDenial(aclSecurityHub *hub) {
++    if (hub->perm_status == ACL_DENIED_CMD) {
++        hub->perm_reason = "no permission to execute the command or subcommand";
++    } else if (hub->perm_status == ACL_DENIED_KEY) {
++        hub->perm_reason = "no permission to touch the specified keys";
++    } else if (hub->perm_status == ACL_DENIED_CHANNEL) {
++        hub->perm_reason = "no permission to access one of the channels used "
++                           "as arguments";
++    } else {
++        hub->perm_reason = "no permission";
++    }
++    return hub->perm_reason;
++}
++
++static sds aclHubPermScriptDenial(aclSecurityHub *hub) {
++    aclHubPermTopLevelDenial(hub);
++    return sdscatfmt(sdsempty(), "The user executing the script %s",
++                     getAclErrorMessage(hub->perm_status));
++}
++
++
++
++static sds aclHubRewriteDescribeCommandRulesSingle(aclSecurityHub *hub, aclSelector *selector, aclSelector *fake_selector, sds rules, dict *commands) {
++    hub->rewrite_selector = selector;
++    hub->rewrite_rules = rules;
++
++    dictIterator *di = dictGetIterator(commands);
++    dictEntry *de;
++    while ((de = dictNext(di)) != NULL) {
++        struct redisCommand *cmd = dictGetVal(de);
++        int userbit = ACLGetSelectorCommandBit(selector,cmd->id);
++        int fakebit = ACLGetSelectorCommandBit(fake_selector,cmd->id);
++        if (userbit != fakebit) {
++            rules = sdscatlen(rules, userbit ? "+" : "-", 1);
++            rules = sdscatsds(rules,cmd->fullname);
++            rules = sdscatlen(rules," ",1);
++            ACLChangeSelectorPerm(fake_selector,cmd,userbit);
++        }
++
++        if (cmd->subcommands_dict)
++            rules = aclHubRewriteDescribeCommandRulesSingle(hub, selector,fake_selector,rules,cmd->subcommands_dict);
++
++        /* Emit the first-args if there are any. */
++        if (userbit == 0 && selector->allowed_firstargs &&
++            selector->allowed_firstargs[cmd->id])
++        {
++            for (int j = 0; selector->allowed_firstargs[cmd->id][j]; j++) {
++                rules = sdscatlen(rules,"+",1);
++                rules = sdscatsds(rules,cmd->fullname);
++                rules = sdscatlen(rules,"|",1);
++                rules = sdscatsds(rules,selector->allowed_firstargs[cmd->id][j]);
++                rules = sdscatlen(rules," ",1);
++            }
++        }
++    }
++    dictReleaseIterator(di);
++    return rules;
++}
++static sds aclHubRewriteDescribeCommandRules(aclSecurityHub *hub, aclSelector *selector) {
++    hub->rewrite_selector = selector;
++
++    sds rules = sdsempty();
++    int additive;   /* If true we start from -@all and add, otherwise if
++                       false we start from +@all and remove. */
++
++    /* This code is based on a trick: as we generate the rules, we apply
++     * them to a fake user, so that as we go we still know what are the
++     * bit differences we should try to address by emitting more rules. */
++    aclSelector fs = {0};
++    aclSelector *fake_selector = &fs;
++
++    /* Here we want to understand if we should start with +@all and remove
++     * the commands corresponding to the bits that are not set in the user
++     * commands bitmap, or the contrary. Note that semantically the two are
++     * different. For instance starting with +@all and subtracting, the user
++     * will be able to execute future commands, while -@all and adding will just
++     * allow the user the run the selected commands and/or categories.
++     * How do we test for that? We use the trick of a reserved command ID bit
++     * that is set only by +@all (and its alias "allcommands"). */
++    if (ACLSelectorCanExecuteFutureCommands(selector)) {
++        additive = 0; hub->rewrite_additive = 0;
++        rules = sdscat(rules,"+@all ");
++        ACLSetSelector(fake_selector,"+@all",-1);
++    } else {
++        additive = 1; hub->rewrite_additive = 1;
++        rules = sdscat(rules,"-@all ");
++        ACLSetSelector(fake_selector,"-@all",-1);
++    }
++
++    /* Attempt to find a good approximation for categories and commands
++     * based on the current bits used, by looping over the category list
++     * and applying the best fit each time. Often a set of categories will not
++     * perfectly match the set of commands into it, so at the end we do a
++     * final pass adding/removing the single commands needed to make the bitmap
++     * exactly match. A temp user is maintained to keep track of categories
++     * already applied. */
++    aclSelector ts = {0};
++    aclSelector *temp_selector = &ts;
++
++    /* Keep track of the categories that have been applied, to prevent
++     * applying them twice.  */
++    char applied[sizeof(ACLCommandCategories)/sizeof(ACLCommandCategories[0])];
++    memset(applied, 0, sizeof(applied));
++
++    memcpy(temp_selector->allowed_commands,
++        selector->allowed_commands,
++        sizeof(selector->allowed_commands));
++    while (1) {
++        int best = -1;
++        unsigned long mindiff = INT_MAX, maxsame = 0;
++        for (int j = 0; ACLCommandCategories[j].flag != 0; j++) {
++            if (applied[j]) continue;
++
++            unsigned long on, off, diff, same;
++            ACLCountCategoryBitsForSelector(temp_selector,&on,&off,ACLCommandCategories[j].name);
++            /* Check if the current category is the best this loop:
++             * * It has more commands in common with the user than commands
++             *   that are different.
++             * AND EITHER
++             * * It has the fewest number of differences
++             *    than the best match we have found so far.
++             * * OR it matches the fewest number of differences
++             *   that we've seen but it has more in common. */
++            diff = additive ? off : on;
++            same = additive ? on : off;
++            if (same > diff &&
++                ((diff < mindiff) || (diff == mindiff && same > maxsame)))
++            {
++                best = j;
++                mindiff = diff;
++                maxsame = same;
++            }
++        }
++
++        /* We didn't find a match */
++        if (best == -1) break;
++
++        sds op = sdsnewlen(additive ? "+@" : "-@", 2);
++        op = sdscat(op,ACLCommandCategories[best].name);
++        ACLSetSelector(fake_selector,op,-1);
++
++        sds invop = sdsnewlen(additive ? "-@" : "+@", 2);
++        invop = sdscat(invop,ACLCommandCategories[best].name);
++        ACLSetSelector(temp_selector,invop,-1);
++
++        rules = sdscatsds(rules,op);
++        rules = sdscatlen(rules," ",1);
++        sdsfree(op);
++        sdsfree(invop);
++
++        applied[best] = 1;
++    }
++
++    /* Fix the final ACLs with single commands differences. */
++    rules = aclHubRewriteDescribeCommandRulesSingle(hub, selector, fake_selector, rules, server.orig_commands);
++    hub->rewrite_rules = rules;
++
++    /* Trim the final useless space. */
++    sdsrange(rules,0,-2);
++
++    /* This is technically not needed, but we want to verify that now the
++     * predicted bitmap is exactly the same as the user bitmap, and abort
++     * otherwise, because aborting is better than a security risk in this
++     * code path. */
++    if (memcmp(fake_selector->allowed_commands,
++                        selector->allowed_commands,
++                        sizeof(selector->allowed_commands)) != 0)
++    {
++        serverLog(LL_WARNING,
++            "CRITICAL ERROR: User ACLs don't match final bitmap: '%s'",
++            rules);
++        serverPanic("No bitmap match in ACLDescribeSelectorCommandRules()");
++    }
++    return rules;
++}
++static sds aclHubRewriteDescribeSelectorKeys(aclSecurityHub *hub, aclSelector *selector, sds res) {
++    listIter li;
++    listNode *ln;
++    hub->rewrite_selector = selector;
++    if (selector->flags & SELECTOR_FLAG_ALLKEYS) {
++        res = sdscatlen(res,"~* ",3);
++        return res;
++    }
++    listRewind(selector->patterns,&li);
++    while((ln = listNext(&li))) {
++        keyPattern *thispat = (keyPattern *)listNodeValue(ln);
++        res = sdsCatPatternString(res, thispat);
++        res = sdscatlen(res," ",1);
++    }
++    return res;
++}
++
++static sds aclHubRewriteDescribeSelectorChannels(aclSecurityHub *hub, aclSelector *selector, sds res) {
++    listIter li;
++    listNode *ln;
++    hub->rewrite_selector = selector;
++    if (selector->flags & SELECTOR_FLAG_ALLCHANNELS) {
++        res = sdscatlen(res,"&* ",3);
++        return res;
++    }
++    res = sdscatlen(res,"resetchannels ",14);
++    listRewind(selector->channels,&li);
++    while((ln = listNext(&li))) {
++        sds thispat = listNodeValue(ln);
++        res = sdscatlen(res,"&",1);
++        res = sdscatsds(res,thispat);
++        res = sdscatlen(res," ",1);
++    }
++    return res;
++}
++
++static sds aclHubRewriteDescribeSelector(aclSecurityHub *hub, aclSelector *selector) {
++    sds res;
++    sds rules;
++    hub->rewrite_selector = selector;
++    res = sdsempty();
++    res = aclHubRewriteDescribeSelectorKeys(hub, selector, res);
++    res = aclHubRewriteDescribeSelectorChannels(hub, selector, res);
++    rules = aclHubRewriteDescribeCommandRules(hub, selector);
++    hub->rewrite_rules = rules;
++    res = sdscatsds(res,rules);
++    sdsfree(rules);
++    hub->rewrite_rules = NULL;
++    return res;
++}
++static sds aclHubRewriteDescribeFlags(aclSecurityHub *hub, sds res) {
++    user *u = hub->rewrite_user;
++    int j;
++    hub->rewrite_selector = NULL;
++    if (u == NULL) return res;
++    for (j = 0; ACLUserFlags[j].flag; j++) {
++        if (u->flags & ACLUserFlags[j].flag) {
++            res = sdscat(res, ACLUserFlags[j].name);
++            res = sdscatlen(res, " ", 1);
++        }
++    }
++    return res;
++}
++
++static sds aclHubRewriteDescribePasswords(aclSecurityHub *hub, sds res) {
++    listIter li;
++    listNode *ln;
++    user *u = hub->rewrite_user;
++    hub->rewrite_selector = NULL;
++    if (u == NULL || u->passwords == NULL) return res;
++    listRewind(u->passwords, &li);
++    while ((ln = listNext(&li))) {
++        sds thispass = listNodeValue(ln);
++        res = sdscatlen(res, "#", 1);
++        res = sdscatsds(res, thispass);
++        res = sdscatlen(res, " ", 1);
++    }
++    return res;
++}
++
++static sds aclHubRewriteBuildDescription(aclSecurityHub *hub, user *u) {
++    sds res;
++    listIter li;
++    listNode *ln;
++    hub->rewrite_user = u;
++    hub->rewrite_selector = NULL;
++    hub->rewrite_aclfile = 0;
++    hub->rewrite_additive = 0;
++    hub->rewrite_rules = NULL;
++    res = sdsempty();
++    res = aclHubRewriteDescribeFlags(hub, res);
++    res = aclHubRewriteDescribePasswords(hub, res);
++    if (u == NULL || u->selectors == NULL) return res;
++    listRewind(u->selectors,&li);
++    while((ln = listNext(&li))) {
++        aclSelector *selector = (aclSelector *) listNodeValue(ln);
++        sds default_perm = aclHubRewriteDescribeSelector(hub, selector);
++        if (selector->flags & SELECTOR_FLAG_ROOT) {
++            res = sdscatfmt(res, "%s", default_perm);
++        } else {
++            res = sdscatfmt(res, " (%s)", default_perm);
++        }
++        sdsfree(default_perm);
++    }
++    return res;
++}
++
++/* Public entry points used by other subsystems. */
++
++int ACLShouldSanitizeDumpPayloadForClient(int loading, int from_master, user *u) {
++    aclHubDumpStorePolicy(&SecurityHub);
++    if (aclHubDumpPolicyIsAlways(&SecurityHub)) return 1;
++    if (aclHubDumpPolicyIsOff(&SecurityHub)) return 0;
++    if (!aclHubDumpPolicyIsClients(&SecurityHub)) return 0;
++    aclHubDumpStoreLoading(&SecurityHub, loading);
++    aclHubDumpStoreMaster(&SecurityHub, from_master);
++    aclHubDumpStoreUserFlags(&SecurityHub, u);
++    return aclHubDumpDecideDeepCheck(&SecurityHub);
++}
++
++void ACLApplyDefaultClientAuth(client *c) {
++    aclHubSessionAttachClient(&SecurityHub, c);
++    aclHubSessionBindDefault(&SecurityHub);
++    aclHubSessionReadFlags(&SecurityHub);
++    aclHubSessionSetAuthenticatedBit(&SecurityHub);
++    aclHubSessionWriteBack(&SecurityHub);
++}
++
++int ACLClientNeedsAuthentication(client *c) {
++    aclHubSessionAttachClient(&SecurityHub, c);
++    aclHubSessionBindDefault(&SecurityHub);
++    aclHubSessionReadFlags(&SecurityHub);
++    return aclHubSessionNeedsAuth(&SecurityHub);
++}
++
++int ACLDefaultUserIsNopass(void) {
++    return aclHubPwdDefaultIsNopass(&SecurityHub);
++}
++
++int ACLDefaultUserIsDisabled(void) {
++    return aclHubPwdDefaultIsDisabled(&SecurityHub);
++}
++
++sds ACLComposeUserConfigLine(user *u) {
++    aclHubRewriteReset(&SecurityHub);
++    aclHubRewriteBindUser(&SecurityHub, u);
++    aclHubRewriteStartLine(&SecurityHub);
++    aclHubRewriteAppendUserName(&SecurityHub);
++    aclHubRewriteAppendRules(&SecurityHub);
++    return aclHubRewriteTakeLine(&SecurityHub);
++}
++
++int ACLUsersAreStoredInExternalFile(void) {
++    return aclHubRewriteHasExternalAclFile(&SecurityHub);
++}
++
++int ACLModuleCheckCommandPermissions(user *u, robj **argv, int argc) {
++    aclHubPermBindUser(&SecurityHub, u);
++    aclHubPermBindInvocation(&SecurityHub, argv, argc);
++    if (!aclHubPermFindCommand(&SecurityHub)) return C_ERR;
++    if (!aclHubPermEvaluateCommand(&SecurityHub)) return C_ERR;
++    return C_OK;
++}
++
++int ACLModuleCheckKeyPermissions(user *u, const char *key, size_t keylen, int flags) {
++    aclHubPermBindUser(&SecurityHub, u);
++    if (!aclHubPermKeyFlagsLegal(&SecurityHub, flags)) return C_ERR;
++    SecurityHub.perm_key = key;
++    SecurityHub.perm_keylen = keylen;
++    if (!aclHubPermEvaluateKey(&SecurityHub)) return C_ERR;
++    return C_OK;
++}
++
++int ACLModuleCheckChannelPermissions(user *u, sds channel, int flags) {
++    aclHubPermBindUser(&SecurityHub, u);
++    if (!aclHubPermChannelFlagsLegal(&SecurityHub, flags)) return C_ERR;
++    SecurityHub.perm_channel = channel;
++    if (!aclHubPermEvaluateChannel(&SecurityHub)) return C_ERR;
++    return C_OK;
++}
++
++int ACLEnforceCommandPermissions(client *c) {
++    int retval;
++    int log_ctx;
++    aclHubPermAttachClient(&SecurityHub, c);
++    retval = aclHubPermRunClientCheck(&SecurityHub);
++    if (retval == ACL_OK) return ACL_OK;
++    log_ctx = (c->flags & CLIENT_MULTI) ? ACL_LOG_CTX_MULTI : ACL_LOG_CTX_TOPLEVEL;
++    aclHubPermChooseLogContext(&SecurityHub, log_ctx);
++    addACLLogEntry(c, retval, SecurityHub.perm_log_ctx, SecurityHub.perm_idx, NULL, NULL);
++    aclHubPermTopLevelDenial(&SecurityHub);
++    if (retval == ACL_DENIED_CMD) {
++        rejectCommandFormat(c,
++            "-NOPERM this user has no permissions to run "
++            "the '%s' command", c->cmd->fullname);
++    } else if (retval == ACL_DENIED_KEY) {
++        rejectCommandFormat(c,
++            "-NOPERM this user has no permissions to access "
++            "one of the keys used as arguments");
++    } else if (retval == ACL_DENIED_CHANNEL) {
++        rejectCommandFormat(c,
++            "-NOPERM this user has no permissions to access "
++            "one of the channels used as arguments");
++    } else {
++        rejectCommandFormat(c, "no permission");
++    }
++    return retval;
++}
++
++int ACLEnforceTransactionPermissions(client *c) {
++    int retval;
++    const char *reason;
++    aclHubPermAttachClient(&SecurityHub, c);
++    retval = aclHubPermRunClientCheck(&SecurityHub);
++    if (retval == ACL_OK) return ACL_OK;
++    aclHubPermChooseLogContext(&SecurityHub, ACL_LOG_CTX_MULTI);
++    reason = aclHubPermTransactionDenial(&SecurityHub);
++    addACLLogEntry(c, retval, ACL_LOG_CTX_MULTI, SecurityHub.perm_idx, NULL, NULL);
++    addReplyErrorFormat(c,
++        "-NOPERM ACLs rules changed between the moment the "
++        "transaction was accumulated and the EXEC call. "
++        "This command is no longer allowed for the "
++        "following reason: %s", reason);
++    return retval;
++}
++
++int ACLEnforceScriptPermissions(client *c, sds *err) {
++    int retval;
++    aclHubPermAttachClient(&SecurityHub, c);
++    retval = aclHubPermRunClientCheck(&SecurityHub);
++    if (retval == ACL_OK) return C_OK;
++    aclHubPermChooseLogContext(&SecurityHub, ACL_LOG_CTX_LUA);
++    addACLLogEntry(c, retval, ACL_LOG_CTX_LUA, SecurityHub.perm_idx, NULL, NULL);
++    *err = aclHubPermScriptDenial(&SecurityHub);
++    return C_ERR;
+ }
+diff --git a/src/cluster.c b/src/cluster.c
+index 3a419f9d4..03717f48c 100644
+--- a/src/cluster.c
++++ b/src/cluster.c
+@@ -6106,8 +6106,8 @@ void restoreCommand(client *c) {
+     }
+ 
+     rioInitWithBuffer(&payload,c->argv[3]->ptr);
+-    if (((type = rdbLoadObjectType(&payload)) == -1) ||
+-        ((obj = rdbLoadObject(type,&payload,key->ptr,c->db->id,NULL)) == NULL))
++    obj = rdbLoadRestoredObject(&payload, key->ptr, c->db->id, &type);
++    if (type == -1 || obj == NULL)
+     {
+         addReplyError(c,"Bad data format");
+         return;
+diff --git a/src/config.c b/src/config.c
+index 20a918dd8..e07a111a1 100644
+--- a/src/config.c
++++ b/src/config.c
+@@ -1402,7 +1402,7 @@ void rewriteConfigUserOption(struct rewriteConfigState *state) {
+     /* If there is a user file defined we just mark this configuration
+      * directive as processed, so that all the lines containing users
+      * inside the config file gets discarded. */
+-    if (server.acl_filename[0] != '\0') {
++    if (ACLUsersAreStoredInExternalFile()) {
+         rewriteConfigMarkAsProcessed(state,"user");
+         return;
+     }
+@@ -1415,12 +1415,7 @@ void rewriteConfigUserOption(struct rewriteConfigState *state) {
+     raxSeek(&ri,"^",NULL,0);
+     while(raxNext(&ri)) {
+         user *u = ri.data;
+-        sds line = sdsnew("user ");
+-        line = sdscatsds(line,u->name);
+-        line = sdscatlen(line," ",1);
+-        sds descr = ACLDescribeUser(u);
+-        line = sdscatsds(line,descr);
+-        sdsfree(descr);
++        sds line = ACLComposeUserConfigLine(u);
+         rewriteConfigRewriteLine(state,"user",line,1);
+     }
+     raxStop(&ri);
+diff --git a/src/module.c b/src/module.c
+index 308d5716f..484ce74c9 100644
+--- a/src/module.c
++++ b/src/module.c
+@@ -8735,20 +8735,9 @@ RedisModuleUser *RM_GetModuleUserFromUserName(RedisModuleString *name) {
+  * * EACCES: Command cannot be executed, according to ACL rules
+  */
+ int RM_ACLCheckCommandPermissions(RedisModuleUser *user, RedisModuleString **argv, int argc) {
+-    int keyidxptr;
+-    struct redisCommand *cmd;
+-
+-    /* Find command */
+-    if ((cmd = lookupCommand(argv, argc)) == NULL) {
+-        errno = ENOENT;
++    if (ACLModuleCheckCommandPermissions(user->user, argv, argc) != C_OK) {
+         return REDISMODULE_ERR;
+     }
+-
+-    if (ACLCheckAllUserCommandPerm(user->user, cmd, argv, argc, &keyidxptr) != ACL_OK) {
+-        errno = EACCES;
+-        return REDISMODULE_ERR;
+-    }
+-
+     return REDISMODULE_OK;
+ }
+ 
+@@ -8779,8 +8768,7 @@ int RM_ACLCheckKeyPermissions(RedisModuleUser *user, RedisModuleString *key, int
+     }
+ 
+     int keyspec_flags = moduleConvertKeySpecsFlags(flags, 0);
+-    if (ACLUserCheckKeyPerm(user->user, key->ptr, sdslen(key->ptr), keyspec_flags) != ACL_OK) {
+-        errno = EACCES;
++    if (ACLModuleCheckKeyPermissions(user->user, key->ptr, sdslen(key->ptr), keyspec_flags) != C_OK) {
+         return REDISMODULE_ERR;
+     }
+ 
+@@ -8813,8 +8801,7 @@ int RM_ACLCheckChannelPermissions(RedisModuleUser *user, RedisModuleString *ch,
+         return REDISMODULE_OK;
+     }
+ 
+-    int is_pattern = flags & REDISMODULE_CMD_CHANNEL_PATTERN;
+-    if (ACLUserCheckChannelPerm(user->user, ch->ptr, is_pattern) != ACL_OK)
++    if (ACLModuleCheckChannelPermissions(user->user, ch->ptr, flags) != C_OK)
+         return REDISMODULE_ERR;
+ 
+     return REDISMODULE_OK;
+diff --git a/src/multi.c b/src/multi.c
+index 5249c58bf..34ece1c92 100644
+--- a/src/multi.c
++++ b/src/multi.c
+@@ -201,32 +201,7 @@ void execCommand(client *c) {
+ 
+         /* ACL permissions are also checked at the time of execution in case
+          * they were changed after the commands were queued. */
+-        int acl_errpos;
+-        int acl_retval = ACLCheckAllPerm(c,&acl_errpos);
+-        if (acl_retval != ACL_OK) {
+-            char *reason;
+-            switch (acl_retval) {
+-            case ACL_DENIED_CMD:
+-                reason = "no permission to execute the command or subcommand";
+-                break;
+-            case ACL_DENIED_KEY:
+-                reason = "no permission to touch the specified keys";
+-                break;
+-            case ACL_DENIED_CHANNEL:
+-                reason = "no permission to access one of the channels used "
+-                         "as arguments";
+-                break;
+-            default:
+-                reason = "no permission";
+-                break;
+-            }
+-            addACLLogEntry(c,acl_retval,ACL_LOG_CTX_MULTI,acl_errpos,NULL,NULL);
+-            addReplyErrorFormat(c,
+-                "-NOPERM ACLs rules changed between the moment the "
+-                "transaction was accumulated and the EXEC call. "
+-                "This command is no longer allowed for the "
+-                "following reason: %s", reason);
+-        } else {
++        if (ACLEnforceTransactionPermissions(c) == ACL_OK) {
+             if (c->id == CLIENT_ID_AOF)
+                 call(c,CMD_CALL_NONE);
+             else
+diff --git a/src/networking.c b/src/networking.c
+index 932413816..e008f17d5 100644
+--- a/src/networking.c
++++ b/src/networking.c
+@@ -103,18 +103,20 @@ void linkClient(client *c) {
+ static void clientSetDefaultAuth(client *c) {
+     /* If the default user does not require authentication, the user is
+      * directly authenticated. */
+-    c->user = DefaultUser;
+-    c->authenticated = (c->user->flags & USER_FLAG_NOPASS) &&
+-                       !(c->user->flags & USER_FLAG_DISABLED);
++    ACLApplyDefaultClientAuth(c);
+ }
+ 
+ int authRequired(client *c) {
+     /* Check if the user is authenticated. This check is skipped in case
+      * the default user is flagged as "nopass" and is active. */
+-    int auth_required = (!(DefaultUser->flags & USER_FLAG_NOPASS) ||
+-                          (DefaultUser->flags & USER_FLAG_DISABLED)) &&
+-                        !c->authenticated;
+-    return auth_required;
++    return ACLClientNeedsAuthentication(c);
++}
++
++int evaluateDumpPayloadSanitization(void) {
++    client *c = server.current_client;
++    int from_master = (c && (c->flags & CLIENT_MASTER));
++    user *u = (c ? c->user : NULL);
++    return ACLShouldSanitizeDumpPayloadForClient(server.loading, from_master, u);
+ }
+ 
+ client *createClient(connection *conn) {
+@@ -1234,7 +1236,7 @@ void clientAcceptHandler(connection *conn) {
+      * requests from non loopback interfaces. Instead we try to explain the
+      * user what to do to fix it if needed. */
+     if (server.protected_mode &&
+-        DefaultUser->flags & USER_FLAG_NOPASS)
++        ACLDefaultUserIsNopass())
+     {
+         if (!islocalClient(c)) {
+             char *err =
+diff --git a/src/rdb.c b/src/rdb.c
+index 77499c39e..6eb21c914 100644
+--- a/src/rdb.c
++++ b/src/rdb.c
+@@ -1722,6 +1722,13 @@ int lpPairsValidateIntegrityAndDups(unsigned char *lp, size_t size, int deep) {
+  * On success a newly allocated object is returned, otherwise NULL.
+  * When the function returns NULL and if 'error' is not NULL, the
+  * integer pointed by 'error' is set to the type of error that occurred */
++robj *rdbLoadRestoredObject(rio *payload, sds key, int dbid, int *typeptr) {
++    int type = rdbLoadObjectType(payload);
++    if (typeptr) *typeptr = type;
++    if (type == -1) return NULL;
++    return rdbLoadObject(type, payload, key, dbid, NULL);
++}
++
+ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error) {
+     robj *o = NULL, *ele, *dec;
+     uint64_t len;
+@@ -1730,16 +1737,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error) {
+     /* Set default error of load object, it will be set to 0 on success. */
+     if (error) *error = RDB_LOAD_ERR_OTHER;
+ 
+-    int deep_integrity_validation = server.sanitize_dump_payload == SANITIZE_DUMP_YES;
+-    if (server.sanitize_dump_payload == SANITIZE_DUMP_CLIENTS) {
+-        /* Skip sanitization when loading (an RDB), or getting a RESTORE command
+-         * from either the master or a client using an ACL user with the skip-sanitize-payload flag. */
+-        int skip = server.loading ||
+-            (server.current_client && (server.current_client->flags & CLIENT_MASTER));
+-        if (!skip && server.current_client && server.current_client->user)
+-            skip = !!(server.current_client->user->flags & USER_FLAG_SANITIZE_PAYLOAD_SKIP);
+-        deep_integrity_validation = !skip;
+-    }
++    int deep_integrity_validation = evaluateDumpPayloadSanitization();
+ 
+     if (rdbtype == RDB_TYPE_STRING) {
+         /* Read string value */
+diff --git a/src/rdb.h b/src/rdb.h
+index 010c4d7df..87687eb6f 100644
+--- a/src/rdb.h
++++ b/src/rdb.h
+@@ -157,6 +157,7 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi);
+ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid);
+ size_t rdbSavedObjectLen(robj *o, robj *key, int dbid);
+ robj *rdbLoadObject(int type, rio *rdb, sds key, int dbid, int *error);
++robj *rdbLoadRestoredObject(rio *payload, sds key, int dbid, int *typeptr);
+ void backgroundSaveDoneHandler(int exitcode, int bysignal);
+ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime,int dbid);
+ ssize_t rdbSaveSingleModuleAux(rio *rdb, int when, moduleType *mt);
+diff --git a/src/script.c b/src/script.c
+index 12d87322d..a3b07cae1 100644
+--- a/src/script.c
++++ b/src/script.c
+@@ -331,14 +331,7 @@ static int scriptVerifyCommandArity(struct redisCommand *cmd, int argc, sds *err
+ 
+ static int scriptVerifyACL(client *c, sds *err) {
+     /* Check the ACLs. */
+-    int acl_errpos;
+-    int acl_retval = ACLCheckAllPerm(c, &acl_errpos);
+-    if (acl_retval != ACL_OK) {
+-        addACLLogEntry(c,acl_retval,ACL_LOG_CTX_LUA,acl_errpos,NULL,NULL);
+-        *err = sdscatfmt(sdsempty(), "The user executing the script %s", getAclErrorMessage(acl_retval));
+-        return C_ERR;
+-    }
+-    return C_OK;
++    return ACLEnforceScriptPermissions(c, err);
+ }
+ 
+ static int scriptVerifyWriteCommandAllow(scriptRunCtx *run_ctx, char **err) {
+diff --git a/src/server.c b/src/server.c
+index a1f8eca78..b14005105 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -3719,32 +3719,7 @@ int processCommand(client *c) {
+ 
+     /* Check if the user can run this command according to the current
+      * ACLs. */
+-    int acl_errpos;
+-    int acl_retval = ACLCheckAllPerm(c,&acl_errpos);
+-    if (acl_retval != ACL_OK) {
+-        addACLLogEntry(c,acl_retval,(c->flags & CLIENT_MULTI) ? ACL_LOG_CTX_MULTI : ACL_LOG_CTX_TOPLEVEL,acl_errpos,NULL,NULL);
+-        switch (acl_retval) {
+-        case ACL_DENIED_CMD:
+-        {
+-            rejectCommandFormat(c,
+-                "-NOPERM this user has no permissions to run "
+-                "the '%s' command", c->cmd->fullname);
+-            break;
+-        }
+-        case ACL_DENIED_KEY:
+-            rejectCommandFormat(c,
+-                "-NOPERM this user has no permissions to access "
+-                "one of the keys used as arguments");
+-            break;
+-        case ACL_DENIED_CHANNEL:
+-            rejectCommandFormat(c,
+-                "-NOPERM this user has no permissions to access "
+-                "one of the channels used as arguments");
+-            break;
+-        default:
+-            rejectCommandFormat(c, "no permission");
+-            break;
+-        }
++    if (ACLEnforceCommandPermissions(c) != ACL_OK) {
+         return C_OK;
+     }
+ 
+diff --git a/src/server.h b/src/server.h
+index 7280cd7c3..508656e42 100644
+--- a/src/server.h
++++ b/src/server.h
+@@ -2793,6 +2793,20 @@ void ACLFreeUserAndKillClients(user *u);
+ void addACLLogEntry(client *c, int reason, int context, int argpos, sds username, sds object);
+ const char* getAclErrorMessage(int acl_res);
+ void ACLUpdateDefaultUserPassword(sds password);
++int ACLShouldSanitizeDumpPayloadForClient(int loading, int from_master, user *u);
++void ACLApplyDefaultClientAuth(client *c);
++int ACLClientNeedsAuthentication(client *c);
++int ACLDefaultUserIsNopass(void);
++int ACLDefaultUserIsDisabled(void);
++sds ACLComposeUserConfigLine(user *u);
++int ACLUsersAreStoredInExternalFile(void);
++int ACLModuleCheckCommandPermissions(user *u, robj **argv, int argc);
++int ACLModuleCheckKeyPermissions(user *u, const char *key, size_t keylen, int flags);
++int ACLModuleCheckChannelPermissions(user *u, sds channel, int flags);
++int evaluateDumpPayloadSanitization(void);
++int ACLEnforceCommandPermissions(client *c);
++int ACLEnforceTransactionPermissions(client *c);
++int ACLEnforceScriptPermissions(client *c, sds *err);
+ 
+ /* Sorted sets data type */
+ 

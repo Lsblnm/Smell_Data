@@ -1,0 +1,163 @@
+diff --git a/src/script_lua.c b/src/script_lua.c
+index eca21d60c..ebb0b9a49 100644
+--- a/src/script_lua.c
++++ b/src/script_lua.c
+@@ -799,7 +799,7 @@ static robj **luaArgsToRedisArgv(lua_State *lua, int *argc, int *argv_len) {
+     /* Require at least one argument */
+     *argc = lua_gettop(lua);
+     if (*argc == 0) {
+-        luaPushError(lua, "Please specify at least one argument for this redis lib call");
++        luaPushErrorBuff(lua, sdsnew("Please specify at least one argument for this redis lib call"));
+         return NULL;
+     }
+ 
+@@ -814,6 +814,7 @@ static robj **luaArgsToRedisArgv(lua_State *lua, int *argc, int *argv_len) {
+         char *obj_s;
+         size_t obj_len;
+         char dbuf[64];
++        int reused_cached_arg = 0;
+ 
+         if (lua_type(lua,j+1) == LUA_TNUMBER) {
+             /* We can't use lua_tolstring() for number -> string conversion
+@@ -826,17 +827,75 @@ static robj **luaArgsToRedisArgv(lua_State *lua, int *argc, int *argv_len) {
+             obj_s = (char*)lua_tolstring(lua,j+1,&obj_len);
+             if (obj_s == NULL) break; /* Not a string. */
+         }
+-        /* Try to use a cached object. */
+-        if (j < LUA_CMD_OBJCACHE_SIZE && lua_args_cached_objects[j] &&
+-            lua_args_cached_objects_len[j] >= obj_len)
+-        {
+-            sds s = lua_args_cached_objects[j]->ptr;
+-            lua_argv[j] = lua_args_cached_objects[j];
+-            lua_args_cached_objects[j] = NULL;
+-            memcpy(s,obj_s,obj_len+1);
+-            sdssetlen(s, obj_len);
+-        } else {
+-            lua_argv[j] = createStringObject(obj_s, obj_len);
++        /* Try to use a cached object, updating the SDS header in place. */
++        if (j < LUA_CMD_OBJCACHE_SIZE) {
++            robj *cached = lua_args_cached_objects[j];
++            if (cached != NULL) {
++                if (lua_args_cached_objects_len[j] >= obj_len) {
++                    sds s = cached->ptr;
++                    unsigned char flags = s[-1];
++                    switch(flags & SDS_TYPE_MASK) {
++                    case SDS_TYPE_5:
++                        {
++                            unsigned char *fp = ((unsigned char*)s)-1;
++                            *fp = SDS_TYPE_5 | (obj_len << SDS_TYPE_BITS);
++                            reused_cached_arg = 1;
++                        }
++                        break;
++                    case SDS_TYPE_8:
++                        if (obj_len <= SDS_HDR(8,s)->alloc) {
++                            SDS_HDR(8,s)->len = obj_len;
++                            reused_cached_arg = 1;
++                        }
++                        break;
++                    case SDS_TYPE_16:
++                        SDS_HDR(16,s)->len = obj_len;
++                        reused_cached_arg = 1;
++                        break;
++                    case SDS_TYPE_32:
++                        SDS_HDR(32,s)->len = obj_len;
++                        reused_cached_arg = 1;
++                        break;
++                    case SDS_TYPE_64:
++                        SDS_HDR(64,s)->len = obj_len;
++                        reused_cached_arg = 1;
++                        break;
++                    }
++                    if (reused_cached_arg) {
++                        memcpy(s,obj_s,obj_len+1);
++                        lua_argv[j] = cached;
++                        lua_args_cached_objects[j] = NULL;
++                    }
++                }
++            }
++        }
++
++        if (!reused_cached_arg) {
++            robj *built;
++            /* Keep the same EMBSTR/RAW split used by string object creation so
++             * small Lua arguments stay packed in a single allocation. */
++            if (obj_len <= 44) {
++                built = zmalloc(sizeof(robj)+sizeof(struct sdshdr8)+obj_len+1);
++                struct sdshdr8 *sh = (void*)(built+1);
++                built->type = OBJ_STRING;
++                built->encoding = OBJ_ENCODING_EMBSTR;
++                built->ptr = sh+1;
++                built->refcount = 1;
++                built->lru = 0;
++                sh->len = obj_len;
++                sh->alloc = obj_len;
++                sh->flags = SDS_TYPE_8;
++                if (obj_len != 0) {
++                    memcpy(sh->buf,obj_s,obj_len);
++                    sh->buf[obj_len] = '\0';
++                } else {
++                    sh->buf[0] = '\0';
++                }
++            } else {
++                sds raw = sdsnewlen(obj_s, obj_len);
++                built = createObject(OBJ_STRING, raw);
++            }
++            lua_argv[j] = built;
+         }
+     }
+ 
+@@ -848,8 +907,52 @@ static robj **luaArgsToRedisArgv(lua_State *lua, int *argc, int *argv_len) {
+      * is not a string or an integer (lua_isstring() return true for
+      * integers as well). */
+     if (j != *argc) {
+-        freeLuaRedisArgv(lua_argv, j, lua_argv_size);
+-        luaPushError(lua, "Lua redis lib command arguments must be strings or integers");
++        int k;
++        for (k = 0; k < j; k++) {
++            robj *o = lua_argv[k];
++            int cacheable = 0;
++            size_t alloc_len = 0;
++            if (k < LUA_CMD_OBJCACHE_SIZE && o->refcount == 1 &&
++                (o->encoding == OBJ_ENCODING_RAW ||
++                 o->encoding == OBJ_ENCODING_EMBSTR))
++            {
++                sds s = o->ptr;
++                unsigned char flags = s[-1];
++                size_t curlen = 0;
++                switch(flags & SDS_TYPE_MASK) {
++                case SDS_TYPE_5:
++                    curlen = SDS_TYPE_5_LEN(flags);
++                    alloc_len = curlen;
++                    break;
++                case SDS_TYPE_8:
++                    curlen = SDS_HDR(8,s)->len;
++                    alloc_len = SDS_HDR(8,s)->alloc;
++                    break;
++                case SDS_TYPE_16:
++                    curlen = SDS_HDR(16,s)->len;
++                    alloc_len = SDS_HDR(16,s)->alloc;
++                    break;
++                case SDS_TYPE_32:
++                    curlen = SDS_HDR(32,s)->len;
++                    alloc_len = SDS_HDR(32,s)->alloc;
++                    break;
++                case SDS_TYPE_64:
++                    curlen = SDS_HDR(64,s)->len;
++                    alloc_len = SDS_HDR(64,s)->alloc;
++                    break;
++                }
++                if (curlen <= LUA_CMD_OBJCACHE_MAX_LEN) {
++                    if (lua_args_cached_objects[k]) decrRefCount(lua_args_cached_objects[k]);
++                    lua_args_cached_objects[k] = o;
++                    lua_args_cached_objects_len[k] = alloc_len;
++                    cacheable = 1;
++                }
++            }
++            if (!cacheable) {
++                decrRefCount(o);
++            }
++        }
++        luaPushErrorBuff(lua, sdsnew("Lua redis lib command arguments must be strings or integers"));
+         return NULL;
+     }
+ 

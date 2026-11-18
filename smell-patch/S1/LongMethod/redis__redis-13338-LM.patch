@@ -1,0 +1,199 @@
+diff --git a/src/t_stream.c b/src/t_stream.c
+index 478d75c5c..d1a23f7e4 100644
+--- a/src/t_stream.c
++++ b/src/t_stream.c
+@@ -1681,11 +1681,33 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
+     if (!(flags & STREAM_RWR_RAWENTRIES))
+         arraylen_ptr = addReplyDeferredLen(c);
+     streamIteratorStart(&si,s,start,end,rev);
++
+     while(streamIteratorGetID(&si,&id,&numfields)) {
+         /* Update the group last_id if needed. */
+         if (group && streamCompareID(&id,&group->last_id) > 0) {
+-            if (group->entries_read != SCG_INVALID_ENTRIES_READ && !streamRangeHasTombstones(s,&id,NULL)) {
+-                /* A valid counter and no future tombstones mean we can 
++            int range_has_tombstones = 0;
++            if (!s->length || streamIDEqZero(&s->max_deleted_entry_id)) {
++                /* The stream is empty or has no tombstones. */
++                range_has_tombstones = 0;
++            } else if (streamCompareID(&s->first_id,&s->max_deleted_entry_id) > 0) {
++                /* The latest tombstone is before the first entry. */
++                range_has_tombstones = 0;
++            } else {
++                streamID tomb_range_start = id;
++                if (tomb_range_start.ms > s->max_deleted_entry_id.ms) {
++                    range_has_tombstones = 0;
++                } else if (tomb_range_start.ms < s->max_deleted_entry_id.ms) {
++                    range_has_tombstones = 1;
++                } else {
++                    if (tomb_range_start.seq > s->max_deleted_entry_id.seq) {
++                        range_has_tombstones = 0;
++                    } else {
++                        range_has_tombstones = 1;
++                    }
++                }
++            }
++            if (group->entries_read != SCG_INVALID_ENTRIES_READ && !range_has_tombstones) {
++                /* A valid counter and no future tombstones mean we can
+                  * increment the read counter to keep tracking the group's
+                  * progress. */
+                 group->entries_read++;
+@@ -1704,7 +1726,12 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
+         /* Emit a two elements array for each item. The first is
+          * the ID, the second is an array of field-value pairs. */
+         addReplyArrayLen(c,2);
+-        addReplyStreamID(c,&id);
++        {
++            sds idstr = sdsnewlen(SDS_NOINIT, STREAM_ID_STR_LEN);
++            sdssetlen(idstr, 0);
++            idstr = sdscatfmt(idstr,"%U-%U", id.ms,id.seq);
++            addReplyBulkSds(c,idstr);
++        }
+ 
+         addReplyArrayLen(c,numfields*2);
+ 
+@@ -1728,12 +1755,18 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
+          * consumer. */
+         if (group && !noack) {
+             unsigned char buf[sizeof(streamID)];
+-            streamEncodeID(buf,&id);
++            uint64_t encoded_id[2];
++            encoded_id[0] = htonu64(id.ms);
++            encoded_id[1] = htonu64(id.seq);
++            memcpy(buf,encoded_id,sizeof(encoded_id));
+ 
+             /* Try to add a new NACK. Most of the time this will work and
+              * will not require extra lookups. We'll fix the problem later
+              * if we find that there is already a entry for this ID. */
+-            streamNACK *nack = streamCreateNACK(consumer);
++            streamNACK *nack = zmalloc(sizeof(*nack));
++            nack->delivery_time = server.cmd_time_snapshot;
++            nack->delivery_count = 1;
++            nack->consumer = consumer;
+             int group_inserted =
+                 raxTryInsert(group->pel,buf,sizeof(buf),nack,NULL);
+             int consumer_inserted =
+@@ -1751,7 +1784,7 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
+                 raxRemove(nack->consumer->pel,buf,sizeof(buf),NULL);
+                 /* Update the consumer and NACK metadata. */
+                 nack->consumer = consumer;
+-                nack->delivery_time = commandTimeSnapshot();
++                nack->delivery_time = server.cmd_time_snapshot;
+                 nack->delivery_count = 1;
+                 /* Add the entry in the new consumer local PEL. */
+                 raxInsert(consumer->pel,buf,sizeof(buf),nack,NULL);
+@@ -1759,12 +1792,81 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
+                 serverPanic("NACK half-created. Should not be possible.");
+             }
+ 
+-            consumer->active_time = commandTimeSnapshot();
++            consumer->active_time = server.cmd_time_snapshot;
+ 
+             /* Propagate as XCLAIM. */
+             if (spi) {
+-                robj *idarg = createObjectFromStreamID(&id);
+-                streamPropagateXCLAIM(c,spi->keyname,group,spi->groupname,idarg,nack);
++                sds idstr = sdsnewlen(SDS_NOINIT, STREAM_ID_STR_LEN);
++                sdssetlen(idstr, 0);
++                idstr = sdscatfmt(idstr,"%U-%U", id.ms,id.seq);
++                robj *idarg = zmalloc(sizeof(*idarg));
++                idarg->type = OBJ_STRING;
++                idarg->encoding = OBJ_ENCODING_RAW;
++                idarg->ptr = idstr;
++                idarg->refcount = 1;
++                idarg->lru = 0;
++
++                robj *argv[14];
++                argv[0] = shared.xclaim;
++                argv[1] = spi->keyname;
++                argv[2] = spi->groupname;
++                size_t consumer_name_len = sdslen(nack->consumer->name);
++                if (consumer_name_len <= 44) {
++                    robj *consumer_obj = zmalloc(sizeof(robj)+sizeof(struct sdshdr8)+consumer_name_len+1);
++                    struct sdshdr8 *sh = (void*)(consumer_obj+1);
++                    consumer_obj->type = OBJ_STRING;
++                    consumer_obj->encoding = OBJ_ENCODING_EMBSTR;
++                    consumer_obj->ptr = sh+1;
++                    consumer_obj->refcount = 1;
++                    consumer_obj->lru = 0;
++                    sh->len = consumer_name_len;
++                    sh->alloc = consumer_name_len;
++                    sh->flags = SDS_TYPE_8;
++                    memcpy(sh->buf,nack->consumer->name,consumer_name_len);
++                    sh->buf[consumer_name_len] = '\0';
++                    argv[3] = consumer_obj;
++                } else {
++                    robj *consumer_obj = zmalloc(sizeof(*consumer_obj));
++                    consumer_obj->type = OBJ_STRING;
++                    consumer_obj->encoding = OBJ_ENCODING_RAW;
++                    consumer_obj->ptr = sdsnewlen(nack->consumer->name,consumer_name_len);
++                    consumer_obj->refcount = 1;
++                    consumer_obj->lru = 0;
++                    argv[3] = consumer_obj;
++                }
++                argv[4] = shared.integers[0];
++                argv[5] = idarg;
++                argv[6] = shared.time;
++                argv[7] = createStringObjectFromLongLong(nack->delivery_time);
++                argv[8] = shared.retrycount;
++                argv[9] = createStringObjectFromLongLong(nack->delivery_count);
++                argv[10] = shared.force;
++                argv[11] = shared.justid;
++                argv[12] = shared.lastid;
++                {
++                    sds lastidstr = sdsnewlen(SDS_NOINIT, STREAM_ID_STR_LEN);
++                    sdssetlen(lastidstr, 0);
++                    lastidstr = sdscatfmt(lastidstr,"%U-%U", group->last_id.ms,group->last_id.seq);
++                    robj *lastidobj = zmalloc(sizeof(*lastidobj));
++                    lastidobj->type = OBJ_STRING;
++                    lastidobj->encoding = OBJ_ENCODING_RAW;
++                    lastidobj->ptr = lastidstr;
++                    lastidobj->refcount = 1;
++                    lastidobj->lru = 0;
++                    argv[13] = lastidobj;
++                }
++
++                if (!server.replication_allowed || server.loading) {
++                    /* Skip extra propagation while loading or when
++                     * replication is explicitly disabled. */
++                } else {
++                    alsoPropagate(c->db->id,argv,14,PROPAGATE_AOF|PROPAGATE_REPL);
++                }
++
++                decrRefCount(argv[3]);
++                decrRefCount(argv[7]);
++                decrRefCount(argv[9]);
++                decrRefCount(argv[13]);
+                 decrRefCount(idarg);
+                 if (propCount) (*propCount)++;
+             }
+@@ -1775,7 +1877,28 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
+     }
+ 
+     if (spi && propagate_last_id) {
+-        streamPropagateGroupID(c,spi->keyname,group,spi->groupname);
++        robj *argv[7];
++        argv[0] = shared.xgroup;
++        argv[1] = shared.setid;
++        argv[2] = spi->keyname;
++        argv[3] = spi->groupname;
++        {
++            sds lastidstr = sdsnewlen(SDS_NOINIT, STREAM_ID_STR_LEN);
++            sdssetlen(lastidstr, 0);
++            lastidstr = sdscatfmt(lastidstr,"%U-%U", group->last_id.ms,group->last_id.seq);
++            robj *lastidobj = zmalloc(sizeof(*lastidobj));
++            lastidobj->type = OBJ_STRING;
++            lastidobj->encoding = OBJ_ENCODING_RAW;
++            lastidobj->ptr = lastidstr;
++            lastidobj->refcount = 1;
++            lastidobj->lru = 0;
++            argv[4] = lastidobj;
++        }
++        argv[5] = shared.entriesread;
++        argv[6] = createStringObjectFromLongLong(group->entries_read);
++        alsoPropagate(c->db->id,argv,7,PROPAGATE_AOF|PROPAGATE_REPL);
++        decrRefCount(argv[4]);
++        decrRefCount(argv[6]);
+         if (propCount) (*propCount)++;
+     }
+ 

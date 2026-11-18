@@ -1,0 +1,453 @@
+diff --git a/tokio/src/runtime/blocking/mod.rs b/tokio/src/runtime/blocking/mod.rs
+index c42924be..9cccf7ba 100644
+--- a/tokio/src/runtime/blocking/mod.rs
++++ b/tokio/src/runtime/blocking/mod.rs
+@@ -4,7 +4,7 @@
+ //! compilation.
+ 
+ mod pool;
+-pub(crate) use pool::{spawn_blocking, BlockingPool, Spawner};
++pub(crate) use pool::{spawn_blocking, BlockingPool, SpawnError, Spawner, Task};
+ 
+ cfg_fs! {
+     pub(crate) use pool::spawn_mandatory_blocking;
+diff --git a/tokio/src/runtime/blocking/pool.rs b/tokio/src/runtime/blocking/pool.rs
+index c74aea76..066f1c33 100644
+--- a/tokio/src/runtime/blocking/pool.rs
++++ b/tokio/src/runtime/blocking/pool.rs
+@@ -21,7 +21,7 @@ pub(crate) struct BlockingPool {
+ 
+ #[derive(Clone)]
+ pub(crate) struct Spawner {
+-    inner: Arc<Inner>,
++    pub(crate) inner: Arc<Inner>,
+ }
+ 
+ #[derive(Default)]
+@@ -32,11 +32,11 @@ pub(crate) struct SpawnerMetrics {
+ }
+ 
+ impl SpawnerMetrics {
+-    fn num_threads(&self) -> usize {
++    pub(crate) fn num_threads(&self) -> usize {
+         self.num_threads.load(Ordering::Relaxed)
+     }
+ 
+-    fn num_idle_threads(&self) -> usize {
++    pub(crate) fn num_idle_threads(&self) -> usize {
+         self.num_idle_threads.load(Ordering::Relaxed)
+     }
+ 
+@@ -71,9 +71,9 @@ impl SpawnerMetrics {
+     }
+ }
+ 
+-struct Inner {
++pub(crate) struct Inner {
+     /// State shared between worker threads.
+-    shared: Mutex<Shared>,
++    pub(crate) shared: Mutex<Shared>,
+ 
+     /// Pool threads wait on this.
+     condvar: Condvar,
+@@ -91,20 +91,20 @@ struct Inner {
+     before_stop: Option<Callback>,
+ 
+     // Maximum number of threads.
+-    thread_cap: usize,
++    pub(crate) thread_cap: usize,
+ 
+     // Customizable wait timeout.
+     keep_alive: Duration,
+ 
+     // Metrics about the pool.
+-    metrics: SpawnerMetrics,
++    pub(crate) metrics: SpawnerMetrics,
+ }
+ 
+-struct Shared {
++pub(crate) struct Shared {
+     queue: VecDeque<Task>,
+     num_notify: u32,
+-    shutdown: bool,
+-    shutdown_tx: Option<shutdown::Sender>,
++    pub(crate) shutdown: bool,
++    pub(crate) shutdown_tx: Option<shutdown::Sender>,
+     /// Prior to shutdown, we clean up `JoinHandles` by having each timed-out
+     /// thread join on the previous timed-out thread. This is not strictly
+     /// necessary but helps avoid Valgrind false positives, see
+@@ -159,6 +159,10 @@ impl Task {
+         self.task.run();
+     }
+ 
++    pub(crate) fn shutdown(self) {
++        self.task.shutdown();
++    }
++
+     fn shutdown_or_run_if_mandatory(self) {
+         match self.mandatory {
+             Mandatory::NonMandatory => self.task.shutdown(),
+@@ -383,72 +387,80 @@ impl Spawner {
+ 
+         let (task, handle) = task::unowned(fut, BlockingSchedule::new(rt), id);
+ 
+-        let spawned = self.spawn_task(Task::new(task, is_mandatory), rt);
++        let spawned = rt.inner.spawn_blocking_task(Task::new(task, is_mandatory), rt);
+         (handle, spawned)
+     }
++}
+ 
+-    fn spawn_task(&self, task: Task, rt: &Handle) -> Result<(), SpawnError> {
+-        let mut shared = self.inner.shared.lock();
++cfg_metrics! {
++    impl Spawner {
++        pub(crate) fn num_threads(&self) -> usize {
++            self.inner.metrics.num_threads()
++        }
+ 
+-        if shared.shutdown {
+-            // Shutdown the task: it's fine to shutdown this task (even if
+-            // mandatory) because it was scheduled after the shutdown of the
+-            // runtime began.
+-            task.task.shutdown();
++        pub(crate) fn num_idle_threads(&self) -> usize {
++            self.inner.metrics.num_idle_threads()
++        }
+ 
+-            // no need to even push this task; it would never get picked up
+-            return Err(SpawnError::ShuttingDown);
++        pub(crate) fn queue_depth(&self) -> usize {
++            self.inner.metrics.queue_depth()
+         }
++    }
++}
++
++// Tells whether the error when spawning a thread is temporary.
++#[inline]
++fn is_temporary_os_thread_error(error: &std::io::Error) -> bool {
++    matches!(error.kind(), std::io::ErrorKind::WouldBlock)
++}
+ 
++impl Inner {
++    pub(crate) fn enqueue_task(&self, shared: &mut Shared, task: Task) {
+         shared.queue.push_back(task);
+-        self.inner.metrics.inc_queue_depth();
++        self.metrics.inc_queue_depth();
++    }
+ 
+-        if self.inner.metrics.num_idle_threads() == 0 {
+-            // No threads are able to process the task.
++    pub(crate) fn wake_idle_thread(&self, shared: &mut Shared) {
++        // Notify an idle worker thread. The notification counter
++        // is used to count the needed amount of notifications
++        // exactly. Thread libraries may generate spurious
++        // wakeups, this counter is used to keep us in a
++        // consistent state.
++        self.metrics.dec_num_idle_threads();
++        shared.num_notify += 1;
++        self.condvar.notify_one();
++    }
+ 
+-            if self.inner.metrics.num_threads() == self.inner.thread_cap {
+-                // At max number of threads
+-            } else {
+-                assert!(shared.shutdown_tx.is_some());
+-                let shutdown_tx = shared.shutdown_tx.clone();
+-
+-                if let Some(shutdown_tx) = shutdown_tx {
+-                    let id = shared.worker_thread_index;
+-
+-                    match self.spawn_thread(shutdown_tx, rt, id) {
+-                        Ok(handle) => {
+-                            self.inner.metrics.inc_num_threads();
+-                            shared.worker_thread_index += 1;
+-                            shared.worker_threads.insert(id, handle);
+-                        }
+-                        Err(ref e)
+-                            if is_temporary_os_thread_error(e)
+-                                && self.inner.metrics.num_threads() > 0 =>
+-                        {
+-                            // OS temporarily failed to spawn a new thread.
+-                            // The task will be picked up eventually by a currently
+-                            // busy thread.
+-                        }
+-                        Err(e) => {
+-                            // The OS refused to spawn the thread and there is no thread
+-                            // to pick up the task that has just been pushed to the queue.
+-                            return Err(SpawnError::NoThreads(e));
+-                        }
+-                    }
+-                }
++    pub(crate) fn spawn_additional_thread(
++        &self,
++        shared: &mut Shared,
++        shutdown_tx: shutdown::Sender,
++        rt: &Handle,
++    ) -> Result<(), SpawnError> {
++        let id = shared.worker_thread_index;
++
++        match self.spawn_thread(shutdown_tx, rt, id) {
++            Ok(handle) => {
++                self.metrics.inc_num_threads();
++                shared.worker_thread_index += 1;
++                shared.worker_threads.insert(id, handle);
++                Ok(())
++            }
++            Err(ref e)
++                if is_temporary_os_thread_error(e)
++                    && self.metrics.num_threads() > 0 =>
++            {
++                // OS temporarily failed to spawn a new thread.
++                // The task will be picked up eventually by a currently
++                // busy thread.
++                Ok(())
++            }
++            Err(e) => {
++                // The OS refused to spawn the thread and there is no thread
++                // to pick up the task that has just been pushed to the queue.
++                Err(SpawnError::NoThreads(e))
+             }
+-        } else {
+-            // Notify an idle worker thread. The notification counter
+-            // is used to count the needed amount of notifications
+-            // exactly. Thread libraries may generate spurious
+-            // wakeups, this counter is used to keep us in a
+-            // consistent state.
+-            self.inner.metrics.dec_num_idle_threads();
+-            shared.num_notify += 1;
+-            self.inner.condvar.notify_one();
+         }
+-
+-        Ok(())
+     }
+ 
+     fn spawn_thread(
+@@ -457,9 +469,9 @@ impl Spawner {
+         rt: &Handle,
+         id: usize,
+     ) -> std::io::Result<thread::JoinHandle<()>> {
+-        let mut builder = thread::Builder::new().name((self.inner.thread_name)());
++        let mut builder = thread::Builder::new().name((self.thread_name)());
+ 
+-        if let Some(stack_size) = self.inner.stack_size {
++        if let Some(stack_size) = self.stack_size {
+             builder = builder.stack_size(stack_size);
+         }
+ 
+@@ -472,31 +484,7 @@ impl Spawner {
+             drop(shutdown_tx);
+         })
+     }
+-}
+-
+-cfg_metrics! {
+-    impl Spawner {
+-        pub(crate) fn num_threads(&self) -> usize {
+-            self.inner.metrics.num_threads()
+-        }
+-
+-        pub(crate) fn num_idle_threads(&self) -> usize {
+-            self.inner.metrics.num_idle_threads()
+-        }
+-
+-        pub(crate) fn queue_depth(&self) -> usize {
+-            self.inner.metrics.queue_depth()
+-        }
+-    }
+-}
+ 
+-// Tells whether the error when spawning a thread is temporary.
+-#[inline]
+-fn is_temporary_os_thread_error(error: &std::io::Error) -> bool {
+-    matches!(error.kind(), std::io::ErrorKind::WouldBlock)
+-}
+-
+-impl Inner {
+     fn run(&self, worker_thread_id: usize) {
+         if let Some(f) = &self.after_start {
+             f();
+diff --git a/tokio/src/runtime/blocking/shutdown.rs b/tokio/src/runtime/blocking/shutdown.rs
+index fe5abae0..60b0b6af 100644
+--- a/tokio/src/runtime/blocking/shutdown.rs
++++ b/tokio/src/runtime/blocking/shutdown.rs
+@@ -9,7 +9,7 @@ use crate::sync::oneshot;
+ use std::time::Duration;
+ 
+ #[derive(Debug, Clone)]
+-pub(super) struct Sender {
++pub(crate) struct Sender {
+     _tx: Arc<oneshot::Sender<()>>,
+ }
+ 
+diff --git a/tokio/src/runtime/scheduler/current_thread/mod.rs b/tokio/src/runtime/scheduler/current_thread/mod.rs
+index 36bcefc4..9770e473 100644
+--- a/tokio/src/runtime/scheduler/current_thread/mod.rs
++++ b/tokio/src/runtime/scheduler/current_thread/mod.rs
+@@ -500,6 +500,46 @@ impl Handle {
+     pub(crate) fn reset_woken(&self) -> bool {
+         self.shared.woken.swap(false, AcqRel)
+     }
++
++    pub(crate) fn spawn_blocking_task(
++        &self,
++        task: blocking::Task,
++        rt: &crate::runtime::Handle,
++    ) -> Result<(), blocking::SpawnError> {
++        let inner = &self.blocking_spawner.inner;
++        let mut shared = inner.shared.lock();
++
++        if shared.shutdown {
++            // Shutdown the task: it's fine to shutdown this task (even if
++            // mandatory) because it was scheduled after the shutdown of the
++            // runtime began.
++            task.shutdown();
++
++            // no need to even push this task; it would never get picked up
++            return Err(blocking::SpawnError::ShuttingDown);
++        }
++
++        inner.enqueue_task(&mut shared, task);
++
++        if inner.metrics.num_idle_threads() == 0 {
++            // No threads are able to process the task.
++
++            if inner.metrics.num_threads() == inner.thread_cap {
++                // At max number of threads
++            } else {
++                assert!(shared.shutdown_tx.is_some());
++                let shutdown_tx = shared.shutdown_tx.clone();
++
++                if let Some(shutdown_tx) = shutdown_tx {
++                    inner.spawn_additional_thread(&mut shared, shutdown_tx, rt)?;
++                }
++            }
++        } else {
++            inner.wake_idle_thread(&mut shared);
++        }
++
++        Ok(())
++    }
+ }
+ 
+ cfg_metrics! {
+diff --git a/tokio/src/runtime/scheduler/mod.rs b/tokio/src/runtime/scheduler/mod.rs
+index 04fbff39..b7d587e9 100644
+--- a/tokio/src/runtime/scheduler/mod.rs
++++ b/tokio/src/runtime/scheduler/mod.rs
+@@ -111,6 +111,14 @@ cfg_rt! {
+             match_flavor!(self, Handle(h) => &h.blocking_spawner)
+         }
+ 
++        pub(crate) fn spawn_blocking_task(
++            &self,
++            task: blocking::Task,
++            rt: &crate::runtime::Handle,
++        ) -> Result<(), blocking::SpawnError> {
++            match_flavor!(self, Handle(h) => h.spawn_blocking_task(task, rt))
++        }
++
+         pub(crate) fn spawn<F>(&self, future: F, id: Id) -> JoinHandle<F::Output>
+         where
+             F: Future + Send + 'static,
+diff --git a/tokio/src/runtime/scheduler/multi_thread/handle.rs b/tokio/src/runtime/scheduler/multi_thread/handle.rs
+index 568eb80a..da8ce961 100644
+--- a/tokio/src/runtime/scheduler/multi_thread/handle.rs
++++ b/tokio/src/runtime/scheduler/multi_thread/handle.rs
+@@ -42,6 +42,46 @@ impl Handle {
+         Self::bind_new_task(me, future, id)
+     }
+ 
++    pub(crate) fn spawn_blocking_task(
++        &self,
++        task: blocking::Task,
++        rt: &crate::runtime::Handle,
++    ) -> Result<(), blocking::SpawnError> {
++        let inner = &self.blocking_spawner.inner;
++        let mut shared = inner.shared.lock();
++
++        if shared.shutdown {
++            // Shutdown the task: it's fine to shutdown this task (even if
++            // mandatory) because it was scheduled after the shutdown of the
++            // runtime began.
++            task.shutdown();
++
++            // no need to even push this task; it would never get picked up
++            return Err(blocking::SpawnError::ShuttingDown);
++        }
++
++        inner.enqueue_task(&mut shared, task);
++
++        if inner.metrics.num_idle_threads() == 0 {
++            // No threads are able to process the task.
++
++            if inner.metrics.num_threads() == inner.thread_cap {
++                // At max number of threads
++            } else {
++                assert!(shared.shutdown_tx.is_some());
++                let shutdown_tx = shared.shutdown_tx.clone();
++
++                if let Some(shutdown_tx) = shutdown_tx {
++                    inner.spawn_additional_thread(&mut shared, shutdown_tx, rt)?;
++                }
++            }
++        } else {
++            inner.wake_idle_thread(&mut shared);
++        }
++
++        Ok(())
++    }
++
+     pub(crate) fn shutdown(&self) {
+         self.close();
+     }
+diff --git a/tokio/src/runtime/scheduler/multi_thread_alt/handle.rs b/tokio/src/runtime/scheduler/multi_thread_alt/handle.rs
+index d746bca1..857c749c 100644
+--- a/tokio/src/runtime/scheduler/multi_thread_alt/handle.rs
++++ b/tokio/src/runtime/scheduler/multi_thread_alt/handle.rs
+@@ -38,6 +38,46 @@ impl Handle {
+         Self::bind_new_task(me, future, id)
+     }
+ 
++    pub(crate) fn spawn_blocking_task(
++        &self,
++        task: blocking::Task,
++        rt: &crate::runtime::Handle,
++    ) -> Result<(), blocking::SpawnError> {
++        let inner = &self.blocking_spawner.inner;
++        let mut shared = inner.shared.lock();
++
++        if shared.shutdown {
++            // Shutdown the task: it's fine to shutdown this task (even if
++            // mandatory) because it was scheduled after the shutdown of the
++            // runtime began.
++            task.shutdown();
++
++            // no need to even push this task; it would never get picked up
++            return Err(blocking::SpawnError::ShuttingDown);
++        }
++
++        inner.enqueue_task(&mut shared, task);
++
++        if inner.metrics.num_idle_threads() == 0 {
++            // No threads are able to process the task.
++
++            if inner.metrics.num_threads() == inner.thread_cap {
++                // At max number of threads
++            } else {
++                assert!(shared.shutdown_tx.is_some());
++                let shutdown_tx = shared.shutdown_tx.clone();
++
++                if let Some(shutdown_tx) = shutdown_tx {
++                    inner.spawn_additional_thread(&mut shared, shutdown_tx, rt)?;
++                }
++            }
++        } else {
++            inner.wake_idle_thread(&mut shared);
++        }
++
++        Ok(())
++    }
++
+     pub(crate) fn shutdown(&self) {
+         self.shared.close(self);
+         self.driver.unpark();

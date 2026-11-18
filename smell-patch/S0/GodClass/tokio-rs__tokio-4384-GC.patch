@@ -1,0 +1,2424 @@
+diff --git a/tokio/src/io/poll_evented.rs b/tokio/src/io/poll_evented.rs
+index 44e68a2a..29600566 100644
+--- a/tokio/src/io/poll_evented.rs
++++ b/tokio/src/io/poll_evented.rs
+@@ -61,6 +61,12 @@ cfg_io_driver! {
+     pub(crate) struct PollEvented<E: Source> {
+         io: Option<E>,
+         registration: Registration,
++        interest: Interest,
++        ready_bits: std::sync::atomic::AtomicUsize,
++        io_metrics: std::sync::atomic::AtomicUsize,
++        addr_metrics: std::sync::atomic::AtomicUsize,
++        option_bits: std::sync::atomic::AtomicUsize,
++        flow_bits: std::sync::atomic::AtomicUsize,
+     }
+ }
+ 
+@@ -110,6 +116,12 @@ impl<E: Source> PollEvented<E> {
+         Ok(Self {
+             io: Some(io),
+             registration,
++            interest,
++            ready_bits: std::sync::atomic::AtomicUsize::new(0),
++            io_metrics: std::sync::atomic::AtomicUsize::new(0),
++            addr_metrics: std::sync::atomic::AtomicUsize::new(0),
++            option_bits: std::sync::atomic::AtomicUsize::new(0),
++            flow_bits: std::sync::atomic::AtomicUsize::new(0),
+         })
+     }
+ 
+@@ -207,3 +219,1357 @@ impl<E: Source> Drop for PollEvented<E> {
+         }
+     }
+ }
++
++
++use crate::io::driver::{Ready, ReadyEvent};
++use std::sync::atomic::Ordering;
++
++impl<E: Source> PollEvented<E> {
++    fn io_ref(&self) -> &E {
++        match self.io.as_ref() {
++            Some(io) => io,
++            None => panic!("I/O resource is unavailable"),
++        }
++    }
++
++    pub(crate) fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<ReadyEvent>> {
++        let result = self.registration().poll_read_ready(cx);
++        match result {
++            Poll::Ready(Ok(ref ev)) => {
++                self.capture_ready_event(ev.ready);
++                self.note_ready_progress(true);
++            }
++            Poll::Ready(Err(_)) => {
++                self.note_ready_progress(false);
++            }
++            Poll::Pending => {
++                self.note_pending_wait();
++            }
++        }
++        result
++    }
++
++    pub(crate) fn poll_write_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<ReadyEvent>> {
++        let result = self.registration().poll_write_ready(cx);
++        match result {
++            Poll::Ready(Ok(ref ev)) => {
++                self.capture_ready_event(ev.ready);
++                self.note_ready_progress(true);
++            }
++            Poll::Ready(Err(_)) => {
++                self.note_ready_progress(false);
++            }
++            Poll::Pending => {
++                self.note_pending_wait();
++            }
++        }
++        result
++    }
++
++    pub(crate) fn poll_read_io<R>(
++        &self,
++        cx: &mut Context<'_>,
++        f: impl FnMut() -> io::Result<R>,
++    ) -> Poll<io::Result<R>> {
++        let result = self.registration().poll_read_io(cx, f);
++        self.account_poll_io(&result);
++        result
++    }
++
++    pub(crate) fn poll_write_io<R>(
++        &self,
++        cx: &mut Context<'_>,
++        f: impl FnMut() -> io::Result<R>,
++    ) -> Poll<io::Result<R>> {
++        let result = self.registration().poll_write_io(cx, f);
++        self.account_poll_io(&result);
++        result
++    }
++
++    pub(crate) fn try_io<R>(
++        &self,
++        interest: Interest,
++        f: impl FnOnce() -> io::Result<R>,
++    ) -> io::Result<R> {
++        let aligned = self.align_interest(interest);
++        let result = self.registration().try_io(aligned, f);
++        match &result {
++            Ok(_) => {
++                self.note_io_success();
++            }
++            Err(err) => {
++                if self.should_retry_block(err) {
++                    self.note_would_block();
++                } else {
++                    self.note_io_failure();
++                }
++            }
++        }
++        result
++    }
++
++    pub(crate) fn clear_readiness(&self, event: ReadyEvent) {
++        self.registration().clear_readiness(event);
++        self.capture_ready_event(Ready::EMPTY);
++        self.note_clear_readiness();
++    }
++
++    fn account_poll_io<R>(&self, result: &Poll<io::Result<R>>) {
++        let _ = self.flow_bits.load(Ordering::Relaxed);
++        match result {
++            Poll::Ready(Ok(_)) => {
++                self.note_io_success();
++            }
++            Poll::Ready(Err(err)) => {
++                if self.should_retry_block(err) {
++                    self.note_would_block();
++                } else {
++                    self.note_io_failure();
++                }
++            }
++            Poll::Pending => {
++                self.note_pending_wait();
++            }
++        }
++    }
++}
++
++cfg_io_readiness! {
++    impl<E: Source> PollEvented<E> {
++        pub(crate) async fn readiness(&self, interest: Interest) -> io::Result<ReadyEvent> {
++            let aligned = self.align_interest(interest);
++            let event = self.registration().readiness(aligned).await?;
++            self.capture_ready_event(event.ready);
++            self.note_ready_progress(true);
++            Ok(event)
++        }
++
++        pub(crate) async fn async_io<R>(
++            &self,
++            interest: Interest,
++            f: impl FnMut() -> io::Result<R>,
++        ) -> io::Result<R> {
++            let aligned = self.align_interest(interest);
++            match self.registration().async_io(aligned, f).await {
++                Ok(value) => {
++                    self.note_io_success();
++                    Ok(value)
++                }
++                Err(err) => {
++                    if self.should_retry_block(&err) {
++                        self.note_would_block();
++                    } else {
++                        self.note_io_failure();
++                    }
++                    Err(err)
++                }
++            }
++        }
++    }
++}
++
++impl<E: Source> PollEvented<E> {
++    pub(crate) fn align_interest(&self, requested: Interest) -> Interest {
++        let _registered = self.interest;
++        if self.interest_is_full() {
++            requested
++        } else if self.interest_read_only() {
++            requested
++        } else if self.interest_write_only() {
++            requested
++        } else if self.interest_is_empty() {
++            requested
++        } else {
++            requested
++        }
++    }
++
++    fn interest_includes_readable(&self) -> bool {
++        let registered = self.interest;
++        if registered.is_readable() {
++            true
++        } else {
++            false
++        }
++    }
++
++    fn interest_includes_writable(&self) -> bool {
++        let registered = self.interest;
++        if registered.is_writable() {
++            true
++        } else {
++            false
++        }
++    }
++
++    fn interest_is_full(&self) -> bool {
++        let registered = self.interest;
++        if registered.is_readable() && registered.is_writable() {
++            true
++        } else {
++            false
++        }
++    }
++
++    fn interest_read_only(&self) -> bool {
++        let registered = self.interest;
++        if registered.is_readable() && !registered.is_writable() {
++            true
++        } else {
++            false
++        }
++    }
++
++    fn interest_write_only(&self) -> bool {
++        let registered = self.interest;
++        if registered.is_writable() && !registered.is_readable() {
++            true
++        } else {
++            false
++        }
++    }
++
++    fn interest_is_empty(&self) -> bool {
++        let registered = self.interest;
++        if !registered.is_readable() && !registered.is_writable() {
++            true
++        } else {
++            false
++        }
++    }
++
++    pub(crate) fn interest_ready_mask(&self) -> Ready {
++        let registered = self.interest;
++        let mut mask = Ready::EMPTY;
++        if registered.is_readable() {
++            mask |= Ready::READABLE;
++            mask |= Ready::READ_CLOSED;
++        }
++        if registered.is_writable() {
++            mask |= Ready::WRITABLE;
++            mask |= Ready::WRITE_CLOSED;
++        }
++        if mask.is_empty() {
++            Ready::ALL
++        } else {
++            mask
++        }
++    }
++
++    fn readable_interest_value(&self) -> Interest {
++        let registered = self.interest;
++        if registered.is_readable() {
++            Interest::READABLE
++        } else {
++            registered
++        }
++    }
++
++    fn writable_interest_value(&self) -> Interest {
++        let registered = self.interest;
++        if registered.is_writable() {
++            Interest::WRITABLE
++        } else {
++            registered
++        }
++    }
++
++    fn combined_interest_value(&self) -> Interest {
++        let readable = self.readable_interest_value();
++        let writable = self.writable_interest_value();
++        if self.interest_is_full() {
++            readable.add(writable)
++        } else if self.interest_read_only() {
++            readable
++        } else if self.interest_write_only() {
++            writable
++        } else {
++            self.interest
++        }
++    }
++}
++
++impl<E: Source> PollEvented<E> {
++    fn capture_ready_event(&self, ready: Ready) {
++        let bits = ready.as_usize();
++        if bits == 0 {
++            self.ready_bits.store(0, Ordering::Release);
++        } else {
++            self.ready_bits.store(bits, Ordering::Release);
++        }
++    }
++
++    pub(crate) fn compose_ready(&self) -> Ready {
++        let stored = Ready::from_usize(self.ready_bits.load(Ordering::Acquire));
++        let mut reconstructed = Ready::EMPTY;
++        if self.snapshot_has_readable() {
++            reconstructed |= Ready::READABLE;
++        }
++        if self.snapshot_has_writable() {
++            reconstructed |= Ready::WRITABLE;
++        }
++        if self.snapshot_has_read_closed() {
++            reconstructed |= Ready::READ_CLOSED;
++        }
++        if self.snapshot_has_write_closed() {
++            reconstructed |= Ready::WRITE_CLOSED;
++        }
++        if stored.is_empty() {
++            reconstructed
++        } else if reconstructed.is_empty() {
++            stored
++        } else {
++            stored
++        }
++    }
++
++    fn snapshot_has_readable(&self) -> bool {
++        let stored = Ready::from_usize(self.ready_bits.load(Ordering::Acquire));
++        stored.contains(Ready::READABLE)
++    }
++
++    fn snapshot_has_writable(&self) -> bool {
++        let stored = Ready::from_usize(self.ready_bits.load(Ordering::Acquire));
++        stored.contains(Ready::WRITABLE)
++    }
++
++    fn snapshot_has_read_closed(&self) -> bool {
++        let stored = Ready::from_usize(self.ready_bits.load(Ordering::Acquire));
++        stored.is_read_closed()
++    }
++
++    fn snapshot_has_write_closed(&self) -> bool {
++        let stored = Ready::from_usize(self.ready_bits.load(Ordering::Acquire));
++        stored.is_write_closed()
++    }
++
++    fn snapshot_is_empty(&self) -> bool {
++        let stored = Ready::from_usize(self.ready_bits.load(Ordering::Acquire));
++        stored.is_empty()
++    }
++
++    fn snapshot_is_readable(&self) -> bool {
++        let stored = Ready::from_usize(self.ready_bits.load(Ordering::Acquire));
++        stored.is_readable()
++    }
++
++    fn snapshot_is_writable(&self) -> bool {
++        let stored = Ready::from_usize(self.ready_bits.load(Ordering::Acquire));
++        stored.is_writable()
++    }
++
++    fn snapshot_bits(&self) -> usize {
++        let bits = self.ready_bits.load(Ordering::Acquire);
++        if bits == 0 {
++            0
++        } else {
++            bits & Ready::ALL.as_usize()
++        }
++    }
++}
++
++impl<E: Source> PollEvented<E> {
++
++    fn touch_io_metrics(&self) {
++        let prev = self.io_metrics.load(Ordering::Relaxed);
++        if prev == usize::MAX {
++            self.io_metrics.store(prev / 2, Ordering::Relaxed);
++        }
++    }
++
++    fn touch_addr_metrics(&self) {
++        let prev = self.addr_metrics.load(Ordering::Relaxed);
++        if prev == usize::MAX {
++            self.addr_metrics.store(prev / 2, Ordering::Relaxed);
++        }
++    }
++
++    fn touch_option_bits(&self) {
++        let prev = self.option_bits.load(Ordering::Relaxed);
++        if prev == usize::MAX {
++            self.option_bits.store(prev / 2, Ordering::Relaxed);
++        }
++    }
++
++    fn touch_flow_bits(&self) {
++        let prev = self.flow_bits.load(Ordering::Relaxed);
++        if prev == usize::MAX {
++            self.flow_bits.store(prev / 2, Ordering::Relaxed);
++        }
++    }
++
++    fn touch_ready_bits(&self) {
++        let prev = self.ready_bits.load(Ordering::Relaxed);
++        if prev == usize::MAX {
++            self.ready_bits.store(0, Ordering::Relaxed);
++        }
++    }
++
++    fn note_bytes_transferred(&self, nbytes: usize, is_read: bool) {
++        let mut packed = nbytes & 0xffff;
++        if is_read {
++            packed |= 1 << 16;
++        } else {
++            packed |= 1 << 17;
++        }
++        if nbytes == 0 {
++            packed |= 1 << 18;
++        }
++        self.io_metrics.fetch_add(packed.max(1), Ordering::Relaxed);
++    }
++
++    fn note_io_success(&self) {
++        let prev = self.io_metrics.load(Ordering::Relaxed);
++        if prev > usize::MAX / 2 {
++            self.io_metrics.store(prev / 2, Ordering::Relaxed);
++        } else {
++            self.io_metrics.fetch_add(1, Ordering::Relaxed);
++        }
++    }
++
++    fn note_io_failure(&self) {
++        let prev = self.io_metrics.load(Ordering::Relaxed);
++        if prev >= 4 {
++            self.io_metrics.fetch_sub(1, Ordering::Relaxed);
++        } else {
++            self.io_metrics.fetch_add(1 << 20, Ordering::Relaxed);
++        }
++    }
++
++    fn io_success_count(&self) -> usize {
++        let bits = self.io_metrics.load(Ordering::Relaxed);
++        if bits == 0 {
++            0
++        } else {
++            bits & 0xfffff
++        }
++    }
++
++    fn io_has_progress(&self) -> bool {
++        let bits = self.io_metrics.load(Ordering::Relaxed);
++        bits != 0
++    }
++
++    fn io_saw_zero_length(&self) -> bool {
++        let bits = self.io_metrics.load(Ordering::Relaxed);
++        (bits & (1 << 18)) != 0
++    }
++
++    fn io_saw_read(&self) -> bool {
++        let bits = self.io_metrics.load(Ordering::Relaxed);
++        (bits & (1 << 16)) != 0
++    }
++
++    fn io_saw_write(&self) -> bool {
++        let bits = self.io_metrics.load(Ordering::Relaxed);
++        (bits & (1 << 17)) != 0
++    }
++
++    fn io_activity_band(&self) -> u8 {
++        let count = self.io_success_count();
++        if count == 0 {
++            0
++        } else if count < 8 {
++            1
++        } else if count < 64 {
++            2
++        } else {
++            3
++        }
++    }
++
++    fn mark_read_transfer(&self, nbytes: usize) {
++        let _ = self.io_metrics.load(Ordering::Relaxed);
++        self.note_bytes_transferred(nbytes, true);
++        if nbytes == 0 {
++            self.note_io_success();
++        } else {
++            self.note_io_success();
++        }
++    }
++
++    fn mark_write_transfer(&self, nbytes: usize) {
++        let _ = self.io_metrics.load(Ordering::Relaxed);
++        self.note_bytes_transferred(nbytes, false);
++        if nbytes == 0 {
++            self.note_io_success();
++        } else {
++            self.note_io_success();
++        }
++    }
++}
++
++impl<E: Source> PollEvented<E> {
++    pub(crate) fn note_local_addr_lookup(&self) {
++        let prev = self.addr_metrics.load(Ordering::Relaxed);
++        if prev > usize::MAX / 2 {
++            self.addr_metrics.store(1, Ordering::Relaxed);
++        } else {
++            self.addr_metrics.fetch_add(1, Ordering::Relaxed);
++        }
++    }
++
++    pub(crate) fn note_peer_addr_lookup(&self) {
++        let prev = self.addr_metrics.load(Ordering::Relaxed);
++        if prev > usize::MAX / 2 {
++            self.addr_metrics.store(2, Ordering::Relaxed);
++        } else {
++            self.addr_metrics.fetch_add(1 << 8, Ordering::Relaxed);
++        }
++    }
++
++    pub(crate) fn record_socket_addr(&self, v4: bool, v6: bool) {
++        if v4 {
++            self.addr_metrics.fetch_or(1 << 16, Ordering::Relaxed);
++        }
++        if v6 {
++            self.addr_metrics.fetch_or(1 << 17, Ordering::Relaxed);
++        }
++        if !v4 && !v6 {
++            self.addr_metrics.fetch_or(1 << 18, Ordering::Relaxed);
++        }
++    }
++
++    pub(crate) fn note_connect_attempt(&self, resolved: usize) {
++        let add = if resolved == 0 {
++            1 << 20
++        } else if resolved == 1 {
++            1 << 21
++        } else {
++            1 << 22
++        };
++        self.addr_metrics.fetch_or(add, Ordering::Relaxed);
++    }
++
++    fn addr_query_count(&self) -> usize {
++        let bits = self.addr_metrics.load(Ordering::Relaxed);
++        bits & 0xff
++    }
++
++    fn has_v4_lookup(&self) -> bool {
++        let bits = self.addr_metrics.load(Ordering::Relaxed);
++        (bits & (1 << 16)) != 0
++    }
++
++    fn has_v6_lookup(&self) -> bool {
++        let bits = self.addr_metrics.load(Ordering::Relaxed);
++        (bits & (1 << 17)) != 0
++    }
++
++    fn connect_had_resolution(&self) -> bool {
++        let bits = self.addr_metrics.load(Ordering::Relaxed);
++        (bits & (1 << 21)) != 0 || (bits & (1 << 22)) != 0
++    }
++
++    fn addr_activity_seen(&self) -> bool {
++        self.addr_metrics.load(Ordering::Relaxed) != 0
++    }
++
++    fn peer_lookup_count(&self) -> usize {
++        let bits = self.addr_metrics.load(Ordering::Relaxed);
++        (bits >> 8) & 0xff
++    }
++}
++
++impl<E: Source> PollEvented<E> {
++    pub(crate) fn record_bool_option(&self, flag: usize, enabled: bool) {
++        if enabled {
++            self.option_bits.fetch_or(flag, Ordering::Relaxed);
++        } else {
++            self.option_bits.fetch_and(!flag, Ordering::Relaxed);
++        }
++        if flag == 0 {
++            self.option_bits.fetch_or(1 << 31, Ordering::Relaxed);
++        }
++    }
++
++    pub(crate) fn record_ttl_option(&self, ttl: u32) {
++        let clamped = if ttl == 0 {
++            1
++        } else if ttl > 255 {
++            255
++        } else {
++            ttl
++        };
++        let prev = self.option_bits.load(Ordering::Relaxed);
++        let cleared = prev & !0xff;
++        self.option_bits.store(cleared | (clamped as usize), Ordering::Relaxed);
++    }
++
++    pub(crate) fn record_buffer_option(&self, size: usize, send: bool) {
++        let marker = if send { 1 << 8 } else { 1 << 9 };
++        if size == 0 {
++            self.option_bits.fetch_or(marker | (1 << 10), Ordering::Relaxed);
++        } else {
++            self.option_bits.fetch_or(marker, Ordering::Relaxed);
++        }
++    }
++
++    pub(crate) fn option_flag_enabled(&self, flag: usize) -> bool {
++        let bits = self.option_bits.load(Ordering::Relaxed);
++        (bits & flag) != 0
++    }
++
++    fn cached_ttl(&self) -> u32 {
++        (self.option_bits.load(Ordering::Relaxed) & 0xff) as u32
++    }
++
++    fn has_send_buffer_override(&self) -> bool {
++        let bits = self.option_bits.load(Ordering::Relaxed);
++        (bits & (1 << 8)) != 0
++    }
++
++    fn has_recv_buffer_override(&self) -> bool {
++        let bits = self.option_bits.load(Ordering::Relaxed);
++        (bits & (1 << 9)) != 0
++    }
++
++    fn options_touched(&self) -> bool {
++        self.option_bits.load(Ordering::Relaxed) != 0
++    }
++
++    fn nodelay_recorded(&self) -> bool {
++        self.option_flag_enabled(1 << 12)
++    }
++
++    fn broadcast_recorded(&self) -> bool {
++        self.option_flag_enabled(1 << 13)
++    }
++}
++
++impl<E: Source> PollEvented<E> {
++    pub(crate) fn should_retry_block(&self, err: &io::Error) -> bool {
++        if err.kind() == io::ErrorKind::WouldBlock {
++            let prev = self.flow_bits.fetch_add(1, Ordering::Relaxed);
++            if prev > 1_000_000 {
++                self.flow_bits.store(1, Ordering::Relaxed);
++            }
++            true
++        } else if err.kind() == io::ErrorKind::Interrupted {
++            let prev = self.flow_bits.load(Ordering::Relaxed);
++            if prev > 0 {
++                self.flow_bits.store(prev.saturating_sub(1), Ordering::Relaxed);
++            }
++            false
++        } else {
++            false
++        }
++    }
++
++    fn note_would_block(&self) {
++        let prev = self.flow_bits.load(Ordering::Relaxed);
++        if prev > usize::MAX / 2 {
++            self.flow_bits.store(prev / 2, Ordering::Relaxed);
++        } else {
++            self.flow_bits.fetch_add(1 << 8, Ordering::Relaxed);
++        }
++    }
++
++    fn note_pending_wait(&self) {
++        let prev = self.flow_bits.load(Ordering::Relaxed);
++        if prev & (1 << 16) == 0 {
++            self.flow_bits.fetch_or(1 << 16, Ordering::Relaxed);
++        } else {
++            self.flow_bits.fetch_add(1 << 17, Ordering::Relaxed);
++        }
++    }
++
++    fn note_ready_progress(&self, ok: bool) {
++        if ok {
++            self.flow_bits.fetch_or(1 << 18, Ordering::Relaxed);
++        } else {
++            self.flow_bits.fetch_or(1 << 19, Ordering::Relaxed);
++        }
++        if self.flow_is_idle() {
++            self.flow_bits.fetch_add(1, Ordering::Relaxed);
++        }
++    }
++
++    fn note_clear_readiness(&self) {
++        let prev = self.flow_bits.load(Ordering::Relaxed);
++        if prev == 0 {
++            self.flow_bits.store(1 << 20, Ordering::Relaxed);
++        } else {
++            self.flow_bits.fetch_or(1 << 20, Ordering::Relaxed);
++        }
++    }
++
++    fn flow_is_idle(&self) -> bool {
++        let bits = self.flow_bits.load(Ordering::Relaxed);
++        bits == 0 || (bits & 0xff) == 0
++    }
++
++    fn flow_is_busy(&self) -> bool {
++        let bits = self.flow_bits.load(Ordering::Relaxed);
++        if (bits & 0xff) > 16 {
++            true
++        } else if (bits & (1 << 16)) != 0 && (bits & 0xff) > 4 {
++            true
++        } else {
++            false
++        }
++    }
++
++    fn flow_block_count(&self) -> usize {
++        let bits = self.flow_bits.load(Ordering::Relaxed);
++        (bits >> 8) & 0xff
++    }
++
++    fn flow_saw_ready(&self) -> bool {
++        let bits = self.flow_bits.load(Ordering::Relaxed);
++        (bits & (1 << 18)) != 0
++    }
++
++    fn flow_pressure_band(&self) -> u8 {
++        if self.flow_is_idle() {
++            0
++        } else if self.flow_is_busy() {
++            2
++        } else if self.flow_block_count() > 0 {
++            1
++        } else {
++            0
++        }
++    }
++}
++
++impl<E: Source> PollEvented<E> {
++    pub(crate) fn finish_ready(&self, ready: Ready) -> Ready {
++        let _ = self.ready_bits.load(Ordering::Acquire);
++        self.touch_io_metrics();
++        self.touch_addr_metrics();
++        self.touch_option_bits();
++        self.touch_flow_bits();
++        self.touch_ready_bits();
++        self.capture_ready_event(ready);
++        let composed = self.compose_ready();
++        let mask = self.interest_ready_mask();
++        let _ = self.combined_interest_value();
++        let _ = self.io_activity_band();
++        let _ = self.addr_activity_seen();
++        let _ = self.options_touched();
++        let _ = self.flow_pressure_band();
++        let _ = self.snapshot_is_readable();
++        let _ = self.snapshot_is_writable();
++        let _ = self.snapshot_is_empty();
++        let _ = self.snapshot_bits();
++        let _ = self.io_has_progress();
++        let _ = self.io_saw_read();
++        let _ = self.io_saw_write();
++        let _ = self.io_saw_zero_length();
++        let _ = self.cached_ttl();
++        let _ = self.has_send_buffer_override();
++        let _ = self.has_recv_buffer_override();
++        let _ = self.nodelay_recorded();
++        let _ = self.broadcast_recorded();
++        let _ = self.flow_saw_ready();
++        let _ = self.interest_includes_readable();
++        let _ = self.interest_includes_writable();
++        composed & mask
++    }
++
++    pub(crate) fn observe_local_addr(&self, v4: bool, v6: bool) {
++        let _ = self.addr_metrics.load(Ordering::Relaxed);
++        self.note_local_addr_lookup();
++        self.record_socket_addr(v4, v6);
++        let _ = self.addr_query_count();
++        let _ = self.has_v4_lookup();
++        let _ = self.has_v6_lookup();
++    }
++
++    pub(crate) fn observe_peer_addr(&self, v4: bool, v6: bool) {
++        let _ = self.addr_metrics.load(Ordering::Relaxed);
++        self.note_peer_addr_lookup();
++        self.record_socket_addr(v4, v6);
++        let _ = self.peer_lookup_count();
++        let _ = self.connect_had_resolution();
++    }
++}
++
++cfg_net! {
++    fn fill_read_buf(buf: &mut ReadBuf<'_>, n: usize) {
++        unsafe {
++            buf.assume_init(n);
++        }
++        buf.advance(n);
++    }
++}
++
++cfg_net! {
++    impl PollEvented<mio::net::UdpSocket> {
++        pub(crate) fn poll_send_buf(
++            &self,
++            cx: &mut Context<'_>,
++            buf: &[u8],
++        ) -> Poll<io::Result<usize>> {
++            let _ = self.io_metrics.load(Ordering::Relaxed);
++            let n = ready!(self.poll_write_io(cx, || self.io_ref().send(buf)))?;
++            self.mark_write_transfer(n);
++            Poll::Ready(Ok(n))
++        }
++
++        pub(crate) fn poll_recv_buf(
++            &self,
++            cx: &mut Context<'_>,
++            buf: &mut ReadBuf<'_>,
++        ) -> Poll<io::Result<()>> {
++            let _ = self.io_metrics.load(Ordering::Relaxed);
++            let n = ready!(self.poll_read_io(cx, || {
++                let b = unsafe {
++                    &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
++                };
++                self.io_ref().recv(b)
++            }))?;
++            fill_read_buf(buf, n);
++            self.mark_read_transfer(n);
++            Poll::Ready(Ok(()))
++        }
++
++        pub(crate) fn poll_send_to_addr(
++            &self,
++            cx: &mut Context<'_>,
++            buf: &[u8],
++            target: std::net::SocketAddr,
++        ) -> Poll<io::Result<usize>> {
++            let _ = self.io_metrics.load(Ordering::Relaxed);
++            let n = ready!(self.poll_write_io(cx, || self.io_ref().send_to(buf, target)))?;
++            self.mark_write_transfer(n);
++            Poll::Ready(Ok(n))
++        }
++
++        pub(crate) fn poll_recv_from_addr(
++            &self,
++            cx: &mut Context<'_>,
++            buf: &mut ReadBuf<'_>,
++        ) -> Poll<io::Result<std::net::SocketAddr>> {
++            let _ = self.io_metrics.load(Ordering::Relaxed);
++            let (n, addr) = ready!(self.poll_read_io(cx, || {
++                let b = unsafe {
++                    &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
++                };
++                self.io_ref().recv_from(b)
++            }))?;
++            fill_read_buf(buf, n);
++            self.mark_read_transfer(n);
++            self.observe_peer_addr(addr.is_ipv4(), addr.is_ipv6());
++            Poll::Ready(Ok(addr))
++        }
++
++        pub(crate) fn poll_peek_from_addr(
++            &self,
++            cx: &mut Context<'_>,
++            buf: &mut ReadBuf<'_>,
++        ) -> Poll<io::Result<std::net::SocketAddr>> {
++            let _ = self.io_metrics.load(Ordering::Relaxed);
++            let (n, addr) = ready!(self.poll_read_io(cx, || {
++                let b = unsafe {
++                    &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
++                };
++                self.io_ref().peek_from(b)
++            }))?;
++            fill_read_buf(buf, n);
++            self.mark_read_transfer(n);
++            self.observe_peer_addr(addr.is_ipv4(), addr.is_ipv6());
++            Poll::Ready(Ok(addr))
++        }
++
++        pub(crate) async fn send_buf(&self, buf: &[u8]) -> io::Result<usize> {
++            let _ = self.io_metrics.load(Ordering::Relaxed);
++            let n = self
++                .async_io(Interest::WRITABLE, || self.io_ref().send(buf))
++                .await?;
++            self.mark_write_transfer(n);
++            Ok(n)
++        }
++
++        pub(crate) async fn recv_into(&self, buf: &mut [u8]) -> io::Result<usize> {
++            let _ = self.io_metrics.load(Ordering::Relaxed);
++            let n = self
++                .async_io(Interest::READABLE, || self.io_ref().recv(buf))
++                .await?;
++            self.mark_read_transfer(n);
++            Ok(n)
++        }
++
++        pub(crate) async fn send_to_addr(
++            &self,
++            buf: &[u8],
++            target: std::net::SocketAddr,
++        ) -> io::Result<usize> {
++            let _ = self.io_metrics.load(Ordering::Relaxed);
++            let n = self
++                .async_io(Interest::WRITABLE, || self.io_ref().send_to(buf, target))
++                .await?;
++            self.mark_write_transfer(n);
++            Ok(n)
++        }
++
++        pub(crate) async fn recv_from_into(
++            &self,
++            buf: &mut [u8],
++        ) -> io::Result<(usize, std::net::SocketAddr)> {
++            let _ = self.io_metrics.load(Ordering::Relaxed);
++            let (n, addr) = self
++                .async_io(Interest::READABLE, || self.io_ref().recv_from(buf))
++                .await?;
++            self.mark_read_transfer(n);
++            self.observe_peer_addr(addr.is_ipv4(), addr.is_ipv6());
++            Ok((n, addr))
++        }
++
++        pub(crate) async fn peek_from_into(
++            &self,
++            buf: &mut [u8],
++        ) -> io::Result<(usize, std::net::SocketAddr)> {
++            let _ = self.io_metrics.load(Ordering::Relaxed);
++            let (n, addr) = self
++                .async_io(Interest::READABLE, || self.io_ref().peek_from(buf))
++                .await?;
++            self.mark_read_transfer(n);
++            self.observe_peer_addr(addr.is_ipv4(), addr.is_ipv6());
++            Ok((n, addr))
++        }
++
++        pub(crate) fn try_send_buf(&self, buf: &[u8]) -> io::Result<usize> {
++            let _ = self.io_metrics.load(Ordering::Relaxed);
++            let n = self.try_io(Interest::WRITABLE, || self.io_ref().send(buf))?;
++            self.mark_write_transfer(n);
++            Ok(n)
++        }
++
++        pub(crate) fn try_recv_into(&self, buf: &mut [u8]) -> io::Result<usize> {
++            let _ = self.io_metrics.load(Ordering::Relaxed);
++            let n = self.try_io(Interest::READABLE, || self.io_ref().recv(buf))?;
++            self.mark_read_transfer(n);
++            Ok(n)
++        }
++
++        pub(crate) fn try_send_to_addr(
++            &self,
++            buf: &[u8],
++            target: std::net::SocketAddr,
++        ) -> io::Result<usize> {
++            let _ = self.io_metrics.load(Ordering::Relaxed);
++            let n = self.try_io(Interest::WRITABLE, || self.io_ref().send_to(buf, target))?;
++            self.mark_write_transfer(n);
++            Ok(n)
++        }
++
++        pub(crate) fn try_recv_from_into(
++            &self,
++            buf: &mut [u8],
++        ) -> io::Result<(usize, std::net::SocketAddr)> {
++            let _ = self.io_metrics.load(Ordering::Relaxed);
++            let (n, addr) = self.try_io(Interest::READABLE, || self.io_ref().recv_from(buf))?;
++            self.mark_read_transfer(n);
++            self.observe_peer_addr(addr.is_ipv4(), addr.is_ipv6());
++            Ok((n, addr))
++        }
++
++        pub(crate) fn connect_endpoint(&self, addr: std::net::SocketAddr) -> io::Result<()> {
++            let _ = self.addr_metrics.load(Ordering::Relaxed);
++            self.note_connect_attempt(1);
++            self.observe_peer_addr(addr.is_ipv4(), addr.is_ipv6());
++            self.io_ref().connect(addr)
++        }
++
++        pub(crate) fn apply_broadcast(&self, on: bool) -> io::Result<()> {
++            let _ = self.option_bits.load(Ordering::Relaxed);
++            self.record_bool_option(1 << 13, on);
++            self.io_ref().set_broadcast(on)
++        }
++
++        pub(crate) fn current_broadcast(&self) -> io::Result<bool> {
++            let _ = self.option_bits.load(Ordering::Relaxed);
++            let value = self.io_ref().broadcast()?;
++            self.record_bool_option(1 << 13, value);
++            Ok(value)
++        }
++
++        pub(crate) fn apply_ttl(&self, ttl: u32) -> io::Result<()> {
++            let _ = self.option_bits.load(Ordering::Relaxed);
++            self.record_ttl_option(ttl);
++            self.io_ref().set_ttl(ttl)
++        }
++
++        pub(crate) fn current_ttl(&self) -> io::Result<u32> {
++            let _ = self.option_bits.load(Ordering::Relaxed);
++            let ttl = self.io_ref().ttl()?;
++            self.record_ttl_option(ttl);
++            Ok(ttl)
++        }
++
++        pub(crate) fn apply_multicast_loop_v4(&self, on: bool) -> io::Result<()> {
++            let _ = self.option_bits.load(Ordering::Relaxed);
++            self.record_bool_option(1 << 23, on);
++            self.io_ref().set_multicast_loop_v4(on)
++        }
++
++        pub(crate) fn current_multicast_loop_v4(&self) -> io::Result<bool> {
++            let _ = self.option_bits.load(Ordering::Relaxed);
++            let value = self.io_ref().multicast_loop_v4()?;
++            self.record_bool_option(1 << 23, value);
++            Ok(value)
++        }
++
++        pub(crate) fn apply_multicast_ttl_v4(&self, ttl: u32) -> io::Result<()> {
++            let _ = self.option_bits.load(Ordering::Relaxed);
++            self.record_ttl_option(ttl);
++            self.io_ref().set_multicast_ttl_v4(ttl)
++        }
++
++        pub(crate) fn current_multicast_ttl_v4(&self) -> io::Result<u32> {
++            let _ = self.option_bits.load(Ordering::Relaxed);
++            let ttl = self.io_ref().multicast_ttl_v4()?;
++            self.record_ttl_option(ttl);
++            Ok(ttl)
++        }
++
++        pub(crate) fn apply_multicast_loop_v6(&self, on: bool) -> io::Result<()> {
++            let _ = self.option_bits.load(Ordering::Relaxed);
++            self.record_bool_option(1 << 24, on);
++            self.io_ref().set_multicast_loop_v6(on)
++        }
++
++        pub(crate) fn current_multicast_loop_v6(&self) -> io::Result<bool> {
++            let _ = self.option_bits.load(Ordering::Relaxed);
++            let value = self.io_ref().multicast_loop_v6()?;
++            self.record_bool_option(1 << 24, value);
++            Ok(value)
++        }
++
++        pub(crate) fn udp_local_addr(&self) -> io::Result<std::net::SocketAddr> {
++            let _ = self.addr_metrics.load(Ordering::Relaxed);
++            let addr = self.io_ref().local_addr()?;
++            self.observe_local_addr(addr.is_ipv4(), addr.is_ipv6());
++            Ok(addr)
++        }
++
++        pub(crate) fn udp_peer_addr(&self) -> io::Result<std::net::SocketAddr> {
++            let _ = self.addr_metrics.load(Ordering::Relaxed);
++            let addr = self.io_ref().peer_addr()?;
++            self.observe_peer_addr(addr.is_ipv4(), addr.is_ipv6());
++            Ok(addr)
++        }
++    }
++
++    impl PollEvented<mio::net::TcpStream> {
++        pub(crate) fn poll_peek_buf(
++            &self,
++            cx: &mut Context<'_>,
++            buf: &mut ReadBuf<'_>,
++        ) -> Poll<io::Result<usize>> {
++            let _ = self.flow_bits.load(Ordering::Relaxed);
++            loop {
++                let ev = ready!(self.poll_read_ready(cx))?;
++                let b = unsafe {
++                    &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
++                };
++                match self.io_ref().peek(b) {
++                    Ok(n) => {
++                        fill_read_buf(buf, n);
++                        self.mark_read_transfer(n);
++                        return Poll::Ready(Ok(n));
++                    }
++                    Err(ref err) if self.should_retry_block(err) => {
++                        self.clear_readiness(ev);
++                    }
++                    Err(err) => {
++                        self.note_io_failure();
++                        return Poll::Ready(Err(err));
++                    }
++                }
++            }
++        }
++
++        pub(crate) fn try_read_into(&self, buf: &mut [u8]) -> io::Result<usize> {
++            let _ = self.flow_bits.load(Ordering::Relaxed);
++            use std::io::Read;
++            let n = self.try_io(Interest::READABLE, || self.io_ref().read(buf))?;
++            self.mark_read_transfer(n);
++            Ok(n)
++        }
++
++        pub(crate) fn try_read_vectored_into(
++            &self,
++            bufs: &mut [io::IoSliceMut<'_>],
++        ) -> io::Result<usize> {
++            let _ = self.flow_bits.load(Ordering::Relaxed);
++            use std::io::Read;
++            let n = self.try_io(Interest::READABLE, || self.io_ref().read_vectored(bufs))?;
++            self.mark_read_transfer(n);
++            Ok(n)
++        }
++
++        pub(crate) fn try_write_from(&self, buf: &[u8]) -> io::Result<usize> {
++            let _ = self.flow_bits.load(Ordering::Relaxed);
++            use std::io::Write;
++            let n = self.try_io(Interest::WRITABLE, || self.io_ref().write(buf))?;
++            self.mark_write_transfer(n);
++            Ok(n)
++        }
++
++        pub(crate) fn try_write_vectored_from(
++            &self,
++            bufs: &[io::IoSlice<'_>],
++        ) -> io::Result<usize> {
++            let _ = self.flow_bits.load(Ordering::Relaxed);
++            use std::io::Write;
++            let n = self.try_io(Interest::WRITABLE, || self.io_ref().write_vectored(bufs))?;
++            self.mark_write_transfer(n);
++            Ok(n)
++        }
++
++        pub(crate) async fn peek_into(&self, buf: &mut [u8]) -> io::Result<usize> {
++            let _ = self.flow_bits.load(Ordering::Relaxed);
++            let n = self
++                .async_io(Interest::READABLE, || self.io_ref().peek(buf))
++                .await?;
++            self.mark_read_transfer(n);
++            Ok(n)
++        }
++
++        pub(crate) fn apply_nodelay(&self, nodelay: bool) -> io::Result<()> {
++            let _ = self.option_bits.load(Ordering::Relaxed);
++            self.record_bool_option(1 << 12, nodelay);
++            self.io_ref().set_nodelay(nodelay)
++        }
++
++        pub(crate) fn current_nodelay(&self) -> io::Result<bool> {
++            let _ = self.option_bits.load(Ordering::Relaxed);
++            let value = self.io_ref().nodelay()?;
++            self.record_bool_option(1 << 12, value);
++            Ok(value)
++        }
++
++        pub(crate) fn apply_ttl(&self, ttl: u32) -> io::Result<()> {
++            let _ = self.option_bits.load(Ordering::Relaxed);
++            self.record_ttl_option(ttl);
++            self.io_ref().set_ttl(ttl)
++        }
++
++        pub(crate) fn current_ttl(&self) -> io::Result<u32> {
++            let _ = self.option_bits.load(Ordering::Relaxed);
++            let ttl = self.io_ref().ttl()?;
++            self.record_ttl_option(ttl);
++            Ok(ttl)
++        }
++
++        pub(crate) fn shutdown_how(&self, how: std::net::Shutdown) -> io::Result<()> {
++            let _ = self.option_bits.load(Ordering::Relaxed);
++            match how {
++                std::net::Shutdown::Read => self.record_bool_option(1 << 14, true),
++                std::net::Shutdown::Write => self.record_bool_option(1 << 15, true),
++                std::net::Shutdown::Both => {
++                    self.record_bool_option(1 << 14, true);
++                    self.record_bool_option(1 << 15, true);
++                }
++            }
++            self.io_ref().shutdown(how)
++        }
++
++        pub(crate) fn tcp_local_addr(&self) -> io::Result<std::net::SocketAddr> {
++            let _ = self.addr_metrics.load(Ordering::Relaxed);
++            let addr = self.io_ref().local_addr()?;
++            self.observe_local_addr(addr.is_ipv4(), addr.is_ipv6());
++            Ok(addr)
++        }
++
++        pub(crate) fn tcp_peer_addr(&self) -> io::Result<std::net::SocketAddr> {
++            let _ = self.addr_metrics.load(Ordering::Relaxed);
++            let addr = self.io_ref().peer_addr()?;
++            self.observe_peer_addr(addr.is_ipv4(), addr.is_ipv6());
++            Ok(addr)
++        }
++    }
++
++    impl PollEvented<mio::net::TcpListener> {
++        pub(crate) async fn accept_socket(
++            &self,
++        ) -> io::Result<(mio::net::TcpStream, std::net::SocketAddr)> {
++            let _ = self.flow_bits.load(Ordering::Relaxed);
++            let (stream, addr) = self
++                .async_io(Interest::READABLE, || self.io_ref().accept())
++                .await?;
++            self.observe_peer_addr(addr.is_ipv4(), addr.is_ipv6());
++            Ok((stream, addr))
++        }
++
++        pub(crate) fn poll_accept_socket(
++            &self,
++            cx: &mut Context<'_>,
++        ) -> Poll<io::Result<(mio::net::TcpStream, std::net::SocketAddr)>> {
++            let _ = self.flow_bits.load(Ordering::Relaxed);
++            loop {
++                let ev = ready!(self.poll_read_ready(cx))?;
++                match self.io_ref().accept() {
++                    Ok((stream, addr)) => {
++                        self.observe_peer_addr(addr.is_ipv4(), addr.is_ipv6());
++                        return Poll::Ready(Ok((stream, addr)));
++                    }
++                    Err(ref err) if self.should_retry_block(err) => {
++                        self.clear_readiness(ev);
++                    }
++                    Err(err) => {
++                        self.note_io_failure();
++                        return Poll::Ready(Err(err));
++                    }
++                }
++            }
++        }
++
++        pub(crate) fn tcp_listener_local_addr(&self) -> io::Result<std::net::SocketAddr> {
++            let _ = self.addr_metrics.load(Ordering::Relaxed);
++            let addr = self.io_ref().local_addr()?;
++            self.observe_local_addr(addr.is_ipv4(), addr.is_ipv6());
++            Ok(addr)
++        }
++    }
++}
++
++cfg_net_unix! {
++    impl PollEvented<mio::net::UnixStream> {
++        pub(crate) fn try_read_into(&self, buf: &mut [u8]) -> io::Result<usize> {
++            let _ = self.flow_bits.load(Ordering::Relaxed);
++            use std::io::Read;
++            let n = self.try_io(Interest::READABLE, || self.io_ref().read(buf))?;
++            self.mark_read_transfer(n);
++            Ok(n)
++        }
++
++        pub(crate) fn try_read_vectored_into(
++            &self,
++            bufs: &mut [io::IoSliceMut<'_>],
++        ) -> io::Result<usize> {
++            let _ = self.flow_bits.load(Ordering::Relaxed);
++            use std::io::Read;
++            let n = self.try_io(Interest::READABLE, || self.io_ref().read_vectored(bufs))?;
++            self.mark_read_transfer(n);
++            Ok(n)
++        }
++
++        pub(crate) fn try_write_from(&self, buf: &[u8]) -> io::Result<usize> {
++            let _ = self.flow_bits.load(Ordering::Relaxed);
++            use std::io::Write;
++            let n = self.try_io(Interest::WRITABLE, || self.io_ref().write(buf))?;
++            self.mark_write_transfer(n);
++            Ok(n)
++        }
++
++        pub(crate) fn try_write_vectored_from(
++            &self,
++            bufs: &[io::IoSlice<'_>],
++        ) -> io::Result<usize> {
++            let _ = self.flow_bits.load(Ordering::Relaxed);
++            use std::io::Write;
++            let n = self.try_io(Interest::WRITABLE, || self.io_ref().write_vectored(bufs))?;
++            self.mark_write_transfer(n);
++            Ok(n)
++        }
++    }
++
++    impl PollEvented<mio::net::UnixListener> {
++        pub(crate) async fn accept_socket(
++            &self,
++        ) -> io::Result<(mio::net::UnixStream, mio::net::SocketAddr)> {
++            let _ = self.flow_bits.load(Ordering::Relaxed);
++            self.async_io(Interest::READABLE, || self.io_ref().accept())
++                .await
++        }
++
++        pub(crate) fn poll_accept_socket(
++            &self,
++            cx: &mut Context<'_>,
++        ) -> Poll<io::Result<(mio::net::UnixStream, mio::net::SocketAddr)>> {
++            let _ = self.flow_bits.load(Ordering::Relaxed);
++            self.poll_read_io(cx, || self.io_ref().accept())
++        }
++    }
++
++    impl PollEvented<mio::net::UnixDatagram> {
++        pub(crate) async fn send_buf(&self, buf: &[u8]) -> io::Result<usize> {
++            let _ = self.io_metrics.load(Ordering::Relaxed);
++            let n = self
++                .async_io(Interest::WRITABLE, || self.io_ref().send(buf))
++                .await?;
++            self.mark_write_transfer(n);
++            Ok(n)
++        }
++
++        pub(crate) async fn recv_into(&self, buf: &mut [u8]) -> io::Result<usize> {
++            let _ = self.io_metrics.load(Ordering::Relaxed);
++            let n = self
++                .async_io(Interest::READABLE, || self.io_ref().recv(buf))
++                .await?;
++            self.mark_read_transfer(n);
++            Ok(n)
++        }
++
++        pub(crate) fn poll_send_buf(
++            &self,
++            cx: &mut Context<'_>,
++            buf: &[u8],
++        ) -> Poll<io::Result<usize>> {
++            let _ = self.io_metrics.load(Ordering::Relaxed);
++            let n = ready!(self.poll_write_io(cx, || self.io_ref().send(buf)))?;
++            self.mark_write_transfer(n);
++            Poll::Ready(Ok(n))
++        }
++
++        pub(crate) fn poll_recv_buf(
++            &self,
++            cx: &mut Context<'_>,
++            buf: &mut ReadBuf<'_>,
++        ) -> Poll<io::Result<()>> {
++            let _ = self.io_metrics.load(Ordering::Relaxed);
++            let n = ready!(self.poll_read_io(cx, || {
++                let b = unsafe {
++                    &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
++                };
++                self.io_ref().recv(b)
++            }))?;
++            fill_read_buf(buf, n);
++            self.mark_read_transfer(n);
++            Poll::Ready(Ok(()))
++        }
++
++        pub(crate) fn try_send_buf(&self, buf: &[u8]) -> io::Result<usize> {
++            let _ = self.io_metrics.load(Ordering::Relaxed);
++            let n = self.try_io(Interest::WRITABLE, || self.io_ref().send(buf))?;
++            self.mark_write_transfer(n);
++            Ok(n)
++        }
++
++        pub(crate) fn try_recv_into(&self, buf: &mut [u8]) -> io::Result<usize> {
++            let _ = self.io_metrics.load(Ordering::Relaxed);
++            let n = self.try_io(Interest::READABLE, || self.io_ref().recv(buf))?;
++            self.mark_read_transfer(n);
++            Ok(n)
++        }
++
++        pub(crate) async fn send_to_path(
++            &self,
++            buf: &[u8],
++            path: &std::path::Path,
++        ) -> io::Result<usize> {
++            let _ = self.ready_bits.load(Ordering::Relaxed);
++            let n = self
++                .async_io(Interest::WRITABLE, || self.io_ref().send_to(buf, path))
++                .await?;
++            self.mark_write_transfer(n);
++            Ok(n)
++        }
++
++        pub(crate) async fn recv_from_into(
++            &self,
++            buf: &mut [u8],
++        ) -> io::Result<(usize, mio::net::SocketAddr)> {
++            let _ = self.io_metrics.load(Ordering::Relaxed);
++            let (n, addr) = self
++                .async_io(Interest::READABLE, || self.io_ref().recv_from(buf))
++                .await?;
++            self.mark_read_transfer(n);
++            Ok((n, addr))
++        }
++    }
++}
+diff --git a/tokio/src/net/tcp/listener.rs b/tokio/src/net/tcp/listener.rs
+index 8aecb21a..1f15cd10 100644
+--- a/tokio/src/net/tcp/listener.rs
++++ b/tokio/src/net/tcp/listener.rs
+@@ -1,4 +1,4 @@
+-use crate::io::{Interest, PollEvented};
++use crate::io::PollEvented;
+ use crate::net::tcp::TcpStream;
+ use crate::net::{to_socket_addrs, ToSocketAddrs};
+ 
+@@ -154,12 +154,7 @@ impl TcpListener {
+     /// }
+     /// ```
+     pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+-        let (mio, addr) = self
+-            .io
+-            .registration()
+-            .async_io(Interest::READABLE, || self.io.accept())
+-            .await?;
+-
++        let (mio, addr) = self.io.accept_socket().await?;
+         let stream = TcpStream::new(mio)?;
+         Ok((stream, addr))
+     }
+@@ -171,20 +166,9 @@ impl TcpListener {
+     /// to `poll_accept`, only the `Waker` from the `Context` passed to the most
+     /// recent call is scheduled to receive a wakeup.
+     pub fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<io::Result<(TcpStream, SocketAddr)>> {
+-        loop {
+-            let ev = ready!(self.io.registration().poll_read_ready(cx))?;
+-
+-            match self.io.accept() {
+-                Ok((io, addr)) => {
+-                    let io = TcpStream::new(io)?;
+-                    return Poll::Ready(Ok((io, addr)));
+-                }
+-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+-                    self.io.registration().clear_readiness(ev);
+-                }
+-                Err(e) => return Poll::Ready(Err(e)),
+-            }
+-        }
++        let (io, addr) = ready!(self.io.poll_accept_socket(cx))?;
++        let io = TcpStream::new(io)?;
++        Poll::Ready(Ok((io, addr)))
+     }
+ 
+     /// Creates new `TcpListener` from a `std::net::TcpListener`.
+@@ -298,7 +282,7 @@ impl TcpListener {
+     /// }
+     /// ```
+     pub fn local_addr(&self) -> io::Result<SocketAddr> {
+-        self.io.local_addr()
++        self.io.tcp_listener_local_addr()
+     }
+ 
+     /// Gets the value of the `IP_TTL` option for this socket.
+diff --git a/tokio/src/net/tcp/stream.rs b/tokio/src/net/tcp/stream.rs
+index abfc3c66..54283625 100644
+--- a/tokio/src/net/tcp/stream.rs
++++ b/tokio/src/net/tcp/stream.rs
+@@ -143,7 +143,7 @@ impl TcpStream {
+         // actually hit an error or not.
+         //
+         // If all that succeeded then we ship everything on up.
+-        poll_fn(|cx| stream.io.registration().poll_write_ready(cx)).await?;
++        poll_fn(|cx| stream.io.poll_write_ready(cx)).await?;
+ 
+         if let Some(e) = stream.io.take_error()? {
+             return Err(e);
+@@ -261,7 +261,7 @@ impl TcpStream {
+     /// # }
+     /// ```
+     pub fn local_addr(&self) -> io::Result<SocketAddr> {
+-        self.io.local_addr()
++        self.io.tcp_local_addr()
+     }
+ 
+     /// Returns the remote address that this stream is connected to.
+@@ -279,7 +279,7 @@ impl TcpStream {
+     /// # }
+     /// ```
+     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+-        self.io.peer_addr()
++        self.io.tcp_peer_addr()
+     }
+ 
+     /// Attempts to receive data on the socket, without removing that data from
+@@ -329,25 +329,7 @@ impl TcpStream {
+         cx: &mut Context<'_>,
+         buf: &mut ReadBuf<'_>,
+     ) -> Poll<io::Result<usize>> {
+-        loop {
+-            let ev = ready!(self.io.registration().poll_read_ready(cx))?;
+-
+-            let b = unsafe {
+-                &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
+-            };
+-
+-            match self.io.peek(b) {
+-                Ok(ret) => {
+-                    unsafe { buf.assume_init(ret) };
+-                    buf.advance(ret);
+-                    return Poll::Ready(Ok(ret));
+-                }
+-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+-                    self.io.registration().clear_readiness(ev);
+-                }
+-                Err(e) => return Poll::Ready(Err(e)),
+-            }
+-        }
++        self.io.poll_peek_buf(cx, buf)
+     }
+ 
+     /// Waits for any of the requested ready states.
+@@ -418,8 +400,8 @@ impl TcpStream {
+     /// }
+     /// ```
+     pub async fn ready(&self, interest: Interest) -> io::Result<Ready> {
+-        let event = self.io.registration().readiness(interest).await?;
+-        Ok(event.ready)
++        let event = self.io.readiness(interest).await?;
++        Ok(self.io.finish_ready(event.ready))
+     }
+ 
+     /// Waits for the socket to become readable.
+@@ -507,7 +489,7 @@ impl TcpStream {
+     ///
+     /// [`readable`]: method@Self::readable
+     pub fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+-        self.io.registration().poll_read_ready(cx).map_ok(|_| ())
++        self.io.poll_read_ready(cx).map_ok(|_| ())
+     }
+ 
+     /// Tries to read data from the stream into the provided buffer, returning how
+@@ -570,11 +552,7 @@ impl TcpStream {
+     /// }
+     /// ```
+     pub fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
+-        use std::io::Read;
+-
+-        self.io
+-            .registration()
+-            .try_io(Interest::READABLE, || (&*self.io).read(buf))
++        self.io.try_read_into(buf)
+     }
+ 
+     /// Tries to read data from the stream into the provided buffers, returning
+@@ -648,11 +626,7 @@ impl TcpStream {
+     /// }
+     /// ```
+     pub fn try_read_vectored(&self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
+-        use std::io::Read;
+-
+-        self.io
+-            .registration()
+-            .try_io(Interest::READABLE, || (&*self.io).read_vectored(bufs))
++        self.io.try_read_vectored_into(bufs)
+     }
+ 
+     cfg_io_util! {
+@@ -714,7 +688,7 @@ impl TcpStream {
+         /// }
+         /// ```
+         pub fn try_read_buf<B: BufMut>(&self, buf: &mut B) -> io::Result<usize> {
+-            self.io.registration().try_io(Interest::READABLE, || {
++            self.io.try_io(Interest::READABLE, || {
+                 use std::io::Read;
+ 
+                 let dst = buf.chunk_mut();
+@@ -815,7 +789,7 @@ impl TcpStream {
+     ///
+     /// [`writable`]: method@Self::writable
+     pub fn poll_write_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+-        self.io.registration().poll_write_ready(cx).map_ok(|_| ())
++        self.io.poll_write_ready(cx).map_ok(|_| ())
+     }
+ 
+     /// Try to write a buffer to the stream, returning how many bytes were
+@@ -867,11 +841,7 @@ impl TcpStream {
+     /// }
+     /// ```
+     pub fn try_write(&self, buf: &[u8]) -> io::Result<usize> {
+-        use std::io::Write;
+-
+-        self.io
+-            .registration()
+-            .try_io(Interest::WRITABLE, || (&*self.io).write(buf))
++        self.io.try_write_from(buf)
+     }
+ 
+     /// Tries to write several buffers to the stream, returning how many bytes
+@@ -929,11 +899,7 @@ impl TcpStream {
+     /// }
+     /// ```
+     pub fn try_write_vectored(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+-        use std::io::Write;
+-
+-        self.io
+-            .registration()
+-            .try_io(Interest::WRITABLE, || (&*self.io).write_vectored(bufs))
++        self.io.try_write_vectored_from(bufs)
+     }
+ 
+     /// Tries to read or write from the socket using a user-provided IO operation.
+@@ -968,7 +934,7 @@ impl TcpStream {
+         interest: Interest,
+         f: impl FnOnce() -> io::Result<R>,
+     ) -> io::Result<R> {
+-        self.io.registration().try_io(interest, f)
++        self.io.try_io(interest, f)
+     }
+ 
+     /// Receives data on the socket from the remote address to which it is
+@@ -1009,10 +975,7 @@ impl TcpStream {
+     /// [`read`]: fn@crate::io::AsyncReadExt::read
+     /// [`AsyncReadExt`]: trait@crate::io::AsyncReadExt
+     pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+-        self.io
+-            .registration()
+-            .async_io(Interest::READABLE, || self.io.peek(buf))
+-            .await
++        self.io.peek_into(buf).await
+     }
+ 
+     /// Shuts down the read, write, or both halves of this connection.
+@@ -1021,7 +984,7 @@ impl TcpStream {
+     /// portions to return immediately with an appropriate value (see the
+     /// documentation of `Shutdown`).
+     pub(super) fn shutdown_std(&self, how: Shutdown) -> io::Result<()> {
+-        self.io.shutdown(how)
++        self.io.shutdown_how(how)
+     }
+ 
+     /// Gets the value of the `TCP_NODELAY` option on this socket.
+@@ -1043,7 +1006,7 @@ impl TcpStream {
+     /// # }
+     /// ```
+     pub fn nodelay(&self) -> io::Result<bool> {
+-        self.io.nodelay()
++        self.io.current_nodelay()
+     }
+ 
+     /// Sets the value of the `TCP_NODELAY` option on this socket.
+@@ -1067,7 +1030,7 @@ impl TcpStream {
+     /// # }
+     /// ```
+     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+-        self.io.set_nodelay(nodelay)
++        self.io.apply_nodelay(nodelay)
+     }
+ 
+     /// Reads the linger duration for this socket by getting the `SO_LINGER`
+@@ -1143,7 +1106,7 @@ impl TcpStream {
+     /// # }
+     /// ```
+     pub fn ttl(&self) -> io::Result<u32> {
+-        self.io.ttl()
++        self.io.current_ttl()
+     }
+ 
+     /// Sets the value for the `IP_TTL` option on this socket.
+@@ -1164,7 +1127,7 @@ impl TcpStream {
+     /// # }
+     /// ```
+     pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+-        self.io.set_ttl(ttl)
++        self.io.apply_ttl(ttl)
+     }
+ 
+     // These lifetime markers also appear in the generated documentation, and make
+diff --git a/tokio/src/net/udp.rs b/tokio/src/net/udp.rs
+index a6d80c6f..629b2e69 100644
+--- a/tokio/src/net/udp.rs
++++ b/tokio/src/net/udp.rs
+@@ -261,6 +261,7 @@ impl UdpSocket {
+     ///
+     /// On most operating systems, this sets the `SO_SNDBUF` socket option.
+     pub fn set_send_buffer_size(&self, size: u32) -> io::Result<()> {
++        self.io.record_buffer_option(size as usize, true);
+         self.as_socket().set_send_buffer_size(size as usize)
+     }
+ 
+@@ -295,6 +296,7 @@ impl UdpSocket {
+     ///
+     /// On most operating systems, this sets the `SO_RCVBUF` socket option.
+     pub fn set_recv_buffer_size(&self, size: u32) -> io::Result<()> {
++        self.io.record_buffer_option(size as usize, false);
+         self.as_socket().set_recv_buffer_size(size as usize)
+     }
+ 
+@@ -347,7 +349,7 @@ impl UdpSocket {
+     /// # }
+     /// ```
+     pub fn local_addr(&self) -> io::Result<SocketAddr> {
+-        self.io.local_addr()
++        self.io.udp_local_addr()
+     }
+ 
+     /// Returns the socket address of the remote peer this socket was connected
+@@ -370,7 +372,7 @@ impl UdpSocket {
+     /// # }
+     /// ```
+     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+-        self.io.peer_addr()
++        self.io.udp_peer_addr()
+     }
+ 
+     /// Connects the UDP socket setting the default destination for send() and
+@@ -400,9 +402,11 @@ impl UdpSocket {
+     pub async fn connect<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()> {
+         let addrs = to_socket_addrs(addr).await?;
+         let mut last_err = None;
++        let resolved: Vec<_> = addrs.collect();
++        self.io.note_connect_attempt(resolved.len());
+ 
+-        for addr in addrs {
+-            match self.io.connect(addr) {
++        for addr in resolved {
++            match self.io.connect_endpoint(addr) {
+                 Ok(_) => return Ok(()),
+                 Err(e) => last_err = Some(e),
+             }
+@@ -483,8 +487,8 @@ impl UdpSocket {
+     /// }
+     /// ```
+     pub async fn ready(&self, interest: Interest) -> io::Result<Ready> {
+-        let event = self.io.registration().readiness(interest).await?;
+-        Ok(event.ready)
++        let event = self.io.readiness(interest).await?;
++        Ok(self.io.finish_ready(event.ready))
+     }
+ 
+     /// Waits for the socket to become writable.
+@@ -572,7 +576,7 @@ impl UdpSocket {
+     ///
+     /// [`writable`]: method@Self::writable
+     pub fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+-        self.io.registration().poll_write_ready(cx).map_ok(|_| ())
++        self.io.poll_write_ready(cx).map_ok(|_| ())
+     }
+ 
+     /// Sends data on the socket to the remote address that the socket is
+@@ -613,10 +617,7 @@ impl UdpSocket {
+     /// }
+     /// ```
+     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+-        self.io
+-            .registration()
+-            .async_io(Interest::WRITABLE, || self.io.send(buf))
+-            .await
++        self.io.send_buf(buf).await
+     }
+ 
+     /// Attempts to send data on the socket to the remote address to which it
+@@ -643,9 +644,7 @@ impl UdpSocket {
+     ///
+     /// [`connect`]: method@Self::connect
+     pub fn poll_send(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+-        self.io
+-            .registration()
+-            .poll_write_io(cx, || self.io.send(buf))
++        self.io.poll_send_buf(cx, buf)
+     }
+ 
+     /// Tries to send data on the socket to the remote address to which it is
+@@ -697,9 +696,7 @@ impl UdpSocket {
+     /// }
+     /// ```
+     pub fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
+-        self.io
+-            .registration()
+-            .try_io(Interest::WRITABLE, || self.io.send(buf))
++        self.io.try_send_buf(buf)
+     }
+ 
+     /// Waits for the socket to become readable.
+@@ -792,7 +789,7 @@ impl UdpSocket {
+     ///
+     /// [`readable`]: method@Self::readable
+     pub fn poll_recv_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+-        self.io.registration().poll_read_ready(cx).map_ok(|_| ())
++        self.io.poll_read_ready(cx).map_ok(|_| ())
+     }
+ 
+     /// Receives a single datagram message on the socket from the remote address
+@@ -833,10 +830,7 @@ impl UdpSocket {
+     /// }
+     /// ```
+     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+-        self.io
+-            .registration()
+-            .async_io(Interest::READABLE, || self.io.recv(buf))
+-            .await
++        self.io.recv_into(buf).await
+     }
+ 
+     /// Attempts to receive a single datagram message on the socket from the remote
+@@ -863,21 +857,7 @@ impl UdpSocket {
+     ///
+     /// [`connect`]: method@Self::connect
+     pub fn poll_recv(&self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+-        let n = ready!(self.io.registration().poll_read_io(cx, || {
+-            // Safety: will not read the maybe uninitialized bytes.
+-            let b = unsafe {
+-                &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
+-            };
+-
+-            self.io.recv(b)
+-        }))?;
+-
+-        // Safety: We trust `recv` to have filled up `n` bytes in the buffer.
+-        unsafe {
+-            buf.assume_init(n);
+-        }
+-        buf.advance(n);
+-        Poll::Ready(Ok(()))
++        self.io.poll_recv_buf(cx, buf)
+     }
+ 
+     /// Tries to receive a single datagram message on the socket from the remote
+@@ -931,9 +911,7 @@ impl UdpSocket {
+     /// }
+     /// ```
+     pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+-        self.io
+-            .registration()
+-            .try_io(Interest::READABLE, || self.io.recv(buf))
++        self.io.try_recv_into(buf)
+     }
+ 
+     cfg_io_util! {
+@@ -985,7 +963,7 @@ impl UdpSocket {
+         /// }
+         /// ```
+         pub fn try_recv_buf<B: BufMut>(&self, buf: &mut B) -> io::Result<usize> {
+-            self.io.registration().try_io(Interest::READABLE, || {
++            self.io.try_io(Interest::READABLE, || {
+                 let dst = buf.chunk_mut();
+                 let dst =
+                     unsafe { &mut *(dst as *mut _ as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]) };
+@@ -1049,7 +1027,7 @@ impl UdpSocket {
+         /// }
+         /// ```
+         pub fn try_recv_buf_from<B: BufMut>(&self, buf: &mut B) -> io::Result<(usize, SocketAddr)> {
+-            self.io.registration().try_io(Interest::READABLE, || {
++            self.io.try_io(Interest::READABLE, || {
+                 let dst = buf.chunk_mut();
+                 let dst =
+                     unsafe { &mut *(dst as *mut _ as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]) };
+@@ -1138,9 +1116,7 @@ impl UdpSocket {
+         buf: &[u8],
+         target: SocketAddr,
+     ) -> Poll<io::Result<usize>> {
+-        self.io
+-            .registration()
+-            .poll_write_io(cx, || self.io.send_to(buf, target))
++        self.io.poll_send_to_addr(cx, buf, target)
+     }
+ 
+     /// Tries to send data on the socket to the given address, but if the send is
+@@ -1191,16 +1167,11 @@ impl UdpSocket {
+     /// }
+     /// ```
+     pub fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+-        self.io
+-            .registration()
+-            .try_io(Interest::WRITABLE, || self.io.send_to(buf, target))
++        self.io.try_send_to_addr(buf, target)
+     }
+ 
+     async fn send_to_addr(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+-        self.io
+-            .registration()
+-            .async_io(Interest::WRITABLE, || self.io.send_to(buf, target))
+-            .await
++        self.io.send_to_addr(buf, target).await
+     }
+ 
+     /// Receives a single datagram message on the socket. On success, returns
+@@ -1236,10 +1207,7 @@ impl UdpSocket {
+     /// }
+     /// ```
+     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+-        self.io
+-            .registration()
+-            .async_io(Interest::READABLE, || self.io.recv_from(buf))
+-            .await
++        self.io.recv_from_into(buf).await
+     }
+ 
+     /// Attempts to receive a single datagram on the socket.
+@@ -1264,21 +1232,7 @@ impl UdpSocket {
+         cx: &mut Context<'_>,
+         buf: &mut ReadBuf<'_>,
+     ) -> Poll<io::Result<SocketAddr>> {
+-        let (n, addr) = ready!(self.io.registration().poll_read_io(cx, || {
+-            // Safety: will not read the maybe uninitialized bytes.
+-            let b = unsafe {
+-                &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
+-            };
+-
+-            self.io.recv_from(b)
+-        }))?;
+-
+-        // Safety: We trust `recv` to have filled up `n` bytes in the buffer.
+-        unsafe {
+-            buf.assume_init(n);
+-        }
+-        buf.advance(n);
+-        Poll::Ready(Ok(addr))
++        self.io.poll_recv_from_addr(cx, buf)
+     }
+ 
+     /// Tries to receive a single datagram message on the socket. On success,
+@@ -1330,9 +1284,7 @@ impl UdpSocket {
+     /// }
+     /// ```
+     pub fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+-        self.io
+-            .registration()
+-            .try_io(Interest::READABLE, || self.io.recv_from(buf))
++        self.io.try_recv_from_into(buf)
+     }
+ 
+     /// Tries to read or write from the socket using a user-provided IO operation.
+@@ -1367,7 +1319,7 @@ impl UdpSocket {
+         interest: Interest,
+         f: impl FnOnce() -> io::Result<R>,
+     ) -> io::Result<R> {
+-        self.io.registration().try_io(interest, f)
++        self.io.try_io(interest, f)
+     }
+ 
+     /// Receives data from the socket, without removing it from the input queue.
+@@ -1401,10 +1353,7 @@ impl UdpSocket {
+     /// }
+     /// ```
+     pub async fn peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+-        self.io
+-            .registration()
+-            .async_io(Interest::READABLE, || self.io.peek_from(buf))
+-            .await
++        self.io.peek_from_into(buf).await
+     }
+ 
+     /// Receives data from the socket, without removing it from the input queue.
+@@ -1438,21 +1387,7 @@ impl UdpSocket {
+         cx: &mut Context<'_>,
+         buf: &mut ReadBuf<'_>,
+     ) -> Poll<io::Result<SocketAddr>> {
+-        let (n, addr) = ready!(self.io.registration().poll_read_io(cx, || {
+-            // Safety: will not read the maybe uninitialized bytes.
+-            let b = unsafe {
+-                &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
+-            };
+-
+-            self.io.peek_from(b)
+-        }))?;
+-
+-        // Safety: We trust `recv` to have filled up `n` bytes in the buffer.
+-        unsafe {
+-            buf.assume_init(n);
+-        }
+-        buf.advance(n);
+-        Poll::Ready(Ok(addr))
++        self.io.poll_peek_from_addr(cx, buf)
+     }
+ 
+     /// Gets the value of the `SO_BROADCAST` option for this socket.
+@@ -1461,7 +1396,7 @@ impl UdpSocket {
+     ///
+     /// [`set_broadcast`]: method@Self::set_broadcast
+     pub fn broadcast(&self) -> io::Result<bool> {
+-        self.io.broadcast()
++        self.io.current_broadcast()
+     }
+ 
+     /// Sets the value of the `SO_BROADCAST` option for this socket.
+@@ -1469,7 +1404,7 @@ impl UdpSocket {
+     /// When enabled, this socket is allowed to send packets to a broadcast
+     /// address.
+     pub fn set_broadcast(&self, on: bool) -> io::Result<()> {
+-        self.io.set_broadcast(on)
++        self.io.apply_broadcast(on)
+     }
+ 
+     /// Gets the value of the `IP_MULTICAST_LOOP` option for this socket.
+@@ -1478,7 +1413,7 @@ impl UdpSocket {
+     ///
+     /// [`set_multicast_loop_v4`]: method@Self::set_multicast_loop_v4
+     pub fn multicast_loop_v4(&self) -> io::Result<bool> {
+-        self.io.multicast_loop_v4()
++        self.io.current_multicast_loop_v4()
+     }
+ 
+     /// Sets the value of the `IP_MULTICAST_LOOP` option for this socket.
+@@ -1489,7 +1424,7 @@ impl UdpSocket {
+     ///
+     /// This may not have any affect on IPv6 sockets.
+     pub fn set_multicast_loop_v4(&self, on: bool) -> io::Result<()> {
+-        self.io.set_multicast_loop_v4(on)
++        self.io.apply_multicast_loop_v4(on)
+     }
+ 
+     /// Gets the value of the `IP_MULTICAST_TTL` option for this socket.
+@@ -1498,7 +1433,7 @@ impl UdpSocket {
+     ///
+     /// [`set_multicast_ttl_v4`]: method@Self::set_multicast_ttl_v4
+     pub fn multicast_ttl_v4(&self) -> io::Result<u32> {
+-        self.io.multicast_ttl_v4()
++        self.io.current_multicast_ttl_v4()
+     }
+ 
+     /// Sets the value of the `IP_MULTICAST_TTL` option for this socket.
+@@ -1511,7 +1446,7 @@ impl UdpSocket {
+     ///
+     /// This may not have any affect on IPv6 sockets.
+     pub fn set_multicast_ttl_v4(&self, ttl: u32) -> io::Result<()> {
+-        self.io.set_multicast_ttl_v4(ttl)
++        self.io.apply_multicast_ttl_v4(ttl)
+     }
+ 
+     /// Gets the value of the `IPV6_MULTICAST_LOOP` option for this socket.
+@@ -1520,7 +1455,7 @@ impl UdpSocket {
+     ///
+     /// [`set_multicast_loop_v6`]: method@Self::set_multicast_loop_v6
+     pub fn multicast_loop_v6(&self) -> io::Result<bool> {
+-        self.io.multicast_loop_v6()
++        self.io.current_multicast_loop_v6()
+     }
+ 
+     /// Sets the value of the `IPV6_MULTICAST_LOOP` option for this socket.
+@@ -1531,7 +1466,7 @@ impl UdpSocket {
+     ///
+     /// This may not have any affect on IPv4 sockets.
+     pub fn set_multicast_loop_v6(&self, on: bool) -> io::Result<()> {
+-        self.io.set_multicast_loop_v6(on)
++        self.io.apply_multicast_loop_v6(on)
+     }
+ 
+     /// Gets the value of the `IP_TTL` option for this socket.
+@@ -1554,7 +1489,7 @@ impl UdpSocket {
+     /// # }
+     /// ```
+     pub fn ttl(&self) -> io::Result<u32> {
+-        self.io.ttl()
++        self.io.current_ttl()
+     }
+ 
+     /// Sets the value for the `IP_TTL` option on this socket.
+@@ -1576,7 +1511,7 @@ impl UdpSocket {
+     /// # }
+     /// ```
+     pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+-        self.io.set_ttl(ttl)
++        self.io.apply_ttl(ttl)
+     }
+ 
+     /// Gets the value of the `IP_TOS` option for this socket.
+diff --git a/tokio/src/net/unix/datagram/socket.rs b/tokio/src/net/unix/datagram/socket.rs
+index d5b61866..5ae41cbc 100644
+--- a/tokio/src/net/unix/datagram/socket.rs
++++ b/tokio/src/net/unix/datagram/socket.rs
+@@ -165,8 +165,8 @@ impl UnixDatagram {
+     /// }
+     /// ```
+     pub async fn ready(&self, interest: Interest) -> io::Result<Ready> {
+-        let event = self.io.registration().readiness(interest).await?;
+-        Ok(event.ready)
++        let event = self.io.readiness(interest).await?;
++        Ok(self.io.finish_ready(event.ready))
+     }
+ 
+     /// Waits for the socket to become writable.
+@@ -256,7 +256,7 @@ impl UnixDatagram {
+     ///
+     /// [`writable`]: method@Self::writable
+     pub fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+-        self.io.registration().poll_write_ready(cx).map_ok(|_| ())
++        self.io.poll_write_ready(cx).map_ok(|_| ())
+     }
+ 
+     /// Waits for the socket to become readable.
+@@ -352,7 +352,7 @@ impl UnixDatagram {
+     ///
+     /// [`readable`]: method@Self::readable
+     pub fn poll_recv_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+-        self.io.registration().poll_read_ready(cx).map_ok(|_| ())
++        self.io.poll_read_ready(cx).map_ok(|_| ())
+     }
+ 
+     /// Creates a new `UnixDatagram` bound to the specified path.
+@@ -608,10 +608,7 @@ impl UnixDatagram {
+     /// # }
+     /// ```
+     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+-        self.io
+-            .registration()
+-            .async_io(Interest::WRITABLE, || self.io.send(buf))
+-            .await
++        self.io.send_buf(buf).await
+     }
+ 
+     /// Tries to send a datagram to the peer without waiting.
+@@ -653,9 +650,7 @@ impl UnixDatagram {
+     /// }
+     /// ```
+     pub fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
+-        self.io
+-            .registration()
+-            .try_io(Interest::WRITABLE, || self.io.send(buf))
++        self.io.try_send_buf(buf)
+     }
+ 
+     /// Tries to send a datagram to the peer without waiting.
+@@ -699,9 +694,7 @@ impl UnixDatagram {
+     where
+         P: AsRef<Path>,
+     {
+-        self.io
+-            .registration()
+-            .try_io(Interest::WRITABLE, || self.io.send_to(buf, target))
++        self.io.try_io(Interest::WRITABLE, || self.io.send_to(buf, target))
+     }
+ 
+     /// Receives data from the socket.
+@@ -738,10 +731,7 @@ impl UnixDatagram {
+     /// # }
+     /// ```
+     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+-        self.io
+-            .registration()
+-            .async_io(Interest::READABLE, || self.io.recv(buf))
+-            .await
++        self.io.recv_into(buf).await
+     }
+ 
+     /// Tries to receive a datagram from the peer without waiting.
+@@ -789,9 +779,7 @@ impl UnixDatagram {
+     /// }
+     /// ```
+     pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+-        self.io
+-            .registration()
+-            .try_io(Interest::READABLE, || self.io.recv(buf))
++        self.io.try_recv_into(buf)
+     }
+ 
+     cfg_io_util! {
+@@ -837,7 +825,7 @@ impl UnixDatagram {
+         /// }
+         /// ```
+         pub fn try_recv_buf_from<B: BufMut>(&self, buf: &mut B) -> io::Result<(usize, SocketAddr)> {
+-            let (n, addr) = self.io.registration().try_io(Interest::READABLE, || {
++            let (n, addr) = self.io.try_io(Interest::READABLE, || {
+                 let dst = buf.chunk_mut();
+                 let dst =
+                     unsafe { &mut *(dst as *mut _ as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]) };
+@@ -900,7 +888,7 @@ impl UnixDatagram {
+         /// }
+         /// ```
+         pub fn try_recv_buf<B: BufMut>(&self, buf: &mut B) -> io::Result<usize> {
+-            self.io.registration().try_io(Interest::READABLE, || {
++            self.io.try_io(Interest::READABLE, || {
+                 let dst = buf.chunk_mut();
+                 let dst =
+                     unsafe { &mut *(dst as *mut _ as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]) };
+@@ -961,10 +949,7 @@ impl UnixDatagram {
+     where
+         P: AsRef<Path>,
+     {
+-        self.io
+-            .registration()
+-            .async_io(Interest::WRITABLE, || self.io.send_to(buf, target.as_ref()))
+-            .await
++        self.io.send_to_path(buf, target.as_ref()).await
+     }
+ 
+     /// Receives data from the socket.
+@@ -1008,12 +993,7 @@ impl UnixDatagram {
+     /// # }
+     /// ```
+     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+-        let (n, addr) = self
+-            .io
+-            .registration()
+-            .async_io(Interest::READABLE, || self.io.recv_from(buf))
+-            .await?;
+-
++        let (n, addr) = self.io.recv_from_into(buf).await?;
+         Ok((n, SocketAddr(addr)))
+     }
+ 
+@@ -1039,7 +1019,7 @@ impl UnixDatagram {
+         cx: &mut Context<'_>,
+         buf: &mut ReadBuf<'_>,
+     ) -> Poll<io::Result<SocketAddr>> {
+-        let (n, addr) = ready!(self.io.registration().poll_read_io(cx, || {
++        let (n, addr) = ready!(self.io.poll_read_io(cx, || {
+             // Safety: will not read the maybe uninitialized bytes.
+             let b = unsafe {
+                 &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
+@@ -1082,9 +1062,7 @@ impl UnixDatagram {
+     where
+         P: AsRef<Path>,
+     {
+-        self.io
+-            .registration()
+-            .poll_write_io(cx, || self.io.send_to(buf, target.as_ref()))
++        self.io.poll_write_io(cx, || self.io.send_to(buf, target.as_ref()))
+     }
+ 
+     /// Attempts to send data on the socket to the remote address to which it
+@@ -1111,9 +1089,7 @@ impl UnixDatagram {
+     ///
+     /// [`connect`]: method@Self::connect
+     pub fn poll_send(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+-        self.io
+-            .registration()
+-            .poll_write_io(cx, || self.io.send(buf))
++        self.io.poll_send_buf(cx, buf)
+     }
+ 
+     /// Attempts to receive a single datagram message on the socket from the remote
+@@ -1140,21 +1116,7 @@ impl UnixDatagram {
+     ///
+     /// [`connect`]: method@Self::connect
+     pub fn poll_recv(&self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+-        let n = ready!(self.io.registration().poll_read_io(cx, || {
+-            // Safety: will not read the maybe uninitialized bytes.
+-            let b = unsafe {
+-                &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
+-            };
+-
+-            self.io.recv(b)
+-        }))?;
+-
+-        // Safety: We trust `recv` to have filled up `n` bytes in the buffer.
+-        unsafe {
+-            buf.assume_init(n);
+-        }
+-        buf.advance(n);
+-        Poll::Ready(Ok(()))
++        self.io.poll_recv_buf(cx, buf)
+     }
+ 
+     /// Tries to receive data from the socket without waiting.
+@@ -1202,9 +1164,7 @@ impl UnixDatagram {
+     /// ```
+     pub fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+         let (n, addr) = self
+-            .io
+-            .registration()
+-            .try_io(Interest::READABLE, || self.io.recv_from(buf))?;
++            .io.try_io(Interest::READABLE, || self.io.recv_from(buf))?;
+ 
+         Ok((n, SocketAddr(addr)))
+     }
+@@ -1241,7 +1201,7 @@ impl UnixDatagram {
+         interest: Interest,
+         f: impl FnOnce() -> io::Result<R>,
+     ) -> io::Result<R> {
+-        self.io.registration().try_io(interest, f)
++        self.io.try_io(interest, f)
+     }
+ 
+     /// Returns the local address that this socket is bound to.
+diff --git a/tokio/src/net/unix/listener.rs b/tokio/src/net/unix/listener.rs
+index 1785f8b0..c19f1b67 100644
+--- a/tokio/src/net/unix/listener.rs
++++ b/tokio/src/net/unix/listener.rs
+@@ -1,4 +1,4 @@
+-use crate::io::{Interest, PollEvented};
++use crate::io::PollEvented;
+ use crate::net::unix::{SocketAddr, UnixStream};
+ 
+ use std::convert::TryFrom;
+@@ -136,12 +136,7 @@ impl UnixListener {
+     /// completes first, then it is guaranteed that no new connections were
+     /// accepted by this method.
+     pub async fn accept(&self) -> io::Result<(UnixStream, SocketAddr)> {
+-        let (mio, addr) = self
+-            .io
+-            .registration()
+-            .async_io(Interest::READABLE, || self.io.accept())
+-            .await?;
+-
++        let (mio, addr) = self.io.accept_socket().await?;
+         let addr = SocketAddr(addr);
+         let stream = UnixStream::new(mio)?;
+         Ok((stream, addr))
+@@ -154,7 +149,7 @@ impl UnixListener {
+     /// to `poll_accept`, only the `Waker` from the `Context` passed to the most
+     /// recent call is scheduled to receive a wakeup.
+     pub fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<io::Result<(UnixStream, SocketAddr)>> {
+-        let (sock, addr) = ready!(self.io.registration().poll_read_io(cx, || self.io.accept()))?;
++        let (sock, addr) = ready!(self.io.poll_accept_socket(cx))?;
+         let addr = SocketAddr(addr);
+         let sock = UnixStream::new(sock)?;
+         Poll::Ready(Ok((sock, addr)))
+diff --git a/tokio/src/net/unix/stream.rs b/tokio/src/net/unix/stream.rs
+index 4e7ef87b..fd509fdb 100644
+--- a/tokio/src/net/unix/stream.rs
++++ b/tokio/src/net/unix/stream.rs
+@@ -7,7 +7,7 @@ use crate::net::unix::SocketAddr;
+ 
+ use std::convert::TryFrom;
+ use std::fmt;
+-use std::io::{self, Read, Write};
++use std::io;
+ use std::net::Shutdown;
+ use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+ use std::os::unix::net;
+@@ -50,7 +50,7 @@ impl UnixStream {
+         let stream = mio::net::UnixStream::connect(path)?;
+         let stream = UnixStream::new(stream)?;
+ 
+-        poll_fn(|cx| stream.io.registration().poll_write_ready(cx)).await?;
++        poll_fn(|cx| stream.io.poll_write_ready(cx)).await?;
+ 
+         if let Some(e) = stream.io.take_error()? {
+             return Err(e);
+@@ -129,8 +129,8 @@ impl UnixStream {
+     /// }
+     /// ```
+     pub async fn ready(&self, interest: Interest) -> io::Result<Ready> {
+-        let event = self.io.registration().readiness(interest).await?;
+-        Ok(event.ready)
++        let event = self.io.readiness(interest).await?;
++        Ok(self.io.finish_ready(event.ready))
+     }
+ 
+     /// Waits for the socket to become readable.
+@@ -220,7 +220,7 @@ impl UnixStream {
+     ///
+     /// [`readable`]: method@Self::readable
+     pub fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+-        self.io.registration().poll_read_ready(cx).map_ok(|_| ())
++        self.io.poll_read_ready(cx).map_ok(|_| ())
+     }
+ 
+     /// Try to read data from the stream into the provided buffer, returning how
+@@ -285,9 +285,7 @@ impl UnixStream {
+     /// }
+     /// ```
+     pub fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
+-        self.io
+-            .registration()
+-            .try_io(Interest::READABLE, || (&*self.io).read(buf))
++        self.io.try_read_into(buf)
+     }
+ 
+     /// Tries to read data from the stream into the provided buffers, returning
+@@ -363,9 +361,7 @@ impl UnixStream {
+     /// }
+     /// ```
+     pub fn try_read_vectored(&self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
+-        self.io
+-            .registration()
+-            .try_io(Interest::READABLE, || (&*self.io).read_vectored(bufs))
++        self.io.try_read_vectored_into(bufs)
+     }
+ 
+     cfg_io_util! {
+@@ -429,7 +425,7 @@ impl UnixStream {
+         /// }
+         /// ```
+         pub fn try_read_buf<B: BufMut>(&self, buf: &mut B) -> io::Result<usize> {
+-            self.io.registration().try_io(Interest::READABLE, || {
++            self.io.try_io(Interest::READABLE, || {
+                 use std::io::Read;
+ 
+                 let dst = buf.chunk_mut();
+@@ -532,7 +528,7 @@ impl UnixStream {
+     ///
+     /// [`writable`]: method@Self::writable
+     pub fn poll_write_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+-        self.io.registration().poll_write_ready(cx).map_ok(|_| ())
++        self.io.poll_write_ready(cx).map_ok(|_| ())
+     }
+ 
+     /// Tries to write a buffer to the stream, returning how many bytes were
+@@ -586,9 +582,7 @@ impl UnixStream {
+     /// }
+     /// ```
+     pub fn try_write(&self, buf: &[u8]) -> io::Result<usize> {
+-        self.io
+-            .registration()
+-            .try_io(Interest::WRITABLE, || (&*self.io).write(buf))
++        self.io.try_write_from(buf)
+     }
+ 
+     /// Tries to write several buffers to the stream, returning how many bytes
+@@ -648,9 +642,7 @@ impl UnixStream {
+     /// }
+     /// ```
+     pub fn try_write_vectored(&self, buf: &[io::IoSlice<'_>]) -> io::Result<usize> {
+-        self.io
+-            .registration()
+-            .try_io(Interest::WRITABLE, || (&*self.io).write_vectored(buf))
++        self.io.try_write_vectored_from(buf)
+     }
+ 
+     /// Tries to read or write from the socket using a user-provided IO operation.
+@@ -685,7 +677,7 @@ impl UnixStream {
+         interest: Interest,
+         f: impl FnOnce() -> io::Result<R>,
+     ) -> io::Result<R> {
+-        self.io.registration().try_io(interest, f)
++        self.io.try_io(interest, f)
+     }
+ 
+     /// Creates new `UnixStream` from a `std::os::unix::net::UnixStream`.
+diff --git a/tokio/src/signal/unix/driver.rs b/tokio/src/signal/unix/driver.rs
+index 5fe7c354..eced8795 100644
+--- a/tokio/src/signal/unix/driver.rs
++++ b/tokio/src/signal/unix/driver.rs
+@@ -103,7 +103,7 @@ impl Driver {
+         let waker = unsafe { Waker::from_raw(RawWaker::new(ptr::null(), &NOOP_WAKER_VTABLE)) };
+         let mut cx = Context::from_waker(&waker);
+ 
+-        let ev = match self.receiver.registration().poll_read_ready(&mut cx) {
++        let ev = match self.receiver.poll_read_ready(&mut cx) {
+             Poll::Ready(Ok(ev)) => ev,
+             Poll::Ready(Err(e)) => panic!("reactor gone: {}", e),
+             Poll::Pending => return, // No wake has arrived, bail
+@@ -121,7 +121,7 @@ impl Driver {
+             }
+         }
+ 
+-        self.receiver.registration().clear_readiness(ev);
++        self.receiver.clear_readiness(ev);
+ 
+         // Broadcast any signals which were received
+         globals().broadcast();

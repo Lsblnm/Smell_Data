@@ -1,0 +1,300 @@
+diff --git a/lib/fluent/plugin/in_http.rb b/lib/fluent/plugin/in_http.rb
+index 1fe8f998..a74252ba 100644
+--- a/lib/fluent/plugin/in_http.rb
++++ b/lib/fluent/plugin/in_http.rb
+@@ -101,6 +101,7 @@ module Fluent::Plugin
+       # default parsers
+       @parser_msgpack = nil
+       @parser_json = nil
++      @default_parser = nil
+       @default_time_parser = nil
+       @default_keep_time_key = nil
+       @float_time_parser = nil
+@@ -130,6 +131,7 @@ module Fluent::Plugin
+ 
+             default_parser = parser_create(usage: '')
+             @format_name = 'default'
++            @default_parser = default_parser
+             @parser_time_key = default_parser.time_key
+             @default_time_parser = default_parser.get_time_parser
+             @default_keep_time_key = default_parser.keep_time_key
+@@ -146,6 +148,8 @@ module Fluent::Plugin
+     end
+ 
+     class KeepaliveManager < Coolio::TimerWatcher
++      attr_reader :timeout
++
+       def initialize(timeout)
+         super(1, true)
+         @cons = {}
+@@ -250,10 +254,102 @@ module Fluent::Plugin
+       end
+     end
+ 
++    def complete_http_message(handler)
++      return if handler.closing?
++      km = handler.km
++
++      return if handler.handled_as_non_post?
++
++      if handler.rejected_by_cors?
++        handler.send_response_and_close(Handler::RES_403_STATUS, {'Connection' => 'close'}, "")
++        return
++      end
++
++      body = handler.body
++      content_encoding = handler.content_encoding
++      begin
++        if content_encoding == 'gzip'.freeze
++          body = Zlib::GzipReader.new(StringIO.new(body)).read
++          handler.body = body
++        elsif content_encoding == 'deflate'.freeze
++          body = Zlib::Inflate.inflate(body)
++          handler.body = body
++        end
++      rescue
++        log.warn 'fails to decode payload', error: $!.to_s
++        handler.send_response_and_close(RES_400_STATUS, {}, "")
++        return
++      end
++
++      env = handler.env
++      socket_addr = handler.io.remote_addr
++      env['REMOTE_ADDR'] = socket_addr if env['REMOTE_ADDR'].nil? && socket_addr
++
++      uri = handler.request_uri
++      params = WEBrick::HTTPUtils.parse_query(uri.query)
++
++      parser = record_parser
++      if @format_name != 'default'
++        params[EVENT_RECORD_PARAMETER] = body
++      elsif /^application\/x-www-form-urlencoded/.match?(handler.content_type)
++        params.update WEBrick::HTTPUtils.parse_query(body)
++      elsif handler.content_type =~ /^multipart\/form-data; boundary=(.+)/
++        boundary = WEBrick::HTTPUtils.dequote($1)
++        params.update WEBrick::HTTPUtils.parse_form_data(body, boundary)
++      elsif /^application\/json/.match?(handler.content_type)
++        params['json'] = body
++      elsif /^application\/csp-report/.match?(handler.content_type)
++        params['json'] = body
++      elsif /^application\/msgpack/.match?(handler.content_type)
++        params['msgpack'] = body
++      elsif /^application\/x-ndjson/.match?(handler.content_type)
++        params['ndjson'] = body
++      end
++
++      if parser
++        time_key = parser.time_key
++        keep_time_key = parser.keep_time_key
++        time_parser = parser.time_parser
++        record_time_supported = time_parser.nil? || time_parser.is_a?(Fluent::TimeParser)
++        if time_key == 'time' && params.key?('time') && !keep_time_key && record_time_supported
++          params['time'] = params[time_key]
++        end
++      end
++
++      path_info = uri.path
++
++      if @add_query_params
++        query_params = WEBrick::HTTPUtils.parse_query(uri.query)
++        query_params.each_pair {|k,v|
++          params["QUERY_#{k.tr('-','_').upcase}"] = v
++        }
++      end
++
++      params.merge!(env)
++      env.clear
++
++      code, header, resp_body = on_request(path_info, params)
++      resp_body = resp_body.to_s
++      header = header.dup if header.frozen?
++
++      handler.apply_cors_headers(header)
++
++      if handler.keep_alive && km.timeout >= 0
++        header['Connection'] = 'Keep-Alive'.freeze
++        handler.send_response(code, header, resp_body)
++      else
++        handler.send_response_and_close(code, header, resp_body)
++      end
++    end
++
++    def record_parser
++      @custom_parser || @default_parser || @parser_json
++    end
++
+     private
+ 
+     def on_server_connect(conn)
+-      handler = Handler.new(conn, @km, method(:on_request),
++      handler = Handler.new(conn, @km, self,
+                             @body_size_limit, @format_name, log,
+                             @cors_allow_origins, @cors_allow_credentials,
+                             @add_query_params)
+@@ -336,13 +432,14 @@ module Fluent::Plugin
+     end
+ 
+     class Handler
+-      attr_reader :content_type
++      attr_accessor :body
++      attr_reader :content_type, :content_encoding, :env, :keep_alive, :io, :km
+ 
+-      def initialize(io, km, callback, body_size_limit, format_name, log,
++      def initialize(io, km, input, body_size_limit, format_name, log,
+                      cors_allow_origins, cors_allow_credentials, add_query_params)
+         @io = io
+         @km = km
+-        @callback = callback
++        @input = input
+         @body_size_limit = body_size_limit
+         @next_close = false
+         @format_name = format_name
+@@ -419,6 +516,7 @@ module Fluent::Plugin
+             @access_control_request_headers = v
+           end
+         }
++        @env['REMOTE_ADDR'] = @remote_addr if @remote_addr
+         if expect
+           if expect == '100-continue'.freeze
+             if !size || size < @body_size_limit
+@@ -484,101 +582,41 @@ module Fluent::Plugin
+         end
+       end
+ 
+-      def on_message_complete
+-        return if closing?
+-
++      def handled_as_non_post?
+         if @parser.http_method == 'GET'.freeze
+-          return handle_get_request()
+-        end
+-
+-        if @parser.http_method == 'OPTIONS'.freeze
+-          return handle_options_request()
+-        end
+-
+-        # CORS check
+-        # ==========
+-        # For every incoming request, we check if we have some CORS
+-        # restrictions and allow listed origins through @cors_allow_origins.
+-        unless @cors_allow_origins.nil?
+-          unless @cors_allow_origins.include?('*') || include_cors_allow_origin
+-            send_response_and_close(RES_403_STATUS, {'Connection' => 'close'}, "")
+-            return
+-          end
+-        end
+-
+-        # Content Encoding
+-        # =================
+-        # Decode payload according to the "Content-Encoding" header.
+-        # For now, we only support 'gzip' and 'deflate'.
+-        begin
+-          if @content_encoding == 'gzip'.freeze
+-            @body = Zlib::GzipReader.new(StringIO.new(@body)).read
+-          elsif @content_encoding == 'deflate'.freeze
+-            @body = Zlib::Inflate.inflate(@body)
+-          end
+-        rescue
+-          @log.warn 'fails to decode payload', error: $!.to_s
+-          send_response_and_close(RES_400_STATUS, {}, "")
+-          return
+-        end
+-
+-        @env['REMOTE_ADDR'] = @remote_addr if @remote_addr
+-
+-        uri = URI.parse(@parser.request_url)
+-        params = WEBrick::HTTPUtils.parse_query(uri.query)
+-
+-        if @format_name != 'default'
+-          params[EVENT_RECORD_PARAMETER] = @body
+-        elsif /^application\/x-www-form-urlencoded/.match?(@content_type)
+-          params.update WEBrick::HTTPUtils.parse_query(@body)
+-        elsif @content_type =~ /^multipart\/form-data; boundary=(.+)/
+-          boundary = WEBrick::HTTPUtils.dequote($1)
+-          params.update WEBrick::HTTPUtils.parse_form_data(@body, boundary)
+-        elsif /^application\/json/.match?(@content_type)
+-          params['json'] = @body
+-        elsif /^application\/csp-report/.match?(@content_type)
+-          params['json'] = @body
+-        elsif /^application\/msgpack/.match?(@content_type)
+-          params['msgpack'] = @body
+-        elsif /^application\/x-ndjson/.match?(@content_type)
+-          params['ndjson'] = @body
+-        end
+-        path_info = uri.path
+-
+-        if (@add_query_params)
+-
+-          query_params = WEBrick::HTTPUtils.parse_query(uri.query)
+-
+-          query_params.each_pair {|k,v|
+-            params["QUERY_#{k.tr('-','_').upcase}"] = v
+-          }
++          handle_get_request
++          true
++        elsif @parser.http_method == 'OPTIONS'.freeze
++          handle_options_request
++          true
++        else
++          false
+         end
++      end
+ 
+-        params.merge!(@env)
+-
+-        @env.clear
++      def rejected_by_cors?
++        return false if @cors_allow_origins.nil?
++        !(@cors_allow_origins.include?('*') || include_cors_allow_origin)
++      end
+ 
+-        code, header, body = @callback.call(path_info, params)
+-        body = body.to_s
+-        header = header.dup if header.frozen?
++      def request_uri
++        URI.parse(@parser.request_url)
++      end
+ 
+-        unless @cors_allow_origins.nil?
+-          if @cors_allow_origins.include?('*')
+-            header['Access-Control-Allow-Origin'] = '*'
+-          elsif include_cors_allow_origin
+-            header['Access-Control-Allow-Origin'] = @origin
+-            if @cors_allow_credentials
+-              header["Access-Control-Allow-Credentials"] = true
+-            end
++      def apply_cors_headers(header)
++        return if @cors_allow_origins.nil?
++        if @cors_allow_origins.include?('*')
++          header['Access-Control-Allow-Origin'] = '*'
++        elsif include_cors_allow_origin
++          header['Access-Control-Allow-Origin'] = @origin
++          if @cors_allow_credentials
++            header["Access-Control-Allow-Credentials"] = true
+           end
+         end
++      end
+ 
+-        if @keep_alive
+-          header['Connection'] = 'Keep-Alive'.freeze
+-          send_response(code, header, body)
+-        else
+-          send_response_and_close(code, header, body)
+-        end
++      def on_message_complete
++        @input.complete_http_message(self)
+       end
+ 
+       def close
+diff --git a/lib/fluent/plugin/parser.rb b/lib/fluent/plugin/parser.rb
+index 0854129f..55e09bb6 100644
+--- a/lib/fluent/plugin/parser.rb
++++ b/lib/fluent/plugin/parser.rb
+@@ -99,6 +99,7 @@ module Fluent
+ 
+       # for tests
+       attr_reader :type_converters
++      attr_reader :time_parser
+ 
+       PARSER_TYPES = [:text_per_line, :text, :binary]
+       def parser_type

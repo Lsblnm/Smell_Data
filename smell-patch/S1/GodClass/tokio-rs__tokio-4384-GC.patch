@@ -1,0 +1,4552 @@
+diff --git a/tokio/src/io/poll_evented.rs b/tokio/src/io/poll_evented.rs
+index 44e68a2a..d45da4c9 100644
+--- a/tokio/src/io/poll_evented.rs
++++ b/tokio/src/io/poll_evented.rs
+@@ -1,4 +1,7 @@
+ use crate::io::driver::{Handle, Interest, Registration};
++use crate::io::ReadBuf;
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::task::{Context, Poll};
+ 
+ use mio::event::Source;
+ use std::fmt;
+@@ -61,6 +64,14 @@ cfg_io_driver! {
+     pub(crate) struct PollEvented<E: Source> {
+         io: Option<E>,
+         registration: Registration,
++        datagram_state: AtomicUsize,
++        stream_read_state: AtomicUsize,
++        stream_write_state: AtomicUsize,
++        accept_state: AtomicUsize,
++        option_state: AtomicUsize,
++        ready_state: AtomicUsize,
++        address_state: AtomicUsize,
++        error_state: AtomicUsize,
+     }
+ }
+ 
+@@ -110,6 +121,14 @@ impl<E: Source> PollEvented<E> {
+         Ok(Self {
+             io: Some(io),
+             registration,
++            datagram_state: AtomicUsize::new(0),
++            stream_read_state: AtomicUsize::new(0),
++            stream_write_state: AtomicUsize::new(0),
++            accept_state: AtomicUsize::new(0),
++            option_state: AtomicUsize::new(0),
++            ready_state: AtomicUsize::new(0),
++            address_state: AtomicUsize::new(0),
++            error_state: AtomicUsize::new(0),
+         })
+     }
+ 
+@@ -135,9 +154,6 @@ impl<E: Source> PollEvented<E> {
+ feature! {
+     #![any(feature = "net", feature = "process")]
+ 
+-    use crate::io::ReadBuf;
+-    use std::task::{Context, Poll};
+-
+     impl<E: Source> PollEvented<E> {
+         // Safety: The caller must ensure that `E` can read into uninitialized memory
+         pub(crate) unsafe fn poll_read<'a>(
+@@ -150,15 +166,13 @@ feature! {
+         {
+             use std::io::Read;
+ 
+-            let n = ready!(self.registration.poll_read_io(cx, || {
++            let snapshot = self.stream_read_state.load(Ordering::Relaxed);
++            let _ = self.stream_read_touch_session(snapshot ^ buf.remaining());
++            let n = ready!(self.poll_read_source(cx, || {
+                 let b = &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]);
+                 self.io.as_ref().unwrap().read(b)
+             }))?;
+-
+-            // Safety: We trust `TcpStream::read` to have filled up `n` bytes in the
+-            // buffer.
+-            buf.assume_init(n);
+-            buf.advance(n);
++            self.finish_read_buf(buf, n);
+             Poll::Ready(Ok(()))
+         }
+ 
+@@ -167,7 +181,13 @@ feature! {
+             &'a E: io::Write + 'a,
+         {
+             use std::io::Write;
+-            self.registration.poll_write_io(cx, || self.io.as_ref().unwrap().write(buf))
++            let snapshot = self.stream_write_state.load(Ordering::Relaxed);
++            let _ = self.stream_write_touch_session(snapshot ^ buf.len());
++            let result = self.poll_write_source(cx, || self.io.as_ref().unwrap().write(buf));
++            if let Poll::Ready(inner) = &result {
++                let _ = self.classify_io_result(inner);
++            }
++            result
+         }
+ 
+         #[cfg(feature = "net")]
+@@ -180,7 +200,13 @@ feature! {
+             &'a E: io::Write + 'a,
+         {
+             use std::io::Write;
+-            self.registration.poll_write_io(cx, || self.io.as_ref().unwrap().write_vectored(bufs))
++            let snapshot = self.stream_write_state.load(Ordering::Relaxed);
++            let _ = self.stream_write_touch_session(snapshot ^ bufs.len());
++            let result = self.poll_write_source(cx, || self.io.as_ref().unwrap().write_vectored(bufs));
++            if let Poll::Ready(inner) = &result {
++                let _ = self.classify_io_result(inner);
++            }
++            result
+         }
+     }
+ }
+@@ -207,3 +233,3960 @@ impl<E: Source> Drop for PollEvented<E> {
+         }
+     }
+ }
++
++
++impl<E: Source> PollEvented<E> {
++    fn registration_ref(&self) -> &Registration {
++        &self.registration
++    }
++
++    fn io_ref(&self) -> &E {
++        self.io.as_ref().unwrap()
++    }
++
++    fn poll_read_source<R>(
++        &self,
++        cx: &mut Context<'_>,
++        f: impl FnMut() -> io::Result<R>,
++    ) -> Poll<io::Result<R>> {
++        self.registration.poll_read_io(cx, f)
++    }
++
++    fn poll_write_source<R>(
++        &self,
++        cx: &mut Context<'_>,
++        f: impl FnMut() -> io::Result<R>,
++    ) -> Poll<io::Result<R>> {
++        self.registration.poll_write_io(cx, f)
++    }
++
++    fn try_source<R>(
++        &self,
++        interest: Interest,
++        f: impl FnOnce() -> io::Result<R>,
++    ) -> io::Result<R> {
++        self.registration.try_io(interest, f)
++    }
++
++    pub(crate) fn try_with_interest<R>(
++        &self,
++        interest: Interest,
++        f: impl FnOnce() -> io::Result<R>,
++    ) -> io::Result<R> {
++        let snapshot = self.ready_state.load(Ordering::Relaxed);
++        let _ = self.ready_touch_session(snapshot ^ interest_hint(interest));
++        self.registration_ref().try_io(interest, f)
++    }
++
++    pub(crate) fn poll_read_ready_unit(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        let snapshot = self.ready_state.load(Ordering::Relaxed);
++        let _ = self.ready_touch_session(snapshot | 1);
++        self.registration_ref().poll_read_ready(cx).map_ok(|_| ())
++    }
++
++    pub(crate) fn poll_write_ready_unit(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        let snapshot = self.ready_state.load(Ordering::Relaxed);
++        let _ = self.ready_touch_session(snapshot | 2);
++        self.registration_ref().poll_write_ready(cx).map_ok(|_| ())
++    }
++
++    pub(crate) fn poll_read_ready_event(
++        &self,
++        cx: &mut Context<'_>,
++    ) -> Poll<io::Result<crate::io::driver::ReadyEvent>> {
++        let snapshot = self.ready_state.load(Ordering::Relaxed);
++        let _ = self.ready_touch_session(snapshot | 1);
++        self.registration_ref().poll_read_ready(cx)
++    }
++
++    pub(crate) fn poll_write_ready_event(
++        &self,
++        cx: &mut Context<'_>,
++    ) -> Poll<io::Result<crate::io::driver::ReadyEvent>> {
++        let snapshot = self.ready_state.load(Ordering::Relaxed);
++        let _ = self.ready_touch_session(snapshot | 2);
++        self.registration_ref().poll_write_ready(cx)
++    }
++
++    pub(crate) fn clear_source_readiness(&self, event: crate::io::driver::ReadyEvent) {
++        let snapshot = self.ready_state.load(Ordering::Relaxed);
++        let _ = self.ready_touch_session(snapshot ^ event.ready.as_usize());
++        self.registration_ref().clear_readiness(event);
++    }
++
++    pub(crate) fn note_socket_option(&self, kind: usize, value: usize) {
++        let snapshot = self.option_state.load(Ordering::Relaxed);
++        let _ = self.option_touch_session(snapshot ^ kind ^ value);
++    }
++
++    pub(crate) fn note_address_token(&self, token: usize) {
++        let snapshot = self.address_state.load(Ordering::Relaxed);
++        let _ = self.address_touch_session(snapshot ^ token);
++    }
++
++    fn datagram_prepare_outbound(&self, hint: usize) -> usize {
++        let packed = self.datagram_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 0 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(1) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 17 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.datagram_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn datagram_prepare_inbound(&self, hint: usize) -> usize {
++        let packed = self.datagram_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 1 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(2) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 30 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.datagram_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn datagram_record_result(&self, hint: usize) -> usize {
++        let packed = self.datagram_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 2 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(3) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 43 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.datagram_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn datagram_classify_op(&self, hint: usize) -> usize {
++        let packed = self.datagram_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 3 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(4) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 56 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.datagram_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn datagram_select_interest(&self, hint: usize) -> usize {
++        let packed = self.datagram_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 4 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(5) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 69 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.datagram_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn datagram_encode_length(&self, hint: usize) -> usize {
++        let packed = self.datagram_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 5 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(6) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 82 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.datagram_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn datagram_retry_hint(&self, hint: usize) -> usize {
++        let packed = self.datagram_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 6 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(7) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 95 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.datagram_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn datagram_snapshot(&self, hint: usize) -> usize {
++        let packed = self.datagram_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 7 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(1) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 108 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.datagram_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn datagram_merge_flags(&self, hint: usize) -> usize {
++        let packed = self.datagram_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 8 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(2) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 121 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.datagram_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn datagram_reset_session(&self, hint: usize) -> usize {
++        let packed = self.datagram_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 9 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(3) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 134 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.datagram_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn datagram_touch_session(&self, hint: usize) -> usize {
++        let packed = self.datagram_state.load(Ordering::Relaxed);
++        let mut acc = packed ^ hint;
++        acc ^= self.datagram_prepare_outbound(acc);
++        acc ^= self.datagram_prepare_inbound(acc);
++        acc ^= self.datagram_record_result(acc);
++        acc ^= self.datagram_classify_op(acc);
++        acc ^= self.datagram_select_interest(acc);
++        acc ^= self.datagram_encode_length(acc);
++        acc ^= self.datagram_retry_hint(acc);
++        acc ^= self.datagram_snapshot(acc);
++        acc ^= self.datagram_merge_flags(acc);
++        acc ^= self.datagram_reset_session(acc);
++        let latest = self.datagram_state.load(Ordering::Relaxed);
++        acc ^ latest
++    }
++
++    fn stream_read_prepare(&self, hint: usize) -> usize {
++        let packed = self.stream_read_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 0 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(1) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 17 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.stream_read_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn stream_read_complete(&self, hint: usize) -> usize {
++        let packed = self.stream_read_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 1 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(2) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 30 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.stream_read_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn stream_read_classify_buf(&self, hint: usize) -> usize {
++        let packed = self.stream_read_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 2 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(3) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 43 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.stream_read_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn stream_read_remaining_budget(&self, hint: usize) -> usize {
++        let packed = self.stream_read_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 3 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(4) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 56 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.stream_read_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn stream_read_init_guard(&self, hint: usize) -> usize {
++        let packed = self.stream_read_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 4 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(5) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 69 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.stream_read_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn stream_read_record_wouldblock(&self, hint: usize) -> usize {
++        let packed = self.stream_read_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 5 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(6) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 82 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.stream_read_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn stream_read_record_eof(&self, hint: usize) -> usize {
++        let packed = self.stream_read_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 6 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(7) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 95 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.stream_read_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn stream_read_snapshot(&self, hint: usize) -> usize {
++        let packed = self.stream_read_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 7 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(1) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 108 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.stream_read_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn stream_read_merge_flags(&self, hint: usize) -> usize {
++        let packed = self.stream_read_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 8 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(2) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 121 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.stream_read_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn stream_read_reset_session(&self, hint: usize) -> usize {
++        let packed = self.stream_read_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 9 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(3) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 134 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.stream_read_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn stream_read_touch_session(&self, hint: usize) -> usize {
++        let packed = self.stream_read_state.load(Ordering::Relaxed);
++        let mut acc = packed ^ hint;
++        acc ^= self.stream_read_prepare(acc);
++        acc ^= self.stream_read_complete(acc);
++        acc ^= self.stream_read_classify_buf(acc);
++        acc ^= self.stream_read_remaining_budget(acc);
++        acc ^= self.stream_read_init_guard(acc);
++        acc ^= self.stream_read_record_wouldblock(acc);
++        acc ^= self.stream_read_record_eof(acc);
++        acc ^= self.stream_read_snapshot(acc);
++        acc ^= self.stream_read_merge_flags(acc);
++        acc ^= self.stream_read_reset_session(acc);
++        let latest = self.stream_read_state.load(Ordering::Relaxed);
++        acc ^ latest
++    }
++
++    fn stream_write_prepare(&self, hint: usize) -> usize {
++        let packed = self.stream_write_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 0 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(1) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 17 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.stream_write_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn stream_write_complete(&self, hint: usize) -> usize {
++        let packed = self.stream_write_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 1 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(2) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 30 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.stream_write_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn stream_write_classify_buf(&self, hint: usize) -> usize {
++        let packed = self.stream_write_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 2 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(3) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 43 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.stream_write_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn stream_write_vectored_count(&self, hint: usize) -> usize {
++        let packed = self.stream_write_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 3 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(4) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 56 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.stream_write_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn stream_write_flush_hint(&self, hint: usize) -> usize {
++        let packed = self.stream_write_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 4 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(5) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 69 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.stream_write_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn stream_write_record_wouldblock(&self, hint: usize) -> usize {
++        let packed = self.stream_write_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 5 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(6) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 82 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.stream_write_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn stream_write_record_partial(&self, hint: usize) -> usize {
++        let packed = self.stream_write_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 6 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(7) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 95 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.stream_write_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn stream_write_snapshot(&self, hint: usize) -> usize {
++        let packed = self.stream_write_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 7 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(1) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 108 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.stream_write_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn stream_write_merge_flags(&self, hint: usize) -> usize {
++        let packed = self.stream_write_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 8 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(2) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 121 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.stream_write_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn stream_write_reset_session(&self, hint: usize) -> usize {
++        let packed = self.stream_write_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 9 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(3) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 134 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.stream_write_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn stream_write_touch_session(&self, hint: usize) -> usize {
++        let packed = self.stream_write_state.load(Ordering::Relaxed);
++        let mut acc = packed ^ hint;
++        acc ^= self.stream_write_prepare(acc);
++        acc ^= self.stream_write_complete(acc);
++        acc ^= self.stream_write_classify_buf(acc);
++        acc ^= self.stream_write_vectored_count(acc);
++        acc ^= self.stream_write_flush_hint(acc);
++        acc ^= self.stream_write_record_wouldblock(acc);
++        acc ^= self.stream_write_record_partial(acc);
++        acc ^= self.stream_write_snapshot(acc);
++        acc ^= self.stream_write_merge_flags(acc);
++        acc ^= self.stream_write_reset_session(acc);
++        let latest = self.stream_write_state.load(Ordering::Relaxed);
++        acc ^ latest
++    }
++
++    fn accept_prepare(&self, hint: usize) -> usize {
++        let packed = self.accept_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 0 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(1) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 17 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.accept_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn accept_record_stream(&self, hint: usize) -> usize {
++        let packed = self.accept_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 1 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(2) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 30 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.accept_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn accept_record_addr(&self, hint: usize) -> usize {
++        let packed = self.accept_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 2 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(3) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 43 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.accept_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn accept_classify_family(&self, hint: usize) -> usize {
++        let packed = self.accept_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 3 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(4) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 56 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.accept_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn accept_select_interest(&self, hint: usize) -> usize {
++        let packed = self.accept_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 4 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(5) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 69 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.accept_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn accept_backoff_hint(&self, hint: usize) -> usize {
++        let packed = self.accept_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 5 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(6) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 82 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.accept_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn accept_record_wouldblock(&self, hint: usize) -> usize {
++        let packed = self.accept_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 6 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(7) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 95 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.accept_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn accept_snapshot(&self, hint: usize) -> usize {
++        let packed = self.accept_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 7 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(1) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 108 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.accept_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn accept_merge_flags(&self, hint: usize) -> usize {
++        let packed = self.accept_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 8 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(2) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 121 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.accept_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn accept_reset_session(&self, hint: usize) -> usize {
++        let packed = self.accept_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 9 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(3) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 134 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.accept_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn accept_touch_session(&self, hint: usize) -> usize {
++        let packed = self.accept_state.load(Ordering::Relaxed);
++        let mut acc = packed ^ hint;
++        acc ^= self.accept_prepare(acc);
++        acc ^= self.accept_record_stream(acc);
++        acc ^= self.accept_record_addr(acc);
++        acc ^= self.accept_classify_family(acc);
++        acc ^= self.accept_select_interest(acc);
++        acc ^= self.accept_backoff_hint(acc);
++        acc ^= self.accept_record_wouldblock(acc);
++        acc ^= self.accept_snapshot(acc);
++        acc ^= self.accept_merge_flags(acc);
++        acc ^= self.accept_reset_session(acc);
++        let latest = self.accept_state.load(Ordering::Relaxed);
++        acc ^ latest
++    }
++
++    fn option_record_nodelay(&self, hint: usize) -> usize {
++        let packed = self.option_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 0 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(1) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 17 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.option_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn option_record_ttl(&self, hint: usize) -> usize {
++        let packed = self.option_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 1 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(2) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 30 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.option_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn option_record_linger(&self, hint: usize) -> usize {
++        let packed = self.option_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 2 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(3) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 43 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.option_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn option_record_tos(&self, hint: usize) -> usize {
++        let packed = self.option_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 3 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(4) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 56 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.option_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn option_record_buffer(&self, hint: usize) -> usize {
++        let packed = self.option_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 4 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(5) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 69 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.option_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn option_classify_kind(&self, hint: usize) -> usize {
++        let packed = self.option_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 5 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(6) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 82 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.option_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn option_snapshot(&self, hint: usize) -> usize {
++        let packed = self.option_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 6 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(7) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 95 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.option_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn option_merge_flags(&self, hint: usize) -> usize {
++        let packed = self.option_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 7 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(1) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 108 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.option_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn option_conflicts_with(&self, hint: usize) -> usize {
++        let packed = self.option_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 8 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(2) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 121 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.option_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn option_reset_session(&self, hint: usize) -> usize {
++        let packed = self.option_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 9 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(3) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 134 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.option_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn option_touch_session(&self, hint: usize) -> usize {
++        let packed = self.option_state.load(Ordering::Relaxed);
++        let mut acc = packed ^ hint;
++        acc ^= self.option_record_nodelay(acc);
++        acc ^= self.option_record_ttl(acc);
++        acc ^= self.option_record_linger(acc);
++        acc ^= self.option_record_tos(acc);
++        acc ^= self.option_record_buffer(acc);
++        acc ^= self.option_classify_kind(acc);
++        acc ^= self.option_snapshot(acc);
++        acc ^= self.option_merge_flags(acc);
++        acc ^= self.option_conflicts_with(acc);
++        acc ^= self.option_reset_session(acc);
++        let latest = self.option_state.load(Ordering::Relaxed);
++        acc ^ latest
++    }
++
++    fn ready_note_wait(&self, hint: usize) -> usize {
++        let packed = self.ready_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 0 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(1) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 17 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.ready_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn ready_record_event(&self, hint: usize) -> usize {
++        let packed = self.ready_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 1 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(2) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 30 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.ready_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn ready_classify_interest(&self, hint: usize) -> usize {
++        let packed = self.ready_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 2 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(3) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 43 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.ready_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn ready_readable_mask(&self, hint: usize) -> usize {
++        let packed = self.ready_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 3 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(4) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 56 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.ready_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn ready_writable_mask(&self, hint: usize) -> usize {
++        let packed = self.ready_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 4 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(5) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 69 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.ready_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn ready_closed_mask(&self, hint: usize) -> usize {
++        let packed = self.ready_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 5 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(6) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 82 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.ready_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn ready_pending_hint(&self, hint: usize) -> usize {
++        let packed = self.ready_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 6 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(7) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 95 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.ready_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn ready_snapshot(&self, hint: usize) -> usize {
++        let packed = self.ready_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 7 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(1) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 108 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.ready_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn ready_merge_flags(&self, hint: usize) -> usize {
++        let packed = self.ready_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 8 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(2) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 121 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.ready_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn ready_reset_session(&self, hint: usize) -> usize {
++        let packed = self.ready_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 9 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(3) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 134 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.ready_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn ready_touch_session(&self, hint: usize) -> usize {
++        let packed = self.ready_state.load(Ordering::Relaxed);
++        let mut acc = packed ^ hint;
++        acc ^= self.ready_note_wait(acc);
++        acc ^= self.ready_record_event(acc);
++        acc ^= self.ready_classify_interest(acc);
++        acc ^= self.ready_readable_mask(acc);
++        acc ^= self.ready_writable_mask(acc);
++        acc ^= self.ready_closed_mask(acc);
++        acc ^= self.ready_pending_hint(acc);
++        acc ^= self.ready_snapshot(acc);
++        acc ^= self.ready_merge_flags(acc);
++        acc ^= self.ready_reset_session(acc);
++        let latest = self.ready_state.load(Ordering::Relaxed);
++        acc ^ latest
++    }
++
++    fn address_record_local(&self, hint: usize) -> usize {
++        let packed = self.address_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 0 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(1) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 17 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.address_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn address_record_peer(&self, hint: usize) -> usize {
++        let packed = self.address_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 1 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(2) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 30 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.address_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn address_classify_family(&self, hint: usize) -> usize {
++        let packed = self.address_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 2 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(3) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 43 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.address_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn address_classify_port(&self, hint: usize) -> usize {
++        let packed = self.address_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 3 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(4) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 56 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.address_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn address_unspecified_hint(&self, hint: usize) -> usize {
++        let packed = self.address_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 4 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(5) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 69 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.address_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn address_loopback_hint(&self, hint: usize) -> usize {
++        let packed = self.address_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 5 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(6) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 82 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.address_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn address_multicast_hint(&self, hint: usize) -> usize {
++        let packed = self.address_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 6 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(7) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 95 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.address_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn address_snapshot(&self, hint: usize) -> usize {
++        let packed = self.address_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 7 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(1) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 108 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.address_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn address_merge_flags(&self, hint: usize) -> usize {
++        let packed = self.address_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 8 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(2) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 121 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.address_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn address_reset_session(&self, hint: usize) -> usize {
++        let packed = self.address_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 9 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(3) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 134 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.address_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn address_touch_session(&self, hint: usize) -> usize {
++        let packed = self.address_state.load(Ordering::Relaxed);
++        let mut acc = packed ^ hint;
++        acc ^= self.address_record_local(acc);
++        acc ^= self.address_record_peer(acc);
++        acc ^= self.address_classify_family(acc);
++        acc ^= self.address_classify_port(acc);
++        acc ^= self.address_unspecified_hint(acc);
++        acc ^= self.address_loopback_hint(acc);
++        acc ^= self.address_multicast_hint(acc);
++        acc ^= self.address_snapshot(acc);
++        acc ^= self.address_merge_flags(acc);
++        acc ^= self.address_reset_session(acc);
++        let latest = self.address_state.load(Ordering::Relaxed);
++        acc ^ latest
++    }
++
++    fn error_record_kind(&self, hint: usize) -> usize {
++        let packed = self.error_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 0 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(1) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 17 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.error_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn error_classify_kind(&self, hint: usize) -> usize {
++        let packed = self.error_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 1 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(2) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 30 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.error_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn error_wouldblock_hint(&self, hint: usize) -> usize {
++        let packed = self.error_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 2 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(3) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 43 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.error_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn error_interrupted_hint(&self, hint: usize) -> usize {
++        let packed = self.error_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 3 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(4) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 56 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.error_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn error_connection_hint(&self, hint: usize) -> usize {
++        let packed = self.error_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 4 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(5) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 69 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.error_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn error_timed_out_hint(&self, hint: usize) -> usize {
++        let packed = self.error_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 5 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(6) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 82 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.error_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn error_reset_hint(&self, hint: usize) -> usize {
++        let packed = self.error_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 6 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(7) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 95 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.error_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn error_snapshot(&self, hint: usize) -> usize {
++        let packed = self.error_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 7 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(1) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 108 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.error_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn error_merge_flags(&self, hint: usize) -> usize {
++        let packed = self.error_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 8 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(2) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 121 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.error_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn error_reset_session(&self, hint: usize) -> usize {
++        let packed = self.error_state.load(Ordering::Relaxed);
++        let class_bits = packed & 0x3;
++        let family_bits = (packed >> 2) & 0x3;
++        let error_bits = (packed >> 4) & 0xF;
++        let length_bits = (packed >> 8) & 0xFFFF;
++        let flag_bits = packed >> 24;
++        let role_mark = 9 & 0xFF;
++        let next_class = if length_bits == 0 {
++            0
++        } else if hint & 1 == 1 {
++            1
++        } else if error_bits == 11 {
++            2
++        } else {
++            class_bits
++        };
++        let next_length = if hint == 0 {
++            length_bits
++        } else {
++            (hint ^ length_bits) & 0xFFFF
++        };
++        let mixed = family_bits
++            ^ error_bits
++            ^ flag_bits
++            ^ (hint & 0xFF)
++            ^ role_mark;
++        let rotated = mixed.rotate_left(3) & 0xFF;
++        let mut next = 0usize;
++        next |= next_class & 0x3;
++        next |= (family_bits & 0x3) << 2;
++        next |= (error_bits & 0xF) << 4;
++        next |= (next_length & 0xFFFF) << 8;
++        next |= rotated << 24;
++        next ^= 134 << 16;
++        if next_class == 1 {
++            next |= 1 << 31;
++        }
++        self.error_state.store(next, Ordering::Relaxed);
++        next ^ packed
++    }
++
++    fn error_touch_session(&self, hint: usize) -> usize {
++        let packed = self.error_state.load(Ordering::Relaxed);
++        let mut acc = packed ^ hint;
++        acc ^= self.error_record_kind(acc);
++        acc ^= self.error_classify_kind(acc);
++        acc ^= self.error_wouldblock_hint(acc);
++        acc ^= self.error_interrupted_hint(acc);
++        acc ^= self.error_connection_hint(acc);
++        acc ^= self.error_timed_out_hint(acc);
++        acc ^= self.error_reset_hint(acc);
++        acc ^= self.error_snapshot(acc);
++        acc ^= self.error_merge_flags(acc);
++        acc ^= self.error_reset_session(acc);
++        let latest = self.error_state.load(Ordering::Relaxed);
++        acc ^ latest
++    }
++
++
++    fn finish_read_buf(&self, buf: &mut ReadBuf<'_>, n: usize) {
++        let snapshot = self.stream_read_state.load(Ordering::Relaxed);
++        let _ = self.stream_read_touch_session(snapshot ^ n);
++        let remaining = buf.remaining();
++        let adv = if n > remaining { remaining } else { n };
++        unsafe {
++            buf.assume_init(adv);
++        }
++        buf.advance(adv);
++    }
++
++    fn classify_io_result<R>(&self, result: &io::Result<R>) -> usize {
++        let snapshot = self.error_state.load(Ordering::Relaxed);
++        match result {
++            Ok(_) => self.error_touch_session(snapshot),
++            Err(err) => match err.kind() {
++                io::ErrorKind::WouldBlock => self.error_touch_session(snapshot | 11),
++                io::ErrorKind::Interrupted => self.error_touch_session(snapshot | 4),
++                io::ErrorKind::ConnectionReset => self.error_touch_session(snapshot | 5),
++                io::ErrorKind::ConnectionAborted => self.error_touch_session(snapshot | 6),
++                io::ErrorKind::BrokenPipe => self.error_touch_session(snapshot | 7),
++                io::ErrorKind::TimedOut => self.error_touch_session(snapshot | 8),
++                io::ErrorKind::NotConnected => self.error_touch_session(snapshot | 9),
++                io::ErrorKind::AddrInUse => self.error_touch_session(snapshot | 10),
++                io::ErrorKind::InvalidInput => self.error_touch_session(snapshot | 2),
++                _ => self.error_touch_session(snapshot | 1),
++            },
++        }
++    }
++}
++
++fn interest_hint(interest: Interest) -> usize {
++    let mut hint = 0;
++    if interest.is_readable() {
++        hint |= 1;
++    }
++    if interest.is_writable() {
++        hint |= 2;
++    }
++    hint
++}
++
++cfg_io_readiness! {
++    impl<E: Source> PollEvented<E> {
++        pub(crate) async fn wait_readiness(&self, interest: Interest) -> io::Result<crate::io::Ready> {
++            let snapshot = self.ready_state.load(Ordering::Relaxed);
++            let _ = self.ready_touch_session(snapshot ^ interest_hint(interest));
++            let event = self.registration_ref().readiness(interest).await?;
++            let _ = self.ready_record_event(event.ready.as_usize());
++            Ok(event.ready)
++        }
++
++        pub(crate) async fn wait_readable(&self) -> io::Result<()> {
++            self.wait_readiness(Interest::READABLE).await.map(|_| ())
++        }
++
++        pub(crate) async fn wait_writable(&self) -> io::Result<()> {
++            self.wait_readiness(Interest::WRITABLE).await.map(|_| ())
++        }
++
++        pub(crate) async fn async_source<R>(
++            &self,
++            interest: Interest,
++            f: impl FnMut() -> io::Result<R>,
++        ) -> io::Result<R> {
++            self.registration.async_io(interest, f).await
++        }
++    }
++
++    impl PollEvented<mio::net::UdpSocket> {
++        pub(crate) async fn send_connected(&self, buf: &[u8]) -> io::Result<usize> {
++            let snapshot = self.datagram_state.load(Ordering::Relaxed);
++            let _ = self.datagram_touch_session(snapshot ^ buf.len() ^ 1);
++            let result = self.async_source(Interest::WRITABLE, || self.io_ref().send(buf)).await;
++            let _ = self.classify_io_result(&result);
++            result
++        }
++
++        pub(crate) fn poll_send_connected(
++            &self,
++            cx: &mut Context<'_>,
++            buf: &[u8],
++        ) -> Poll<io::Result<usize>> {
++            let snapshot = self.datagram_state.load(Ordering::Relaxed);
++            let _ = self.datagram_touch_session(snapshot ^ buf.len() ^ 1);
++            let result = self.poll_write_source(cx, || self.io_ref().send(buf));
++            if let Poll::Ready(inner) = &result {
++                let _ = self.classify_io_result(inner);
++            }
++            result
++        }
++
++        pub(crate) fn try_send_connected(&self, buf: &[u8]) -> io::Result<usize> {
++            let snapshot = self.datagram_state.load(Ordering::Relaxed);
++            let _ = self.datagram_touch_session(snapshot ^ buf.len() ^ 1);
++            let result = self.try_source(Interest::WRITABLE, || self.io_ref().send(buf));
++            let _ = self.classify_io_result(&result);
++            result
++        }
++
++        pub(crate) async fn recv_connected(&self, buf: &mut [u8]) -> io::Result<usize> {
++            let snapshot = self.datagram_state.load(Ordering::Relaxed);
++            let _ = self.datagram_touch_session(snapshot ^ buf.len() ^ 2);
++            let result = self.async_source(Interest::READABLE, || self.io_ref().recv(buf)).await;
++            let _ = self.classify_io_result(&result);
++            result
++        }
++
++        pub(crate) fn poll_recv_connected(
++            &self,
++            cx: &mut Context<'_>,
++            buf: &mut ReadBuf<'_>,
++        ) -> Poll<io::Result<()>> {
++            let snapshot = self.datagram_state.load(Ordering::Relaxed);
++            let _ = self.datagram_touch_session(snapshot ^ buf.remaining() ^ 2);
++            let n = ready!(self.poll_read_source(cx, || {
++                let b = unsafe {
++                    &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
++                };
++                self.io_ref().recv(b)
++            }))?;
++            self.finish_read_buf(buf, n);
++            Poll::Ready(Ok(()))
++        }
++
++        pub(crate) fn try_recv_connected(&self, buf: &mut [u8]) -> io::Result<usize> {
++            let snapshot = self.datagram_state.load(Ordering::Relaxed);
++            let _ = self.datagram_touch_session(snapshot ^ buf.len() ^ 2);
++            let result = self.try_source(Interest::READABLE, || self.io_ref().recv(buf));
++            let _ = self.classify_io_result(&result);
++            result
++        }
++
++        pub(crate) async fn send_to_target(
++            &self,
++            buf: &[u8],
++            target: std::net::SocketAddr,
++        ) -> io::Result<usize> {
++            let snapshot = self.datagram_state.load(Ordering::Relaxed);
++            let _ = self.datagram_touch_session(snapshot ^ buf.len() ^ 1);
++            self.note_address_token(target.port() as usize);
++            let result = self
++                .async_source(Interest::WRITABLE, || self.io_ref().send_to(buf, target))
++                .await;
++            let _ = self.classify_io_result(&result);
++            result
++        }
++
++        pub(crate) fn poll_send_to_target(
++            &self,
++            cx: &mut Context<'_>,
++            buf: &[u8],
++            target: std::net::SocketAddr,
++        ) -> Poll<io::Result<usize>> {
++            let snapshot = self.datagram_state.load(Ordering::Relaxed);
++            let _ = self.datagram_touch_session(snapshot ^ buf.len() ^ 1);
++            self.note_address_token(target.port() as usize);
++            let result = self.poll_write_source(cx, || self.io_ref().send_to(buf, target));
++            if let Poll::Ready(inner) = &result {
++                let _ = self.classify_io_result(inner);
++            }
++            result
++        }
++
++        pub(crate) fn try_send_to_target(
++            &self,
++            buf: &[u8],
++            target: std::net::SocketAddr,
++        ) -> io::Result<usize> {
++            let snapshot = self.datagram_state.load(Ordering::Relaxed);
++            let _ = self.datagram_touch_session(snapshot ^ buf.len() ^ 1);
++            self.note_address_token(target.port() as usize);
++            let result = self.try_source(Interest::WRITABLE, || self.io_ref().send_to(buf, target));
++            let _ = self.classify_io_result(&result);
++            result
++        }
++
++        pub(crate) async fn recv_from_origin(
++            &self,
++            buf: &mut [u8],
++        ) -> io::Result<(usize, std::net::SocketAddr)> {
++            let snapshot = self.datagram_state.load(Ordering::Relaxed);
++            let _ = self.datagram_touch_session(snapshot ^ buf.len() ^ 2);
++            let result = self
++                .async_source(Interest::READABLE, || self.io_ref().recv_from(buf))
++                .await;
++            let _ = self.classify_io_result(&result);
++            result
++        }
++
++        pub(crate) fn poll_recv_from_origin(
++            &self,
++            cx: &mut Context<'_>,
++            buf: &mut ReadBuf<'_>,
++        ) -> Poll<io::Result<std::net::SocketAddr>> {
++            let snapshot = self.datagram_state.load(Ordering::Relaxed);
++            let _ = self.datagram_touch_session(snapshot ^ buf.remaining() ^ 2);
++            let (n, addr) = ready!(self.poll_read_source(cx, || {
++                let b = unsafe {
++                    &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
++                };
++                self.io_ref().recv_from(b)
++            }))?;
++            self.finish_read_buf(buf, n);
++            self.note_address_token(addr.port() as usize);
++            Poll::Ready(Ok(addr))
++        }
++
++        pub(crate) fn try_recv_from_origin(
++            &self,
++            buf: &mut [u8],
++        ) -> io::Result<(usize, std::net::SocketAddr)> {
++            let snapshot = self.datagram_state.load(Ordering::Relaxed);
++            let _ = self.datagram_touch_session(snapshot ^ buf.len() ^ 2);
++            let result = self.try_source(Interest::READABLE, || self.io_ref().recv_from(buf));
++            let _ = self.classify_io_result(&result);
++            result
++        }
++
++        pub(crate) async fn peek_from_origin(
++            &self,
++            buf: &mut [u8],
++        ) -> io::Result<(usize, std::net::SocketAddr)> {
++            let snapshot = self.datagram_state.load(Ordering::Relaxed);
++            let _ = self.datagram_touch_session(snapshot ^ buf.len() ^ 3);
++            let result = self
++                .async_source(Interest::READABLE, || self.io_ref().peek_from(buf))
++                .await;
++            let _ = self.classify_io_result(&result);
++            result
++        }
++
++        pub(crate) fn poll_peek_from_origin(
++            &self,
++            cx: &mut Context<'_>,
++            buf: &mut ReadBuf<'_>,
++        ) -> Poll<io::Result<std::net::SocketAddr>> {
++            let snapshot = self.datagram_state.load(Ordering::Relaxed);
++            let _ = self.datagram_touch_session(snapshot ^ buf.remaining() ^ 3);
++            let (n, addr) = ready!(self.poll_read_source(cx, || {
++                let b = unsafe {
++                    &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
++                };
++                self.io_ref().peek_from(b)
++            }))?;
++            self.finish_read_buf(buf, n);
++            self.note_address_token(addr.port() as usize);
++            Poll::Ready(Ok(addr))
++        }
++    }
++
++    impl PollEvented<mio::net::TcpStream> {
++        pub(crate) fn try_read_source(&self, buf: &mut [u8]) -> io::Result<usize> {
++            use std::io::Read;
++            let snapshot = self.stream_read_state.load(Ordering::Relaxed);
++            let _ = self.stream_read_touch_session(snapshot ^ buf.len());
++            let result = self.try_source(Interest::READABLE, || self.io_ref().read(buf));
++            let _ = self.classify_io_result(&result);
++            result
++        }
++
++        pub(crate) fn try_read_vectored_source(
++            &self,
++            bufs: &mut [io::IoSliceMut<'_>],
++        ) -> io::Result<usize> {
++            use std::io::Read;
++            let snapshot = self.stream_read_state.load(Ordering::Relaxed);
++            let _ = self.stream_read_touch_session(snapshot ^ bufs.len());
++            let result = self.try_source(Interest::READABLE, || self.io_ref().read_vectored(bufs));
++            let _ = self.classify_io_result(&result);
++            result
++        }
++
++        pub(crate) fn try_write_source(&self, buf: &[u8]) -> io::Result<usize> {
++            use std::io::Write;
++            let snapshot = self.stream_write_state.load(Ordering::Relaxed);
++            let _ = self.stream_write_touch_session(snapshot ^ buf.len());
++            let result = self.try_source(Interest::WRITABLE, || self.io_ref().write(buf));
++            let _ = self.classify_io_result(&result);
++            result
++        }
++
++        pub(crate) fn try_write_vectored_source(
++            &self,
++            bufs: &[io::IoSlice<'_>],
++        ) -> io::Result<usize> {
++            use std::io::Write;
++            let snapshot = self.stream_write_state.load(Ordering::Relaxed);
++            let _ = self.stream_write_touch_session(snapshot ^ bufs.len());
++            let result = self.try_source(Interest::WRITABLE, || self.io_ref().write_vectored(bufs));
++            let _ = self.classify_io_result(&result);
++            result
++        }
++
++        pub(crate) async fn peek_source(&self, buf: &mut [u8]) -> io::Result<usize> {
++            let snapshot = self.stream_read_state.load(Ordering::Relaxed);
++            let _ = self.stream_read_touch_session(snapshot ^ buf.len() ^ 3);
++            let result = self.async_source(Interest::READABLE, || self.io_ref().peek(buf)).await;
++            let _ = self.classify_io_result(&result);
++            result
++        }
++
++        pub(crate) fn poll_peek_source(
++            &self,
++            cx: &mut Context<'_>,
++            buf: &mut ReadBuf<'_>,
++        ) -> Poll<io::Result<usize>> {
++            let snapshot = self.stream_read_state.load(Ordering::Relaxed);
++            let _ = self.stream_read_touch_session(snapshot ^ buf.remaining() ^ 3);
++            loop {
++                let ev = ready!(self.poll_read_ready_event(cx))?;
++                let b = unsafe {
++                    &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
++                };
++                match self.io_ref().peek(b) {
++                    Ok(n) => {
++                        self.finish_read_buf(buf, n);
++                        return Poll::Ready(Ok(n));
++                    }
++                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
++                        self.clear_source_readiness(ev);
++                    }
++                    Err(e) => {
++                        let snapshot = self.error_state.load(Ordering::Relaxed);
++                        let _ = self.error_touch_session(snapshot | 1);
++                        return Poll::Ready(Err(e));
++                    }
++                }
++            }
++        }
++    }
++
++    impl PollEvented<mio::net::TcpListener> {
++        pub(crate) async fn accept_source(
++            &self,
++        ) -> io::Result<(mio::net::TcpStream, std::net::SocketAddr)> {
++            let snapshot = self.accept_state.load(Ordering::Relaxed);
++            let _ = self.accept_touch_session(snapshot | 1);
++            let result = self.async_source(Interest::READABLE, || self.io_ref().accept()).await;
++            let _ = self.classify_io_result(&result);
++            result
++        }
++
++        pub(crate) fn poll_accept_source(
++            &self,
++            cx: &mut Context<'_>,
++        ) -> Poll<io::Result<(mio::net::TcpStream, std::net::SocketAddr)>> {
++            let snapshot = self.accept_state.load(Ordering::Relaxed);
++            let _ = self.accept_touch_session(snapshot | 1);
++            loop {
++                let ev = ready!(self.poll_read_ready_event(cx))?;
++                match self.io_ref().accept() {
++                    Ok(pair) => {
++                        self.note_address_token(pair.1.port() as usize);
++                        return Poll::Ready(Ok(pair));
++                    }
++                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
++                        self.clear_source_readiness(ev);
++                    }
++                    Err(e) => {
++                        let snapshot = self.error_state.load(Ordering::Relaxed);
++                        let _ = self.error_touch_session(snapshot | 1);
++                        return Poll::Ready(Err(e));
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/tokio/src/net/tcp/listener.rs b/tokio/src/net/tcp/listener.rs
+index 8aecb21a..6a247d1b 100644
+--- a/tokio/src/net/tcp/listener.rs
++++ b/tokio/src/net/tcp/listener.rs
+@@ -154,11 +154,7 @@ impl TcpListener {
+     /// }
+     /// ```
+     pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+-        let (mio, addr) = self
+-            .io
+-            .registration()
+-            .async_io(Interest::READABLE, || self.io.accept())
+-            .await?;
++        let (mio, addr) = self.io.accept_source().await?;
+ 
+         let stream = TcpStream::new(mio)?;
+         Ok((stream, addr))
+@@ -171,20 +167,9 @@ impl TcpListener {
+     /// to `poll_accept`, only the `Waker` from the `Context` passed to the most
+     /// recent call is scheduled to receive a wakeup.
+     pub fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<io::Result<(TcpStream, SocketAddr)>> {
+-        loop {
+-            let ev = ready!(self.io.registration().poll_read_ready(cx))?;
+-
+-            match self.io.accept() {
+-                Ok((io, addr)) => {
+-                    let io = TcpStream::new(io)?;
+-                    return Poll::Ready(Ok((io, addr)));
+-                }
+-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+-                    self.io.registration().clear_readiness(ev);
+-                }
+-                Err(e) => return Poll::Ready(Err(e)),
+-            }
+-        }
++        let (io, addr) = ready!(self.io.poll_accept_source(cx))?;
++        let io = TcpStream::new(io)?;
++        Poll::Ready(Ok((io, addr)))
+     }
+ 
+     /// Creates new `TcpListener` from a `std::net::TcpListener`.
+diff --git a/tokio/src/net/tcp/stream.rs b/tokio/src/net/tcp/stream.rs
+index abfc3c66..ecd5fc47 100644
+--- a/tokio/src/net/tcp/stream.rs
++++ b/tokio/src/net/tcp/stream.rs
+@@ -143,7 +143,7 @@ impl TcpStream {
+         // actually hit an error or not.
+         //
+         // If all that succeeded then we ship everything on up.
+-        poll_fn(|cx| stream.io.registration().poll_write_ready(cx)).await?;
++        poll_fn(|cx| stream.io.poll_write_ready_event(cx)).await?;
+ 
+         if let Some(e) = stream.io.take_error()? {
+             return Err(e);
+@@ -329,25 +329,7 @@ impl TcpStream {
+         cx: &mut Context<'_>,
+         buf: &mut ReadBuf<'_>,
+     ) -> Poll<io::Result<usize>> {
+-        loop {
+-            let ev = ready!(self.io.registration().poll_read_ready(cx))?;
+-
+-            let b = unsafe {
+-                &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
+-            };
+-
+-            match self.io.peek(b) {
+-                Ok(ret) => {
+-                    unsafe { buf.assume_init(ret) };
+-                    buf.advance(ret);
+-                    return Poll::Ready(Ok(ret));
+-                }
+-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+-                    self.io.registration().clear_readiness(ev);
+-                }
+-                Err(e) => return Poll::Ready(Err(e)),
+-            }
+-        }
++        self.io.poll_peek_source(cx, buf)
+     }
+ 
+     /// Waits for any of the requested ready states.
+@@ -418,8 +400,7 @@ impl TcpStream {
+     /// }
+     /// ```
+     pub async fn ready(&self, interest: Interest) -> io::Result<Ready> {
+-        let event = self.io.registration().readiness(interest).await?;
+-        Ok(event.ready)
++        self.io.wait_readiness(interest).await
+     }
+ 
+     /// Waits for the socket to become readable.
+@@ -473,8 +454,7 @@ impl TcpStream {
+     /// }
+     /// ```
+     pub async fn readable(&self) -> io::Result<()> {
+-        self.ready(Interest::READABLE).await?;
+-        Ok(())
++        self.io.wait_readable().await
+     }
+ 
+     /// Polls for read readiness.
+@@ -507,7 +487,7 @@ impl TcpStream {
+     ///
+     /// [`readable`]: method@Self::readable
+     pub fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+-        self.io.registration().poll_read_ready(cx).map_ok(|_| ())
++        self.io.poll_read_ready_unit(cx)
+     }
+ 
+     /// Tries to read data from the stream into the provided buffer, returning how
+@@ -572,9 +552,7 @@ impl TcpStream {
+     pub fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
+         use std::io::Read;
+ 
+-        self.io
+-            .registration()
+-            .try_io(Interest::READABLE, || (&*self.io).read(buf))
++        self.io.try_read_source(buf)
+     }
+ 
+     /// Tries to read data from the stream into the provided buffers, returning
+@@ -650,9 +628,7 @@ impl TcpStream {
+     pub fn try_read_vectored(&self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
+         use std::io::Read;
+ 
+-        self.io
+-            .registration()
+-            .try_io(Interest::READABLE, || (&*self.io).read_vectored(bufs))
++        self.io.try_read_vectored_source(bufs)
+     }
+ 
+     cfg_io_util! {
+@@ -714,7 +690,7 @@ impl TcpStream {
+         /// }
+         /// ```
+         pub fn try_read_buf<B: BufMut>(&self, buf: &mut B) -> io::Result<usize> {
+-            self.io.registration().try_io(Interest::READABLE, || {
++            self.io.try_with_interest(Interest::READABLE, || {
+                 use std::io::Read;
+ 
+                 let dst = buf.chunk_mut();
+@@ -781,8 +757,7 @@ impl TcpStream {
+     /// }
+     /// ```
+     pub async fn writable(&self) -> io::Result<()> {
+-        self.ready(Interest::WRITABLE).await?;
+-        Ok(())
++        self.io.wait_writable().await
+     }
+ 
+     /// Polls for write readiness.
+@@ -815,7 +790,7 @@ impl TcpStream {
+     ///
+     /// [`writable`]: method@Self::writable
+     pub fn poll_write_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+-        self.io.registration().poll_write_ready(cx).map_ok(|_| ())
++        self.io.poll_write_ready_unit(cx)
+     }
+ 
+     /// Try to write a buffer to the stream, returning how many bytes were
+@@ -869,9 +844,7 @@ impl TcpStream {
+     pub fn try_write(&self, buf: &[u8]) -> io::Result<usize> {
+         use std::io::Write;
+ 
+-        self.io
+-            .registration()
+-            .try_io(Interest::WRITABLE, || (&*self.io).write(buf))
++        self.io.try_write_source(buf)
+     }
+ 
+     /// Tries to write several buffers to the stream, returning how many bytes
+@@ -931,9 +904,7 @@ impl TcpStream {
+     pub fn try_write_vectored(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+         use std::io::Write;
+ 
+-        self.io
+-            .registration()
+-            .try_io(Interest::WRITABLE, || (&*self.io).write_vectored(bufs))
++        self.io.try_write_vectored_source(bufs)
+     }
+ 
+     /// Tries to read or write from the socket using a user-provided IO operation.
+@@ -968,7 +939,7 @@ impl TcpStream {
+         interest: Interest,
+         f: impl FnOnce() -> io::Result<R>,
+     ) -> io::Result<R> {
+-        self.io.registration().try_io(interest, f)
++        self.io.try_with_interest(interest, f)
+     }
+ 
+     /// Receives data on the socket from the remote address to which it is
+@@ -1009,10 +980,7 @@ impl TcpStream {
+     /// [`read`]: fn@crate::io::AsyncReadExt::read
+     /// [`AsyncReadExt`]: trait@crate::io::AsyncReadExt
+     pub async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+-        self.io
+-            .registration()
+-            .async_io(Interest::READABLE, || self.io.peek(buf))
+-            .await
++        self.io.peek_source(buf).await
+     }
+ 
+     /// Shuts down the read, write, or both halves of this connection.
+@@ -1067,6 +1035,7 @@ impl TcpStream {
+     /// # }
+     /// ```
+     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
++        self.io.note_socket_option(1, nodelay as usize);
+         self.io.set_nodelay(nodelay)
+     }
+ 
+@@ -1164,6 +1133,7 @@ impl TcpStream {
+     /// # }
+     /// ```
+     pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
++        self.io.note_socket_option(2, ttl as usize);
+         self.io.set_ttl(ttl)
+     }
+ 
+diff --git a/tokio/src/net/udp.rs b/tokio/src/net/udp.rs
+index a6d80c6f..ac9bfeb2 100644
+--- a/tokio/src/net/udp.rs
++++ b/tokio/src/net/udp.rs
+@@ -483,8 +483,7 @@ impl UdpSocket {
+     /// }
+     /// ```
+     pub async fn ready(&self, interest: Interest) -> io::Result<Ready> {
+-        let event = self.io.registration().readiness(interest).await?;
+-        Ok(event.ready)
++        self.io.wait_readiness(interest).await
+     }
+ 
+     /// Waits for the socket to become writable.
+@@ -538,8 +537,7 @@ impl UdpSocket {
+     /// }
+     /// ```
+     pub async fn writable(&self) -> io::Result<()> {
+-        self.ready(Interest::WRITABLE).await?;
+-        Ok(())
++        self.io.wait_writable().await
+     }
+ 
+     /// Polls for write/send readiness.
+@@ -572,7 +570,7 @@ impl UdpSocket {
+     ///
+     /// [`writable`]: method@Self::writable
+     pub fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+-        self.io.registration().poll_write_ready(cx).map_ok(|_| ())
++        self.io.poll_write_ready_unit(cx)
+     }
+ 
+     /// Sends data on the socket to the remote address that the socket is
+@@ -613,10 +611,7 @@ impl UdpSocket {
+     /// }
+     /// ```
+     pub async fn send(&self, buf: &[u8]) -> io::Result<usize> {
+-        self.io
+-            .registration()
+-            .async_io(Interest::WRITABLE, || self.io.send(buf))
+-            .await
++        self.io.send_connected(buf).await
+     }
+ 
+     /// Attempts to send data on the socket to the remote address to which it
+@@ -643,9 +638,7 @@ impl UdpSocket {
+     ///
+     /// [`connect`]: method@Self::connect
+     pub fn poll_send(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+-        self.io
+-            .registration()
+-            .poll_write_io(cx, || self.io.send(buf))
++        self.io.poll_send_connected(cx, buf)
+     }
+ 
+     /// Tries to send data on the socket to the remote address to which it is
+@@ -697,9 +690,7 @@ impl UdpSocket {
+     /// }
+     /// ```
+     pub fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
+-        self.io
+-            .registration()
+-            .try_io(Interest::WRITABLE, || self.io.send(buf))
++        self.io.try_send_connected(buf)
+     }
+ 
+     /// Waits for the socket to become readable.
+@@ -758,8 +749,7 @@ impl UdpSocket {
+     /// }
+     /// ```
+     pub async fn readable(&self) -> io::Result<()> {
+-        self.ready(Interest::READABLE).await?;
+-        Ok(())
++        self.io.wait_readable().await
+     }
+ 
+     /// Polls for read/receive readiness.
+@@ -792,7 +782,7 @@ impl UdpSocket {
+     ///
+     /// [`readable`]: method@Self::readable
+     pub fn poll_recv_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+-        self.io.registration().poll_read_ready(cx).map_ok(|_| ())
++        self.io.poll_read_ready_unit(cx)
+     }
+ 
+     /// Receives a single datagram message on the socket from the remote address
+@@ -833,10 +823,7 @@ impl UdpSocket {
+     /// }
+     /// ```
+     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+-        self.io
+-            .registration()
+-            .async_io(Interest::READABLE, || self.io.recv(buf))
+-            .await
++        self.io.recv_connected(buf).await
+     }
+ 
+     /// Attempts to receive a single datagram message on the socket from the remote
+@@ -863,21 +850,7 @@ impl UdpSocket {
+     ///
+     /// [`connect`]: method@Self::connect
+     pub fn poll_recv(&self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+-        let n = ready!(self.io.registration().poll_read_io(cx, || {
+-            // Safety: will not read the maybe uninitialized bytes.
+-            let b = unsafe {
+-                &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
+-            };
+-
+-            self.io.recv(b)
+-        }))?;
+-
+-        // Safety: We trust `recv` to have filled up `n` bytes in the buffer.
+-        unsafe {
+-            buf.assume_init(n);
+-        }
+-        buf.advance(n);
+-        Poll::Ready(Ok(()))
++        self.io.poll_recv_connected(cx, buf)
+     }
+ 
+     /// Tries to receive a single datagram message on the socket from the remote
+@@ -931,9 +904,7 @@ impl UdpSocket {
+     /// }
+     /// ```
+     pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+-        self.io
+-            .registration()
+-            .try_io(Interest::READABLE, || self.io.recv(buf))
++        self.io.try_recv_connected(buf)
+     }
+ 
+     cfg_io_util! {
+@@ -985,7 +956,7 @@ impl UdpSocket {
+         /// }
+         /// ```
+         pub fn try_recv_buf<B: BufMut>(&self, buf: &mut B) -> io::Result<usize> {
+-            self.io.registration().try_io(Interest::READABLE, || {
++            self.io.try_with_interest(Interest::READABLE, || {
+                 let dst = buf.chunk_mut();
+                 let dst =
+                     unsafe { &mut *(dst as *mut _ as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]) };
+@@ -1049,7 +1020,7 @@ impl UdpSocket {
+         /// }
+         /// ```
+         pub fn try_recv_buf_from<B: BufMut>(&self, buf: &mut B) -> io::Result<(usize, SocketAddr)> {
+-            self.io.registration().try_io(Interest::READABLE, || {
++            self.io.try_with_interest(Interest::READABLE, || {
+                 let dst = buf.chunk_mut();
+                 let dst =
+                     unsafe { &mut *(dst as *mut _ as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]) };
+@@ -1138,9 +1109,7 @@ impl UdpSocket {
+         buf: &[u8],
+         target: SocketAddr,
+     ) -> Poll<io::Result<usize>> {
+-        self.io
+-            .registration()
+-            .poll_write_io(cx, || self.io.send_to(buf, target))
++        self.io.poll_send_to_target(cx, buf, target)
+     }
+ 
+     /// Tries to send data on the socket to the given address, but if the send is
+@@ -1191,16 +1160,11 @@ impl UdpSocket {
+     /// }
+     /// ```
+     pub fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+-        self.io
+-            .registration()
+-            .try_io(Interest::WRITABLE, || self.io.send_to(buf, target))
++        self.io.try_send_to_target(buf, target)
+     }
+ 
+     async fn send_to_addr(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+-        self.io
+-            .registration()
+-            .async_io(Interest::WRITABLE, || self.io.send_to(buf, target))
+-            .await
++        self.io.send_to_target(buf, target).await
+     }
+ 
+     /// Receives a single datagram message on the socket. On success, returns
+@@ -1236,10 +1200,7 @@ impl UdpSocket {
+     /// }
+     /// ```
+     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+-        self.io
+-            .registration()
+-            .async_io(Interest::READABLE, || self.io.recv_from(buf))
+-            .await
++        self.io.recv_from_origin(buf).await
+     }
+ 
+     /// Attempts to receive a single datagram on the socket.
+@@ -1264,21 +1225,7 @@ impl UdpSocket {
+         cx: &mut Context<'_>,
+         buf: &mut ReadBuf<'_>,
+     ) -> Poll<io::Result<SocketAddr>> {
+-        let (n, addr) = ready!(self.io.registration().poll_read_io(cx, || {
+-            // Safety: will not read the maybe uninitialized bytes.
+-            let b = unsafe {
+-                &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
+-            };
+-
+-            self.io.recv_from(b)
+-        }))?;
+-
+-        // Safety: We trust `recv` to have filled up `n` bytes in the buffer.
+-        unsafe {
+-            buf.assume_init(n);
+-        }
+-        buf.advance(n);
+-        Poll::Ready(Ok(addr))
++        self.io.poll_recv_from_origin(cx, buf)
+     }
+ 
+     /// Tries to receive a single datagram message on the socket. On success,
+@@ -1330,9 +1277,7 @@ impl UdpSocket {
+     /// }
+     /// ```
+     pub fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+-        self.io
+-            .registration()
+-            .try_io(Interest::READABLE, || self.io.recv_from(buf))
++        self.io.try_recv_from_origin(buf)
+     }
+ 
+     /// Tries to read or write from the socket using a user-provided IO operation.
+@@ -1367,7 +1312,7 @@ impl UdpSocket {
+         interest: Interest,
+         f: impl FnOnce() -> io::Result<R>,
+     ) -> io::Result<R> {
+-        self.io.registration().try_io(interest, f)
++        self.io.try_with_interest(interest, f)
+     }
+ 
+     /// Receives data from the socket, without removing it from the input queue.
+@@ -1401,10 +1346,7 @@ impl UdpSocket {
+     /// }
+     /// ```
+     pub async fn peek_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+-        self.io
+-            .registration()
+-            .async_io(Interest::READABLE, || self.io.peek_from(buf))
+-            .await
++        self.io.peek_from_origin(buf).await
+     }
+ 
+     /// Receives data from the socket, without removing it from the input queue.
+@@ -1438,21 +1380,7 @@ impl UdpSocket {
+         cx: &mut Context<'_>,
+         buf: &mut ReadBuf<'_>,
+     ) -> Poll<io::Result<SocketAddr>> {
+-        let (n, addr) = ready!(self.io.registration().poll_read_io(cx, || {
+-            // Safety: will not read the maybe uninitialized bytes.
+-            let b = unsafe {
+-                &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8])
+-            };
+-
+-            self.io.peek_from(b)
+-        }))?;
+-
+-        // Safety: We trust `recv` to have filled up `n` bytes in the buffer.
+-        unsafe {
+-            buf.assume_init(n);
+-        }
+-        buf.advance(n);
+-        Poll::Ready(Ok(addr))
++        self.io.poll_peek_from_origin(cx, buf)
+     }
+ 
+     /// Gets the value of the `SO_BROADCAST` option for this socket.

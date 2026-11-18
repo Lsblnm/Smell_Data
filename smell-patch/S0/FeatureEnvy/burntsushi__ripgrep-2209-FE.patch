@@ -1,0 +1,307 @@
+diff --git a/crates/printer/src/standard.rs b/crates/printer/src/standard.rs
+index df4447c..6008f57 100644
+--- a/crates/printer/src/standard.rs
++++ b/crates/printer/src/standard.rs
+@@ -6,10 +6,10 @@ use std::sync::Arc;
+ use std::time::Instant;
+ 
+ use bstr::ByteSlice;
+-use grep_matcher::{Match, Matcher};
++use grep_matcher::{Captures, Match, Matcher};
+ use grep_searcher::{
+-    LineStep, Searcher, Sink, SinkContext, SinkContextKind, SinkFinish,
+-    SinkMatch,
++    LineStep, Searcher, Sink, SinkContext, SinkContextKind, SinkError,
++    SinkFinish, SinkMatch,
+ };
+ use termcolor::{ColorSpec, NoColor, WriteColor};
+ 
+@@ -20,6 +20,7 @@ use crate::util::{
+     find_iter_at_in_context, trim_ascii_prefix, trim_line_terminator,
+     PrinterPath, Replacer, Sunk,
+ };
++use crate::MAX_LOOK_AHEAD;
+ 
+ /// The configuration for the standard printer.
+ ///
+@@ -735,18 +736,75 @@ impl<'p, 's, M: Matcher, W: WriteColor> StandardSink<'p, 's, M, W> {
+         range: std::ops::Range<usize>,
+     ) -> io::Result<()> {
+         self.replacer.clear();
+-        if self.standard.config.replacement.is_some() {
+-            let replacement = (*self.standard.config.replacement)
+-                .as_ref()
+-                .map(|r| &*r)
+-                .unwrap();
+-            self.replacer.replace_all(
+-                searcher,
+-                &self.matcher,
+-                bytes,
+-                range,
+-                replacement,
+-            )?;
++        let replacement = Arc::clone(&self.standard.config.replacement);
++        if let Some(ref replacement) = *replacement {
++            self.replace_all(searcher, bytes, range, replacement)?;
++        }
++        Ok(())
++    }
++
++    /// Executes a replacement on the given subject string by replacing all
++    /// matches with the given replacement. To access the result of the
++    /// replacement, use the `replacer.replacement` method.
++    ///
++    /// This can fail if the underlying matcher reports an error.
++    fn replace_all(
++        &mut self,
++        searcher: &Searcher,
++        mut subject: &[u8],
++        range: std::ops::Range<usize>,
++        replacement: &[u8],
++    ) -> io::Result<()> {
++        // See the giant comment in `find_iter_at_in_context` for why we do
++        // this dance. Multi-line replacement depends on the searcher's
++        // configured multi-line mode and line terminator, plus whether the
++        // matcher itself can produce matches that span those terminators.
++        let is_multi_line = searcher.multi_line()
++            && searcher.multi_line_with_matcher(&self.matcher);
++        if is_multi_line {
++            if subject[range.end..].len() >= MAX_LOOK_AHEAD {
++                subject = &subject[..range.end + MAX_LOOK_AHEAD];
++            }
++        } else {
++            // When searching a single line, we should remove the line
++            // terminator. Otherwise, it's possible for the regex (via
++            // look-around) to observe the line terminator and not match
++            // because of it.
++            let mut m = Match::new(0, range.end);
++            subject = &subject[..trim_line_terminator(
++                searcher.line_terminator(),
++                subject,
++                &mut m,
++            )];
++        }
++        let matcher = &self.matcher;
++        self.replacer.allocate(matcher)?;
++        self.replacer.dst.clear();
++        self.replacer.matches.clear();
++        {
++            let caps = self.replacer.caps.as_mut().unwrap();
++            let dst = &mut self.replacer.dst;
++            let matches = &mut self.replacer.matches;
++            matcher
++                .replace_with_captures_at(
++                    subject,
++                    range.start,
++                    caps,
++                    dst,
++                    |caps, dst| {
++                        let start = dst.len();
++                        caps.interpolate(
++                            |name| matcher.capture_index(name),
++                            subject,
++                            replacement,
++                            dst,
++                        );
++                        let end = dst.len();
++                        matches.push(Match::new(start, end));
++                        true
++                    },
++                )
++                .map_err(io::Error::error_message)?;
+         }
+         Ok(())
+     }
+@@ -1548,7 +1606,7 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
+     }
+ 
+     fn trim_line_terminator(&self, buf: &[u8], line: &mut Match) {
+-        trim_line_terminator(&self.searcher, buf, line);
++        trim_line_terminator(self.searcher.line_terminator(), buf, line);
+     }
+ 
+     fn has_line_terminator(&self, buf: &[u8]) -> bool {
+diff --git a/crates/printer/src/util.rs b/crates/printer/src/util.rs
+index 434deec..61509e9 100644
+--- a/crates/printer/src/util.rs
++++ b/crates/printer/src/util.rs
+@@ -5,7 +5,7 @@ use std::path::Path;
+ use std::time;
+ 
+ use bstr::{ByteSlice, ByteVec};
+-use grep_matcher::{Captures, LineTerminator, Match, Matcher};
++use grep_matcher::{LineTerminator, Match, Matcher};
+ use grep_searcher::{
+     LineIter, Searcher, SinkContext, SinkContextKind, SinkError, SinkMatch,
+ };
+@@ -16,16 +16,12 @@ use crate::MAX_LOOK_AHEAD;
+ 
+ /// A type for handling replacements while amortizing allocation.
+ pub struct Replacer<M: Matcher> {
+-    space: Option<Space<M>>,
+-}
+-
+-struct Space<M: Matcher> {
+     /// The place to store capture locations.
+-    caps: M::Captures,
++    pub(crate) caps: Option<M::Captures>,
+     /// The place to write a replacement to.
+-    dst: Vec<u8>,
++    pub(crate) dst: Vec<u8>,
+     /// The place to store match offsets in terms of `dst`.
+-    matches: Vec<Match>,
++    pub(crate) matches: Vec<Match>,
+ }
+ 
+ impl<M: Matcher> fmt::Debug for Replacer<M> {
+@@ -44,66 +40,7 @@ impl<M: Matcher> Replacer<M> {
+     /// This constructor does not allocate. Instead, space for dealing with
+     /// replacements is allocated lazily only when needed.
+     pub fn new() -> Replacer<M> {
+-        Replacer { space: None }
+-    }
+-
+-    /// Executes a replacement on the given subject string by replacing all
+-    /// matches with the given replacement. To access the result of the
+-    /// replacement, use the `replacement` method.
+-    ///
+-    /// This can fail if the underlying matcher reports an error.
+-    pub fn replace_all<'a>(
+-        &'a mut self,
+-        searcher: &Searcher,
+-        matcher: &M,
+-        mut subject: &[u8],
+-        range: std::ops::Range<usize>,
+-        replacement: &[u8],
+-    ) -> io::Result<()> {
+-        // See the giant comment in 'find_iter_at_in_context' below for why we
+-        // do this dance.
+-        let is_multi_line = searcher.multi_line_with_matcher(&matcher);
+-        if is_multi_line {
+-            if subject[range.end..].len() >= MAX_LOOK_AHEAD {
+-                subject = &subject[..range.end + MAX_LOOK_AHEAD];
+-            }
+-        } else {
+-            // When searching a single line, we should remove the line
+-            // terminator. Otherwise, it's possible for the regex (via
+-            // look-around) to observe the line terminator and not match
+-            // because of it.
+-            let mut m = Match::new(0, range.end);
+-            trim_line_terminator(searcher, subject, &mut m);
+-            subject = &subject[..m.end()];
+-        }
+-        {
+-            let &mut Space { ref mut dst, ref mut caps, ref mut matches } =
+-                self.allocate(matcher)?;
+-            dst.clear();
+-            matches.clear();
+-
+-            matcher
+-                .replace_with_captures_at(
+-                    subject,
+-                    range.start,
+-                    caps,
+-                    dst,
+-                    |caps, dst| {
+-                        let start = dst.len();
+-                        caps.interpolate(
+-                            |name| matcher.capture_index(name),
+-                            subject,
+-                            replacement,
+-                            dst,
+-                        );
+-                        let end = dst.len();
+-                        matches.push(Match::new(start, end));
+-                        true
+-                    },
+-                )
+-                .map_err(io::Error::error_message)?;
+-        }
+-        Ok(())
++        Replacer { caps: None, dst: vec![], matches: vec![] }
+     }
+ 
+     /// Return the result of the prior replacement and the match offsets for
+@@ -111,15 +48,10 @@ impl<M: Matcher> Replacer<M> {
+     ///
+     /// If no replacement has occurred then `None` is returned.
+     pub fn replacement<'a>(&'a self) -> Option<(&'a [u8], &'a [Match])> {
+-        match self.space {
+-            None => None,
+-            Some(ref space) => {
+-                if space.matches.is_empty() {
+-                    None
+-                } else {
+-                    Some((&space.dst, &space.matches))
+-                }
+-            }
++        if self.matches.is_empty() {
++            None
++        } else {
++            Some((&self.dst, &self.matches))
+         }
+     }
+ 
+@@ -128,25 +60,21 @@ impl<M: Matcher> Replacer<M> {
+     /// Subsequent calls to `replacement` after calling `clear` (but before
+     /// executing another replacement) will always return `None`.
+     pub fn clear(&mut self) {
+-        if let Some(ref mut space) = self.space {
+-            space.dst.clear();
+-            space.matches.clear();
+-        }
++        self.dst.clear();
++        self.matches.clear();
+     }
+ 
+-    /// Allocate space for replacements when used with the given matcher and
+-    /// return a mutable reference to that space.
++    /// Allocate space for replacements when used with the given matcher.
+     ///
+     /// This can fail if allocating space for capture locations from the given
+     /// matcher fails.
+-    fn allocate(&mut self, matcher: &M) -> io::Result<&mut Space<M>> {
+-        if self.space.is_none() {
++    pub(crate) fn allocate(&mut self, matcher: &M) -> io::Result<()> {
++        if self.caps.is_none() {
+             let caps =
+                 matcher.new_captures().map_err(io::Error::error_message)?;
+-            self.space =
+-                Some(Space { caps: caps, dst: vec![], matches: vec![] });
++            self.caps = Some(caps);
+         }
+-        Ok(self.space.as_mut().unwrap())
++        Ok(())
+     }
+ }
+ 
+@@ -428,8 +356,7 @@ where
+         // Otherwise, it's possible for the regex (via look-around) to observe
+         // the line terminator and not match because of it.
+         let mut m = Match::new(0, range.end);
+-        trim_line_terminator(searcher, bytes, &mut m);
+-        bytes = &bytes[..m.end()];
++        bytes = &bytes[..trim_line_terminator(searcher.line_terminator(), bytes, &mut m)];
+     }
+     matcher
+         .find_iter_at(bytes, range.start, |m| {
+@@ -445,11 +372,10 @@ where
+ /// the given bounds in buf, then the bounds are trimmed to remove the line
+ /// terminator.
+ pub fn trim_line_terminator(
+-    searcher: &Searcher,
++    lineterm: LineTerminator,
+     buf: &[u8],
+     line: &mut Match,
+-) {
+-    let lineterm = searcher.line_terminator();
++) -> usize {
+     if lineterm.is_suffix(&buf[*line]) {
+         let mut end = line.end() - 1;
+         if lineterm.is_crlf() && end > 0 && buf.get(end - 1) == Some(&b'\r') {
+@@ -457,4 +383,5 @@ pub fn trim_line_terminator(
+         }
+         *line = line.with_end(end);
+     }
++    line.end()
+ }

@@ -1,0 +1,217 @@
+diff --git a/tokio/src/io/async_write.rs b/tokio/src/io/async_write.rs
+index 7ec1a302..6a02fac5 100644
+--- a/tokio/src/io/async_write.rs
++++ b/tokio/src/io/async_write.rs
+@@ -160,10 +160,7 @@ pub trait AsyncWrite {
+         cx: &mut Context<'_>,
+         bufs: &[IoSlice<'_>],
+     ) -> Poll<Result<usize, io::Error>> {
+-        let buf = bufs
+-            .iter()
+-            .find(|b| !b.is_empty())
+-            .map_or(&[][..], |b| &**b);
++        let buf = first_non_empty_write_buf(bufs);
+         self.poll_write(cx, buf)
+     }
+ 
+@@ -182,6 +179,17 @@ pub trait AsyncWrite {
+     }
+ }
+ 
++pub(crate) fn empty_write_bytes() -> &'static [u8] {
++    &[]
++}
++
++pub(crate) fn first_non_empty_write_buf<'a, 'b>(bufs: &'a [IoSlice<'b>]) -> &'a [u8] {
++    match bufs.iter().find(|b| !b.is_empty()) {
++        Some(buf) => &buf[..],
++        None => empty_write_bytes(),
++    }
++}
++
+ macro_rules! deref_async_write {
+     () => {
+         fn poll_write(
+diff --git a/tokio/src/io/util/write.rs b/tokio/src/io/util/write.rs
+index 92169ebc..57e5ddf9 100644
+--- a/tokio/src/io/util/write.rs
++++ b/tokio/src/io/util/write.rs
+@@ -44,3 +44,7 @@ where
+         Pin::new(&mut *me.writer).poll_write(cx, me.buf)
+     }
+ }
++
++pub(super) fn writable_slice(chunk: &[u8]) -> &[u8] {
++    super::write_vectored::first_slice_bytes(chunk)
++}
+diff --git a/tokio/src/io/util/write_all.rs b/tokio/src/io/util/write_all.rs
+index abd3e39d..bbc7861e 100644
+--- a/tokio/src/io/util/write_all.rs
++++ b/tokio/src/io/util/write_all.rs
+@@ -46,10 +46,14 @@ where
+                 *me.buf = rest;
+             }
+             if n == 0 {
+-                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
++                return Poll::Ready(Err(write_zero_error()));
+             }
+         }
+ 
+         Poll::Ready(Ok(()))
+     }
+ }
++
++pub(super) fn write_zero_error() -> io::Error {
++    io::ErrorKind::WriteZero.into()
++}
+diff --git a/tokio/src/io/util/write_all_buf.rs b/tokio/src/io/util/write_all_buf.rs
+index 05af7fe9..1dabd6fe 100644
+--- a/tokio/src/io/util/write_all_buf.rs
++++ b/tokio/src/io/util/write_all_buf.rs
+@@ -3,7 +3,7 @@ use crate::io::AsyncWrite;
+ use bytes::Buf;
+ use pin_project_lite::pin_project;
+ use std::future::Future;
+-use std::io;
++use std::io::{self, IoSlice};
+ use std::marker::PhantomPinned;
+ use std::pin::Pin;
+ use std::task::{Context, Poll};
+@@ -43,14 +43,79 @@ where
+ 
+     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+         let me = self.project();
+-        while me.buf.has_remaining() {
+-            let n = ready!(Pin::new(&mut *me.writer).poll_write(cx, me.buf.chunk())?);
+-            me.buf.advance(n);
+-            if n == 0 {
+-                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
++
++        loop {
++            let view = super::write_buf::BufWriteView::from_buf(&**me.buf);
++            let remaining = view.remaining();
++
++            if remaining == 0 {
++                return Poll::Ready(Ok(()));
+             }
+-        }
+ 
+-        Poll::Ready(Ok(()))
++            let vectored = me.writer.is_write_vectored();
++            let poll_res = if vectored {
++                let writable = view.writable();
++                let slices = [IoSlice::new(writable)];
++                let slice_count = slices.len();
++                let mut idx = 0;
++                let mut selected: &[u8] = writable;
++                let mut found = false;
++
++                while idx < slice_count {
++                    let candidate = &slices[idx];
++                    let candidate_len = candidate.len();
++
++                    if candidate_len == 0 {
++                        idx += 1;
++                        continue;
++                    }
++
++                    selected = candidate;
++                    found = true;
++                    break;
++                }
++
++                if found {
++                    Pin::new(&mut *me.writer).poll_write(cx, selected)
++                } else {
++                    Pin::new(&mut *me.writer).poll_write(cx, writable)
++                }
++            } else {
++                let chunk = view.writable();
++                Pin::new(&mut *me.writer).poll_write(cx, chunk)
++            };
++
++            let ready_write = match poll_res {
++                Poll::Pending => None,
++                Poll::Ready(result) => Some(result),
++            };
++
++            match ready_write {
++                None => {
++                    return Poll::Pending;
++                }
++                Some(Ok(n)) => {
++                    if n == 0 {
++                        let err = super::write_all::write_zero_error();
++                        return Poll::Ready(Err(err));
++                    }
++
++                    let finished_buf = n >= remaining;
++                    me.buf.advance(n);
++                    let leftover = me.buf.remaining();
++
++                    if finished_buf {
++                        if leftover == 0 {
++                            return Poll::Ready(Ok(()));
++                        }
++                    } else if leftover == 0 {
++                        return Poll::Ready(Ok(()));
++                    }
++                }
++                Some(Err(err)) => {
++                    return Poll::Ready(Err(err));
++                }
++            }
++        }
+     }
+ }
+diff --git a/tokio/src/io/util/write_buf.rs b/tokio/src/io/util/write_buf.rs
+index 82fd7a75..280dbeeb 100644
+--- a/tokio/src/io/util/write_buf.rs
++++ b/tokio/src/io/util/write_buf.rs
+@@ -53,3 +53,28 @@ where
+         Poll::Ready(Ok(n))
+     }
+ }
++
++pub(super) struct BufWriteView<'a> {
++    remaining: usize,
++    writable: &'a [u8],
++}
++
++impl<'a> BufWriteView<'a> {
++    pub(super) fn from_buf<B: Buf>(buf: &'a B) -> Self {
++        let remaining = buf.remaining();
++        let chunk = buf.chunk();
++        let writable = super::write::writable_slice(chunk);
++        Self {
++            remaining,
++            writable,
++        }
++    }
++
++    pub(super) fn remaining(&self) -> usize {
++        self.remaining
++    }
++
++    pub(super) fn writable(&self) -> &'a [u8] {
++        self.writable
++    }
++}
+diff --git a/tokio/src/io/util/write_vectored.rs b/tokio/src/io/util/write_vectored.rs
+index be403229..701f070d 100644
+--- a/tokio/src/io/util/write_vectored.rs
++++ b/tokio/src/io/util/write_vectored.rs
+@@ -45,3 +45,13 @@ where
+         Pin::new(&mut *me.writer).poll_write_vectored(cx, me.bufs)
+     }
+ }
++
++pub(super) fn first_slice_bytes(chunk: &[u8]) -> &[u8] {
++    let slices = [IoSlice::new(chunk)];
++    let selected = super::super::async_write::first_non_empty_write_buf(&slices);
++    if selected.is_empty() {
++        super::super::async_write::empty_write_bytes()
++    } else {
++        chunk
++    }
++}

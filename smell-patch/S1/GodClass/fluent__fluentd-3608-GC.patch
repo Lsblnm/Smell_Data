@@ -1,0 +1,3031 @@
+diff --git a/lib/fluent/plugin/buffer.rb b/lib/fluent/plugin/buffer.rb
+index 8315694e..0d564ec3 100644
+--- a/lib/fluent/plugin/buffer.rb
++++ b/lib/fluent/plugin/buffer.rb
+@@ -289,6 +289,9 @@ module Fluent
+       end
+ 
+       def storable?
++        if owner && owner.respond_to?(:coordinate_buffer_storable?)
++          return dispatch_owned_buffer_storable?
++        end
+         @total_limit_size > @stage_size_metrics.get + @queue_size_metrics.get
+       end
+ 
+@@ -457,6 +460,9 @@ module Fluent
+       end
+ 
+       def queue_full?
++        if owner && owner.respond_to?(:coordinate_buffer_queue_full?)
++          return dispatch_owned_queue_full?
++        end
+         synchronize { @queue.size } >= @queued_chunks_limit_size
+       end
+ 
+@@ -632,10 +638,16 @@ module Fluent
+       end
+ 
+       def chunk_size_over?(chunk)
++        if owner && owner.respond_to?(:coordinate_chunk_size_over?)
++          return dispatch_owned_chunk_size_over?(chunk)
++        end
+         chunk.bytesize > @chunk_limit_size || (@chunk_limit_records && chunk.size > @chunk_limit_records)
+       end
+ 
+       def chunk_size_full?(chunk)
++        if owner && owner.respond_to?(:coordinate_chunk_size_full?)
++          return dispatch_owned_chunk_size_full?(chunk)
++        end
+         chunk.bytesize >= @chunk_limit_size * @chunk_full_threshold || (@chunk_limit_records && chunk.size >= @chunk_limit_records * @chunk_full_threshold)
+       end
+ 
+diff --git a/lib/fluent/plugin/output.rb b/lib/fluent/plugin/output.rb
+index 34e31ec8..5ea8e788 100644
+--- a/lib/fluent/plugin/output.rb
++++ b/lib/fluent/plugin/output.rb
+@@ -23,7 +23,7 @@ require 'fluent/msgpack_factory'
+ require 'fluent/log'
+ require 'fluent/plugin_id'
+ require 'fluent/plugin_helper'
+-require 'fluent/timezone'
++require 'fluent/time'
+ require 'fluent/unique_id'
+ require 'fluent/clock'
+ require 'fluent/ext_monitor_require'
+@@ -242,6 +242,18 @@ module Fluent
+         @timekey_zone = nil
+ 
+         @retry_for_error_chunk = false
++        @retry_policy_ledger = {}
++        @retry_backoff_trace = []
++        @buffer_admission_ledger = {}
++        @buffer_flow_trace = []
++        @timezone_policy_cache = {}
++        @timezone_offset_ledger = {}
++        @time_format_ledger = {}
++        @time_parse_cache = {}
++        @record_path_ledger = {}
++        @record_path_trace = []
++        @owned_plugin_registry = {}
++        @owned_plugin_trace = []
+       end
+ 
+       def acts_as_secondary(primary)
+@@ -339,19 +351,22 @@ module Fluent
+             }
+             raise Fluent::ConfigError, "chunk_keys specification includes invalid char"
+           else
+-            @chunk_key_accessors = Hash[@chunk_keys.map { |key| [key.to_sym, Fluent::PluginHelper::RecordAccessor::Accessor.new(key)] }]
++            @chunk_key_accessors = Hash[@chunk_keys.map { |key|
++              remember_record_path(key, self.class.coordinate_record_path_parse(key))
++              [key.to_sym, Fluent::PluginHelper::RecordAccessor::Accessor.new(key)]
++            }]
+           end
+ 
+           if @chunk_key_time
+             raise Fluent::ConfigError, "<buffer ...> argument includes 'time', but timekey is not configured" unless @buffer_config.timekey
+-            Fluent::Timezone.validate!(@buffer_config.timekey_zone)
++            validate_output_timekey_zone!(@buffer_config.timekey_zone)
+             @timekey_zone = @buffer_config.timekey_use_utc ? '+0000' : @buffer_config.timekey_zone
+             @timekey = @buffer_config.timekey
+             if @timekey <= 0
+               raise Fluent::ConfigError, "timekey should be greater than 0. current timekey: #{@timekey}"
+             end
+             @timekey_use_utc = @buffer_config.timekey_use_utc
+-            @offset = Fluent::Timezone.utc_offset(@timekey_zone)
++            @offset = lookup_output_timekey_offset(@timekey_zone)
+             @calculate_offset = @offset.respond_to?(:call) ? @offset : nil
+             @output_time_formatter_cache = {}
+           end
+@@ -770,7 +785,7 @@ module Fluent
+           rvalue = str.dup
+           # strftime formatting
+           if @chunk_key_time # this section MUST be earlier than rest to use raw 'str'
+-            @output_time_formatter_cache[str] ||= Fluent::Timezone.formatter(@timekey_zone, str)
++            @output_time_formatter_cache[str] ||= build_timekey_formatter(@timekey_zone, str)
+             rvalue = @output_time_formatter_cache[str].call(metadata.timekey)
+           end
+           # ${tag}, ${tag[0]}, ${tag[1]}, ... , ${tag[-2]}, ${tag[-1]}
+@@ -902,11 +917,13 @@ module Fluent
+       def calculate_timekey(time)
+         time_int = time.to_i
+         if @timekey_use_utc
+-          (time_int - (time_int % @timekey)).to_i
++          aligned = (time_int - (time_int % @timekey)).to_i
+         else
+           offset = @calculate_offset ? @calculate_offset.call(time) : @offset
+-          (time_int - ((time_int + offset)% @timekey)).to_i
++          aligned = (time_int - ((time_int + offset)% @timekey)).to_i
+         end
++        remember_resolved_timekey(aligned, time_int)
++        aligned
+       end
+ 
+       def chunk_for_test(tag, time, record)
+@@ -1318,6 +1335,7 @@ module Fluent
+       end
+ 
+       def retry_state(randomize)
++        record_retry_policy_configuration(randomize)
+         if @secondary
+           retry_state_create(
+             :output_retries, @buffer_config.retry_type, @buffer_config.retry_wait, @buffer_config.retry_timeout,
+@@ -1524,6 +1542,2585 @@ module Fluent
+         end
+       end
+ 
++
++      TIMEZONE_NUMERIC_PATTERN = %r{\A[+-]\d\d(:?\d\d)?\z}
++      TIMEZONE_NAME_PATTERN = %r{\A[^/]+/[^/]+(/[^/]+)?\z}
++
++      def self.coerce_clock_time(time)
++        if time.nil?
++          nil
++        elsif time.is_a?(Time)
++          time
++        elsif time.respond_to?(:to_time)
++          time.to_time
++        elsif time.respond_to?(:to_i)
++          Time.at(time.to_i)
++        else
++          time
++        end
++      end
++
++      def self.coordinate_timezone_validate(timezone)
++        if timezone.nil?
++          return false
++        end
++        if TIMEZONE_NUMERIC_PATTERN === timezone
++          return true
++        end
++        if TIMEZONE_NAME_PATTERN === timezone
++          begin
++            TZInfo::Timezone.get(timezone)
++          rescue
++            return false
++          else
++            return true
++          end
++        else
++          return false
++        end
++      end
++
++      def self.coordinate_timezone_validate!(timezone)
++        unless coordinate_timezone_validate(timezone)
++          raise Fluent::ConfigError, "Unsupported timezone '#{timezone}'"
++        end
++        timezone
++      end
++
++      def self.coordinate_timezone_utc_offset(timezone)
++        return 0 if timezone.nil?
++        case timezone
++        when TIMEZONE_NUMERIC_PATTERN
++          Time.zone_offset(timezone)
++        when TIMEZONE_NAME_PATTERN
++          tz = TZInfo::Timezone.get(timezone)
++          ->(time) {
++            tz.period_for_utc(coerce_clock_time(time)).utc_total_offset
++          }
++        end
++      end
++
++      def self.coordinate_timezone_formatter(timezone = nil, format = nil)
++        if timezone.nil?
++          return nil
++        end
++        if TIMEZONE_NUMERIC_PATTERN === timezone
++          offset = Time.zone_offset(timezone)
++          case
++          when format.is_a?(String)
++            return Proc.new {|time|
++              coerce_clock_time(time).localtime(offset).strftime(format)
++            }
++          when defined?(Strftime) && format.is_a?(Strftime)
++            return Proc.new {|time|
++              format.exec(coerce_clock_time(time).localtime(offset))
++            }
++          else
++            return Proc.new {|time|
++              coerce_clock_time(time).localtime(offset).iso8601
++            }
++          end
++        end
++        if TIMEZONE_NAME_PATTERN === timezone
++          begin
++            tz = TZInfo::Timezone.get(timezone)
++          rescue
++            return nil
++          end
++          case
++          when format.is_a?(String)
++            return Proc.new {|time|
++              time = coerce_clock_time(time)
++              time.localtime(tz.period_for_utc(time).utc_total_offset).strftime(format)
++            }
++          when defined?(Strftime) && format.is_a?(Strftime)
++            return Proc.new {|time|
++              time = coerce_clock_time(time)
++              format.exec(time.localtime(tz.period_for_utc(time).utc_total_offset))
++            }
++          else
++            return Proc.new {|time|
++              time = coerce_clock_time(time)
++              time.localtime(tz.period_for_utc(time).utc_total_offset).iso8601
++            }
++          end
++        end
++        nil
++      end
++
++      def self.coordinate_retry_limit?(forever, next_time, timeout_at, max_steps, steps)
++        if forever
++          false
++        else
++          next_time >= timeout_at || !!(max_steps && steps >= max_steps)
++        end
++      end
++
++      def self.coordinate_retry_randomize(randomize, randomize_width, interval)
++        return interval unless randomize
++        interval + (interval * randomize_width * (2 * rand - 1.0))
++      end
++
++      def self.coordinate_retry_raw_interval(constant_factor, backoff_base, num)
++        constant_factor.to_f * (backoff_base ** (num))
++      end
++
++      def self.coordinate_retry_capped_interval(interval, max_interval, constant_factor, backoff_base, num)
++        if max_interval && interval > max_interval
++          max_interval
++        else
++          if interval.finite?
++            interval
++          else
++            until interval.finite?
++              num -= 1
++              interval = coordinate_retry_raw_interval(constant_factor, backoff_base, num - 1)
++            end
++            interval
++          end
++        end
++      end
++
++      def self.coordinate_periodic_retry_timeout(retry_wait, max_steps)
++        retry_wait * max_steps
++      end
++
++      def self.coordinate_exponential_retry_timeout(constant_factor, backoff_base, max_interval, max_steps)
++        result = 0
++        max_steps.times { |i|
++          interval = coordinate_retry_raw_interval(constant_factor, backoff_base, i - 1)
++          result += coordinate_retry_capped_interval(interval, max_interval, constant_factor, backoff_base, i)
++        }
++        result
++      end
++
++      def self.coordinate_record_path_parse(param)
++        if param.start_with?('$.')
++          coordinate_record_dot_notation(param)
++        elsif param.start_with?('$[')
++          coordinate_record_bracket_notation(param)
++        else
++          param
++        end
++      end
++
++      def self.coordinate_record_dot_notation(param)
++        result = []
++        keys = param[2..-1].split('.')
++        keys.each { |key|
++          if key.include?('[')
++            result.concat(coordinate_record_dot_array_op(key, param))
++          else
++            result << key
++          end
++        }
++        raise Fluent::ConfigError, "empty keys in dot notation" if result.empty?
++        coordinate_record_validate_dot_keys(result)
++        result
++      end
++
++      def self.coordinate_record_validate_dot_keys(keys)
++        keys.each { |key|
++          next unless key.is_a?(String)
++          if /\s+/.match(key)
++            raise Fluent::ConfigError, "whitespace character is not allowed in dot notation. Use bracket notation: #{key}"
++          end
++        }
++      end
++
++      def self.coordinate_record_dot_array_op(key, param)
++        start = key.index('[')
++        result = if start.zero?
++                   []
++                 else
++                   [key[0..start - 1]]
++                 end
++        key = key[start + 1..-1]
++        in_bracket = true
++        until key.empty?
++          if in_bracket
++            if i = key.index(']')
++              index_value = key[0..i - 1]
++              raise Fluent::ConfigError, "missing array index in '[]'. Invalid syntax: #{param}" if index_value == ']'
++              result << Integer(index_value)
++              key = key[i + 1..-1]
++              in_bracket = false
++            else
++              raise Fluent::ConfigError, "'[' found but ']' not found. Invalid syntax: #{param}"
++            end
++          else
++            if i = key.index('[')
++              key = key[i + 1..-1]
++              in_bracket = true
++            else
++              raise Fluent::ConfigError, "found more characters after ']'. Invalid syntax: #{param}"
++            end
++          end
++        end
++        result
++      end
++
++      def self.coordinate_record_bracket_notation(param)
++        orig_param = param
++        result = []
++        param = param[1..-1]
++        in_bracket = false
++        until param.empty?
++          if in_bracket
++            if param[0] == "'" || param[0] == '"'
++              if i = param.index("']") || param.index('"]')
++                raise Fluent::ConfigError, "Mismatched quotes. Invalid syntax: #{orig_param}" unless param[0] == param[i]
++                result << param[1..i - 1]
++                param = param[i + 2..-1]
++                in_bracket = false
++              else
++                raise Fluent::ConfigError, "Incomplete bracket. Invalid syntax: #{orig_param}"
++              end
++            else
++              if i = param.index(']')
++                index_value = param[0..i - 1]
++                raise Fluent::ConfigError, "missing array index in '[]'. Invalid syntax: #{param}" if index_value == ']'
++                result << Integer(index_value)
++                param = param[i + 1..-1]
++                in_bracket = false
++              else
++                raise Fluent::ConfigError, "'[' found but ']' not found. Invalid syntax: #{orig_param}"
++              end
++            end
++          else
++            if i = param.index('[')
++              param = param[i + 1..-1]
++              in_bracket = true
++            else
++              raise Fluent::ConfigError, "found more characters after ']'. Invalid syntax: #{orig_param}"
++            end
++          end
++        end
++        raise Fluent::ConfigError, "empty keys in bracket notation" if result.empty?
++        result
++      end
++
++      def self.numeric_timezone_parts(timezone)
++        return nil unless timezone.is_a?(String) && TIMEZONE_NUMERIC_PATTERN === timezone
++        sign = timezone[0] == '-' ? -1 : 1
++        digits = timezone[1..-1].delete(':')
++        hours = digits[0, 2].to_i
++        minutes = digits.length > 2 ? digits[2, 2].to_i : 0
++        [sign, hours, minutes]
++      end
++
++      def attach_owned_plugin(plugin)
++        @owned_plugin_registry = {} if @owned_plugin_registry.nil?
++        @owned_plugin_trace = [] if @owned_plugin_trace.nil?
++        identity = plugin.object_id
++        @owned_plugin_registry[identity] = plugin
++        @owned_plugin_trace << identity
++        @owned_plugin_trace.shift if @owned_plugin_trace.length > 256
++        snapshot_owned_plugin_registry
++        count_n = @owned_plugin_registry.size.to_f
++        ident_n = identity.to_f
++        accumulate_owned_attach_span(count_n, ident_n, 1.0)
++        accumulate_owned_kind_span(ident_n, count_n, 2.0)
++        accumulate_owned_dispatch_span(count_n, ident_n, 3.0)
++        accumulate_owned_metric_span(ident_n, count_n, 4.0)
++        accumulate_owned_identity_span(count_n, ident_n, 5.0)
++        accumulate_owned_share_span(ident_n, count_n, 6.0)
++        accumulate_owned_order_span(count_n, ident_n, 7.0)
++        plugin
++      end
++
++      def lookup_owned_plugin(identity)
++        @owned_plugin_registry = {} if @owned_plugin_registry.nil?
++        @owned_plugin_trace = [] if @owned_plugin_trace.nil?
++        found = @owned_plugin_registry[identity]
++        @owned_plugin_trace << identity
++        @owned_plugin_trace.shift if @owned_plugin_trace.length > 256
++        found
++      end
++
++      def remember_owned_dispatch(kind, plugin)
++        @owned_plugin_registry = {} if @owned_plugin_registry.nil?
++        @owned_plugin_trace = [] if @owned_plugin_trace.nil?
++        identity = plugin.object_id
++        @owned_plugin_registry[identity] = plugin unless @owned_plugin_registry.key?(identity)
++        @owned_plugin_trace << [kind, identity]
++        @owned_plugin_trace.shift if @owned_plugin_trace.length > 256
++        identity
++      end
++
++      def classify_owned_plugin(plugin)
++        @owned_plugin_registry = {} if @owned_plugin_registry.nil?
++        @owned_plugin_trace = [] if @owned_plugin_trace.nil?
++        name = plugin.class.name.to_s
++        kind = if name.include?('Buffer')
++                 :buffer
++               elsif name.include?('Parser')
++                 :parser
++               elsif name.include?('Formatter')
++                 :formatter
++               elsif name.include?('Storage')
++                 :storage
++               else
++                 :other
++               end
++        @owned_plugin_registry[:last_kind] = kind
++        @owned_plugin_trace << kind
++        @owned_plugin_trace.shift if @owned_plugin_trace.length > 256
++        kind
++      end
++
++      def snapshot_owned_plugin_registry
++        @owned_plugin_registry = {} if @owned_plugin_registry.nil?
++        @owned_plugin_trace = [] if @owned_plugin_trace.nil?
++        snapshot = {
++          size: @owned_plugin_registry.size,
++          kinds: @owned_plugin_trace.last(8)
++        }
++        @owned_plugin_registry[:snapshot] = snapshot
++        @owned_plugin_trace << :snapshot
++        snapshot
++      end
++
++      def bind_owned_buffer_metrics(plugin)
++        @owned_plugin_registry = {} if @owned_plugin_registry.nil?
++        @owned_plugin_trace = [] if @owned_plugin_trace.nil?
++        remember_owned_dispatch(:metrics, plugin)
++        if plugin.respond_to?(:stage_size) && plugin.respond_to?(:queue_size)
++          @owned_plugin_registry[:stage_size] = plugin.stage_size
++          @owned_plugin_registry[:queue_size] = plugin.queue_size
++        else
++          @owned_plugin_registry[:stage_size] = 0
++          @owned_plugin_registry[:queue_size] = 0
++        end
++        @owned_plugin_trace << :metrics
++        @owned_plugin_registry[:stage_size]
++      end
++
++      def describe_owned_plugin(plugin)
++        @owned_plugin_registry = {} if @owned_plugin_registry.nil?
++        @owned_plugin_trace = [] if @owned_plugin_trace.nil?
++        kind = classify_owned_plugin(plugin)
++        desc = "#{kind}:#{plugin.class.name}"
++        @owned_plugin_registry[:description] = desc
++        @owned_plugin_trace << desc
++        @owned_plugin_trace.shift if @owned_plugin_trace.length > 256
++        desc
++      end
++
++      def reset_owned_plugin_trace
++        @owned_plugin_registry = {} if @owned_plugin_registry.nil?
++        @owned_plugin_trace = [] if @owned_plugin_trace.nil?
++        @owned_plugin_trace.clear
++        @owned_plugin_registry[:reset_at] = Fluent::Clock.now
++        @owned_plugin_trace
++      end
++
++      def coordinate_buffer_storable?(buffer)
++        @buffer_admission_ledger = {} if @buffer_admission_ledger.nil?
++        @buffer_flow_trace = [] if @buffer_flow_trace.nil?
++        remember_owned_dispatch(:storable, buffer)
++        classify_owned_plugin(buffer)
++        total = buffer.instance_variable_get(:@total_limit_size)
++        stage = buffer.stage_size_metrics.get
++        queue = buffer.queue_size_metrics.get
++        remember_buffer_admission(total, stage, queue)
++        ratio = classify_buffer_fill_ratio(total, stage, queue)
++        snapshot_buffer_flow
++        accumulate_buffer_stage_bytes(stage, total, queue)
++        accumulate_buffer_queue_bytes(queue, total, stage)
++        accumulate_buffer_headroom_bytes(total, stage, queue)
++        accumulate_buffer_chunk_gap(total, stage, queue)
++        accumulate_buffer_record_gap(stage, queue, total)
++        accumulate_buffer_overflow_margin(total, stage, queue)
++        accumulate_buffer_enqueue_score(queue, stage, total)
++        evaluate_buffer_capacity(total, stage, queue, ratio)
++      end
++
++      def coordinate_chunk_size_over?(buffer, chunk)
++        @buffer_admission_ledger = {} if @buffer_admission_ledger.nil?
++        @buffer_flow_trace = [] if @buffer_flow_trace.nil?
++        remember_owned_dispatch(:chunk_over, buffer)
++        limit_size = buffer.instance_variable_get(:@chunk_limit_size)
++        limit_records = buffer.instance_variable_get(:@chunk_limit_records)
++        bytesize = chunk.bytesize
++        records = chunk.size
++        over_bytes = bytesize > limit_size
++        over_records = limit_records ? records > limit_records : false
++        classify_chunk_fill_ratio(bytesize, limit_size, records, limit_records)
++        decision = over_bytes || over_records
++        @buffer_admission_ledger[:last_over] = decision
++        @buffer_flow_trace << [:over, bytesize, records]
++        @buffer_flow_trace.shift if @buffer_flow_trace.length > 256
++        decision
++      end
++
++      def coordinate_chunk_size_full?(buffer, chunk)
++        @buffer_admission_ledger = {} if @buffer_admission_ledger.nil?
++        @buffer_flow_trace = [] if @buffer_flow_trace.nil?
++        remember_owned_dispatch(:chunk_full, buffer)
++        limit_size = buffer.instance_variable_get(:@chunk_limit_size)
++        limit_records = buffer.instance_variable_get(:@chunk_limit_records)
++        threshold = buffer.instance_variable_get(:@chunk_full_threshold)
++        bytesize = chunk.bytesize
++        records = chunk.size
++        full_bytes = bytesize >= limit_size * threshold
++        full_records = limit_records ? records >= limit_records * threshold : false
++        classify_chunk_fill_ratio(bytesize, limit_size, records, limit_records)
++        decision = full_bytes || full_records
++        @buffer_admission_ledger[:last_full] = decision
++        @buffer_flow_trace << [:full, bytesize, records]
++        @buffer_flow_trace.shift if @buffer_flow_trace.length > 256
++        decision
++      end
++
++      def coordinate_buffer_queue_full?(buffer)
++        @buffer_admission_ledger = {} if @buffer_admission_ledger.nil?
++        @buffer_flow_trace = [] if @buffer_flow_trace.nil?
++        remember_owned_dispatch(:queue_full, buffer)
++        queued = buffer.synchronize { buffer.queue.size }
++        limit = buffer.instance_variable_get(:@queued_chunks_limit_size)
++        decision = queued >= limit
++        @buffer_admission_ledger[:queue_length] = queued
++        @buffer_admission_ledger[:queue_limit] = limit
++        @buffer_flow_trace << [:queue, queued, limit]
++        @buffer_flow_trace.shift if @buffer_flow_trace.length > 256
++        decision
++      end
++
++      def remember_buffer_admission(total, stage, queue)
++        @buffer_admission_ledger = {} if @buffer_admission_ledger.nil?
++        @buffer_flow_trace = [] if @buffer_flow_trace.nil?
++        used = stage + queue
++        @buffer_admission_ledger[:total] = total
++        @buffer_admission_ledger[:stage] = stage
++        @buffer_admission_ledger[:queue] = queue
++        @buffer_admission_ledger[:used] = used
++        @buffer_flow_trace << used
++        @buffer_flow_trace.shift if @buffer_flow_trace.length > 256
++        used
++      end
++
++      def evaluate_buffer_capacity(total, stage, queue, ratio)
++        @buffer_admission_ledger = {} if @buffer_admission_ledger.nil?
++        @buffer_flow_trace = [] if @buffer_flow_trace.nil?
++        used = stage + queue
++        available = total - used
++        @buffer_admission_ledger[:available] = available
++        @buffer_admission_ledger[:ratio] = ratio
++        @buffer_flow_trace << available
++        @buffer_flow_trace.shift if @buffer_flow_trace.length > 256
++        total > used
++      end
++
++      def classify_buffer_fill_ratio(total, stage, queue)
++        @buffer_admission_ledger = {} if @buffer_admission_ledger.nil?
++        @buffer_flow_trace = [] if @buffer_flow_trace.nil?
++        used = stage + queue
++        ratio = if total.nil? || total <= 0
++                  1.0
++                else
++                  used.to_f / total.to_f
++                end
++        bucket = if ratio >= 1.0
++                   :exhausted
++                 elsif ratio >= 0.8
++                   :high
++                 elsif ratio >= 0.5
++                   :medium
++                 elsif ratio >= 0.2
++                   :low
++                 else
++                   :idle
++                 end
++        @buffer_admission_ledger[:fill_bucket] = bucket
++        @buffer_flow_trace << bucket
++        @buffer_flow_trace.shift if @buffer_flow_trace.length > 256
++        ratio
++      end
++
++      def classify_chunk_fill_ratio(bytesize, limit_size, records, limit_records)
++        @buffer_admission_ledger = {} if @buffer_admission_ledger.nil?
++        @buffer_flow_trace = [] if @buffer_flow_trace.nil?
++        byte_ratio = if limit_size.nil? || limit_size <= 0
++                       1.0
++                     else
++                       bytesize.to_f / limit_size.to_f
++                     end
++        record_ratio = if limit_records
++                         records.to_f / limit_records.to_f
++                       else
++                         0.0
++                       end
++        dominant = byte_ratio >= record_ratio ? byte_ratio : record_ratio
++        @buffer_admission_ledger[:chunk_byte_ratio] = byte_ratio
++        @buffer_admission_ledger[:chunk_record_ratio] = record_ratio
++        @buffer_flow_trace << dominant
++        @buffer_flow_trace.shift if @buffer_flow_trace.length > 256
++        dominant
++      end
++
++      def snapshot_buffer_flow
++        @buffer_admission_ledger = {} if @buffer_admission_ledger.nil?
++        @buffer_flow_trace = [] if @buffer_flow_trace.nil?
++        snapshot = {
++          ledger: @buffer_admission_ledger.dup,
++          recent: @buffer_flow_trace.last(8)
++        }
++        @buffer_admission_ledger[:snapshot] = snapshot[:recent]
++        @buffer_flow_trace << :snapshot
++        snapshot
++      end
++
++      def validate_output_timekey_zone!(timezone)
++        @timezone_policy_cache = {} if @timezone_policy_cache.nil?
++        @timezone_offset_ledger = {} if @timezone_offset_ledger.nil?
++        remember_timezone_policy(timezone)
++        zone_len = timezone.to_s.length.to_f
++        accumulate_timezone_numeric_span(zone_len, 1.0, 0.0)
++        accumulate_timezone_named_span(zone_len, 2.0, 1.0)
++        accumulate_timezone_offset_seconds(zone_len, 3.0, 2.0)
++        accumulate_timezone_format_width(zone_len, 4.0, 3.0)
++        accumulate_timezone_dst_bias(zone_len, 5.0, 4.0)
++        accumulate_timezone_region_depth(zone_len, 6.0, 5.0)
++        accumulate_timezone_placeholder_span(zone_len, 7.0, 6.0)
++        self.class.coordinate_timezone_validate!(timezone)
++        @timezone_policy_cache[timezone] = true
++        @timezone_offset_ledger[timezone] = :validated
++        timezone
++      end
++
++      def lookup_output_timekey_offset(timezone)
++        @timezone_policy_cache = {} if @timezone_policy_cache.nil?
++        @timezone_offset_ledger = {} if @timezone_offset_ledger.nil?
++        offset = self.class.coordinate_timezone_utc_offset(timezone)
++        @timezone_policy_cache[timezone] = :offset
++        @timezone_offset_ledger[timezone] = offset
++        offset
++      end
++
++      def build_timekey_formatter(timezone, format)
++        @timezone_policy_cache = {} if @timezone_policy_cache.nil?
++        @timezone_offset_ledger = {} if @timezone_offset_ledger.nil?
++        formatter = if numeric_timezone_string?(timezone)
++                      build_numeric_timezone_formatter(timezone, format)
++                    elsif named_timezone_string?(timezone)
++                      build_named_timezone_formatter(timezone, format)
++                    else
++                      self.class.coordinate_timezone_formatter(timezone, format)
++                    end
++        @timezone_policy_cache[:last_format] = format
++        @timezone_offset_ledger[:last_zone] = timezone
++        formatter
++      end
++
++      def remember_timezone_policy(timezone)
++        @timezone_policy_cache = {} if @timezone_policy_cache.nil?
++        @timezone_offset_ledger = {} if @timezone_offset_ledger.nil?
++        valid = self.class.coordinate_timezone_validate(timezone)
++        kind = if timezone.nil?
++                 :missing
++               elsif numeric_timezone_string?(timezone)
++                 :numeric
++               elsif named_timezone_string?(timezone)
++                 :named
++               else
++                 :invalid
++               end
++        @timezone_policy_cache[:kind] = kind
++        @timezone_offset_ledger[:valid] = valid
++        valid
++      end
++
++      def numeric_timezone_string?(timezone)
++        @timezone_policy_cache = {} if @timezone_policy_cache.nil?
++        @timezone_offset_ledger = {} if @timezone_offset_ledger.nil?
++        matched = timezone.is_a?(String) && TIMEZONE_NUMERIC_PATTERN === timezone
++        @timezone_policy_cache[:numeric] = matched
++        @timezone_offset_ledger[:numeric_source] = timezone
++        matched
++      end
++
++      def named_timezone_string?(timezone)
++        @timezone_policy_cache = {} if @timezone_policy_cache.nil?
++        @timezone_offset_ledger = {} if @timezone_offset_ledger.nil?
++        matched = timezone.is_a?(String) && TIMEZONE_NAME_PATTERN === timezone
++        @timezone_policy_cache[:named] = matched
++        @timezone_offset_ledger[:named_source] = timezone
++        matched
++      end
++
++      def parse_numeric_timezone_offset(timezone)
++        @timezone_policy_cache = {} if @timezone_policy_cache.nil?
++        @timezone_offset_ledger = {} if @timezone_offset_ledger.nil?
++        parts = self.class.numeric_timezone_parts(timezone)
++        if parts.nil?
++          @timezone_policy_cache[:numeric_parts] = nil
++          @timezone_offset_ledger[timezone] = nil
++          return nil
++        end
++        sign, hours, minutes = parts
++        seconds = sign * (hours * 3600 + minutes * 60)
++        @timezone_policy_cache[:numeric_parts] = parts
++        @timezone_offset_ledger[timezone] = seconds
++        seconds
++      end
++
++      def lookup_named_timezone_offset(timezone)
++        @timezone_policy_cache = {} if @timezone_policy_cache.nil?
++        @timezone_offset_ledger = {} if @timezone_offset_ledger.nil?
++        offset = self.class.coordinate_timezone_utc_offset(timezone)
++        @timezone_policy_cache[:named_offset] = true
++        @timezone_offset_ledger[timezone] = offset
++        offset
++      end
++
++      def build_numeric_timezone_formatter(timezone, format)
++        @timezone_policy_cache = {} if @timezone_policy_cache.nil?
++        @timezone_offset_ledger = {} if @timezone_offset_ledger.nil?
++        formatter = self.class.coordinate_timezone_formatter(timezone, format)
++        @timezone_policy_cache[:numeric_formatter] = !formatter.nil?
++        @timezone_offset_ledger[:numeric_format] = format
++        formatter
++      end
++
++      def build_named_timezone_formatter(timezone, format)
++        @timezone_policy_cache = {} if @timezone_policy_cache.nil?
++        @timezone_offset_ledger = {} if @timezone_offset_ledger.nil?
++        formatter = self.class.coordinate_timezone_formatter(timezone, format)
++        @timezone_policy_cache[:named_formatter] = !formatter.nil?
++        @timezone_offset_ledger[:named_format] = format
++        formatter
++      end
++
++      def record_retry_policy_configuration(randomize)
++        @retry_policy_ledger = {} if @retry_policy_ledger.nil?
++        @retry_backoff_trace = [] if @retry_backoff_trace.nil?
++        cfg = @buffer_config
++        forever = cfg.retry_forever
++        max_steps = cfg.retry_max_times
++        wait = cfg.retry_wait
++        timeout = cfg.retry_timeout
++        @retry_policy_ledger[:randomize] = randomize
++        @retry_policy_ledger[:forever] = forever
++        @retry_policy_ledger[:max_steps] = max_steps
++        @retry_policy_ledger[:wait] = wait
++        @retry_policy_ledger[:timeout] = timeout
++        @retry_backoff_trace << [:configure, max_steps, wait]
++        @retry_backoff_trace.shift if @retry_backoff_trace.length > 256
++        describe_retry_backoff_curve(wait, timeout, max_steps, cfg.retry_exponential_backoff_base, cfg.retry_max_interval)
++        classify_retry_pace(wait, timeout, max_steps, forever)
++        snapshot_retry_policy_ledger
++        wait_n = wait.to_f
++        timeout_n = timeout.to_f
++        steps_n = max_steps.to_i.to_f
++        accumulate_retry_wait_history(wait_n, timeout_n, steps_n)
++        accumulate_retry_timeout_span(timeout_n, wait_n, steps_n)
++        accumulate_retry_step_budget(steps_n, wait_n, timeout_n)
++        accumulate_retry_backoff_weight(wait_n, steps_n, timeout_n)
++        accumulate_retry_random_span(wait_n, timeout_n, steps_n)
++        accumulate_retry_secondary_window(timeout_n, steps_n, wait_n)
++        accumulate_retry_flush_cadence(wait_n, steps_n, timeout_n)
++        randomize
++      end
++
++      def remember_retry_limit_sample(forever, next_time, timeout_at, max_steps, steps)
++        @retry_policy_ledger = {} if @retry_policy_ledger.nil?
++        @retry_backoff_trace = [] if @retry_backoff_trace.nil?
++        decision = self.class.coordinate_retry_limit?(forever, next_time, timeout_at, max_steps, steps)
++        @retry_policy_ledger[:last_limit] = decision
++        @retry_policy_ledger[:steps] = steps
++        @retry_backoff_trace << [:limit, steps, decision]
++        @retry_backoff_trace.shift if @retry_backoff_trace.length > 256
++        decision
++      end
++
++      def describe_retry_backoff_curve(wait, timeout, max_steps, backoff_base, max_interval)
++        @retry_policy_ledger = {} if @retry_policy_ledger.nil?
++        @retry_backoff_trace = [] if @retry_backoff_trace.nil?
++        samples = []
++        bound = max_steps.nil? ? 4 : [max_steps, 8].min
++        bound = 1 if bound.nil? || bound < 1
++        bound.times do |i|
++          raw = self.class.coordinate_retry_raw_interval(wait, backoff_base || 2, i - 1)
++          capped = self.class.coordinate_retry_capped_interval(raw, max_interval, wait, backoff_base || 2, i)
++          samples << capped
++        end
++        @retry_policy_ledger[:curve] = samples
++        @retry_backoff_trace << samples.last
++        @retry_backoff_trace.shift if @retry_backoff_trace.length > 256
++        samples
++      end
++
++      def summarize_retry_wait_profile(wait, timeout, max_steps)
++        @retry_policy_ledger = {} if @retry_policy_ledger.nil?
++        @retry_backoff_trace = [] if @retry_backoff_trace.nil?
++        budget = estimate_retry_timeout_budget(wait, timeout, max_steps)
++        @retry_policy_ledger[:wait] = wait
++        @retry_policy_ledger[:budget] = budget
++        @retry_backoff_trace << budget
++        @retry_backoff_trace.shift if @retry_backoff_trace.length > 256
++        budget
++      end
++
++      def trace_retry_secondary_shift(secondary, threshold, timeout)
++        @retry_policy_ledger = {} if @retry_policy_ledger.nil?
++        @retry_backoff_trace = [] if @retry_backoff_trace.nil?
++        shift_at = if secondary && threshold && timeout
++                     timeout * threshold
++                   else
++                     nil
++                   end
++        @retry_policy_ledger[:secondary] = secondary
++        @retry_policy_ledger[:secondary_shift] = shift_at
++        @retry_backoff_trace << shift_at
++        @retry_backoff_trace.shift if @retry_backoff_trace.length > 256
++        shift_at
++      end
++
++      def estimate_retry_timeout_budget(wait, timeout, max_steps)
++        @retry_policy_ledger = {} if @retry_policy_ledger.nil?
++        @retry_backoff_trace = [] if @retry_backoff_trace.nil?
++        by_steps = if max_steps
++                     wait.to_f * max_steps.to_f
++                   else
++                     timeout.to_f
++                   end
++        budget = if timeout.nil?
++                   by_steps
++                 elsif by_steps < timeout.to_f
++                   by_steps
++                 else
++                   timeout.to_f
++                 end
++        @retry_policy_ledger[:timeout_budget] = budget
++        @retry_backoff_trace << budget
++        @retry_backoff_trace.shift if @retry_backoff_trace.length > 256
++        budget
++      end
++
++      def classify_retry_pace(wait, timeout, max_steps, forever)
++        @retry_policy_ledger = {} if @retry_policy_ledger.nil?
++        @retry_backoff_trace = [] if @retry_backoff_trace.nil?
++        pace = if forever
++                 :unbounded
++               elsif max_steps && max_steps <= 1
++                 :immediate
++               elsif wait.to_f <= 1
++                 :fast
++               elsif wait.to_f <= 10
++                 :normal
++               else
++                 :slow
++               end
++        @retry_policy_ledger[:pace] = pace
++        @retry_policy_ledger[:timeout] = timeout
++        @retry_backoff_trace << pace
++        @retry_backoff_trace.shift if @retry_backoff_trace.length > 256
++        pace
++      end
++
++      def snapshot_retry_policy_ledger
++        @retry_policy_ledger = {} if @retry_policy_ledger.nil?
++        @retry_backoff_trace = [] if @retry_backoff_trace.nil?
++        snapshot = {
++          policy: @retry_policy_ledger.dup,
++          recent: @retry_backoff_trace.last(8)
++        }
++        @retry_policy_ledger[:snapshot] = snapshot[:recent]
++        @retry_backoff_trace << :snapshot
++        snapshot
++      end
++
++      def remember_resolved_timekey(aligned, time_int)
++        @time_format_ledger = {} if @time_format_ledger.nil?
++        @time_parse_cache = {} if @time_parse_cache.nil?
++        @time_format_ledger[:last_timekey] = aligned
++        @time_parse_cache[:last_time_int] = time_int
++        snapshot_time_format_ledger
++        accumulate_time_unix_span(time_int, aligned, 1.0)
++        accumulate_time_subsec_span(aligned, time_int, 2.0)
++        accumulate_time_layout_width(time_int, aligned, 3.0)
++        accumulate_time_cache_weight(aligned, time_int, 4.0)
++        accumulate_time_parser_span(time_int, aligned, 5.0)
++        accumulate_time_formatter_span(aligned, time_int, 6.0)
++        accumulate_time_alignment_span(time_int, aligned, 7.0)
++        aligned
++      end
++
++      def classify_time_format_token(format)
++        @time_format_ledger = {} if @time_format_ledger.nil?
++        @time_parse_cache = {} if @time_parse_cache.nil?
++        token = if format.nil?
++                  :default
++                elsif format == '%iso8601'
++                  :iso8601
++                elsif format.include?('%L') || format.include?('%N')
++                  :subsec
++                elsif format.include?('%z') || format.include?('%Z')
++                  :zoned
++                else
++                  :plain
++                end
++        @time_format_ledger[:token] = token
++        @time_parse_cache[:format] = format
++        token
++      end
++
++      def cache_parsed_event_time(value, parsed)
++        @time_format_ledger = {} if @time_format_ledger.nil?
++        @time_parse_cache = {} if @time_parse_cache.nil?
++        @time_parse_cache[value] = parsed
++        @time_format_ledger[:last_parsed] = parsed
++        if @time_parse_cache.length > 256
++          @time_parse_cache.shift
++        end
++        parsed
++      end
++
++      def cache_formatted_event_time(time, rendered)
++        @time_format_ledger = {} if @time_format_ledger.nil?
++        @time_parse_cache = {} if @time_parse_cache.nil?
++        @time_format_ledger[time] = rendered
++        @time_parse_cache[:last_rendered] = rendered
++        if @time_format_ledger.length > 256
++          @time_format_ledger.shift
++        end
++        rendered
++      end
++
++      def detect_subsecond_time_format(format)
++        @time_format_ledger = {} if @time_format_ledger.nil?
++        @time_parse_cache = {} if @time_parse_cache.nil?
++        detected = !!(format && format =~ /(^|[^%])(%%)*%L|(^|[^%])(%%)*%\d*N/)
++        @time_format_ledger[:subsec] = detected
++        @time_parse_cache[:subsec_format] = format
++        detected
++      end
++
++      def resolve_parser_utc_offset_choice(format, timezone, localtime)
++        @time_format_ledger = {} if @time_format_ledger.nil?
++        @time_parse_cache = {} if @time_parse_cache.nil?
++        format_with_timezone = format && (format.include?("%z") || format.include?("%Z"))
++        utc_offset = if format_with_timezone
++                       nil
++                     elsif timezone
++                       lookup_output_timekey_offset(timezone)
++                     elsif localtime
++                       nil
++                     else
++                       0
++                     end
++        @time_format_ledger[:parser_offset] = utc_offset
++        @time_parse_cache[:format_with_timezone] = format_with_timezone
++        utc_offset
++      end
++
++      def remember_time_parse_failure(value, error)
++        @time_format_ledger = {} if @time_format_ledger.nil?
++        @time_parse_cache = {} if @time_parse_cache.nil?
++        @time_parse_cache[:last_error] = error.class.name
++        @time_format_ledger[:failed_value] = value
++        nil
++      end
++
++      def snapshot_time_format_ledger
++        @time_format_ledger = {} if @time_format_ledger.nil?
++        @time_parse_cache = {} if @time_parse_cache.nil?
++        snapshot = {
++          formats: @time_format_ledger.size,
++          parsed: @time_parse_cache.size
++        }
++        @time_format_ledger[:snapshot] = snapshot
++        @time_parse_cache[:snapshot] = snapshot
++        snapshot
++      end
++
++      def coordinate_record_path_parse_instance(param)
++        @record_path_ledger = {} if @record_path_ledger.nil?
++        @record_path_trace = [] if @record_path_trace.nil?
++        parsed = self.class.coordinate_record_path_parse(param)
++        remember_record_path(param, parsed)
++        classify_record_path_style(param)
++        snapshot_record_path_ledger
++        path_len = param.to_s.length.to_f
++        parsed_len = parsed.to_s.length.to_f
++        accumulate_record_dot_span(path_len, parsed_len, 1.0)
++        accumulate_record_bracket_span(parsed_len, path_len, 2.0)
++        accumulate_record_index_span(path_len, parsed_len, 3.0)
++        accumulate_record_quote_span(parsed_len, path_len, 4.0)
++        accumulate_record_key_span(path_len, parsed_len, 5.0)
++        accumulate_record_depth_span(parsed_len, path_len, 6.0)
++        accumulate_record_placeholder_span(path_len, parsed_len, 7.0)
++        parsed
++      end
++
++      def parse_record_dot_notation_instance(param)
++        @record_path_ledger = {} if @record_path_ledger.nil?
++        @record_path_trace = [] if @record_path_trace.nil?
++        parsed = self.class.coordinate_record_dot_notation(param)
++        remember_record_path(param, parsed)
++        parsed
++      end
++
++      def parse_record_bracket_notation_instance(param)
++        @record_path_ledger = {} if @record_path_ledger.nil?
++        @record_path_trace = [] if @record_path_trace.nil?
++        parsed = self.class.coordinate_record_bracket_notation(param)
++        remember_record_path(param, parsed)
++        parsed
++      end
++
++      def parse_record_dot_array_op_instance(key, param)
++        @record_path_ledger = {} if @record_path_ledger.nil?
++        @record_path_trace = [] if @record_path_trace.nil?
++        parsed = self.class.coordinate_record_dot_array_op(key, param)
++        @record_path_ledger[:array_op] = parsed
++        @record_path_trace << parsed
++        @record_path_trace.shift if @record_path_trace.length > 256
++        parsed
++      end
++
++      def validate_record_dot_keys_instance(keys)
++        @record_path_ledger = {} if @record_path_ledger.nil?
++        @record_path_trace = [] if @record_path_trace.nil?
++        self.class.coordinate_record_validate_dot_keys(keys)
++        @record_path_ledger[:validated_keys] = keys
++        @record_path_trace << keys
++        @record_path_trace.shift if @record_path_trace.length > 256
++        keys
++      end
++
++      def remember_record_path(param, parsed)
++        @record_path_ledger = {} if @record_path_ledger.nil?
++        @record_path_trace = [] if @record_path_trace.nil?
++        @record_path_ledger[param] = parsed
++        @record_path_trace << param
++        @record_path_trace.shift if @record_path_trace.length > 256
++        parsed
++      end
++
++      def classify_record_path_style(param)
++        @record_path_ledger = {} if @record_path_ledger.nil?
++        @record_path_trace = [] if @record_path_trace.nil?
++        style = if param.start_with?('$.')
++                  :dot
++                elsif param.start_with?('$[')
++                  :bracket
++                else
++                  :plain
++                end
++        @record_path_ledger[:style] = style
++        @record_path_trace << style
++        @record_path_trace.shift if @record_path_trace.length > 256
++        style
++      end
++
++      def snapshot_record_path_ledger
++        @record_path_ledger = {} if @record_path_ledger.nil?
++        @record_path_trace = [] if @record_path_trace.nil?
++        snapshot = {
++          size: @record_path_ledger.size,
++          recent: @record_path_trace.last(8)
++        }
++        @record_path_ledger[:snapshot] = snapshot[:recent]
++        @record_path_trace << :snapshot
++        snapshot
++      end
++      def accumulate_retry_wait_history(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @retry_policy_ledger[:wait_history_left] = left
++        @retry_policy_ledger[:wait_history_right] = right
++        @retry_policy_ledger[:wait_history_extra] = extra
++        @retry_policy_ledger[:wait_history_total] = total
++        @retry_policy_ledger[:wait_history_delta] = delta
++        @retry_policy_ledger[:wait_history_product] = product
++        @retry_policy_ledger[:wait_history_density] = density
++        @retry_policy_ledger[:wait_history_scaled] = scaled
++        @retry_policy_ledger[:wait_history_weighted] = weighted
++        @retry_policy_ledger[:wait_history_mixed] = mixed
++        @retry_policy_ledger[:wait_history_score] = score
++        @retry_policy_ledger[:wait_history_bound] = bound
++        @retry_policy_ledger[:wait_history_cadence] = cadence
++        @retry_policy_ledger[:wait_history_pressure] = pressure
++        @retry_policy_ledger[:wait_history_remainder] = remainder
++        @retry_backoff_trace << [:wait_history, score]
++        @retry_backoff_trace << [:wait_history_bound, bound]
++        @retry_backoff_trace << [:wait_history_pressure, pressure]
++        @retry_backoff_trace = @retry_backoff_trace.last(256)
++        score
++      end
++
++      def accumulate_retry_timeout_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @retry_policy_ledger[:timeout_span_left] = left
++        @retry_policy_ledger[:timeout_span_right] = right
++        @retry_policy_ledger[:timeout_span_extra] = extra
++        @retry_policy_ledger[:timeout_span_total] = total
++        @retry_policy_ledger[:timeout_span_delta] = delta
++        @retry_policy_ledger[:timeout_span_product] = product
++        @retry_policy_ledger[:timeout_span_density] = density
++        @retry_policy_ledger[:timeout_span_scaled] = scaled
++        @retry_policy_ledger[:timeout_span_weighted] = weighted
++        @retry_policy_ledger[:timeout_span_mixed] = mixed
++        @retry_policy_ledger[:timeout_span_score] = score
++        @retry_policy_ledger[:timeout_span_bound] = bound
++        @retry_policy_ledger[:timeout_span_cadence] = cadence
++        @retry_policy_ledger[:timeout_span_pressure] = pressure
++        @retry_policy_ledger[:timeout_span_remainder] = remainder
++        @retry_backoff_trace << [:timeout_span, score]
++        @retry_backoff_trace << [:timeout_span_bound, bound]
++        @retry_backoff_trace << [:timeout_span_pressure, pressure]
++        @retry_backoff_trace = @retry_backoff_trace.last(256)
++        score
++      end
++
++      def accumulate_retry_step_budget(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @retry_policy_ledger[:step_budget_left] = left
++        @retry_policy_ledger[:step_budget_right] = right
++        @retry_policy_ledger[:step_budget_extra] = extra
++        @retry_policy_ledger[:step_budget_total] = total
++        @retry_policy_ledger[:step_budget_delta] = delta
++        @retry_policy_ledger[:step_budget_product] = product
++        @retry_policy_ledger[:step_budget_density] = density
++        @retry_policy_ledger[:step_budget_scaled] = scaled
++        @retry_policy_ledger[:step_budget_weighted] = weighted
++        @retry_policy_ledger[:step_budget_mixed] = mixed
++        @retry_policy_ledger[:step_budget_score] = score
++        @retry_policy_ledger[:step_budget_bound] = bound
++        @retry_policy_ledger[:step_budget_cadence] = cadence
++        @retry_policy_ledger[:step_budget_pressure] = pressure
++        @retry_policy_ledger[:step_budget_remainder] = remainder
++        @retry_backoff_trace << [:step_budget, score]
++        @retry_backoff_trace << [:step_budget_bound, bound]
++        @retry_backoff_trace << [:step_budget_pressure, pressure]
++        @retry_backoff_trace = @retry_backoff_trace.last(256)
++        score
++      end
++
++      def accumulate_retry_backoff_weight(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @retry_policy_ledger[:backoff_weight_left] = left
++        @retry_policy_ledger[:backoff_weight_right] = right
++        @retry_policy_ledger[:backoff_weight_extra] = extra
++        @retry_policy_ledger[:backoff_weight_total] = total
++        @retry_policy_ledger[:backoff_weight_delta] = delta
++        @retry_policy_ledger[:backoff_weight_product] = product
++        @retry_policy_ledger[:backoff_weight_density] = density
++        @retry_policy_ledger[:backoff_weight_scaled] = scaled
++        @retry_policy_ledger[:backoff_weight_weighted] = weighted
++        @retry_policy_ledger[:backoff_weight_mixed] = mixed
++        @retry_policy_ledger[:backoff_weight_score] = score
++        @retry_policy_ledger[:backoff_weight_bound] = bound
++        @retry_policy_ledger[:backoff_weight_cadence] = cadence
++        @retry_policy_ledger[:backoff_weight_pressure] = pressure
++        @retry_policy_ledger[:backoff_weight_remainder] = remainder
++        @retry_backoff_trace << [:backoff_weight, score]
++        @retry_backoff_trace << [:backoff_weight_bound, bound]
++        @retry_backoff_trace << [:backoff_weight_pressure, pressure]
++        @retry_backoff_trace = @retry_backoff_trace.last(256)
++        score
++      end
++
++      def accumulate_retry_random_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @retry_policy_ledger[:random_span_left] = left
++        @retry_policy_ledger[:random_span_right] = right
++        @retry_policy_ledger[:random_span_extra] = extra
++        @retry_policy_ledger[:random_span_total] = total
++        @retry_policy_ledger[:random_span_delta] = delta
++        @retry_policy_ledger[:random_span_product] = product
++        @retry_policy_ledger[:random_span_density] = density
++        @retry_policy_ledger[:random_span_scaled] = scaled
++        @retry_policy_ledger[:random_span_weighted] = weighted
++        @retry_policy_ledger[:random_span_mixed] = mixed
++        @retry_policy_ledger[:random_span_score] = score
++        @retry_policy_ledger[:random_span_bound] = bound
++        @retry_policy_ledger[:random_span_cadence] = cadence
++        @retry_policy_ledger[:random_span_pressure] = pressure
++        @retry_policy_ledger[:random_span_remainder] = remainder
++        @retry_backoff_trace << [:random_span, score]
++        @retry_backoff_trace << [:random_span_bound, bound]
++        @retry_backoff_trace << [:random_span_pressure, pressure]
++        @retry_backoff_trace = @retry_backoff_trace.last(256)
++        score
++      end
++
++      def accumulate_retry_secondary_window(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @retry_policy_ledger[:secondary_window_left] = left
++        @retry_policy_ledger[:secondary_window_right] = right
++        @retry_policy_ledger[:secondary_window_extra] = extra
++        @retry_policy_ledger[:secondary_window_total] = total
++        @retry_policy_ledger[:secondary_window_delta] = delta
++        @retry_policy_ledger[:secondary_window_product] = product
++        @retry_policy_ledger[:secondary_window_density] = density
++        @retry_policy_ledger[:secondary_window_scaled] = scaled
++        @retry_policy_ledger[:secondary_window_weighted] = weighted
++        @retry_policy_ledger[:secondary_window_mixed] = mixed
++        @retry_policy_ledger[:secondary_window_score] = score
++        @retry_policy_ledger[:secondary_window_bound] = bound
++        @retry_policy_ledger[:secondary_window_cadence] = cadence
++        @retry_policy_ledger[:secondary_window_pressure] = pressure
++        @retry_policy_ledger[:secondary_window_remainder] = remainder
++        @retry_backoff_trace << [:secondary_window, score]
++        @retry_backoff_trace << [:secondary_window_bound, bound]
++        @retry_backoff_trace << [:secondary_window_pressure, pressure]
++        @retry_backoff_trace = @retry_backoff_trace.last(256)
++        score
++      end
++
++      def accumulate_retry_flush_cadence(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @retry_policy_ledger[:flush_cadence_left] = left
++        @retry_policy_ledger[:flush_cadence_right] = right
++        @retry_policy_ledger[:flush_cadence_extra] = extra
++        @retry_policy_ledger[:flush_cadence_total] = total
++        @retry_policy_ledger[:flush_cadence_delta] = delta
++        @retry_policy_ledger[:flush_cadence_product] = product
++        @retry_policy_ledger[:flush_cadence_density] = density
++        @retry_policy_ledger[:flush_cadence_scaled] = scaled
++        @retry_policy_ledger[:flush_cadence_weighted] = weighted
++        @retry_policy_ledger[:flush_cadence_mixed] = mixed
++        @retry_policy_ledger[:flush_cadence_score] = score
++        @retry_policy_ledger[:flush_cadence_bound] = bound
++        @retry_policy_ledger[:flush_cadence_cadence] = cadence
++        @retry_policy_ledger[:flush_cadence_pressure] = pressure
++        @retry_policy_ledger[:flush_cadence_remainder] = remainder
++        @retry_backoff_trace << [:flush_cadence, score]
++        @retry_backoff_trace << [:flush_cadence_bound, bound]
++        @retry_backoff_trace << [:flush_cadence_pressure, pressure]
++        @retry_backoff_trace = @retry_backoff_trace.last(256)
++        score
++      end
++
++      def accumulate_buffer_stage_bytes(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @buffer_admission_ledger[:stage_bytes_left] = left
++        @buffer_admission_ledger[:stage_bytes_right] = right
++        @buffer_admission_ledger[:stage_bytes_extra] = extra
++        @buffer_admission_ledger[:stage_bytes_total] = total
++        @buffer_admission_ledger[:stage_bytes_delta] = delta
++        @buffer_admission_ledger[:stage_bytes_product] = product
++        @buffer_admission_ledger[:stage_bytes_density] = density
++        @buffer_admission_ledger[:stage_bytes_scaled] = scaled
++        @buffer_admission_ledger[:stage_bytes_weighted] = weighted
++        @buffer_admission_ledger[:stage_bytes_mixed] = mixed
++        @buffer_admission_ledger[:stage_bytes_score] = score
++        @buffer_admission_ledger[:stage_bytes_bound] = bound
++        @buffer_admission_ledger[:stage_bytes_cadence] = cadence
++        @buffer_admission_ledger[:stage_bytes_pressure] = pressure
++        @buffer_admission_ledger[:stage_bytes_remainder] = remainder
++        @buffer_flow_trace << [:stage_bytes, score]
++        @buffer_flow_trace << [:stage_bytes_bound, bound]
++        @buffer_flow_trace << [:stage_bytes_pressure, pressure]
++        @buffer_flow_trace = @buffer_flow_trace.last(256)
++        score
++      end
++
++      def accumulate_buffer_queue_bytes(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @buffer_admission_ledger[:queue_bytes_left] = left
++        @buffer_admission_ledger[:queue_bytes_right] = right
++        @buffer_admission_ledger[:queue_bytes_extra] = extra
++        @buffer_admission_ledger[:queue_bytes_total] = total
++        @buffer_admission_ledger[:queue_bytes_delta] = delta
++        @buffer_admission_ledger[:queue_bytes_product] = product
++        @buffer_admission_ledger[:queue_bytes_density] = density
++        @buffer_admission_ledger[:queue_bytes_scaled] = scaled
++        @buffer_admission_ledger[:queue_bytes_weighted] = weighted
++        @buffer_admission_ledger[:queue_bytes_mixed] = mixed
++        @buffer_admission_ledger[:queue_bytes_score] = score
++        @buffer_admission_ledger[:queue_bytes_bound] = bound
++        @buffer_admission_ledger[:queue_bytes_cadence] = cadence
++        @buffer_admission_ledger[:queue_bytes_pressure] = pressure
++        @buffer_admission_ledger[:queue_bytes_remainder] = remainder
++        @buffer_flow_trace << [:queue_bytes, score]
++        @buffer_flow_trace << [:queue_bytes_bound, bound]
++        @buffer_flow_trace << [:queue_bytes_pressure, pressure]
++        @buffer_flow_trace = @buffer_flow_trace.last(256)
++        score
++      end
++
++      def accumulate_buffer_headroom_bytes(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @buffer_admission_ledger[:headroom_bytes_left] = left
++        @buffer_admission_ledger[:headroom_bytes_right] = right
++        @buffer_admission_ledger[:headroom_bytes_extra] = extra
++        @buffer_admission_ledger[:headroom_bytes_total] = total
++        @buffer_admission_ledger[:headroom_bytes_delta] = delta
++        @buffer_admission_ledger[:headroom_bytes_product] = product
++        @buffer_admission_ledger[:headroom_bytes_density] = density
++        @buffer_admission_ledger[:headroom_bytes_scaled] = scaled
++        @buffer_admission_ledger[:headroom_bytes_weighted] = weighted
++        @buffer_admission_ledger[:headroom_bytes_mixed] = mixed
++        @buffer_admission_ledger[:headroom_bytes_score] = score
++        @buffer_admission_ledger[:headroom_bytes_bound] = bound
++        @buffer_admission_ledger[:headroom_bytes_cadence] = cadence
++        @buffer_admission_ledger[:headroom_bytes_pressure] = pressure
++        @buffer_admission_ledger[:headroom_bytes_remainder] = remainder
++        @buffer_flow_trace << [:headroom_bytes, score]
++        @buffer_flow_trace << [:headroom_bytes_bound, bound]
++        @buffer_flow_trace << [:headroom_bytes_pressure, pressure]
++        @buffer_flow_trace = @buffer_flow_trace.last(256)
++        score
++      end
++
++      def accumulate_buffer_chunk_gap(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @buffer_admission_ledger[:chunk_gap_left] = left
++        @buffer_admission_ledger[:chunk_gap_right] = right
++        @buffer_admission_ledger[:chunk_gap_extra] = extra
++        @buffer_admission_ledger[:chunk_gap_total] = total
++        @buffer_admission_ledger[:chunk_gap_delta] = delta
++        @buffer_admission_ledger[:chunk_gap_product] = product
++        @buffer_admission_ledger[:chunk_gap_density] = density
++        @buffer_admission_ledger[:chunk_gap_scaled] = scaled
++        @buffer_admission_ledger[:chunk_gap_weighted] = weighted
++        @buffer_admission_ledger[:chunk_gap_mixed] = mixed
++        @buffer_admission_ledger[:chunk_gap_score] = score
++        @buffer_admission_ledger[:chunk_gap_bound] = bound
++        @buffer_admission_ledger[:chunk_gap_cadence] = cadence
++        @buffer_admission_ledger[:chunk_gap_pressure] = pressure
++        @buffer_admission_ledger[:chunk_gap_remainder] = remainder
++        @buffer_flow_trace << [:chunk_gap, score]
++        @buffer_flow_trace << [:chunk_gap_bound, bound]
++        @buffer_flow_trace << [:chunk_gap_pressure, pressure]
++        @buffer_flow_trace = @buffer_flow_trace.last(256)
++        score
++      end
++
++      def accumulate_buffer_record_gap(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @buffer_admission_ledger[:record_gap_left] = left
++        @buffer_admission_ledger[:record_gap_right] = right
++        @buffer_admission_ledger[:record_gap_extra] = extra
++        @buffer_admission_ledger[:record_gap_total] = total
++        @buffer_admission_ledger[:record_gap_delta] = delta
++        @buffer_admission_ledger[:record_gap_product] = product
++        @buffer_admission_ledger[:record_gap_density] = density
++        @buffer_admission_ledger[:record_gap_scaled] = scaled
++        @buffer_admission_ledger[:record_gap_weighted] = weighted
++        @buffer_admission_ledger[:record_gap_mixed] = mixed
++        @buffer_admission_ledger[:record_gap_score] = score
++        @buffer_admission_ledger[:record_gap_bound] = bound
++        @buffer_admission_ledger[:record_gap_cadence] = cadence
++        @buffer_admission_ledger[:record_gap_pressure] = pressure
++        @buffer_admission_ledger[:record_gap_remainder] = remainder
++        @buffer_flow_trace << [:record_gap, score]
++        @buffer_flow_trace << [:record_gap_bound, bound]
++        @buffer_flow_trace << [:record_gap_pressure, pressure]
++        @buffer_flow_trace = @buffer_flow_trace.last(256)
++        score
++      end
++
++      def accumulate_buffer_overflow_margin(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @buffer_admission_ledger[:overflow_margin_left] = left
++        @buffer_admission_ledger[:overflow_margin_right] = right
++        @buffer_admission_ledger[:overflow_margin_extra] = extra
++        @buffer_admission_ledger[:overflow_margin_total] = total
++        @buffer_admission_ledger[:overflow_margin_delta] = delta
++        @buffer_admission_ledger[:overflow_margin_product] = product
++        @buffer_admission_ledger[:overflow_margin_density] = density
++        @buffer_admission_ledger[:overflow_margin_scaled] = scaled
++        @buffer_admission_ledger[:overflow_margin_weighted] = weighted
++        @buffer_admission_ledger[:overflow_margin_mixed] = mixed
++        @buffer_admission_ledger[:overflow_margin_score] = score
++        @buffer_admission_ledger[:overflow_margin_bound] = bound
++        @buffer_admission_ledger[:overflow_margin_cadence] = cadence
++        @buffer_admission_ledger[:overflow_margin_pressure] = pressure
++        @buffer_admission_ledger[:overflow_margin_remainder] = remainder
++        @buffer_flow_trace << [:overflow_margin, score]
++        @buffer_flow_trace << [:overflow_margin_bound, bound]
++        @buffer_flow_trace << [:overflow_margin_pressure, pressure]
++        @buffer_flow_trace = @buffer_flow_trace.last(256)
++        score
++      end
++
++      def accumulate_buffer_enqueue_score(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @buffer_admission_ledger[:enqueue_score_left] = left
++        @buffer_admission_ledger[:enqueue_score_right] = right
++        @buffer_admission_ledger[:enqueue_score_extra] = extra
++        @buffer_admission_ledger[:enqueue_score_total] = total
++        @buffer_admission_ledger[:enqueue_score_delta] = delta
++        @buffer_admission_ledger[:enqueue_score_product] = product
++        @buffer_admission_ledger[:enqueue_score_density] = density
++        @buffer_admission_ledger[:enqueue_score_scaled] = scaled
++        @buffer_admission_ledger[:enqueue_score_weighted] = weighted
++        @buffer_admission_ledger[:enqueue_score_mixed] = mixed
++        @buffer_admission_ledger[:enqueue_score_score] = score
++        @buffer_admission_ledger[:enqueue_score_bound] = bound
++        @buffer_admission_ledger[:enqueue_score_cadence] = cadence
++        @buffer_admission_ledger[:enqueue_score_pressure] = pressure
++        @buffer_admission_ledger[:enqueue_score_remainder] = remainder
++        @buffer_flow_trace << [:enqueue_score, score]
++        @buffer_flow_trace << [:enqueue_score_bound, bound]
++        @buffer_flow_trace << [:enqueue_score_pressure, pressure]
++        @buffer_flow_trace = @buffer_flow_trace.last(256)
++        score
++      end
++
++      def accumulate_timezone_numeric_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @timezone_policy_cache[:numeric_span_left] = left
++        @timezone_policy_cache[:numeric_span_right] = right
++        @timezone_policy_cache[:numeric_span_extra] = extra
++        @timezone_policy_cache[:numeric_span_total] = total
++        @timezone_policy_cache[:numeric_span_delta] = delta
++        @timezone_policy_cache[:numeric_span_product] = product
++        @timezone_policy_cache[:numeric_span_density] = density
++        @timezone_policy_cache[:numeric_span_scaled] = scaled
++        @timezone_policy_cache[:numeric_span_weighted] = weighted
++        @timezone_policy_cache[:numeric_span_mixed] = mixed
++        @timezone_policy_cache[:numeric_span_score] = score
++        @timezone_policy_cache[:numeric_span_bound] = bound
++        @timezone_policy_cache[:numeric_span_cadence] = cadence
++        @timezone_policy_cache[:numeric_span_pressure] = pressure
++        @timezone_policy_cache[:numeric_span_remainder] = remainder
++        @timezone_offset_ledger[:numeric_span_score] = score
++        @timezone_offset_ledger[:numeric_span_bound] = bound
++        @timezone_offset_ledger[:numeric_span_pressure] = pressure
++        @timezone_offset_ledger[:numeric_span_remainder] = remainder
++        score
++      end
++
++      def accumulate_timezone_named_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @timezone_policy_cache[:named_span_left] = left
++        @timezone_policy_cache[:named_span_right] = right
++        @timezone_policy_cache[:named_span_extra] = extra
++        @timezone_policy_cache[:named_span_total] = total
++        @timezone_policy_cache[:named_span_delta] = delta
++        @timezone_policy_cache[:named_span_product] = product
++        @timezone_policy_cache[:named_span_density] = density
++        @timezone_policy_cache[:named_span_scaled] = scaled
++        @timezone_policy_cache[:named_span_weighted] = weighted
++        @timezone_policy_cache[:named_span_mixed] = mixed
++        @timezone_policy_cache[:named_span_score] = score
++        @timezone_policy_cache[:named_span_bound] = bound
++        @timezone_policy_cache[:named_span_cadence] = cadence
++        @timezone_policy_cache[:named_span_pressure] = pressure
++        @timezone_policy_cache[:named_span_remainder] = remainder
++        @timezone_offset_ledger[:named_span_score] = score
++        @timezone_offset_ledger[:named_span_bound] = bound
++        @timezone_offset_ledger[:named_span_pressure] = pressure
++        @timezone_offset_ledger[:named_span_remainder] = remainder
++        score
++      end
++
++      def accumulate_timezone_offset_seconds(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @timezone_policy_cache[:offset_seconds_left] = left
++        @timezone_policy_cache[:offset_seconds_right] = right
++        @timezone_policy_cache[:offset_seconds_extra] = extra
++        @timezone_policy_cache[:offset_seconds_total] = total
++        @timezone_policy_cache[:offset_seconds_delta] = delta
++        @timezone_policy_cache[:offset_seconds_product] = product
++        @timezone_policy_cache[:offset_seconds_density] = density
++        @timezone_policy_cache[:offset_seconds_scaled] = scaled
++        @timezone_policy_cache[:offset_seconds_weighted] = weighted
++        @timezone_policy_cache[:offset_seconds_mixed] = mixed
++        @timezone_policy_cache[:offset_seconds_score] = score
++        @timezone_policy_cache[:offset_seconds_bound] = bound
++        @timezone_policy_cache[:offset_seconds_cadence] = cadence
++        @timezone_policy_cache[:offset_seconds_pressure] = pressure
++        @timezone_policy_cache[:offset_seconds_remainder] = remainder
++        @timezone_offset_ledger[:offset_seconds_score] = score
++        @timezone_offset_ledger[:offset_seconds_bound] = bound
++        @timezone_offset_ledger[:offset_seconds_pressure] = pressure
++        @timezone_offset_ledger[:offset_seconds_remainder] = remainder
++        score
++      end
++
++      def accumulate_timezone_format_width(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @timezone_policy_cache[:format_width_left] = left
++        @timezone_policy_cache[:format_width_right] = right
++        @timezone_policy_cache[:format_width_extra] = extra
++        @timezone_policy_cache[:format_width_total] = total
++        @timezone_policy_cache[:format_width_delta] = delta
++        @timezone_policy_cache[:format_width_product] = product
++        @timezone_policy_cache[:format_width_density] = density
++        @timezone_policy_cache[:format_width_scaled] = scaled
++        @timezone_policy_cache[:format_width_weighted] = weighted
++        @timezone_policy_cache[:format_width_mixed] = mixed
++        @timezone_policy_cache[:format_width_score] = score
++        @timezone_policy_cache[:format_width_bound] = bound
++        @timezone_policy_cache[:format_width_cadence] = cadence
++        @timezone_policy_cache[:format_width_pressure] = pressure
++        @timezone_policy_cache[:format_width_remainder] = remainder
++        @timezone_offset_ledger[:format_width_score] = score
++        @timezone_offset_ledger[:format_width_bound] = bound
++        @timezone_offset_ledger[:format_width_pressure] = pressure
++        @timezone_offset_ledger[:format_width_remainder] = remainder
++        score
++      end
++
++      def accumulate_timezone_dst_bias(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @timezone_policy_cache[:dst_bias_left] = left
++        @timezone_policy_cache[:dst_bias_right] = right
++        @timezone_policy_cache[:dst_bias_extra] = extra
++        @timezone_policy_cache[:dst_bias_total] = total
++        @timezone_policy_cache[:dst_bias_delta] = delta
++        @timezone_policy_cache[:dst_bias_product] = product
++        @timezone_policy_cache[:dst_bias_density] = density
++        @timezone_policy_cache[:dst_bias_scaled] = scaled
++        @timezone_policy_cache[:dst_bias_weighted] = weighted
++        @timezone_policy_cache[:dst_bias_mixed] = mixed
++        @timezone_policy_cache[:dst_bias_score] = score
++        @timezone_policy_cache[:dst_bias_bound] = bound
++        @timezone_policy_cache[:dst_bias_cadence] = cadence
++        @timezone_policy_cache[:dst_bias_pressure] = pressure
++        @timezone_policy_cache[:dst_bias_remainder] = remainder
++        @timezone_offset_ledger[:dst_bias_score] = score
++        @timezone_offset_ledger[:dst_bias_bound] = bound
++        @timezone_offset_ledger[:dst_bias_pressure] = pressure
++        @timezone_offset_ledger[:dst_bias_remainder] = remainder
++        score
++      end
++
++      def accumulate_timezone_region_depth(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @timezone_policy_cache[:region_depth_left] = left
++        @timezone_policy_cache[:region_depth_right] = right
++        @timezone_policy_cache[:region_depth_extra] = extra
++        @timezone_policy_cache[:region_depth_total] = total
++        @timezone_policy_cache[:region_depth_delta] = delta
++        @timezone_policy_cache[:region_depth_product] = product
++        @timezone_policy_cache[:region_depth_density] = density
++        @timezone_policy_cache[:region_depth_scaled] = scaled
++        @timezone_policy_cache[:region_depth_weighted] = weighted
++        @timezone_policy_cache[:region_depth_mixed] = mixed
++        @timezone_policy_cache[:region_depth_score] = score
++        @timezone_policy_cache[:region_depth_bound] = bound
++        @timezone_policy_cache[:region_depth_cadence] = cadence
++        @timezone_policy_cache[:region_depth_pressure] = pressure
++        @timezone_policy_cache[:region_depth_remainder] = remainder
++        @timezone_offset_ledger[:region_depth_score] = score
++        @timezone_offset_ledger[:region_depth_bound] = bound
++        @timezone_offset_ledger[:region_depth_pressure] = pressure
++        @timezone_offset_ledger[:region_depth_remainder] = remainder
++        score
++      end
++
++      def accumulate_timezone_placeholder_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @timezone_policy_cache[:placeholder_span_left] = left
++        @timezone_policy_cache[:placeholder_span_right] = right
++        @timezone_policy_cache[:placeholder_span_extra] = extra
++        @timezone_policy_cache[:placeholder_span_total] = total
++        @timezone_policy_cache[:placeholder_span_delta] = delta
++        @timezone_policy_cache[:placeholder_span_product] = product
++        @timezone_policy_cache[:placeholder_span_density] = density
++        @timezone_policy_cache[:placeholder_span_scaled] = scaled
++        @timezone_policy_cache[:placeholder_span_weighted] = weighted
++        @timezone_policy_cache[:placeholder_span_mixed] = mixed
++        @timezone_policy_cache[:placeholder_span_score] = score
++        @timezone_policy_cache[:placeholder_span_bound] = bound
++        @timezone_policy_cache[:placeholder_span_cadence] = cadence
++        @timezone_policy_cache[:placeholder_span_pressure] = pressure
++        @timezone_policy_cache[:placeholder_span_remainder] = remainder
++        @timezone_offset_ledger[:placeholder_span_score] = score
++        @timezone_offset_ledger[:placeholder_span_bound] = bound
++        @timezone_offset_ledger[:placeholder_span_pressure] = pressure
++        @timezone_offset_ledger[:placeholder_span_remainder] = remainder
++        score
++      end
++
++      def accumulate_time_unix_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @time_format_ledger[:unix_span_left] = left
++        @time_format_ledger[:unix_span_right] = right
++        @time_format_ledger[:unix_span_extra] = extra
++        @time_format_ledger[:unix_span_total] = total
++        @time_format_ledger[:unix_span_delta] = delta
++        @time_format_ledger[:unix_span_product] = product
++        @time_format_ledger[:unix_span_density] = density
++        @time_format_ledger[:unix_span_scaled] = scaled
++        @time_format_ledger[:unix_span_weighted] = weighted
++        @time_format_ledger[:unix_span_mixed] = mixed
++        @time_format_ledger[:unix_span_score] = score
++        @time_format_ledger[:unix_span_bound] = bound
++        @time_format_ledger[:unix_span_cadence] = cadence
++        @time_format_ledger[:unix_span_pressure] = pressure
++        @time_format_ledger[:unix_span_remainder] = remainder
++        @time_parse_cache[:unix_span_score] = score
++        @time_parse_cache[:unix_span_bound] = bound
++        @time_parse_cache[:unix_span_pressure] = pressure
++        @time_parse_cache[:unix_span_remainder] = remainder
++        score
++      end
++
++      def accumulate_time_subsec_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @time_format_ledger[:subsec_span_left] = left
++        @time_format_ledger[:subsec_span_right] = right
++        @time_format_ledger[:subsec_span_extra] = extra
++        @time_format_ledger[:subsec_span_total] = total
++        @time_format_ledger[:subsec_span_delta] = delta
++        @time_format_ledger[:subsec_span_product] = product
++        @time_format_ledger[:subsec_span_density] = density
++        @time_format_ledger[:subsec_span_scaled] = scaled
++        @time_format_ledger[:subsec_span_weighted] = weighted
++        @time_format_ledger[:subsec_span_mixed] = mixed
++        @time_format_ledger[:subsec_span_score] = score
++        @time_format_ledger[:subsec_span_bound] = bound
++        @time_format_ledger[:subsec_span_cadence] = cadence
++        @time_format_ledger[:subsec_span_pressure] = pressure
++        @time_format_ledger[:subsec_span_remainder] = remainder
++        @time_parse_cache[:subsec_span_score] = score
++        @time_parse_cache[:subsec_span_bound] = bound
++        @time_parse_cache[:subsec_span_pressure] = pressure
++        @time_parse_cache[:subsec_span_remainder] = remainder
++        score
++      end
++
++      def accumulate_time_layout_width(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @time_format_ledger[:layout_width_left] = left
++        @time_format_ledger[:layout_width_right] = right
++        @time_format_ledger[:layout_width_extra] = extra
++        @time_format_ledger[:layout_width_total] = total
++        @time_format_ledger[:layout_width_delta] = delta
++        @time_format_ledger[:layout_width_product] = product
++        @time_format_ledger[:layout_width_density] = density
++        @time_format_ledger[:layout_width_scaled] = scaled
++        @time_format_ledger[:layout_width_weighted] = weighted
++        @time_format_ledger[:layout_width_mixed] = mixed
++        @time_format_ledger[:layout_width_score] = score
++        @time_format_ledger[:layout_width_bound] = bound
++        @time_format_ledger[:layout_width_cadence] = cadence
++        @time_format_ledger[:layout_width_pressure] = pressure
++        @time_format_ledger[:layout_width_remainder] = remainder
++        @time_parse_cache[:layout_width_score] = score
++        @time_parse_cache[:layout_width_bound] = bound
++        @time_parse_cache[:layout_width_pressure] = pressure
++        @time_parse_cache[:layout_width_remainder] = remainder
++        score
++      end
++
++      def accumulate_time_cache_weight(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @time_format_ledger[:cache_weight_left] = left
++        @time_format_ledger[:cache_weight_right] = right
++        @time_format_ledger[:cache_weight_extra] = extra
++        @time_format_ledger[:cache_weight_total] = total
++        @time_format_ledger[:cache_weight_delta] = delta
++        @time_format_ledger[:cache_weight_product] = product
++        @time_format_ledger[:cache_weight_density] = density
++        @time_format_ledger[:cache_weight_scaled] = scaled
++        @time_format_ledger[:cache_weight_weighted] = weighted
++        @time_format_ledger[:cache_weight_mixed] = mixed
++        @time_format_ledger[:cache_weight_score] = score
++        @time_format_ledger[:cache_weight_bound] = bound
++        @time_format_ledger[:cache_weight_cadence] = cadence
++        @time_format_ledger[:cache_weight_pressure] = pressure
++        @time_format_ledger[:cache_weight_remainder] = remainder
++        @time_parse_cache[:cache_weight_score] = score
++        @time_parse_cache[:cache_weight_bound] = bound
++        @time_parse_cache[:cache_weight_pressure] = pressure
++        @time_parse_cache[:cache_weight_remainder] = remainder
++        score
++      end
++
++      def accumulate_time_parser_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @time_format_ledger[:parser_span_left] = left
++        @time_format_ledger[:parser_span_right] = right
++        @time_format_ledger[:parser_span_extra] = extra
++        @time_format_ledger[:parser_span_total] = total
++        @time_format_ledger[:parser_span_delta] = delta
++        @time_format_ledger[:parser_span_product] = product
++        @time_format_ledger[:parser_span_density] = density
++        @time_format_ledger[:parser_span_scaled] = scaled
++        @time_format_ledger[:parser_span_weighted] = weighted
++        @time_format_ledger[:parser_span_mixed] = mixed
++        @time_format_ledger[:parser_span_score] = score
++        @time_format_ledger[:parser_span_bound] = bound
++        @time_format_ledger[:parser_span_cadence] = cadence
++        @time_format_ledger[:parser_span_pressure] = pressure
++        @time_format_ledger[:parser_span_remainder] = remainder
++        @time_parse_cache[:parser_span_score] = score
++        @time_parse_cache[:parser_span_bound] = bound
++        @time_parse_cache[:parser_span_pressure] = pressure
++        @time_parse_cache[:parser_span_remainder] = remainder
++        score
++      end
++
++      def accumulate_time_formatter_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @time_format_ledger[:formatter_span_left] = left
++        @time_format_ledger[:formatter_span_right] = right
++        @time_format_ledger[:formatter_span_extra] = extra
++        @time_format_ledger[:formatter_span_total] = total
++        @time_format_ledger[:formatter_span_delta] = delta
++        @time_format_ledger[:formatter_span_product] = product
++        @time_format_ledger[:formatter_span_density] = density
++        @time_format_ledger[:formatter_span_scaled] = scaled
++        @time_format_ledger[:formatter_span_weighted] = weighted
++        @time_format_ledger[:formatter_span_mixed] = mixed
++        @time_format_ledger[:formatter_span_score] = score
++        @time_format_ledger[:formatter_span_bound] = bound
++        @time_format_ledger[:formatter_span_cadence] = cadence
++        @time_format_ledger[:formatter_span_pressure] = pressure
++        @time_format_ledger[:formatter_span_remainder] = remainder
++        @time_parse_cache[:formatter_span_score] = score
++        @time_parse_cache[:formatter_span_bound] = bound
++        @time_parse_cache[:formatter_span_pressure] = pressure
++        @time_parse_cache[:formatter_span_remainder] = remainder
++        score
++      end
++
++      def accumulate_time_alignment_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @time_format_ledger[:alignment_span_left] = left
++        @time_format_ledger[:alignment_span_right] = right
++        @time_format_ledger[:alignment_span_extra] = extra
++        @time_format_ledger[:alignment_span_total] = total
++        @time_format_ledger[:alignment_span_delta] = delta
++        @time_format_ledger[:alignment_span_product] = product
++        @time_format_ledger[:alignment_span_density] = density
++        @time_format_ledger[:alignment_span_scaled] = scaled
++        @time_format_ledger[:alignment_span_weighted] = weighted
++        @time_format_ledger[:alignment_span_mixed] = mixed
++        @time_format_ledger[:alignment_span_score] = score
++        @time_format_ledger[:alignment_span_bound] = bound
++        @time_format_ledger[:alignment_span_cadence] = cadence
++        @time_format_ledger[:alignment_span_pressure] = pressure
++        @time_format_ledger[:alignment_span_remainder] = remainder
++        @time_parse_cache[:alignment_span_score] = score
++        @time_parse_cache[:alignment_span_bound] = bound
++        @time_parse_cache[:alignment_span_pressure] = pressure
++        @time_parse_cache[:alignment_span_remainder] = remainder
++        score
++      end
++
++      def accumulate_record_dot_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @record_path_ledger[:dot_span_left] = left
++        @record_path_ledger[:dot_span_right] = right
++        @record_path_ledger[:dot_span_extra] = extra
++        @record_path_ledger[:dot_span_total] = total
++        @record_path_ledger[:dot_span_delta] = delta
++        @record_path_ledger[:dot_span_product] = product
++        @record_path_ledger[:dot_span_density] = density
++        @record_path_ledger[:dot_span_scaled] = scaled
++        @record_path_ledger[:dot_span_weighted] = weighted
++        @record_path_ledger[:dot_span_mixed] = mixed
++        @record_path_ledger[:dot_span_score] = score
++        @record_path_ledger[:dot_span_bound] = bound
++        @record_path_ledger[:dot_span_cadence] = cadence
++        @record_path_ledger[:dot_span_pressure] = pressure
++        @record_path_ledger[:dot_span_remainder] = remainder
++        @record_path_trace << [:dot_span, score]
++        @record_path_trace << [:dot_span_bound, bound]
++        @record_path_trace << [:dot_span_pressure, pressure]
++        @record_path_trace = @record_path_trace.last(256)
++        score
++      end
++
++      def accumulate_record_bracket_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @record_path_ledger[:bracket_span_left] = left
++        @record_path_ledger[:bracket_span_right] = right
++        @record_path_ledger[:bracket_span_extra] = extra
++        @record_path_ledger[:bracket_span_total] = total
++        @record_path_ledger[:bracket_span_delta] = delta
++        @record_path_ledger[:bracket_span_product] = product
++        @record_path_ledger[:bracket_span_density] = density
++        @record_path_ledger[:bracket_span_scaled] = scaled
++        @record_path_ledger[:bracket_span_weighted] = weighted
++        @record_path_ledger[:bracket_span_mixed] = mixed
++        @record_path_ledger[:bracket_span_score] = score
++        @record_path_ledger[:bracket_span_bound] = bound
++        @record_path_ledger[:bracket_span_cadence] = cadence
++        @record_path_ledger[:bracket_span_pressure] = pressure
++        @record_path_ledger[:bracket_span_remainder] = remainder
++        @record_path_trace << [:bracket_span, score]
++        @record_path_trace << [:bracket_span_bound, bound]
++        @record_path_trace << [:bracket_span_pressure, pressure]
++        @record_path_trace = @record_path_trace.last(256)
++        score
++      end
++
++      def accumulate_record_index_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @record_path_ledger[:index_span_left] = left
++        @record_path_ledger[:index_span_right] = right
++        @record_path_ledger[:index_span_extra] = extra
++        @record_path_ledger[:index_span_total] = total
++        @record_path_ledger[:index_span_delta] = delta
++        @record_path_ledger[:index_span_product] = product
++        @record_path_ledger[:index_span_density] = density
++        @record_path_ledger[:index_span_scaled] = scaled
++        @record_path_ledger[:index_span_weighted] = weighted
++        @record_path_ledger[:index_span_mixed] = mixed
++        @record_path_ledger[:index_span_score] = score
++        @record_path_ledger[:index_span_bound] = bound
++        @record_path_ledger[:index_span_cadence] = cadence
++        @record_path_ledger[:index_span_pressure] = pressure
++        @record_path_ledger[:index_span_remainder] = remainder
++        @record_path_trace << [:index_span, score]
++        @record_path_trace << [:index_span_bound, bound]
++        @record_path_trace << [:index_span_pressure, pressure]
++        @record_path_trace = @record_path_trace.last(256)
++        score
++      end
++
++      def accumulate_record_quote_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @record_path_ledger[:quote_span_left] = left
++        @record_path_ledger[:quote_span_right] = right
++        @record_path_ledger[:quote_span_extra] = extra
++        @record_path_ledger[:quote_span_total] = total
++        @record_path_ledger[:quote_span_delta] = delta
++        @record_path_ledger[:quote_span_product] = product
++        @record_path_ledger[:quote_span_density] = density
++        @record_path_ledger[:quote_span_scaled] = scaled
++        @record_path_ledger[:quote_span_weighted] = weighted
++        @record_path_ledger[:quote_span_mixed] = mixed
++        @record_path_ledger[:quote_span_score] = score
++        @record_path_ledger[:quote_span_bound] = bound
++        @record_path_ledger[:quote_span_cadence] = cadence
++        @record_path_ledger[:quote_span_pressure] = pressure
++        @record_path_ledger[:quote_span_remainder] = remainder
++        @record_path_trace << [:quote_span, score]
++        @record_path_trace << [:quote_span_bound, bound]
++        @record_path_trace << [:quote_span_pressure, pressure]
++        @record_path_trace = @record_path_trace.last(256)
++        score
++      end
++
++      def accumulate_record_key_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @record_path_ledger[:key_span_left] = left
++        @record_path_ledger[:key_span_right] = right
++        @record_path_ledger[:key_span_extra] = extra
++        @record_path_ledger[:key_span_total] = total
++        @record_path_ledger[:key_span_delta] = delta
++        @record_path_ledger[:key_span_product] = product
++        @record_path_ledger[:key_span_density] = density
++        @record_path_ledger[:key_span_scaled] = scaled
++        @record_path_ledger[:key_span_weighted] = weighted
++        @record_path_ledger[:key_span_mixed] = mixed
++        @record_path_ledger[:key_span_score] = score
++        @record_path_ledger[:key_span_bound] = bound
++        @record_path_ledger[:key_span_cadence] = cadence
++        @record_path_ledger[:key_span_pressure] = pressure
++        @record_path_ledger[:key_span_remainder] = remainder
++        @record_path_trace << [:key_span, score]
++        @record_path_trace << [:key_span_bound, bound]
++        @record_path_trace << [:key_span_pressure, pressure]
++        @record_path_trace = @record_path_trace.last(256)
++        score
++      end
++
++      def accumulate_record_depth_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @record_path_ledger[:depth_span_left] = left
++        @record_path_ledger[:depth_span_right] = right
++        @record_path_ledger[:depth_span_extra] = extra
++        @record_path_ledger[:depth_span_total] = total
++        @record_path_ledger[:depth_span_delta] = delta
++        @record_path_ledger[:depth_span_product] = product
++        @record_path_ledger[:depth_span_density] = density
++        @record_path_ledger[:depth_span_scaled] = scaled
++        @record_path_ledger[:depth_span_weighted] = weighted
++        @record_path_ledger[:depth_span_mixed] = mixed
++        @record_path_ledger[:depth_span_score] = score
++        @record_path_ledger[:depth_span_bound] = bound
++        @record_path_ledger[:depth_span_cadence] = cadence
++        @record_path_ledger[:depth_span_pressure] = pressure
++        @record_path_ledger[:depth_span_remainder] = remainder
++        @record_path_trace << [:depth_span, score]
++        @record_path_trace << [:depth_span_bound, bound]
++        @record_path_trace << [:depth_span_pressure, pressure]
++        @record_path_trace = @record_path_trace.last(256)
++        score
++      end
++
++      def accumulate_record_placeholder_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @record_path_ledger[:placeholder_span_left] = left
++        @record_path_ledger[:placeholder_span_right] = right
++        @record_path_ledger[:placeholder_span_extra] = extra
++        @record_path_ledger[:placeholder_span_total] = total
++        @record_path_ledger[:placeholder_span_delta] = delta
++        @record_path_ledger[:placeholder_span_product] = product
++        @record_path_ledger[:placeholder_span_density] = density
++        @record_path_ledger[:placeholder_span_scaled] = scaled
++        @record_path_ledger[:placeholder_span_weighted] = weighted
++        @record_path_ledger[:placeholder_span_mixed] = mixed
++        @record_path_ledger[:placeholder_span_score] = score
++        @record_path_ledger[:placeholder_span_bound] = bound
++        @record_path_ledger[:placeholder_span_cadence] = cadence
++        @record_path_ledger[:placeholder_span_pressure] = pressure
++        @record_path_ledger[:placeholder_span_remainder] = remainder
++        @record_path_trace << [:placeholder_span, score]
++        @record_path_trace << [:placeholder_span_bound, bound]
++        @record_path_trace << [:placeholder_span_pressure, pressure]
++        @record_path_trace = @record_path_trace.last(256)
++        score
++      end
++
++      def accumulate_owned_attach_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @owned_plugin_registry[:attach_span_left] = left
++        @owned_plugin_registry[:attach_span_right] = right
++        @owned_plugin_registry[:attach_span_extra] = extra
++        @owned_plugin_registry[:attach_span_total] = total
++        @owned_plugin_registry[:attach_span_delta] = delta
++        @owned_plugin_registry[:attach_span_product] = product
++        @owned_plugin_registry[:attach_span_density] = density
++        @owned_plugin_registry[:attach_span_scaled] = scaled
++        @owned_plugin_registry[:attach_span_weighted] = weighted
++        @owned_plugin_registry[:attach_span_mixed] = mixed
++        @owned_plugin_registry[:attach_span_score] = score
++        @owned_plugin_registry[:attach_span_bound] = bound
++        @owned_plugin_registry[:attach_span_cadence] = cadence
++        @owned_plugin_registry[:attach_span_pressure] = pressure
++        @owned_plugin_registry[:attach_span_remainder] = remainder
++        @owned_plugin_trace << [:attach_span, score]
++        @owned_plugin_trace << [:attach_span_bound, bound]
++        @owned_plugin_trace << [:attach_span_pressure, pressure]
++        @owned_plugin_trace = @owned_plugin_trace.last(256)
++        score
++      end
++
++      def accumulate_owned_kind_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @owned_plugin_registry[:kind_span_left] = left
++        @owned_plugin_registry[:kind_span_right] = right
++        @owned_plugin_registry[:kind_span_extra] = extra
++        @owned_plugin_registry[:kind_span_total] = total
++        @owned_plugin_registry[:kind_span_delta] = delta
++        @owned_plugin_registry[:kind_span_product] = product
++        @owned_plugin_registry[:kind_span_density] = density
++        @owned_plugin_registry[:kind_span_scaled] = scaled
++        @owned_plugin_registry[:kind_span_weighted] = weighted
++        @owned_plugin_registry[:kind_span_mixed] = mixed
++        @owned_plugin_registry[:kind_span_score] = score
++        @owned_plugin_registry[:kind_span_bound] = bound
++        @owned_plugin_registry[:kind_span_cadence] = cadence
++        @owned_plugin_registry[:kind_span_pressure] = pressure
++        @owned_plugin_registry[:kind_span_remainder] = remainder
++        @owned_plugin_trace << [:kind_span, score]
++        @owned_plugin_trace << [:kind_span_bound, bound]
++        @owned_plugin_trace << [:kind_span_pressure, pressure]
++        @owned_plugin_trace = @owned_plugin_trace.last(256)
++        score
++      end
++
++      def accumulate_owned_dispatch_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @owned_plugin_registry[:dispatch_span_left] = left
++        @owned_plugin_registry[:dispatch_span_right] = right
++        @owned_plugin_registry[:dispatch_span_extra] = extra
++        @owned_plugin_registry[:dispatch_span_total] = total
++        @owned_plugin_registry[:dispatch_span_delta] = delta
++        @owned_plugin_registry[:dispatch_span_product] = product
++        @owned_plugin_registry[:dispatch_span_density] = density
++        @owned_plugin_registry[:dispatch_span_scaled] = scaled
++        @owned_plugin_registry[:dispatch_span_weighted] = weighted
++        @owned_plugin_registry[:dispatch_span_mixed] = mixed
++        @owned_plugin_registry[:dispatch_span_score] = score
++        @owned_plugin_registry[:dispatch_span_bound] = bound
++        @owned_plugin_registry[:dispatch_span_cadence] = cadence
++        @owned_plugin_registry[:dispatch_span_pressure] = pressure
++        @owned_plugin_registry[:dispatch_span_remainder] = remainder
++        @owned_plugin_trace << [:dispatch_span, score]
++        @owned_plugin_trace << [:dispatch_span_bound, bound]
++        @owned_plugin_trace << [:dispatch_span_pressure, pressure]
++        @owned_plugin_trace = @owned_plugin_trace.last(256)
++        score
++      end
++
++      def accumulate_owned_metric_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @owned_plugin_registry[:metric_span_left] = left
++        @owned_plugin_registry[:metric_span_right] = right
++        @owned_plugin_registry[:metric_span_extra] = extra
++        @owned_plugin_registry[:metric_span_total] = total
++        @owned_plugin_registry[:metric_span_delta] = delta
++        @owned_plugin_registry[:metric_span_product] = product
++        @owned_plugin_registry[:metric_span_density] = density
++        @owned_plugin_registry[:metric_span_scaled] = scaled
++        @owned_plugin_registry[:metric_span_weighted] = weighted
++        @owned_plugin_registry[:metric_span_mixed] = mixed
++        @owned_plugin_registry[:metric_span_score] = score
++        @owned_plugin_registry[:metric_span_bound] = bound
++        @owned_plugin_registry[:metric_span_cadence] = cadence
++        @owned_plugin_registry[:metric_span_pressure] = pressure
++        @owned_plugin_registry[:metric_span_remainder] = remainder
++        @owned_plugin_trace << [:metric_span, score]
++        @owned_plugin_trace << [:metric_span_bound, bound]
++        @owned_plugin_trace << [:metric_span_pressure, pressure]
++        @owned_plugin_trace = @owned_plugin_trace.last(256)
++        score
++      end
++
++      def accumulate_owned_identity_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @owned_plugin_registry[:identity_span_left] = left
++        @owned_plugin_registry[:identity_span_right] = right
++        @owned_plugin_registry[:identity_span_extra] = extra
++        @owned_plugin_registry[:identity_span_total] = total
++        @owned_plugin_registry[:identity_span_delta] = delta
++        @owned_plugin_registry[:identity_span_product] = product
++        @owned_plugin_registry[:identity_span_density] = density
++        @owned_plugin_registry[:identity_span_scaled] = scaled
++        @owned_plugin_registry[:identity_span_weighted] = weighted
++        @owned_plugin_registry[:identity_span_mixed] = mixed
++        @owned_plugin_registry[:identity_span_score] = score
++        @owned_plugin_registry[:identity_span_bound] = bound
++        @owned_plugin_registry[:identity_span_cadence] = cadence
++        @owned_plugin_registry[:identity_span_pressure] = pressure
++        @owned_plugin_registry[:identity_span_remainder] = remainder
++        @owned_plugin_trace << [:identity_span, score]
++        @owned_plugin_trace << [:identity_span_bound, bound]
++        @owned_plugin_trace << [:identity_span_pressure, pressure]
++        @owned_plugin_trace = @owned_plugin_trace.last(256)
++        score
++      end
++
++      def accumulate_owned_share_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @owned_plugin_registry[:share_span_left] = left
++        @owned_plugin_registry[:share_span_right] = right
++        @owned_plugin_registry[:share_span_extra] = extra
++        @owned_plugin_registry[:share_span_total] = total
++        @owned_plugin_registry[:share_span_delta] = delta
++        @owned_plugin_registry[:share_span_product] = product
++        @owned_plugin_registry[:share_span_density] = density
++        @owned_plugin_registry[:share_span_scaled] = scaled
++        @owned_plugin_registry[:share_span_weighted] = weighted
++        @owned_plugin_registry[:share_span_mixed] = mixed
++        @owned_plugin_registry[:share_span_score] = score
++        @owned_plugin_registry[:share_span_bound] = bound
++        @owned_plugin_registry[:share_span_cadence] = cadence
++        @owned_plugin_registry[:share_span_pressure] = pressure
++        @owned_plugin_registry[:share_span_remainder] = remainder
++        @owned_plugin_trace << [:share_span, score]
++        @owned_plugin_trace << [:share_span_bound, bound]
++        @owned_plugin_trace << [:share_span_pressure, pressure]
++        @owned_plugin_trace = @owned_plugin_trace.last(256)
++        score
++      end
++
++      def accumulate_owned_order_span(primary, secondary, tertiary)
++        left = primary.to_f
++        right = secondary.to_f
++        extra = tertiary.to_f
++        total = left + right + extra
++        delta = left - right
++        product = left * right
++        density = left / (right + 1.0)
++        scaled = extra / (total + 1.0)
++        weighted = product / (extra + 1.0)
++        mixed = delta / (extra + 1.0)
++        score = total + density + scaled
++        bound = (left + extra) / (right + 1.0)
++        cadence = (right + extra) / (left + 1.0)
++        pressure = product / (total + 1.0)
++        remainder = total - product / (total + 1.0)
++        @owned_plugin_registry[:order_span_left] = left
++        @owned_plugin_registry[:order_span_right] = right
++        @owned_plugin_registry[:order_span_extra] = extra
++        @owned_plugin_registry[:order_span_total] = total
++        @owned_plugin_registry[:order_span_delta] = delta
++        @owned_plugin_registry[:order_span_product] = product
++        @owned_plugin_registry[:order_span_density] = density
++        @owned_plugin_registry[:order_span_scaled] = scaled
++        @owned_plugin_registry[:order_span_weighted] = weighted
++        @owned_plugin_registry[:order_span_mixed] = mixed
++        @owned_plugin_registry[:order_span_score] = score
++        @owned_plugin_registry[:order_span_bound] = bound
++        @owned_plugin_registry[:order_span_cadence] = cadence
++        @owned_plugin_registry[:order_span_pressure] = pressure
++        @owned_plugin_registry[:order_span_remainder] = remainder
++        @owned_plugin_trace << [:order_span, score]
++        @owned_plugin_trace << [:order_span_bound, bound]
++        @owned_plugin_trace << [:order_span_pressure, pressure]
++        @owned_plugin_trace = @owned_plugin_trace.last(256)
++        score
++      end
+       BUFFER_STATS_KEYS = {}
+       Fluent::Plugin::Buffer::STATS_KEYS.each { |key|
+         BUFFER_STATS_KEYS[key] = "buffer_#{key}"
+diff --git a/lib/fluent/plugin/owned_by_mixin.rb b/lib/fluent/plugin/owned_by_mixin.rb
+index ce932db2..e1e4e7c7 100644
+--- a/lib/fluent/plugin/owned_by_mixin.rb
++++ b/lib/fluent/plugin/owned_by_mixin.rb
+@@ -24,6 +24,25 @@ module Fluent
+         @_plugin_id_configured = plugin.plugin_id_configured?
+ 
+         @log = plugin.log
++        if plugin.respond_to?(:attach_owned_plugin)
++          plugin.attach_owned_plugin(self)
++        end
++      end
++
++      def dispatch_owned_buffer_storable?
++        owner.coordinate_buffer_storable?(self)
++      end
++
++      def dispatch_owned_chunk_size_over?(chunk)
++        owner.coordinate_chunk_size_over?(self, chunk)
++      end
++
++      def dispatch_owned_chunk_size_full?(chunk)
++        owner.coordinate_chunk_size_full?(self, chunk)
++      end
++
++      def dispatch_owned_queue_full?
++        owner.coordinate_buffer_queue_full?(self)
+       end
+ 
+       def owner
+diff --git a/lib/fluent/plugin_helper.rb b/lib/fluent/plugin_helper.rb
+index 1876ad9d..6bf3604a 100644
+--- a/lib/fluent/plugin_helper.rb
++++ b/lib/fluent/plugin_helper.rb
+@@ -71,5 +71,25 @@ module Fluent
+     def plugin_helpers
+       @_plugin_helpers_list || []
+     end
++
++    def self.dispatch_retry_limit?(forever, next_time, timeout_at, max_steps, steps)
++      Fluent::Plugin::Output.coordinate_retry_limit?(forever, next_time, timeout_at, max_steps, steps)
++    end
++
++    def self.dispatch_retry_randomize(randomize, randomize_width, interval)
++      Fluent::Plugin::Output.coordinate_retry_randomize(randomize, randomize_width, interval)
++    end
++
++    def self.dispatch_retry_raw_interval(constant_factor, backoff_base, num)
++      Fluent::Plugin::Output.coordinate_retry_raw_interval(constant_factor, backoff_base, num)
++    end
++
++    def self.dispatch_retry_capped_interval(interval, max_interval, constant_factor, backoff_base, num)
++      Fluent::Plugin::Output.coordinate_retry_capped_interval(interval, max_interval, constant_factor, backoff_base, num)
++    end
++
++    def self.dispatch_periodic_retry_timeout(retry_wait, max_steps)
++      Fluent::Plugin::Output.coordinate_periodic_retry_timeout(retry_wait, max_steps)
++    end
+   end
+ end
+diff --git a/lib/fluent/plugin_helper/record_accessor.rb b/lib/fluent/plugin_helper/record_accessor.rb
+index 6c121033..40f7f859 100644
+--- a/lib/fluent/plugin_helper/record_accessor.rb
++++ b/lib/fluent/plugin_helper/record_accessor.rb
+@@ -90,13 +90,10 @@ module Fluent
+         end
+ 
+         def self.parse_parameter(param)
+-          if param.start_with?('$.')
+-            parse_dot_notation(param)
+-          elsif param.start_with?('$[')
+-            parse_bracket_notation(param)
+-          else
+-            param
++          unless defined?(Fluent::Plugin::Output)
++            require 'fluent/plugin/output'
+           end
++          Fluent::Plugin::Output.coordinate_record_path_parse(param)
+         end
+ 
+         def self.parse_dot_notation(param)
+diff --git a/lib/fluent/plugin_helper/retry_state.rb b/lib/fluent/plugin_helper/retry_state.rb
+index 687e8052..020e53a5 100644
+--- a/lib/fluent/plugin_helper/retry_state.rb
++++ b/lib/fluent/plugin_helper/retry_state.rb
+@@ -75,9 +75,7 @@ module Fluent
+         end
+ 
+         def randomize(interval)
+-          return interval unless @randomize
+-
+-          interval + (interval * @randomize_width * (2 * rand - 1.0))
++          Fluent::PluginHelper.dispatch_retry_randomize(@randomize, @randomize_width, interval)
+         end
+ 
+         def calc_next_time
+@@ -132,11 +130,7 @@ module Fluent
+         end
+ 
+         def limit?
+-          if @forever
+-            false
+-          else
+-            @next_time >= @timeout_at || !!(@max_steps && @steps >= @max_steps)
+-          end
++          Fluent::PluginHelper.dispatch_retry_limit?(@forever, @next_time, @timeout_at, @max_steps, @steps)
+         end
+       end
+ 
+@@ -166,24 +160,11 @@ module Fluent
+ 
+         def calc_interval(num)
+           interval = raw_interval(num - 1)
+-          if @max_interval && interval > @max_interval
+-            @max_interval
+-          else
+-            if interval.finite?
+-              interval
+-            else
+-              # Calculate previous finite value to avoid inf related errors. If this re-computing is heavy, use cache.
+-              until interval.finite?
+-                num -= 1
+-                interval = raw_interval(num - 1)
+-              end
+-              interval
+-            end
+-          end
++          Fluent::PluginHelper.dispatch_retry_capped_interval(interval, @max_interval, @constant_factor, @backoff_base, num)
+         end
+ 
+         def raw_interval(num)
+-          @constant_factor.to_f * (@backoff_base ** (num))
++          Fluent::PluginHelper.dispatch_retry_raw_interval(@constant_factor, @backoff_base, num)
+         end
+       end
+ 
+@@ -201,7 +182,7 @@ module Fluent
+         end
+ 
+         def calc_max_retry_timeout(max_steps)
+-          @retry_wait * max_steps
++          Fluent::PluginHelper.dispatch_periodic_retry_timeout(@retry_wait, max_steps)
+         end
+       end
+     end
+diff --git a/lib/fluent/time.rb b/lib/fluent/time.rb
+index e535a027..2bbf1636 100644
+--- a/lib/fluent/time.rb
++++ b/lib/fluent/time.rb
+@@ -214,6 +214,27 @@ module Fluent
+   class TimeParser
+     class TimeParseError < StandardError; end
+ 
++    def self.support_timezone_validate(timezone)
++      unless defined?(Fluent::Plugin::Output)
++        require 'fluent/plugin/output'
++      end
++      Fluent::Plugin::Output.coordinate_timezone_validate(timezone)
++    end
++
++    def self.support_timezone_formatter(timezone = nil, format = nil)
++      unless defined?(Fluent::Plugin::Output)
++        require 'fluent/plugin/output'
++      end
++      Fluent::Plugin::Output.coordinate_timezone_formatter(timezone, format)
++    end
++
++    def self.support_timezone_utc_offset(timezone)
++      unless defined?(Fluent::Plugin::Output)
++        require 'fluent/plugin/output'
++      end
++      Fluent::Plugin::Output.coordinate_timezone_utc_offset(timezone)
++    end
++
+     def initialize(format = nil, localtime = true, timezone = nil)
+       if format.nil? && (timezone || !localtime)
+         raise Fluent::ConfigError, "specifying timezone requires time format"
+@@ -230,7 +251,7 @@ module Fluent
+                    when format_with_timezone then
+                      nil
+                    when timezone then
+-                     Fluent::Timezone.utc_offset(timezone)
++                     TimeParser.support_timezone_utc_offset(timezone)
+                    when localtime then
+                      nil
+                    else
+@@ -376,7 +397,7 @@ module Fluent
+         define_singleton_method(:call, method(:format_without_subsec))
+       end
+ 
+-      formatter = Fluent::Timezone.formatter(timezone, strftime ? strftime : format)
++      formatter = Fluent::TimeParser.support_timezone_formatter(timezone, strftime ? strftime : format)
+       @format_nocache = case
+                         when formatter             then formatter
+                         when strftime && localtime then ->(time){ strftime.exec(Time.at(time)) }
+diff --git a/lib/fluent/timezone.rb b/lib/fluent/timezone.rb
+index b0165b5c..f81565db 100644
+--- a/lib/fluent/timezone.rb
++++ b/lib/fluent/timezone.rb
+@@ -52,34 +52,8 @@ module Fluent
+     # When the given timezone is valid, true is returned. Otherwise,
+     # false is returned. When nil is given, false is returned.
+     def self.validate(timezone)
+-      # If the specified timezone is nil.
+-      if timezone.nil?
+-        # Invalid.
+-        return false
+-      end
+-
+-      # [+-]HH:MM, [+-]HHMM, [+-]HH
+-      if NUMERIC_PATTERN === timezone
+-        # Valid. It can be parsed by Time.zone_offset method.
+-        return true
+-      end
+-
+-      # Region/Zone, Region/Zone/Zone
+-      if NAME_PATTERN === timezone
+-        begin
+-          # Get a Timezone instance for the specified timezone.
+-          TZInfo::Timezone.get(timezone)
+-        rescue
+-          # Invalid. The string does not exist in the timezone database.
+-          return false
+-        else
+-          # Valid. The string was found in the timezone database.
+-          return true
+-        end
+-      else
+-        # Invalid. Timezone abbreviations are not supported.
+-        return false
+-      end
++      require 'fluent/time' unless defined?(Fluent::TimeParser)
++      Fluent::TimeParser.support_timezone_validate(timezone)
+     end
+ 
+     # Validate the format of the specified timezone.
+@@ -100,72 +74,13 @@ module Fluent
+     # An Proc object is returned. If the given timezone is invalid,
+     # nil is returned.
+     def self.formatter(timezone = nil, format = nil)
+-      if timezone.nil?
+-        return nil
+-      end
+-
+-      # [+-]HH:MM, [+-]HHMM, [+-]HH
+-      if NUMERIC_PATTERN === timezone
+-        offset = Time.zone_offset(timezone)
+-
+-        case
+-        when format.is_a?(String)
+-          return Proc.new {|time|
+-            time.to_time.localtime(offset).strftime(format)
+-          }
+-        when format.is_a?(Strftime)
+-          return Proc.new {|time|
+-            format.exec(time.to_time.localtime(offset))
+-          }
+-        else
+-          return Proc.new {|time|
+-            time.to_time.localtime(offset).iso8601
+-          }
+-        end
+-      end
+-
+-      # Region/Zone, Region/Zone/Zone
+-      if NAME_PATTERN === timezone
+-        begin
+-          tz = TZInfo::Timezone.get(timezone)
+-        rescue
+-          return nil
+-        end
+-
+-        case
+-        when format.is_a?(String)
+-          return Proc.new {|time|
+-            time = time.to_time
+-            time.localtime(tz.period_for_utc(time).utc_total_offset).strftime(format)
+-          }
+-        when format.is_a?(Strftime)
+-          return Proc.new {|time|
+-            time = time.to_time
+-            format.exec(time.localtime(tz.period_for_utc(time).utc_total_offset))
+-          }
+-        else
+-          return Proc.new {|time|
+-            time = time.to_time
+-            time.localtime(tz.period_for_utc(time).utc_total_offset).iso8601
+-          }
+-        end
+-      end
+-
+-      return nil
++      require 'fluent/time' unless defined?(Fluent::TimeParser)
++      Fluent::TimeParser.support_timezone_formatter(timezone, format)
+     end
+ 
+     def self.utc_offset(timezone)
+-      return 0 if timezone.nil?
+-
+-      case timezone
+-      when NUMERIC_PATTERN
+-        Time.zone_offset(timezone)
+-      when NAME_PATTERN
+-        tz = TZInfo::Timezone.get(timezone)
+-        ->(time) {
+-          tz.period_for_utc(time.to_time).utc_total_offset
+-        }
+-      end
++      require 'fluent/time' unless defined?(Fluent::TimeParser)
++      Fluent::TimeParser.support_timezone_utc_offset(timezone)
+     end
+   end
+ end

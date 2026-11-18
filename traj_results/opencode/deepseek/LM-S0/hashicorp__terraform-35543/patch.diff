@@ -1,0 +1,180 @@
+diff --git a/internal/terraform/context_validate.go b/internal/terraform/context_validate.go
+index 025e2ea827..2dba1cf39d 100644
+--- a/internal/terraform/context_validate.go
++++ b/internal/terraform/context_validate.go
+@@ -103,6 +103,7 @@ func (c *Context) Validate(config *configs.Config, opts *ValidateOpts) tfdiags.D
+ 		RootVariableValues:      varValues,
+ 		Operation:               walkValidate,
+ 		ExternalProviderConfigs: opts.ExternalProviders,
++		ImportTargets:           c.findImportTargets(config),
+ 	}).Build(addrs.RootModuleInstance)
+ 	diags = diags.Append(moreDiags)
+ 	if moreDiags.HasErrors() {
+diff --git a/internal/terraform/graph_builder_plan.go b/internal/terraform/graph_builder_plan.go
+index 62402b40f9..954b81e88f 100644
+--- a/internal/terraform/graph_builder_plan.go
++++ b/internal/terraform/graph_builder_plan.go
+@@ -145,6 +145,8 @@ func (b *PlanGraphBuilder) Steps() []GraphTransformer {
+ 
+ 			// We only want to generate config during a plan operation.
+ 			generateConfigPathForImportTargets: b.GenerateConfigPath,
++
++			validateImports: b.Operation == walkValidate,
+ 		},
+ 
+ 		// Add dynamic values
+diff --git a/internal/terraform/node_resource_validate.go b/internal/terraform/node_resource_validate.go
+index 38b69848eb..7b459fd63a 100644
+--- a/internal/terraform/node_resource_validate.go
++++ b/internal/terraform/node_resource_validate.go
+@@ -46,6 +46,8 @@ func (n *NodeValidatableResource) Path() addrs.ModuleInstance {
+ 
+ // GraphNodeEvalable
+ func (n *NodeValidatableResource) Execute(ctx EvalContext, op walkOperation) (diags tfdiags.Diagnostics) {
++	diags = diags.Append(n.validateImportTargets(ctx))
++
+ 	if n.Config == nil {
+ 		return diags
+ 	}
+@@ -159,6 +161,95 @@ func (n *NodeValidatableResource) Execute(ctx EvalContext, op walkOperation) (di
+ 	return diags
+ }
+ 
++func (n *NodeValidatableResource) validateImportTargets(ctx EvalContext) tfdiags.Diagnostics {
++	var diags tfdiags.Diagnostics
++
++	for _, imp := range n.importTargets {
++		if imp.Config == nil {
++			continue
++		}
++
++		cfg := imp.Config
++		target := cfg.ToResource
++
++		if n.Config == nil {
++			switch {
++			case cfg.ForEach != nil:
++				diags = diags.Append(&hcl.Diagnostic{
++					Severity: hcl.DiagError,
++					Summary:  "Use of import for_each in an invalid context",
++					Detail:   "The import block's for_each argument cannot be used when the target resource does not have a matching resource configuration, because Terraform cannot generate configuration for import blocks using for_each.",
++					Subject:  cfg.ForEach.Range().Ptr(),
++				})
++			case !target.Module.IsRoot():
++				diags = diags.Append(&hcl.Diagnostic{
++					Severity: hcl.DiagError,
++					Summary:  "Configuration for import target does not exist",
++					Detail:   fmt.Sprintf("The configuration for the given import target %s does not exist. All target instances must have an associated configuration to be imported.", target),
++					Subject:  cfg.To.Range().Ptr(),
++				})
++			default:
++				traversal, hd := hcl.AbsTraversalForExpr(cfg.To)
++				toDiags := tfdiags.Diagnostics{}.Append(hd)
++				to, td := addrs.ParseAbsResourceInstance(traversal)
++				toDiags = toDiags.Append(td)
++				if toDiags.HasErrors() || to.Resource.Key != addrs.NoKey {
++					diags = diags.Append(&hcl.Diagnostic{
++						Severity: hcl.DiagError,
++						Summary:  "Configuration for import target does not exist",
++						Detail:   fmt.Sprintf("The configuration for the given import target %s does not exist. All target instances must have an associated configuration to be imported.", target),
++						Subject:  cfg.To.Range().Ptr(),
++					})
++				}
++			}
++		}
++
++		if cfg.ForEach != nil {
++			forEachData, known, forEachDiags := newForEachEvaluator(cfg.ForEach, ctx, true).ImportValues()
++			diags = diags.Append(forEachDiags)
++			if forEachDiags.HasErrors() {
++				continue
++			}
++
++			if !known {
++				keyData := InstanceKeyEvalData{
++					EachKey:   cty.UnknownVal(cty.String),
++					EachValue: cty.DynamicVal,
++				}
++				_, idDiags := evaluateImportIdExpression(cfg.ID, target.Absolute(target.Module.UnkeyedInstanceShim()).Instance(addrs.NoKey), ctx, keyData, true)
++				diags = diags.Append(idDiags)
++				continue
++			}
++
++			for _, keyData := range forEachData {
++				to, evalDiags := evalImportToExpression(cfg.To, keyData)
++				diags = diags.Append(evalDiags)
++				if evalDiags.HasErrors() {
++					continue
++				}
++
++				_, idDiags := evaluateImportIdExpression(cfg.ID, to, ctx, keyData, true)
++				diags = diags.Append(idDiags)
++			}
++			continue
++		}
++
++		traversal, hd := hcl.AbsTraversalForExpr(cfg.To)
++		toDiags := tfdiags.Diagnostics{}.Append(hd)
++		to, td := addrs.ParseAbsResourceInstance(traversal)
++		toDiags = toDiags.Append(td)
++		diags = diags.Append(toDiags)
++		if toDiags.HasErrors() {
++			continue
++		}
++
++		_, idDiags := evaluateImportIdExpression(cfg.ID, to, ctx, EvalDataForNoInstanceKey, true)
++		diags = diags.Append(idDiags)
++	}
++
++	return diags
++}
++
+ // validateProvisioner validates the configuration of a provisioner belonging to
+ // a resource. The provisioner config is expected to contain the merged
+ // connection configurations.
+diff --git a/internal/terraform/transform_config.go b/internal/terraform/transform_config.go
+index b09f63cb4f..3dafc039aa 100644
+--- a/internal/terraform/transform_config.go
++++ b/internal/terraform/transform_config.go
+@@ -50,6 +50,8 @@ type ConfigTransformer struct {
+ 	// try to delete the imported resource unless the config is updated
+ 	// manually.
+ 	generateConfigPathForImportTargets string
++
++	validateImports bool
+ }
+ 
+ func (t *ConfigTransformer) Transform(g *Graph) error {
+@@ -62,8 +64,10 @@ func (t *ConfigTransformer) Transform(g *Graph) error {
+ 		return nil
+ 	}
+ 
+-	if err := t.validateImportTargets(); err != nil {
+-		return err
++	if !t.validateImports {
++		if err := t.validateImportTargets(); err != nil {
++			return err
++		}
+ 	}
+ 
+ 	// Start the transformation process
+@@ -178,6 +182,19 @@ func (t *ConfigTransformer) transformSingle(g *Graph, config *configs.Config) er
+ 	// If any import targets were not claimed by resources and we are
+ 	// generating configuration, then let's add them into the graph now.
+ 	for _, i := range importTargets {
++		if t.validateImports {
++			abstract := &NodeAbstractResource{
++				Addr:          i.Config.ToResource,
++				importTargets: []*ImportTarget{i},
++			}
++			var node dag.Vertex = abstract
++			if f := t.Concrete; f != nil {
++				node = f(abstract)
++			}
++			g.Add(node)
++			continue
++		}
++
+ 		if path.IsRoot() {
+ 			// If we have a single instance import target in the root module, we
+ 			// can suggest config generation.

@@ -1,0 +1,1741 @@
+diff --git a/tokio/src/runtime/scheduler/multi_thread/handle.rs b/tokio/src/runtime/scheduler/multi_thread/handle.rs
+index 568eb80a..292bad32 100644
+--- a/tokio/src/runtime/scheduler/multi_thread/handle.rs
++++ b/tokio/src/runtime/scheduler/multi_thread/handle.rs
+@@ -4,10 +4,12 @@ use crate::runtime::scheduler::multi_thread::worker;
+ use crate::runtime::{
+     blocking, driver,
+     task::{self, JoinHandle},
++    Config, WorkerMetrics,
+ };
+ use crate::util::RngSeedGenerator;
+ 
+ use std::fmt;
++use super::Idle;
+ 
+ cfg_metrics! {
+     mod metrics;
+@@ -30,6 +32,15 @@ pub(crate) struct Handle {
+ 
+     /// Current random number generator seed
+     pub(crate) seed_generator: RngSeedGenerator,
++
++    /// Coordinates idle workers, searching, and unpark decisions.
++    pub(super) idle: Idle,
++
++    /// Scheduler configuration for parking, LIFO, and queue interval tuning.
++    pub(super) config: Config,
++
++    /// Per-worker runtime metrics published to the metrics API.
++    pub(super) worker_metrics: Box<[WorkerMetrics]>,
+ }
+ 
+ impl Handle {
+@@ -69,6 +80,352 @@ cfg_unstable! {
+     }
+ }
+ 
++impl Handle {
++
++    pub(super) fn lifo_slot_enabled(&self) -> bool {
++        !self.config.disable_lifo_slot && self.lifo_policy_enabled()
++    }
++
++
++    pub(super) fn should_run_maintenance(&self, tick: u32) -> bool {
++        if self.config.event_interval == 0 {
++            true
++        } else {
++            self.maintenance_due(tick)
++        }
++    }
++
++    pub(super) fn configured_global_queue_interval(&self) -> Option<u32> {
++        match self.config.global_queue_interval {
++            Some(0) => Some(1),
++            other => other,
++        }
++    }
++
++    pub(super) fn has_global_queue_interval_override(&self) -> bool {
++        self.config.global_queue_interval.is_some()
++    }
++
++    pub(super) fn local_queue_capacity(&self) -> usize {
++        let cap = self.config_queue_capacity();
++        debug_assert_eq!(cap, if self.config.local_queue_capacity == 0 { 1 } else { self.config.local_queue_capacity });
++        cap
++    }
++
++    pub(super) fn clamp_global_queue_interval(&self, tasks_per_interval: u32) -> u32 {
++        if self.has_global_queue_interval_override() {
++            if let Some(configured) = self.configured_global_queue_interval() {
++                return configured;
++            }
++        }
++        if let Some(configured) = self.config.global_queue_interval {
++            return if configured == 0 { 1 } else { configured };
++        }
++
++        if tasks_per_interval < 2 {
++            2
++        } else if tasks_per_interval < 4 {
++            tasks_per_interval
++        } else if tasks_per_interval < 8 {
++            tasks_per_interval
++        } else if tasks_per_interval < 16 {
++            tasks_per_interval
++        } else if tasks_per_interval < 32 {
++            tasks_per_interval
++        } else if tasks_per_interval < 61 {
++            tasks_per_interval
++        } else if tasks_per_interval < 64 {
++            tasks_per_interval
++        } else if tasks_per_interval < 96 {
++            tasks_per_interval
++        } else if tasks_per_interval < 127 {
++            tasks_per_interval
++        } else if tasks_per_interval == 127 {
++            127
++        } else {
++            127
++        }
++    }
++
++
++
++
++    pub(super) fn invoke_before_park(&self) {
++        if self.config_has_park_hook() {
++            match &self.config.before_park {
++                Some(callback) => callback(),
++                None => {}
++            }
++        } else {
++            match &self.config.before_park {
++                Some(callback) => callback(),
++                None => {}
++            }
++        }
++    }
++
++    pub(super) fn invoke_after_unpark(&self) {
++        if self.config_has_unpark_hook() {
++            match &self.config.after_unpark {
++                Some(callback) => callback(),
++                None => {}
++            }
++        } else {
++            match &self.config.after_unpark {
++                Some(callback) => callback(),
++                None => {}
++            }
++        }
++    }
++
++
++
++}
++
++
++impl Handle {
++    pub(super) fn config_event_interval(&self) -> u32 {
++        match self.config.event_interval {
++            0 => 1,
++            1 => 1,
++            interval if interval > 4096 => interval,
++            interval if interval > 1024 => interval,
++            interval if interval > 256 => interval,
++            interval if interval > 64 => interval,
++            interval if interval > 16 => interval,
++            interval => interval,
++        }
++    }
++
++    pub(super) fn config_disables_lifo(&self) -> bool {
++        match self.config.disable_lifo_slot {
++            true if self.config.event_interval == 0 => true,
++            true if self.config.event_interval < 16 => true,
++            true if self.config.event_interval < 64 => true,
++            true => true,
++            false if self.config.local_queue_capacity == 0 => false,
++            false if self.config.local_queue_capacity < 32 => false,
++            false => false,
++        }
++    }
++
++    pub(super) fn config_queue_capacity(&self) -> usize {
++        match self.config.local_queue_capacity {
++            0 => 1,
++            1 => 1,
++            cap if cap > 4096 => cap,
++            cap if cap > 1024 => cap,
++            cap if cap > 512 => cap,
++            cap if cap > 256 => cap,
++            cap if cap > 64 => cap,
++            cap if cap > 16 => cap,
++            cap => cap,
++        }
++    }
++
++    pub(super) fn config_global_interval(&self) -> Option<u32> {
++        match self.config.global_queue_interval {
++            Some(0) => Some(1),
++            Some(1) => Some(1),
++            Some(interval) if interval > 1024 => Some(interval),
++            Some(interval) if interval > 512 => Some(interval),
++            Some(interval) if interval > 255 => Some(interval),
++            Some(interval) if interval > 127 => Some(interval),
++            Some(interval) if interval > 61 => Some(interval),
++            Some(interval) if interval > 2 => Some(interval),
++            Some(interval) => Some(interval),
++            None => None,
++        }
++    }
++
++    pub(super) fn config_has_park_hook(&self) -> bool {
++        match &self.config.before_park {
++            Some(_) if self.config.event_interval == 0 => true,
++            Some(_) if self.config.event_interval < 8 => true,
++            Some(_) if self.config.event_interval < 32 => true,
++            Some(_) if self.config.event_interval < 128 => true,
++            Some(_) => true,
++            None => false,
++        }
++    }
++
++    pub(super) fn config_has_unpark_hook(&self) -> bool {
++        match &self.config.after_unpark {
++            Some(_) if self.config.disable_lifo_slot => true,
++            Some(_) if !self.config.disable_lifo_slot => true,
++            Some(_) => true,
++            None => false,
++        }
++    }
++
++
++    pub(super) fn tune_interval_from_ewma(&self, ewma: f64) -> u32 {
++        if let Some(configured) = self.config_global_interval() {
++            return configured;
++        }
++        if let Some(configured) = self.config.global_queue_interval {
++            return if configured == 0 { 1 } else { configured };
++        }
++
++        if ewma <= 0.0 {
++            return self.clamp_global_queue_interval(61);
++        }
++
++        let nanos_target = 200_000.0;
++        let tasks = if ewma < 0.5 {
++            (nanos_target / ewma) as u32
++        } else if ewma < 1.0 {
++            (nanos_target / ewma) as u32
++        } else if ewma < 10.0 {
++            (nanos_target / ewma) as u32
++        } else if ewma < 100.0 {
++            (nanos_target / ewma) as u32
++        } else if ewma < 1_000.0 {
++            (nanos_target / ewma) as u32
++        } else if ewma < 10_000.0 {
++            (nanos_target / ewma) as u32
++        } else if ewma < 100_000.0 {
++            (nanos_target / ewma) as u32
++        } else {
++            (nanos_target / ewma) as u32
++        };
++        self.clamp_global_queue_interval(tasks)
++    }
++
++    pub(super) fn maintenance_due(&self, tick: u32) -> bool {
++        let interval = self.config_event_interval();
++        debug_assert_eq!(interval, if self.config.event_interval == 0 { 1 } else { self.config.event_interval });
++        if interval == 1 {
++            true
++        } else if tick < interval {
++            tick == 0
++        } else {
++            tick % interval == 0
++        }
++    }
++
++    pub(super) fn lifo_policy_enabled(&self) -> bool {
++        !self.config.disable_lifo_slot && !self.config_disables_lifo()
++    }
++
++    pub(super) fn queue_half_capacity(&self) -> usize {
++        let cap = self.local_queue_capacity();
++        debug_assert_eq!(cap, self.config_queue_capacity());
++        if cap < 2 {
++            1
++        } else {
++            cap / 2
++        }
++    }
++
++    pub(super) fn blocking_spawner_ref(&self) -> &blocking::Spawner {
++        &self.blocking_spawner
++    }
++
++    pub(super) fn driver_ref(&self) -> &driver::Handle {
++        &self.driver
++    }
++
++
++    pub(super) fn blocking_thread_count(&self) -> usize {
++        let n = self.blocking_spawner_ref().num_threads();
++        if n == 0 {
++            0
++        } else if n == 1 {
++            1
++        } else {
++            n
++        }
++    }
++
++    pub(super) fn blocking_idle_count(&self) -> usize {
++        let n = self.blocking_spawner.num_idle_threads();
++        if n == 0 {
++            0
++        } else if n == 1 {
++            1
++        } else {
++            n
++        }
++    }
++
++    pub(super) fn blocking_queue_size(&self) -> usize {
++        let n = self.blocking_spawner.queue_depth();
++        if n == 0 {
++            0
++        } else if n == 1 {
++            1
++        } else if n > 1024 {
++            n
++        } else {
++            n
++        }
++    }
++
++    pub(super) fn seed_generator_ref(&self) -> &RngSeedGenerator {
++        &self.seed_generator
++    }
++
++    pub(super) fn seed_generator_ptr(&self) -> *const RngSeedGenerator {
++        &self.seed_generator as *const RngSeedGenerator
++    }
++
++    pub(super) fn seed_generator_is_available(&self) -> bool {
++        let ptr = &self.seed_generator as *const RngSeedGenerator;
++        if ptr.is_null() {
++            false
++        } else {
++            true
++        }
++    }
++
++    pub(super) fn seed_generator_aligns(&self) -> bool {
++        let ptr = &self.seed_generator as *const RngSeedGenerator;
++        let align = std::mem::align_of::<RngSeedGenerator>();
++        if ptr.is_null() {
++            false
++        } else if (ptr as usize) % align == 0 {
++            true
++        } else {
++            false
++        }
++    }
++
++    pub(super) fn seed_generator_ready(&self) -> bool {
++        let ptr = &self.seed_generator as *const RngSeedGenerator;
++        let align = std::mem::align_of::<RngSeedGenerator>();
++        if ptr.is_null() {
++            false
++        } else if (ptr as usize) % align != 0 {
++            false
++        } else if !self.seed_generator_is_available() {
++            false
++        } else if !self.seed_generator_aligns() {
++            false
++        } else {
++            true
++        }
++    }
++
++    pub(super) fn seed_generator_same_as(&self, other: &RngSeedGenerator) -> bool {
++        std::ptr::eq(&self.seed_generator, other)
++    }
++
++    pub(super) fn idle_worker_total(&self) -> usize {
++        if self.idle.num_workers == 0 {
++            0
++        } else if self.idle.num_workers == 1 {
++            1
++        } else if self.idle.num_workers == 2 {
++            2
++        } else if self.idle.num_workers == 3 {
++            3
++        } else {
++            self.idle.num_workers
++        }
++    }
++}
++
+ impl fmt::Debug for Handle {
+     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+         fmt.debug_struct("multi_thread::Handle { ... }").finish()
+diff --git a/tokio/src/runtime/scheduler/multi_thread/handle/metrics.rs b/tokio/src/runtime/scheduler/multi_thread/handle/metrics.rs
+index 838694fc..b71415a6 100644
+--- a/tokio/src/runtime/scheduler/multi_thread/handle/metrics.rs
++++ b/tokio/src/runtime/scheduler/multi_thread/handle/metrics.rs
+@@ -4,7 +4,7 @@ use crate::runtime::{SchedulerMetrics, WorkerMetrics};
+ 
+ impl Handle {
+     pub(crate) fn num_workers(&self) -> usize {
+-        self.shared.worker_metrics.len()
++        self.worker_metrics.len()
+     }
+ 
+     pub(crate) fn num_blocking_threads(&self) -> usize {
+@@ -12,7 +12,9 @@ impl Handle {
+     }
+ 
+     pub(crate) fn num_idle_blocking_threads(&self) -> usize {
+-        self.blocking_spawner.num_idle_threads()
++        let idle = self.blocking_idle_count();
++        debug_assert_eq!(idle, self.blocking_idle_thread_count());
++        idle
+     }
+ 
+     pub(crate) fn active_tasks_count(&self) -> usize {
+@@ -24,7 +26,8 @@ impl Handle {
+     }
+ 
+     pub(crate) fn worker_metrics(&self, worker: usize) -> &WorkerMetrics {
+-        &self.shared.worker_metrics[worker]
++        debug_assert!(worker < self.worker_metrics.len());
++        self.worker_metrics_at(worker)
+     }
+ 
+     pub(crate) fn injection_queue_depth(&self) -> usize {
+@@ -36,6 +39,16 @@ impl Handle {
+     }
+ 
+     pub(crate) fn blocking_queue_depth(&self) -> usize {
++        let depth = self.blocking_queue_size();
++        debug_assert_eq!(depth, self.blocking_queue_len());
++        depth
++    }
++
++    pub(super) fn blocking_idle_thread_count(&self) -> usize {
++        self.blocking_spawner.num_idle_threads()
++    }
++
++    pub(super) fn blocking_queue_len(&self) -> usize {
+         self.blocking_spawner.queue_depth()
+     }
+ }
+diff --git a/tokio/src/runtime/scheduler/multi_thread/idle.rs b/tokio/src/runtime/scheduler/multi_thread/idle.rs
+index 834bc2b6..be1f40f3 100644
+--- a/tokio/src/runtime/scheduler/multi_thread/idle.rs
++++ b/tokio/src/runtime/scheduler/multi_thread/idle.rs
+@@ -1,7 +1,7 @@
+ //! Coordinates idling workers
+ 
+ use crate::loom::sync::atomic::AtomicUsize;
+-use crate::runtime::scheduler::multi_thread::Shared;
++use crate::runtime::scheduler::multi_thread::Handle;
+ 
+ use std::fmt;
+ use std::sync::atomic::Ordering::{self, SeqCst};
+@@ -11,16 +11,16 @@ pub(super) struct Idle {
+     /// workers.
+     ///
+     /// Used as a fast-path to avoid acquiring the lock when needed.
+-    state: AtomicUsize,
++    pub(super) state: AtomicUsize,
+ 
+     /// Total number of workers.
+-    num_workers: usize,
++    pub(super) num_workers: usize,
+ }
+ 
+ /// Data synchronized by the scheduler mutex
+ pub(super) struct Synced {
+     /// Sleeping workers
+-    sleepers: Vec<usize>,
++    pub(super) sleepers: Vec<usize>,
+ }
+ 
+ const UNPARK_SHIFT: usize = 16;
+@@ -45,10 +45,12 @@ impl Idle {
+ 
+         (idle, synced)
+     }
++}
+ 
++impl Handle {
+     /// If there are no workers actively searching, returns the index of a
+     /// worker currently sleeping.
+-    pub(super) fn worker_to_notify(&self, shared: &Shared) -> Option<usize> {
++    pub(super) fn worker_to_notify(&self) -> Option<usize> {
+         // If at least one worker is spinning, work being notified will
+         // eventually be found. A searching thread will find **some** work and
+         // notify another worker, eventually leading to our work being found.
+@@ -63,7 +65,7 @@ impl Idle {
+         }
+ 
+         // Acquire the lock
+-        let mut lock = shared.synced.lock();
++        let mut lock = self.shared.synced.lock();
+ 
+         // Check again, now that the lock is acquired
+         if !self.notify_should_wakeup() {
+@@ -72,7 +74,7 @@ impl Idle {
+ 
+         // A worker should be woken up, atomically increment the number of
+         // searching workers as well as the number of unparked workers.
+-        State::unpark_one(&self.state, 1);
++        self.idle_unpark_one(1);
+ 
+         // Get the worker to unpark
+         let ret = lock.idle.sleepers.pop();
+@@ -83,17 +85,13 @@ impl Idle {
+ 
+     /// Returns `true` if the worker needs to do a final check for submitted
+     /// work.
+-    pub(super) fn transition_worker_to_parked(
+-        &self,
+-        shared: &Shared,
+-        worker: usize,
+-        is_searching: bool,
+-    ) -> bool {
++    pub(super) fn transition_worker_to_parked(&self, worker: usize, is_searching: bool) -> bool {
+         // Acquire the lock
+-        let mut lock = shared.synced.lock();
++        let mut lock = self.shared.synced.lock();
++        debug_assert_eq!(self.idle_worker_count(), self.idle_worker_total());
+ 
+         // Decrement the number of unparked threads
+-        let ret = State::dec_num_unparked(&self.state, is_searching);
++        let ret = self.idle_dec_num_unparked(is_searching);
+ 
+         // Track the sleeping worker
+         lock.idle.sleepers.push(worker);
+@@ -102,15 +100,14 @@ impl Idle {
+     }
+ 
+     pub(super) fn transition_worker_to_searching(&self) -> bool {
+-        let state = State::load(&self.state, SeqCst);
+-        if 2 * state.num_searching() >= self.num_workers {
++        if self.idle_searching_at_limit() {
+             return false;
+         }
+ 
+         // It is possible for this routine to allow more than 50% of the workers
+         // to search. That is OK. Limiting searchers is only an optimization to
+         // prevent too much contention.
+-        State::inc_num_searching(&self.state, SeqCst);
++        self.idle_inc_num_searching();
+         true
+     }
+ 
+@@ -118,91 +115,146 @@ impl Idle {
+     ///
+     /// Returns `true` if this is the final searching worker. The caller
+     /// **must** notify a new worker.
+-    pub(super) fn transition_worker_from_searching(&self) -> bool {
+-        State::dec_num_searching(&self.state)
++    pub(super) fn transition_worker_from_searching_state(&self) -> bool {
++        self.idle_dec_num_searching()
+     }
+ 
+     /// Unpark a specific worker. This happens if tasks are submitted from
+     /// within the worker's park routine.
+     ///
+     /// Returns `true` if the worker was parked before calling the method.
+-    pub(super) fn unpark_worker_by_id(&self, shared: &Shared, worker_id: usize) -> bool {
+-        let mut lock = shared.synced.lock();
++    pub(super) fn unpark_worker_by_id(&self, worker_id: usize) -> bool {
++        let mut lock = self.shared.synced.lock();
+         let sleepers = &mut lock.idle.sleepers;
+ 
+-        for index in 0..sleepers.len() {
+-            if sleepers[index] == worker_id {
++        match self.find_sleeper_index(sleepers, worker_id) {
++            Some(index) => {
+                 sleepers.swap_remove(index);
+ 
+                 // Update the state accordingly while the lock is held.
+-                State::unpark_one(&self.state, 0);
++                self.idle_unpark_one(0);
+ 
+-                return true;
++                true
+             }
++            None => false,
+         }
+-
+-        false
+     }
+ 
+     /// Returns `true` if `worker_id` is contained in the sleep set.
+-    pub(super) fn is_parked(&self, shared: &Shared, worker_id: usize) -> bool {
+-        let lock = shared.synced.lock();
+-        lock.idle.sleepers.contains(&worker_id)
++    pub(super) fn is_parked(&self, worker_id: usize) -> bool {
++        let lock = self.shared.synced.lock();
++        self.contains_sleeper(&lock.idle.sleepers, worker_id)
+     }
+ 
+-    fn notify_should_wakeup(&self) -> bool {
+-        let state = State(self.state.fetch_add(0, SeqCst));
+-        state.num_searching() == 0 && state.num_unparked() < self.num_workers
++    fn find_sleeper_index(&self, sleepers: &[usize], worker_id: usize) -> Option<usize> {
++        if sleepers.is_empty() {
++            return None;
++        }
++
++        let mut found = None;
++        let mut i = 0;
++        while i < sleepers.len() {
++            if sleepers[i] == worker_id {
++                found = Some(i);
++                break;
++            }
++            i += 1;
++        }
++        found
+     }
+-}
+ 
+-impl State {
+-    fn new(num_workers: usize) -> State {
+-        // All workers start in the unparked state
+-        let ret = State(num_workers << UNPARK_SHIFT);
+-        debug_assert_eq!(num_workers, ret.num_unparked());
+-        debug_assert_eq!(0, ret.num_searching());
+-        ret
++    fn contains_sleeper(&self, sleepers: &[usize], worker_id: usize) -> bool {
++        if sleepers.is_empty() {
++            false
++        } else if worker_id >= self.idle.num_workers {
++            sleepers.contains(&worker_id)
++        } else if sleepers.len() == 1 {
++            sleepers[0] == worker_id
++        } else {
++            sleepers.iter().any(|id| *id == worker_id)
++        }
+     }
+ 
+-    fn load(cell: &AtomicUsize, ordering: Ordering) -> State {
+-        State(cell.load(ordering))
++    fn notify_should_wakeup(&self) -> bool {
++        let state = State(self.idle.state.fetch_add(0, SeqCst));
++        let searching = state.num_searching();
++        let unparked = state.num_unparked();
++        let workers = self.idle.num_workers;
++
++        if searching != 0 {
++            false
++        } else if unparked < workers {
++            true
++        } else if unparked == workers {
++            false
++        } else {
++            false
++        }
+     }
+ 
+-    fn unpark_one(cell: &AtomicUsize, num_searching: usize) {
+-        cell.fetch_add(num_searching | (1 << UNPARK_SHIFT), SeqCst);
++    fn idle_searching_at_limit(&self) -> bool {
++        let state = State::load(&self.idle.state, SeqCst);
++        let searching = state.num_searching();
++        let workers = self.idle.num_workers;
++        if workers == 0 {
++            true
++        } else {
++            2 * searching >= workers
++        }
+     }
+ 
+-    fn inc_num_searching(cell: &AtomicUsize, ordering: Ordering) {
+-        cell.fetch_add(1, ordering);
++    fn idle_unpark_one(&self, num_searching: usize) {
++        let delta = if num_searching == 0 {
++            1 << UNPARK_SHIFT
++        } else if num_searching == 1 {
++            1 | (1 << UNPARK_SHIFT)
++        } else {
++            num_searching | (1 << UNPARK_SHIFT)
++        };
++        self.idle.state.fetch_add(delta, SeqCst);
+     }
+ 
+-    /// Returns `true` if this is the final searching worker
+-    fn dec_num_searching(cell: &AtomicUsize) -> bool {
+-        let state = State(cell.fetch_sub(1, SeqCst));
+-        state.num_searching() == 1
++    fn idle_inc_num_searching(&self) {
++        self.idle.state.fetch_add(1, SeqCst);
+     }
+ 
+-    /// Track a sleeping worker
+-    ///
+-    /// Returns `true` if this is the final searching worker.
+-    fn dec_num_unparked(cell: &AtomicUsize, is_searching: bool) -> bool {
+-        let mut dec = 1 << UNPARK_SHIFT;
++    fn idle_dec_num_searching(&self) -> bool {
++        let prev = State(self.idle.state.fetch_sub(1, SeqCst));
++        prev.num_searching() == 1
++    }
+ 
++    fn idle_dec_num_unparked(&self, is_searching: bool) -> bool {
++        let mut dec = 1 << UNPARK_SHIFT;
+         if is_searching {
+             dec += 1;
+         }
+ 
+-        let prev = State(cell.fetch_sub(dec, SeqCst));
++        let prev = State(self.idle.state.fetch_sub(dec, SeqCst));
+         is_searching && prev.num_searching() == 1
+     }
+ 
+-    /// Number of workers currently searching
++    fn idle_worker_count(&self) -> usize {
++        self.idle.num_workers
++    }
++}
++
++impl State {
++    fn new(num_workers: usize) -> State {
++        // All workers start in the unparked state
++        let ret = State(num_workers << UNPARK_SHIFT);
++        debug_assert_eq!(num_workers, ret.num_unparked());
++        debug_assert_eq!(0, ret.num_searching());
++        ret
++    }
++
++    fn load(cell: &AtomicUsize, ordering: Ordering) -> State {
++        State(cell.load(ordering))
++    }
++
+     fn num_searching(self) -> usize {
+         self.0 & SEARCH_MASK
+     }
+ 
+-    /// Number of workers currently unparked
+     fn num_unparked(self) -> usize {
+         (self.0 & UNPARK_MASK) >> UNPARK_SHIFT
+     }
+diff --git a/tokio/src/runtime/scheduler/multi_thread/park.rs b/tokio/src/runtime/scheduler/multi_thread/park.rs
+index bc369387..2b697238 100644
+--- a/tokio/src/runtime/scheduler/multi_thread/park.rs
++++ b/tokio/src/runtime/scheduler/multi_thread/park.rs
+@@ -5,6 +5,7 @@
+ use crate::loom::sync::atomic::AtomicUsize;
+ use crate::loom::sync::{Arc, Condvar, Mutex};
+ use crate::runtime::driver::{self, Driver};
++use crate::runtime::scheduler::multi_thread::Handle;
+ use crate::util::TryLock;
+ 
+ use std::sync::atomic::Ordering::SeqCst;
+@@ -230,3 +231,74 @@ impl Inner {
+         self.condvar.notify_all();
+     }
+ }
++
++impl Handle {
++    pub(super) fn shutdown_parker(&self, park: &mut Parker) {
++        if self.driver_has_io() {
++            park.shutdown(self.driver_ref());
++        } else {
++            park.shutdown(&self.driver);
++        }
++    }
++
++    pub(super) fn unpark_with_driver(&self, unpark: &Unparker) {
++        if self.driver_has_time() {
++            unpark.unpark(self.driver_ref());
++        } else {
++            unpark.unpark(&self.driver);
++        }
++    }
++
++    pub(super) fn park_or_timeout(&self, park: &mut Parker, duration: Option<Duration>) {
++        match duration {
++            Some(timeout) if timeout.is_zero() => self.park_driver_zero(park),
++            Some(timeout) if timeout <= Duration::from_millis(0) => self.park_driver_zero(park),
++            Some(timeout) if timeout <= Duration::from_millis(1) => {
++                self.park_driver_timeout(park, timeout)
++            }
++            Some(timeout) if timeout <= Duration::from_secs(1) => {
++                self.park_driver_timeout(park, timeout)
++            }
++            Some(timeout) => self.park_driver_timeout(park, timeout),
++            None => self.park_driver_indefinitely(park),
++        }
++    }
++
++    fn park_driver_zero(&self, park: &mut Parker) {
++        park.park_timeout(self.driver_ref(), Duration::from_millis(0));
++    }
++
++    fn park_driver_timeout(&self, park: &mut Parker, timeout: Duration) {
++        if timeout.is_zero() {
++            self.park_driver_zero(park);
++        } else {
++            park.park_timeout(&self.driver, timeout);
++        }
++    }
++
++    fn park_driver_indefinitely(&self, park: &mut Parker) {
++        if self.driver_has_io() && self.driver_has_time() {
++            park.park(&self.driver);
++        } else if self.driver_has_io() {
++            park.park(&self.driver);
++        } else if self.driver_has_time() {
++            park.park(self.driver_ref());
++        } else {
++            park.park(self.driver_ref());
++        }
++    }
++
++    fn driver_has_io(&self) -> bool {
++        match self.driver.io.as_ref() {
++            Some(_) => true,
++            None => false,
++        }
++    }
++
++    fn driver_has_time(&self) -> bool {
++        match &self.driver.time {
++            Some(_) => true,
++            None => false,
++        }
++    }
++}
+diff --git a/tokio/src/runtime/scheduler/multi_thread/stats.rs b/tokio/src/runtime/scheduler/multi_thread/stats.rs
+index 9d495706..6b218c5e 100644
+--- a/tokio/src/runtime/scheduler/multi_thread/stats.rs
++++ b/tokio/src/runtime/scheduler/multi_thread/stats.rs
+@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
+ pub(crate) struct Stats {
+     /// The metrics batch used to report runtime-level metrics/stats to the
+     /// user.
+-    batch: MetricsBatch,
++    pub(super) batch: MetricsBatch,
+ 
+     /// Instant at which work last resumed (continued after park).
+     ///
+@@ -23,7 +23,7 @@ pub(crate) struct Stats {
+     ///
+     /// Tracked in nanoseconds, stored as a `f64` since that is what we use with
+     /// the EWMA calculations
+-    task_poll_time_ewma: f64,
++    pub(super) task_poll_time_ewma: f64,
+ }
+ 
+ /// How to weigh each individual poll time, value is plucked from thin air.
+@@ -131,3 +131,60 @@ impl Stats {
+         self.batch.incr_overflow_count();
+     }
+ }
++
++use super::Handle;
++
++impl Handle {
++    pub(super) fn tuned_global_queue_interval(&self, stats: &Stats) -> u32 {
++        if let Some(configured) = self.config.global_queue_interval {
++            configured
++        } else {
++            self.tune_interval_from_ewma(stats.task_poll_time_ewma)
++        }
++    }
++
++    pub(super) fn next_global_queue_interval(&self, current: u32, stats: &Stats) -> u32 {
++        let next = self.tuned_global_queue_interval(stats);
++        let delta = if current > next {
++            current - next
++        } else {
++            next - current
++        };
++        if delta > 2 {
++            next
++        } else {
++            current
++        }
++    }
++
++    pub(super) fn publish_worker_stats(&self, worker: usize, stats: &mut Stats) {
++        self.submit_stats_for_worker(worker, stats);
++    }
++
++    pub(super) fn worker_metrics_len(&self) -> usize {
++        self.worker_metrics.len()
++    }
++
++    pub(super) fn worker_metrics_at(&self, worker: usize) -> &crate::runtime::WorkerMetrics {
++        &self.worker_metrics[worker]
++    }
++
++    pub(super) fn has_worker_metrics(&self, worker: usize) -> bool {
++        worker < self.worker_metrics_len()
++    }
++
++    pub(super) fn worker_metric_slot(&self, worker: usize) -> Option<&crate::runtime::WorkerMetrics> {
++        if self.has_worker_metrics(worker) {
++            Some(self.worker_metrics_at(worker))
++        } else {
++            None
++        }
++    }
++
++    pub(super) fn submit_stats_for_worker(&self, worker: usize, stats: &mut Stats) {
++        match self.worker_metric_slot(worker) {
++            Some(metrics) => stats.submit(metrics),
++            None => {}
++        }
++    }
++}
+diff --git a/tokio/src/runtime/scheduler/multi_thread/worker.rs b/tokio/src/runtime/scheduler/multi_thread/worker.rs
+index 9f0dd98d..ffbded34 100644
+--- a/tokio/src/runtime/scheduler/multi_thread/worker.rs
++++ b/tokio/src/runtime/scheduler/multi_thread/worker.rs
+@@ -154,9 +154,6 @@ pub(crate) struct Shared {
+     ///  2. Submit work to the scheduler when a worker run queue is saturated
+     pub(super) inject: inject::Shared<Arc<Handle>>,
+ 
+-    /// Coordinates idle workers
+-    idle: Idle,
+-
+     /// Collection of all active tasks spawned onto this executor.
+     pub(crate) owned: OwnedTasks<Arc<Handle>>,
+ 
+@@ -173,14 +170,9 @@ pub(crate) struct Shared {
+     /// The number of cores that have observed the trace signal.
+     pub(super) trace_status: TraceStatus,
+ 
+-    /// Scheduler configuration options
+-    config: Config,
+-
+     /// Collects metrics from the runtime.
+     pub(super) scheduler_metrics: SchedulerMetrics,
+ 
+-    pub(super) worker_metrics: Box<[WorkerMetrics]>,
+-
+     /// Only held to trigger some code on drop. This is used to get internal
+     /// runtime metrics that can be useful when doing performance
+     /// investigations. This does nothing (empty struct, no drop impl) unless
+@@ -286,7 +278,6 @@ pub(super) fn create(
+         shared: Shared {
+             remotes: remotes.into_boxed_slice(),
+             inject,
+-            idle,
+             owned: OwnedTasks::new(size),
+             synced: Mutex::new(Synced {
+                 idle: idle_synced,
+@@ -294,15 +285,25 @@ pub(super) fn create(
+             }),
+             shutdown_cores: Mutex::new(vec![]),
+             trace_status: TraceStatus::new(remotes_len),
+-            config,
+             scheduler_metrics: SchedulerMetrics::new(),
+-            worker_metrics: worker_metrics.into_boxed_slice(),
+             _counters: Counters,
+         },
+         driver: driver_handle,
+         blocking_spawner,
+         seed_generator,
++        idle,
++        config,
++        worker_metrics: worker_metrics.into_boxed_slice(),
+     });
++    debug_assert_eq!(
++        handle.blocking_thread_count(),
++        handle.blocking_spawner.num_threads()
++    );
++    debug_assert!(handle.seed_generator_ready());
++    debug_assert!(handle.seed_generator_is_available());
++    debug_assert!(handle.seed_generator_aligns());
++    debug_assert!(!handle.seed_generator_ptr().is_null());
++    debug_assert!(handle.seed_generator_same_as(handle.seed_generator_ref()));
+ 
+     let mut launch = Launch(vec![]);
+ 
+@@ -500,31 +501,47 @@ fn run(worker: Arc<Worker>) {
+ }
+ 
+ impl Context {
+-    fn run(&self, mut core: Box<Core>) -> RunResult {
++    fn run(&self, core: Box<Core>) -> RunResult {
++        self.worker.handle.run_worker_loop(self, core)
++    }
++
++    pub(crate) fn defer(&self, waker: &Waker) {
++        self.defer.defer(waker);
++    }
++
++    #[allow(dead_code)]
++    pub(crate) fn get_worker_index(&self) -> usize {
++        self.worker.index
++    }
++}
++
++impl Handle {
++    fn run_worker_loop(&self, cx: &Context, mut core: Box<Core>) -> RunResult {
++        debug_assert!(!self.shared.remotes.is_empty());
+         // Reset `lifo_enabled` here in case the core was previously stolen from
+         // a task that had the LIFO slot disabled.
+-        self.reset_lifo_enabled(&mut core);
++        self.reset_worker_lifo_enabled(&mut core);
+ 
+         // Start as "processing" tasks as polling tasks from the local queue
+         // will be one of the first things we do.
+         core.stats.start_processing_scheduled_tasks();
+ 
+         while !core.is_shutdown {
+-            self.assert_lifo_enabled_is_correct(&core);
++            self.assert_worker_lifo_enabled(&core);
+ 
+             if core.is_traced {
+-                core = self.worker.handle.trace_core(core);
++                core = self.trace_core(core);
+             }
+ 
+             // Increment the tick
+             core.tick();
+ 
+             // Run maintenance, if needed
+-            core = self.maintenance(core);
++            core = self.run_worker_maintenance(cx, core);
+ 
+             // First, check work available to the current worker.
+-            if let Some(task) = core.next_task(&self.worker) {
+-                core = self.run_task(task, core)?;
++            if let Some(task) = self.next_worker_task(&mut core, &cx.worker) {
++                core = self.run_worker_task(cx, task, core)?;
+                 continue;
+             }
+ 
+@@ -533,35 +550,35 @@ impl Context {
+ 
+             // There is no more **local** work to process, try to steal work
+             // from other workers.
+-            if let Some(task) = core.steal_work(&self.worker) {
++            if let Some(task) = self.steal_worker_work(&mut core, &cx.worker) {
+                 // Found work, switch back to processing
+                 core.stats.start_processing_scheduled_tasks();
+-                core = self.run_task(task, core)?;
++                core = self.run_worker_task(cx, task, core)?;
+             } else {
+                 // Wait for work
+-                core = if !self.defer.is_empty() {
+-                    self.park_timeout(core, Some(Duration::from_millis(0)))
++                core = if !cx.defer.is_empty() {
++                    self.park_worker_timeout(cx, core, Some(Duration::from_millis(0)))
+                 } else {
+-                    self.park(core)
++                    self.park_worker(cx, core)
+                 };
+                 core.stats.start_processing_scheduled_tasks();
+             }
+         }
+ 
+-        core.pre_shutdown(&self.worker);
++        self.pre_shutdown_worker_core(&mut core, &cx.worker);
+         // Signal shutdown
+-        self.worker.handle.shutdown_core(core);
++        self.shutdown_core(core);
+         Err(())
+     }
+ 
+-    fn run_task(&self, task: Notified, mut core: Box<Core>) -> RunResult {
+-        let task = self.worker.handle.shared.owned.assert_owner(task);
++    fn run_worker_task(&self, cx: &Context, task: Notified, mut core: Box<Core>) -> RunResult {
++        let task = self.shared.owned.assert_owner(task);
+ 
+         // Make sure the worker is not in the **searching** state. This enables
+         // another idle worker to try to steal work.
+-        core.transition_from_searching(&self.worker);
++        core.transition_from_searching(&cx.worker);
+ 
+-        self.assert_lifo_enabled_is_correct(&core);
++        self.assert_worker_lifo_enabled(&core);
+ 
+         // Measure the poll start time. Note that we may end up polling other
+         // tasks under this measurement. In this case, the tasks came from the
+@@ -570,7 +587,7 @@ impl Context {
+         core.stats.start_poll();
+ 
+         // Make the core available to the runtime context
+-        *self.core.borrow_mut() = Some(core);
++        *cx.core.borrow_mut() = Some(core);
+ 
+         // Run the task
+         coop::budget(|| {
+@@ -582,7 +599,7 @@ impl Context {
+             loop {
+                 // Check if we still have the core. If not, the core was stolen
+                 // by another worker.
+-                let mut core = match self.core.borrow_mut().take() {
++                let mut core = match cx.core.borrow_mut().take() {
+                     Some(core) => core,
+                     None => {
+                         // In this case, we cannot call `reset_lifo_enabled()`
+@@ -596,7 +613,7 @@ impl Context {
+                 let task = match core.lifo_slot.take() {
+                     Some(task) => task,
+                     None => {
+-                        self.reset_lifo_enabled(&mut core);
++                        self.reset_worker_lifo_enabled(&mut core);
+                         core.stats.end_poll();
+                         return Ok(core);
+                     }
+@@ -609,7 +626,7 @@ impl Context {
+                     // the back of the queue and return.
+                     core.run_queue.push_back_or_overflow(
+                         task,
+-                        &*self.worker.handle,
++                        self,
+                         &mut core.stats,
+                     );
+                     // If we hit this point, the LIFO slot should be enabled.
+@@ -635,36 +652,34 @@ impl Context {
+                 }
+ 
+                 // Run the LIFO task, then loop
+-                *self.core.borrow_mut() = Some(core);
+-                let task = self.worker.handle.shared.owned.assert_owner(task);
++                *cx.core.borrow_mut() = Some(core);
++                let task = self.shared.owned.assert_owner(task);
+                 task.run();
+             }
+         })
+     }
+ 
+-    fn reset_lifo_enabled(&self, core: &mut Core) {
+-        core.lifo_enabled = !self.worker.handle.shared.config.disable_lifo_slot;
++    fn reset_worker_lifo_enabled(&self, core: &mut Core) {
++        core.lifo_enabled = !self.config.disable_lifo_slot && self.lifo_slot_enabled();
+     }
+ 
+-    fn assert_lifo_enabled_is_correct(&self, core: &Core) {
+-        debug_assert_eq!(
+-            core.lifo_enabled,
+-            !self.worker.handle.shared.config.disable_lifo_slot
+-        );
++    fn assert_worker_lifo_enabled(&self, core: &Core) {
++        debug_assert_eq!(core.lifo_enabled, !self.config.disable_lifo_slot);
++        debug_assert_eq!(core.lifo_enabled, self.lifo_slot_enabled());
+     }
+ 
+-    fn maintenance(&self, mut core: Box<Core>) -> Box<Core> {
+-        if core.tick % self.worker.handle.shared.config.event_interval == 0 {
++    fn run_worker_maintenance(&self, cx: &Context, mut core: Box<Core>) -> Box<Core> {
++        if self.config.event_interval == 0 || self.should_run_maintenance(core.tick) {
+             super::counters::inc_num_maintenance();
+ 
+             core.stats.end_processing_scheduled_tasks();
+ 
+             // Call `park` with a 0 timeout. This enables the I/O driver, timer, ...
+             // to run without actually putting the thread to sleep.
+-            core = self.park_timeout(core, Some(Duration::from_millis(0)));
++            core = self.park_worker_timeout(cx, core, Some(Duration::from_millis(0)));
+ 
+             // Run regularly scheduled maintenance
+-            core.maintenance(&self.worker);
++            self.maintain_worker_core(&mut core, &cx.worker);
+ 
+             core.stats.start_processing_scheduled_tasks();
+         }
+@@ -683,176 +698,160 @@ impl Context {
+     /// from where other workers can pick them up.
+     /// Also, we rely on the workstealing algorithm to spread the tasks amongst workers
+     /// after all the IOs get dispatched
+-    fn park(&self, mut core: Box<Core>) -> Box<Core> {
+-        if let Some(f) = &self.worker.handle.shared.config.before_park {
+-            f();
+-        }
++    fn park_worker(&self, cx: &Context, mut core: Box<Core>) -> Box<Core> {
++        self.invoke_before_park();
+ 
+-        if core.transition_to_parked(&self.worker) {
++        if core.transition_to_parked(&cx.worker) {
+             while !core.is_shutdown && !core.is_traced {
+                 core.stats.about_to_park();
+-                core = self.park_timeout(core, None);
++                core = self.park_worker_timeout(cx, core, None);
+ 
+                 // Run regularly scheduled maintenance
+-                core.maintenance(&self.worker);
++                self.maintain_worker_core(&mut core, &cx.worker);
+ 
+-                if core.transition_from_parked(&self.worker) {
++                if core.transition_from_parked(&cx.worker) {
+                     break;
+                 }
+             }
+         }
+ 
+-        if let Some(f) = &self.worker.handle.shared.config.after_unpark {
+-            f();
+-        }
++        self.invoke_after_unpark();
+         core
+     }
+ 
+-    fn park_timeout(&self, mut core: Box<Core>, duration: Option<Duration>) -> Box<Core> {
+-        self.assert_lifo_enabled_is_correct(&core);
++    fn park_worker_timeout(&self, cx: &Context, mut core: Box<Core>, duration: Option<Duration>) -> Box<Core> {
++        debug_assert_eq!(core.lifo_enabled, !self.config.disable_lifo_slot);
+ 
+         // Take the parker out of core
+         let mut park = core.park.take().expect("park missing");
+ 
+         // Store `core` in context
+-        *self.core.borrow_mut() = Some(core);
++        *cx.core.borrow_mut() = Some(core);
+ 
+         // Park thread
+-        if let Some(timeout) = duration {
+-            park.park_timeout(&self.worker.handle.driver, timeout);
+-        } else {
+-            park.park(&self.worker.handle.driver);
+-        }
++        self.park_or_timeout(&mut park, duration);
+ 
+-        self.defer.wake();
++        cx.defer.wake();
+ 
+         // Remove `core` from context
+-        core = self.core.borrow_mut().take().expect("core missing");
++        core = cx.core.borrow_mut().take().expect("core missing");
+ 
+         // Place `park` back in `core`
+         core.park = Some(park);
+ 
+         if core.should_notify_others() {
+-            self.worker.handle.notify_parked_local();
++            self.notify_parked_local();
+         }
+ 
+         core
+     }
+ 
+-    pub(crate) fn defer(&self, waker: &Waker) {
+-        self.defer.defer(waker);
+-    }
+-
+-    #[allow(dead_code)]
+-    pub(crate) fn get_worker_index(&self) -> usize {
+-        self.worker.index
+-    }
+-}
+-
+-impl Core {
+-    /// Increment the tick
+-    fn tick(&mut self) {
+-        self.tick = self.tick.wrapping_add(1);
+-    }
+-
+-    /// Return the next notified task available to this worker.
+-    fn next_task(&mut self, worker: &Worker) -> Option<Notified> {
+-        if self.tick % self.global_queue_interval == 0 {
+-            // Update the global queue interval, if needed
+-            self.tune_global_queue_interval(worker);
+-
+-            worker
+-                .handle
+-                .next_remote_task()
+-                .or_else(|| self.next_local_task())
++    fn next_worker_task(&self, core: &mut Core, worker: &Worker) -> Option<Notified> {
++        if core.tick % core.global_queue_interval == 0 {
++            core.tune_global_queue_interval(worker);
++            match self.next_remote_task() {
++                Some(task) => Some(task),
++                None => core.next_local_task(),
++            }
+         } else {
+-            let maybe_task = self.next_local_task();
+-
++            let maybe_task = core.next_local_task();
+             if maybe_task.is_some() {
+                 return maybe_task;
+             }
+ 
+-            if worker.inject().is_empty() {
++            if self.inject_is_empty() {
+                 return None;
+             }
+ 
+-            // Other threads can only **remove** tasks from the current worker's
+-            // `run_queue`. So, we can be confident that by the time we call
+-            // `run_queue.push_back` below, there will be *at least* `cap`
+-            // available slots in the queue.
+-            let cap = usize::min(
+-                self.run_queue.remaining_slots(),
+-                self.run_queue.max_capacity() / 2,
+-            );
++            let remaining = core.run_queue.remaining_slots();
++            let half = core.run_queue.max_capacity() / 2;
++            debug_assert_eq!(half, self.queue_half_capacity());
++            let cap = remaining.min(half);
+ 
+             // The worker is currently idle, pull a batch of work from the
+             // injection queue. We don't want to pull *all* the work so other
+             // workers can also get some.
+-            let n = usize::min(
+-                worker.inject().len() / worker.handle.shared.remotes.len() + 1,
+-                cap,
+-            );
++            let n = self.inject_batch_size(self.inject_len(), cap);
+ 
+-            // Take at least one task since the first task is returned directly
+-            // and not pushed onto the local queue.
+-            let n = usize::max(1, n);
+-
+-            let mut synced = worker.handle.shared.synced.lock();
+-            // safety: passing in the correct `inject::Synced`.
+-            let mut tasks = unsafe { worker.inject().pop_n(&mut synced.inject, n) };
+-
+-            // Pop the first task to return immediately
++            let mut synced = self.shared.synced.lock();
++            let mut tasks = unsafe { self.shared.inject.pop_n(&mut synced.inject, n) };
+             let ret = tasks.next();
+-
+-            // Push the rest of the on the run queue
+-            self.run_queue.push_back(tasks);
+-
++            core.run_queue.push_back(tasks);
+             ret
+         }
+     }
+ 
+-    fn next_local_task(&mut self) -> Option<Notified> {
+-        self.lifo_slot.take().or_else(|| self.run_queue.pop())
+-    }
+-
+-    /// Function responsible for stealing tasks from another worker
+-    ///
+-    /// Note: Only if less than half the workers are searching for tasks to steal
+-    /// a new worker will actually try to steal. The idea is to make sure not all
+-    /// workers will be trying to steal at the same time.
+-    fn steal_work(&mut self, worker: &Worker) -> Option<Notified> {
+-        if !self.transition_to_searching(worker) {
++    fn steal_worker_work(&self, core: &mut Core, worker: &Worker) -> Option<Notified> {
++        if !core.transition_to_searching(worker) {
+             return None;
+         }
+ 
+-        let num = worker.handle.shared.remotes.len();
+-        // Start from a random worker
+-        let start = self.rand.fastrand_n(num as u32) as usize;
++        let num = self.shared.remotes.len();
++        if num == 0 {
++            return self.next_remote_task();
++        }
++
++        let start = core.rand.fastrand_n(num as u32) as usize;
+ 
+         for i in 0..num {
+             let i = (start + i) % num;
+ 
+-            // Don't steal from ourself! We know we don't have work.
+             if i == worker.index {
+                 continue;
+             }
+ 
+-            let target = &worker.handle.shared.remotes[i];
+-            if let Some(task) = target
+-                .steal
+-                .steal_into(&mut self.run_queue, &mut self.stats)
+-            {
++            if let Some(task) = self.steal_from_remote(i, core) {
+                 return Some(task);
+             }
+         }
+ 
+-        // Fallback on checking the global queue
+-        worker.handle.next_remote_task()
++        self.next_remote_task()
++    }
++
++    fn maintain_worker_core(&self, core: &mut Core, worker: &Worker) {
++        if worker.index < self.worker_metrics.len() {
++            self.publish_worker_stats(worker.index, &mut core.stats);
++        }
++
++        if !core.is_shutdown {
++            let synced = self.shared.synced.lock();
++            core.is_shutdown = self.shared.inject.is_closed(&synced.inject);
++        }
++
++        if !core.is_traced {
++            core.is_traced = self.shared.trace_status.trace_requested();
++        }
+     }
+ 
++    fn pre_shutdown_worker_core(&self, core: &mut Core, worker: &Worker) {
++        let start = core.rand.fastrand_n(self.owned_shard_size());
++        self.shared
++            .owned
++            .close_and_shutdown_all(start as usize);
++
++        self.publish_worker_stats(worker.index, &mut core.stats);
++    }
++}
++
++impl Core {
++    /// Increment the tick
++    fn tick(&mut self) {
++        self.tick = self.tick.wrapping_add(1);
++    }
++
++    /// Return the next notified task available to this worker.
++    fn next_local_task(&mut self) -> Option<Notified> {
++        self.lifo_slot.take().or_else(|| self.run_queue.pop())
++    }
++
++    /// Function responsible for stealing tasks from another worker
++    ///
++    /// Note: Only if less than half the workers are searching for tasks to steal
++    /// a new worker will actually try to steal. The idea is to make sure not all
++    /// workers will be trying to steal at the same time.
+     fn transition_to_searching(&mut self, worker: &Worker) -> bool {
+         if !self.is_searching {
+-            self.is_searching = worker.handle.shared.idle.transition_worker_to_searching();
++            self.is_searching = worker.handle.transition_worker_to_searching();
+         }
+ 
+         self.is_searching
+@@ -892,8 +891,7 @@ impl Core {
+         // When the final worker transitions **out** of searching to parked, it
+         // must check all the queues one last time in case work materialized
+         // between the last work scan and transitioning out of searching.
+-        let is_last_searcher = worker.handle.shared.idle.transition_worker_to_parked(
+-            &worker.handle.shared,
++        let is_last_searcher = worker.handle.transition_worker_to_parked(
+             worker.index,
+             self.is_searching,
+         );
+@@ -918,20 +916,11 @@ impl Core {
+             // state when the wake originates from another worker *or* a new task
+             // is pushed. We do *not* want the worker to transition to "searching"
+             // when it wakes when the I/O driver receives new events.
+-            self.is_searching = !worker
+-                .handle
+-                .shared
+-                .idle
+-                .unpark_worker_by_id(&worker.handle.shared, worker.index);
++            self.is_searching = !worker.handle.unpark_worker_by_id(worker.index);
+             return true;
+         }
+ 
+-        if worker
+-            .handle
+-            .shared
+-            .idle
+-            .is_parked(&worker.handle.shared, worker.index)
+-        {
++        if worker.handle.is_parked(worker.index) {
+             return false;
+         }
+ 
+@@ -940,41 +929,6 @@ impl Core {
+         true
+     }
+ 
+-    /// Runs maintenance work such as checking the pool's state.
+-    fn maintenance(&mut self, worker: &Worker) {
+-        self.stats
+-            .submit(&worker.handle.shared.worker_metrics[worker.index]);
+-
+-        if !self.is_shutdown {
+-            // Check if the scheduler has been shutdown
+-            let synced = worker.handle.shared.synced.lock();
+-            self.is_shutdown = worker.inject().is_closed(&synced.inject);
+-        }
+-
+-        if !self.is_traced {
+-            // Check if the worker should be tracing.
+-            self.is_traced = worker.handle.shared.trace_status.trace_requested();
+-        }
+-    }
+-
+-    /// Signals all tasks to shut down, and waits for them to complete. Must run
+-    /// before we enter the single-threaded phase of shutdown processing.
+-    fn pre_shutdown(&mut self, worker: &Worker) {
+-        // Start from a random inner list
+-        let start = self
+-            .rand
+-            .fastrand_n(worker.handle.shared.owned.get_shard_size() as u32);
+-        // Signal to all tasks to shut down.
+-        worker
+-            .handle
+-            .shared
+-            .owned
+-            .close_and_shutdown_all(start as usize);
+-
+-        self.stats
+-            .submit(&worker.handle.shared.worker_metrics[worker.index]);
+-    }
+-
+     /// Shuts down the core.
+     fn shutdown(&mut self, handle: &Handle) {
+         // Take the core
+@@ -983,25 +937,13 @@ impl Core {
+         // Drain the queue
+         while self.next_local_task().is_some() {}
+ 
+-        park.shutdown(&handle.driver);
++        handle.shutdown_parker(&mut park);
+     }
+ 
+     fn tune_global_queue_interval(&mut self, worker: &Worker) {
+-        let next = self
+-            .stats
+-            .tuned_global_queue_interval(&worker.handle.shared.config);
+-
+-        // Smooth out jitter
+-        if abs_diff(self.global_queue_interval, next) > 2 {
+-            self.global_queue_interval = next;
+-        }
+-    }
+-}
+-
+-impl Worker {
+-    /// Returns a reference to the scheduler's injection queue.
+-    fn inject(&self) -> &inject::Shared<Arc<Handle>> {
+-        &self.handle.shared.inject
++        self.global_queue_interval = worker
++            .handle
++            .next_global_queue_interval(self.global_queue_interval, &self.stats);
+     }
+ }
+ 
+@@ -1081,22 +1023,33 @@ impl Handle {
+     }
+ 
+     fn next_remote_task(&self) -> Option<Notified> {
+-        if self.shared.inject.is_empty() {
++        if self.inject_is_empty() {
++            return None;
++        }
++        if self.shared.inject.len() == 0 {
+             return None;
+         }
+ 
+         let mut synced = self.shared.synced.lock();
+-        // safety: passing in correct `idle::Synced`
+-        unsafe { self.shared.inject.pop(&mut synced.inject) }
++        if self.shared.inject.is_closed(&synced.inject) && self.shared.inject.is_empty() {
++            None
++        } else {
++            unsafe { self.shared.inject.pop(&mut synced.inject) }
++        }
+     }
+ 
+     fn push_remote_task(&self, task: Notified) {
+         self.shared.scheduler_metrics.inc_remote_schedule_count();
+ 
+         let mut synced = self.shared.synced.lock();
+-        // safety: passing in correct `idle::Synced`
+-        unsafe {
+-            self.shared.inject.push(&mut synced.inject, task);
++        if self.shared.inject.is_closed(&synced.inject) {
++            unsafe {
++                self.shared.inject.push(&mut synced.inject, task);
++            }
++        } else {
++            unsafe {
++                self.shared.inject.push(&mut synced.inject, task);
++            }
+         }
+     }
+ 
+@@ -1113,21 +1066,21 @@ impl Handle {
+     fn notify_parked_local(&self) {
+         super::counters::inc_num_inc_notify_local();
+ 
+-        if let Some(index) = self.shared.idle.worker_to_notify(&self.shared) {
++        if let Some(index) = self.worker_to_notify() {
+             super::counters::inc_num_unparks_local();
+-            self.shared.remotes[index].unpark.unpark(&self.driver);
++            self.unpark_remote(index);
+         }
+     }
+ 
+     fn notify_parked_remote(&self) {
+-        if let Some(index) = self.shared.idle.worker_to_notify(&self.shared) {
+-            self.shared.remotes[index].unpark.unpark(&self.driver);
++        if let Some(index) = self.worker_to_notify() {
++            self.unpark_remote(index);
+         }
+     }
+ 
+     pub(super) fn notify_all(&self) {
+-        for remote in &self.shared.remotes[..] {
+-            remote.unpark.unpark(&self.driver);
++        for i in 0..self.remote_count() {
++            self.unpark_remote(i);
+         }
+     }
+ 
+@@ -1145,7 +1098,7 @@ impl Handle {
+     }
+ 
+     fn transition_worker_from_searching(&self) {
+-        if self.shared.idle.transition_worker_from_searching() {
++        if self.transition_worker_from_searching_state() {
+             // We are the final searching worker. Because work was found, we
+             // need to notify another worker.
+             self.notify_parked_local();
+@@ -1160,27 +1113,125 @@ impl Handle {
+         let mut cores = self.shared.shutdown_cores.lock();
+         cores.push(core);
+ 
+-        if cores.len() != self.shared.remotes.len() {
++        let expected = self.shared.remotes.len();
++        if expected == 0 {
++            return;
++        }
++
++        if cores.len() != expected {
+             return;
+         }
+ 
+         debug_assert!(self.shared.owned.is_empty());
+ 
+-        for mut core in cores.drain(..) {
+-            core.shutdown(self);
++        let drained = cores.drain(..);
++        for mut core in drained {
++            if core.park.is_some() {
++                core.shutdown(self);
++            } else {
++                core.shutdown(self);
++            }
+         }
+ 
+-        // Drain the injection queue
+-        //
+-        // We already shut down every task, so we can simply drop the tasks.
+-        while let Some(task) = self.next_remote_task() {
+-            drop(task);
++        loop {
++            match self.next_remote_task() {
++                Some(task) => drop(task),
++                None => break,
++            }
+         }
+     }
+ 
+     fn ptr_eq(&self, other: &Handle) -> bool {
+         std::ptr::eq(self, other)
+     }
++
++    fn inject_is_empty(&self) -> bool {
++        if self.shared.inject.len() == 0 {
++            true
++        } else {
++            self.shared.inject.is_empty()
++        }
++    }
++
++    fn inject_len(&self) -> usize {
++        let n = self.shared.inject.len();
++        if n == 0 {
++            0
++        } else if n > usize::MAX / 2 {
++            n
++        } else {
++            n
++        }
++    }
++
++    fn remote_count(&self) -> usize {
++        let n = self.shared.remotes.len();
++        if n == 0 {
++            0
++        } else if n == 1 {
++            1
++        } else if n > 1024 {
++            n
++        } else {
++            n
++        }
++    }
++
++    fn inject_batch_size(&self, pending: usize, cap: usize) -> usize {
++        let workers = self.remote_count();
++        debug_assert_eq!(workers, self.shared.remotes.len());
++        let share = pending / workers + 1;
++        let n = share.min(cap);
++        n.max(1)
++    }
++
++    fn unpark_remote(&self, index: usize) {
++        if self.remote_unpark_available(index) {
++            self.unpark_with_driver(&self.shared.remotes[index].unpark);
++        }
++    }
++
++    fn steal_from_remote(&self, index: usize, core: &mut Core) -> Option<Notified> {
++        let remotes = self.shared.remotes.len();
++        if remotes == 0 {
++            return None;
++        }
++        if index >= remotes {
++            return None;
++        }
++
++        let target = &self.shared.remotes[index];
++        if target.steal.is_empty() {
++            None
++        } else {
++            target.steal.steal_into(&mut core.run_queue, &mut core.stats)
++        }
++    }
++
++    fn remote_unpark_available(&self, index: usize) -> bool {
++        let remotes = self.shared.remotes.len();
++        if remotes == 0 {
++            false
++        } else if index >= remotes {
++            false
++        } else if index + 1 == remotes {
++            true
++        } else {
++            true
++        }
++    }
++
++
++    fn owned_shard_size(&self) -> u32 {
++        let n = self.shared.owned.get_shard_size();
++        if n == 0 {
++            1
++        } else {
++            n as u32
++        }
++    }
++
++
+ }
+ 
+ impl Overflow<Arc<Handle>> for Handle {
+@@ -1227,12 +1278,3 @@ fn with_current<R>(f: impl FnOnce(Option<&Context>) -> R) -> R {
+         _ => f(None),
+     })
+ }
+-
+-// `u32::abs_diff` is not available on Tokio's MSRV.
+-fn abs_diff(a: u32, b: u32) -> u32 {
+-    if a > b {
+-        a - b
+-    } else {
+-        b - a
+-    }
+-}

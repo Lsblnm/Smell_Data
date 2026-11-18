@@ -1,0 +1,184 @@
+diff --git a/lib/fluent/plugin/out_forward.rb b/lib/fluent/plugin/out_forward.rb
+index 97ec287b..5f1beec8 100644
+--- a/lib/fluent/plugin/out_forward.rb
++++ b/lib/fluent/plugin/out_forward.rb
+@@ -227,7 +227,7 @@ module Fluent::Plugin
+         connection_factory: method(:create_transfer_socket),
+         socket_cache: socket_cache,
+       )
+-      @ack_handler = @require_ack_response ? AckHandler.new(timeout: @ack_response_timeout, log: @log, read_length: @read_length, connection_manager: @connection_manager) : nil
++      @ack_handler = @require_ack_response ? AckHandler.new(timeout: @ack_response_timeout, log: @log, read_length: @read_length) : nil
+ 
+       service_discovery_configure(
+         :out_forward_service_discovery_watcher,
+@@ -521,8 +521,8 @@ module Fluent::Plugin
+         when AckHandler::Result::SUCCESS
+           commit_write(chunk_id)
+         when AckHandler::Result::FAILED
+-          node.disable!
+-          rollback_write(chunk_id, update_retry: false)
++          node&.disable!
++          rollback_write(chunk_id, update_retry: false) if chunk_id
+         when AckHandler::Result::CHUNKID_UNMATCHED
+           rollback_write(chunk_id, update_retry: false)
+         else
+diff --git a/lib/fluent/plugin/out_forward/ack_handler.rb b/lib/fluent/plugin/out_forward/ack_handler.rb
+index c02e392a..e1d19ae7 100644
+--- a/lib/fluent/plugin/out_forward/ack_handler.rb
++++ b/lib/fluent/plugin/out_forward/ack_handler.rb
+@@ -18,7 +18,6 @@ require 'fluent/plugin/output'
+ require 'fluent/plugin_helper/socket'
+ require 'fluent/engine'
+ require 'fluent/clock'
+-require 'fluent/plugin/out_forward/connection_manager'
+ 
+ module Fluent::Plugin
+   class ForwardOutput < Output
+@@ -29,16 +28,13 @@ module Fluent::Plugin
+         CHUNKID_UNMATCHED = :chunkid_unmatched
+       end
+ 
+-      attr_reader :read_length, :unpacker
+-
+-      def initialize(timeout:, log:, read_length:, connection_manager: nil)
++      def initialize(timeout:, log:, read_length:)
+         @mutex = Mutex.new
+         @ack_waitings = []
+         @timeout = timeout
+         @log = log
+         @read_length = read_length
+         @unpacker = Fluent::MessagePackFactory.msgpack_unpacker
+-        @connection_manager = connection_manager || ConnectionManager.new(log: log, secure: false, connection_factory: nil, socket_cache: nil)
+       end
+ 
+       def collect_response(select_interval)
+@@ -63,10 +59,16 @@ module Fluent::Plugin
+             @ack_waitings = new_list
+           end
+ 
+-          readable_sockets, _, _ = IO.select(sockets, nil, nil, select_interval)
++          begin
++            readable_sockets, _, _ = IO.select(sockets, nil, nil, select_interval)
++          rescue IOError
++            @log.info "connection closed while waiting for readable sockets"
++            readable_sockets = nil
++          end
++
+           if readable_sockets
+             readable_sockets.each do |sock|
+-              results << @connection_manager.read_ack_from_sock(self, sock)
++              results << read_ack_from_sock(sock)
+             end
+           end
+ 
+@@ -106,6 +108,58 @@ module Fluent::Plugin
+         end
+       end
+ 
++      private
++
++      def read_ack_from_sock(sock)
++        begin
++          raw_data = sock.instance_of?(Fluent::PluginHelper::Socket::WrappedSocket::TLS) ? sock.readpartial(@read_length) : sock.recv(@read_length)
++        rescue Errno::ECONNRESET, EOFError # ECONNRESET for #recv, #EOFError for #readpartial
++          raw_data = ''
++        rescue IOError
++          @log.info "socket closed while receiving ack response"
++          return nil, Result::FAILED
++        end
++
++        info = find(sock)
++
++        if info.nil?
++          # The info can be deleted by another thread during `sock.recv()` and `find()`.
++          # This is OK since another thread has completed to process the ack, so we can skip this.
++          # Note: exclusion mechanism about `collect_response()` may need to be considered.
++          @log.debug "could not find the ack info. this ack may be processed by another thread."
++          return nil, Result::FAILED
++        elsif raw_data.empty?
++          # When connection is closed by remote host, socket is ready to read and #recv returns an empty string that means EOF.
++          # If this happens we assume the data wasn't delivered and retry it.
++          @log.warn 'destination node closed the connection. regard it as unavailable.', host: info.node.host, port: info.node.port
++          # info.node.disable!
++          return info, Result::FAILED
++        else
++          @unpacker.feed(raw_data)
++          res = @unpacker.read
++          @log.trace 'getting response from destination', host: info.node.host, port: info.node.port, chunk_id: dump_unique_id_hex(info.chunk_id), response: res
++          if res['ack'] != info.chunk_id_base64
++            # Some errors may have occurred when ack and chunk id is different, so send the chunk again.
++            @log.warn 'ack in response and chunk id in sent data are different', chunk_id: dump_unique_id_hex(info.chunk_id), ack: res['ack']
++            return info, Result::CHUNKID_UNMATCHED
++          else
++            @log.trace 'got a correct ack response', chunk_id: dump_unique_id_hex(info.chunk_id)
++          end
++
++          return info, Result::SUCCESS
++        end
++      rescue => e
++        @log.error 'unexpected error while receiving ack message', error: e
++        @log.error_backtrace
++        [nil, Result::FAILED]
++      ensure
++        delete(info)
++      end
++
++      def dump_unique_id_hex(unique_id)
++        Fluent::UniqueId.hex(unique_id)
++      end
++
+       def find(sock)
+         @mutex.synchronize do
+           @ack_waitings.find { |info| info.sock == sock }
+diff --git a/lib/fluent/plugin/out_forward/connection_manager.rb b/lib/fluent/plugin/out_forward/connection_manager.rb
+index 2886a760..af7096ea 100644
+--- a/lib/fluent/plugin/out_forward/connection_manager.rb
++++ b/lib/fluent/plugin/out_forward/connection_manager.rb
+@@ -78,47 +78,6 @@ module Fluent::Plugin
+         end
+       end
+ 
+-      def read_ack_from_sock(ack_handler, sock)
+-        begin
+-          raw_data = sock.instance_of?(Fluent::PluginHelper::Socket::WrappedSocket::TLS) ? sock.readpartial(ack_handler.read_length) : sock.recv(ack_handler.read_length)
+-        rescue Errno::ECONNRESET, EOFError # ECONNRESET for #recv, #EOFError for #readpartial
+-          raw_data = ''
+-        end
+-
+-        info = ack_handler.find(sock)
+-
+-        # When connection is closed by remote host, socket is ready to read and #recv returns an empty string that means EOF.
+-        # If this happens we assume the data wasn't delivered and retry it.
+-        if raw_data.empty?
+-          node = info.node
+-          @log.warn 'destination node closed the connection. regard it as unavailable.', host: node.host, port: node.port, handshake_hostname: node.handshake.hostname, hard_timeout: node.failure.hard_timeout
+-          # info.node.disable!
+-          return info, AckHandler::Result::FAILED
+-        else
+-          unpacker = ack_handler.unpacker
+-          unpacker.feed(raw_data)
+-          res = unpacker.read
+-          node = info.node
+-          chunk_id = info.chunk_id
+-          @log.trace 'getting response from destination', host: node.host, port: node.port, chunk_id: Fluent::UniqueId.hex(chunk_id), response: res, handshake_hostname: node.handshake.hostname, hard_timeout: node.failure.hard_timeout
+-          if res['ack'] != info.chunk_id_base64
+-            # Some errors may have occurred when ack and chunk id is different, so send the chunk again.
+-            @log.warn 'ack in response and chunk id in sent data are different', chunk_id: Fluent::UniqueId.hex(chunk_id), ack: res['ack']
+-            return info, AckHandler::Result::CHUNKID_UNMATCHED
+-          else
+-            @log.trace 'got a correct ack response', chunk_id: Fluent::UniqueId.hex(chunk_id)
+-          end
+-
+-          return info, AckHandler::Result::SUCCESS
+-        end
+-      rescue => e
+-        @log.error 'unexpected error while receiving ack message', error: e
+-        @log.error_backtrace
+-        [nil, AckHandler::Result::FAILED]
+-      ensure
+-        ack_handler.delete(info)
+-      end
+-
+       private
+ 
+       def connect_keepalive(host:, port:, hostname:, ack: nil)

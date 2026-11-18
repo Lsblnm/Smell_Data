@@ -1,0 +1,246 @@
+diff --git a/lucene/facet/src/java/org/apache/lucene/facet/DrillSidewaysQuery.java b/lucene/facet/src/java/org/apache/lucene/facet/DrillSidewaysQuery.java
+index 88850df057c..e6f28c5b36e 100644
+--- a/lucene/facet/src/java/org/apache/lucene/facet/DrillSidewaysQuery.java
++++ b/lucene/facet/src/java/org/apache/lucene/facet/DrillSidewaysQuery.java
+@@ -30,11 +30,14 @@ import org.apache.lucene.search.ConstantScoreScorer;
+ import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.search.Explanation;
+ import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.LeafCollector;
+ import org.apache.lucene.search.Query;
+ import org.apache.lucene.search.QueryVisitor;
+ import org.apache.lucene.search.ScoreMode;
+ import org.apache.lucene.search.Scorer;
++import org.apache.lucene.search.TwoPhaseIterator;
+ import org.apache.lucene.search.Weight;
++import org.apache.lucene.util.Bits;
+ 
+ /** Only purpose is to punch through and return a DrillSidewaysScorer */
+ 
+@@ -228,11 +231,78 @@ class DrillSidewaysQuery extends Query {
+         }
+ 
+         return new DrillSidewaysScorer(
+-            context, baseScorer, drillDownCollector, dims, scoreSubDocsAtOnce);
++            context,
++            baseScorer,
++            drillDownCollector,
++            dims,
++            scoreSubDocsAtOnce,
++            DrillSidewaysQuery.this);
+       }
+     };
+   }
+ 
++  /**
++   * Score one leaf by inspecting the drill-sideways scorer's iterators, dimension costs, and
++   * two-phase approximations.
++   */
++  int scoreSideways(
++      DrillSidewaysScorer scorer, LeafCollector collector, Bits acceptDocs, int min, int maxDoc)
++      throws IOException {
++    if (min != 0) {
++      throw new IllegalArgumentException("min must be 0, got " + min);
++    }
++    if (maxDoc != Integer.MAX_VALUE) {
++      throw new IllegalArgumentException("maxDoc must be Integer.MAX_VALUE");
++    }
++
++    scorer.bindLeafCollectors();
++
++    // some scorers, eg ReqExlScorer, can hit NPE if cost is called after nextDoc
++    DocsAndCost[] dims = scorer.dims;
++    DocIdSetIterator baseIterator = scorer.baseIterator;
++    DocIdSetIterator baseApproximation = scorer.baseApproximation;
++    TwoPhaseIterator baseTwoPhase = scorer.baseTwoPhase;
++    long baseQueryCost;
++    if (baseTwoPhase != null) {
++      baseQueryCost = baseTwoPhase.approximation().cost();
++    } else {
++      baseQueryCost = baseApproximation.cost();
++    }
++
++    final int numDims = drillDownQueries.length;
++
++    long drillDownCost = 0;
++    for (int dim = 0; dim < numDims; dim++) {
++      DocsAndCost dc = dims[dim];
++      if (dc.twoPhase != null) {
++        drillDownCost += dc.twoPhase.approximation().cost();
++      } else {
++        drillDownCost += dc.cost;
++      }
++    }
++
++    long drillDownAdvancedCost = 0;
++    if (numDims > 1) {
++      drillDownAdvancedCost = dims[1].approximation.cost();
++    }
++
++    // Position all scorers to their first matching doc:
++    baseIterator.nextDoc();
++    for (DocsAndCost dim : dims) {
++      dim.approximation.nextDoc();
++    }
++
++    if (scoreSubDocsAtOnce || baseQueryCost < drillDownCost / 10) {
++      scorer.doQueryFirstScoring(acceptDocs, collector, dims);
++    } else if (numDims > 1 && drillDownAdvancedCost < baseQueryCost / 10) {
++      scorer.doDrillDownAdvanceScoring(acceptDocs, collector, dims);
++    } else {
++      scorer.doUnionScoring(acceptDocs, collector, dims);
++    }
++
++    return Integer.MAX_VALUE;
++  }
++
+   // TODO: these should do "deeper" equals/hash on the 2-D drillDownTerms array
+ 
+   @Override
+diff --git a/lucene/facet/src/java/org/apache/lucene/facet/DrillSidewaysScorer.java b/lucene/facet/src/java/org/apache/lucene/facet/DrillSidewaysScorer.java
+index fc415e14897..7d28aeae697 100644
+--- a/lucene/facet/src/java/org/apache/lucene/facet/DrillSidewaysScorer.java
++++ b/lucene/facet/src/java/org/apache/lucene/facet/DrillSidewaysScorer.java
+@@ -49,18 +49,20 @@ class DrillSidewaysScorer extends BulkScorer {
+   private final Collector drillDownCollector;
+   private LeafCollector drillDownLeafCollector;
+ 
+-  private final DocsAndCost[] dims;
++  final DocsAndCost[] dims;
+ 
+   // DrillDown DocsEnums:
+   private final Scorer baseScorer;
+-  private final DocIdSetIterator baseIterator;
+-  private final DocIdSetIterator baseApproximation;
+-  private final TwoPhaseIterator baseTwoPhase;
++  final DocIdSetIterator baseIterator;
++  final DocIdSetIterator baseApproximation;
++  final TwoPhaseIterator baseTwoPhase;
+ 
+   private final LeafReaderContext context;
+ 
+   final boolean scoreSubDocsAtOnce;
+ 
++  final DrillSidewaysQuery query;
++
+   private static final int CHUNK = 2048;
+   private static final int MASK = CHUNK - 1;
+ 
+@@ -72,7 +74,8 @@ class DrillSidewaysScorer extends BulkScorer {
+       Scorer baseScorer,
+       Collector drillDownCollector,
+       DocsAndCost[] dims,
+-      boolean scoreSubDocsAtOnce) {
++      boolean scoreSubDocsAtOnce,
++      DrillSidewaysQuery query) {
+     this.dims = dims;
+     this.context = context;
+     this.baseScorer = baseScorer;
+@@ -85,6 +88,7 @@ class DrillSidewaysScorer extends BulkScorer {
+     }
+     this.drillDownCollector = drillDownCollector;
+     this.scoreSubDocsAtOnce = scoreSubDocsAtOnce;
++    this.query = query;
+   }
+ 
+   @Override
+@@ -95,16 +99,10 @@ class DrillSidewaysScorer extends BulkScorer {
+   @Override
+   public int score(LeafCollector collector, Bits acceptDocs, int min, int maxDoc)
+       throws IOException {
+-    if (min != 0) {
+-      throw new IllegalArgumentException("min must be 0, got " + min);
+-    }
+-    if (maxDoc != Integer.MAX_VALUE) {
+-      throw new IllegalArgumentException("maxDoc must be Integer.MAX_VALUE");
+-    }
+-    // if (DEBUG) {
+-    //  System.out.println("\nscore: reader=" + context.reader());
+-    // }
+-    // System.out.println("score r=" + context.reader());
++    return query.scoreSideways(this, collector, acceptDocs, min, maxDoc);
++  }
++
++  void bindLeafCollectors() throws IOException {
+     if (drillDownCollector != null) {
+       drillDownLeafCollector = drillDownCollector.getLeafCollector(context);
+     } else {
+@@ -113,51 +111,6 @@ class DrillSidewaysScorer extends BulkScorer {
+     for (DocsAndCost dim : dims) {
+       dim.sidewaysLeafCollector = dim.sidewaysCollector.getLeafCollector(context);
+     }
+-
+-    // some scorers, eg ReqExlScorer, can hit NPE if cost is called after nextDoc
+-    long baseQueryCost = baseIterator.cost();
+-
+-    final int numDims = dims.length;
+-
+-    long drillDownCost = 0;
+-    for (int dim = 0; dim < numDims; dim++) {
+-      drillDownCost += dims[dim].approximation.cost();
+-    }
+-
+-    long drillDownAdvancedCost = 0;
+-    if (numDims > 1) {
+-      drillDownAdvancedCost = dims[1].approximation.cost();
+-    }
+-
+-    // Position all scorers to their first matching doc:
+-    baseIterator.nextDoc();
+-    for (DocsAndCost dim : dims) {
+-      dim.approximation.nextDoc();
+-    }
+-
+-    /*
+-    System.out.println("\nbaseDocID=" + baseScorer.docID() + " est=" + estBaseHitCount);
+-    System.out.println("  maxDoc=" + context.reader().maxDoc());
+-    System.out.println("  maxCost=" + maxCost);
+-    System.out.println("  dims[0].freq=" + dims[0].freq);
+-    if (numDims > 1) {
+-      System.out.println("  dims[1].freq=" + dims[1].freq);
+-    }
+-    */
+-
+-    if (scoreSubDocsAtOnce || baseQueryCost < drillDownCost / 10) {
+-      // System.out.println("queryFirst: baseScorer=" + baseScorer + " disis.length=" + disis.length
+-      // + " bits.length=" + bits.length);
+-      doQueryFirstScoring(acceptDocs, collector, dims);
+-    } else if (numDims > 1 && drillDownAdvancedCost < baseQueryCost / 10) {
+-      // System.out.println("drillDownAdvance");
+-      doDrillDownAdvanceScoring(acceptDocs, collector, dims);
+-    } else {
+-      // System.out.println("union");
+-      doUnionScoring(acceptDocs, collector, dims);
+-    }
+-
+-    return Integer.MAX_VALUE;
+   }
+ 
+   /**
+@@ -199,7 +152,7 @@ class DrillSidewaysScorer extends BulkScorer {
+    * Used when base query is highly constraining vs the drilldowns, or when the docs must be scored
+    * at once (i.e., like BooleanScorer2, not BooleanScorer).
+    */
+-  private void doQueryFirstScoring(Bits acceptDocs, LeafCollector collector, DocsAndCost[] dims)
++  void doQueryFirstScoring(Bits acceptDocs, LeafCollector collector, DocsAndCost[] dims)
+       throws IOException {
+     setScorer(collector, ScoreCachingWrappingScorer.wrap(baseScorer));
+ 
+@@ -340,7 +293,7 @@ class DrillSidewaysScorer extends BulkScorer {
+   }
+ 
+   /** Used when drill downs are highly constraining vs baseQuery. */
+-  private void doDrillDownAdvanceScoring(
++  void doDrillDownAdvanceScoring(
+       Bits acceptDocs, LeafCollector collector, DocsAndCost[] dims) throws IOException {
+     setScorer(collector, new ScoreAndDoc());
+ 
+@@ -549,7 +502,7 @@ class DrillSidewaysScorer extends BulkScorer {
+     }
+   }
+ 
+-  private void doUnionScoring(Bits acceptDocs, LeafCollector collector, DocsAndCost[] dims)
++  void doUnionScoring(Bits acceptDocs, LeafCollector collector, DocsAndCost[] dims)
+       throws IOException {
+     // if (DEBUG) {
+     //  System.out.println("  doUnionScoring");

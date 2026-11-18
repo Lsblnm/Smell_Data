@@ -1,0 +1,171 @@
+diff --git a/tokio/src/io/driver/mod.rs b/tokio/src/io/driver/mod.rs
+index 9801a22c..9995ef0d 100644
+--- a/tokio/src/io/driver/mod.rs
++++ b/tokio/src/io/driver/mod.rs
+@@ -12,7 +12,7 @@ mod registration;
+ pub(crate) use registration::Registration;
+ 
+ mod scheduled_io;
+-use scheduled_io::ScheduledIo;
++pub(crate) use scheduled_io::ScheduledIo;
+ 
+ mod metrics;
+ 
+@@ -55,7 +55,7 @@ pub(crate) struct Handle {
+ 
+ #[derive(Debug)]
+ pub(crate) struct ReadyEvent {
+-    tick: u8,
++    pub(crate) tick: u8,
+     pub(crate) ready: Ready,
+ }
+ 
+diff --git a/tokio/src/io/driver/registration.rs b/tokio/src/io/driver/registration.rs
+index b765976b..2f2d0dbe 100644
+--- a/tokio/src/io/driver/registration.rs
++++ b/tokio/src/io/driver/registration.rs
+@@ -101,6 +101,14 @@ impl Registration {
+         self.shared.clear_readiness(event);
+     }
+ 
++    pub(crate) fn handle(&self) -> &Handle {
++        &self.handle
++    }
++
++    pub(crate) fn shared(&self) -> &ScheduledIo {
++        &self.shared
++    }
++
+     // Uses the poll path, requiring the caller to ensure mutual exclusion for
+     // correctness. Only the last task to call this function is notified.
+     pub(crate) fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<ReadyEvent>> {
+diff --git a/tokio/src/signal/registry.rs b/tokio/src/signal/registry.rs
+index 7795ca8d..046df316 100644
+--- a/tokio/src/signal/registry.rs
++++ b/tokio/src/signal/registry.rs
+@@ -15,8 +15,8 @@ pub(crate) type EventId = usize;
+ /// and what listeners are registered.
+ #[derive(Debug)]
+ pub(crate) struct EventInfo {
+-    pending: AtomicBool,
+-    tx: watch::Sender<()>,
++    pub(crate) pending: AtomicBool,
++    pub(crate) tx: watch::Sender<()>,
+ }
+ 
+ impl Default for EventInfo {
+@@ -96,7 +96,8 @@ impl<S: Storage> Registry<S> {
+     /// Broadcasts all previously recorded events to their respective listeners.
+     ///
+     /// Returns `true` if an event was delivered to at least one listener.
+-    fn broadcast(&self) -> bool {
++    #[cfg_attr(unix, allow(dead_code))]
++    pub(crate) fn broadcast(&self) -> bool {
+         let mut did_notify = false;
+         self.storage.for_each(|event_info| {
+             // Any signal of this kind arrived since we checked last?
+@@ -139,11 +140,9 @@ impl Globals {
+         self.registry.record_event(event_id);
+     }
+ 
+-    /// Broadcasts all previously recorded events to their respective listeners.
+-    ///
+-    /// Returns `true` if an event was delivered to at least one listener.
+-    pub(crate) fn broadcast(&self) -> bool {
+-        self.registry.broadcast()
++    #[cfg_attr(unix, allow(dead_code))]
++    pub(crate) fn registry(&self) -> &Registry<OsStorage> {
++        &self.registry
+     }
+ 
+     #[cfg(unix)]
+diff --git a/tokio/src/signal/unix/driver.rs b/tokio/src/signal/unix/driver.rs
+index e14a6d77..a885f649 100644
+--- a/tokio/src/signal/unix/driver.rs
++++ b/tokio/src/signal/unix/driver.rs
+@@ -2,10 +2,12 @@
+ 
+ //! Signal driver
+ 
+-use crate::io::driver::{Driver as IoDriver, Interest};
++use crate::io::driver::{Driver as IoDriver, Interest, ReadyEvent};
+ use crate::io::PollEvented;
+ use crate::park::Park;
+-use crate::signal::registry::globals;
++use crate::signal::registry::{globals, Storage};
++
++use std::sync::atomic::Ordering;
+ 
+ use mio::net::UnixStream;
+ use std::io::{self, Read};
+@@ -103,28 +105,46 @@ impl Driver {
+         let waker = unsafe { Waker::from_raw(RawWaker::new(ptr::null(), &NOOP_WAKER_VTABLE)) };
+         let mut cx = Context::from_waker(&waker);
+ 
+-        let ev = match self.receiver.registration().poll_read_ready(&mut cx) {
++        let registration = self.receiver.registration();
++        let io_handle = registration.handle();
++        let shared = registration.shared();
++
++        let ev = match registration.poll_read_ready(&mut cx) {
+             Poll::Ready(Ok(ev)) => ev,
+             Poll::Ready(Err(e)) => panic!("reactor gone: {}", e),
+             Poll::Pending => return, // No wake has arrived, bail
+         };
+ 
++        let ready = ev.ready;
++        let tick = ev.tick;
++
+         // Drain the pipe completely so we can receive a new readiness event
+         // if another signal has come in.
+-        let mut buf = [0; 128];
+-        loop {
+-            match (&*self.receiver).read(&mut buf) {
+-                Ok(0) => panic!("EOF on self-pipe"),
+-                Ok(_) => continue, // Keep reading
+-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+-                Err(e) => panic!("Bad read on self-pipe: {}", e),
++        if !ready.is_empty() {
++            let mut buf = [0; 128];
++            loop {
++                match (&*self.receiver).read(&mut buf) {
++                    Ok(0) => panic!("EOF on self-pipe"),
++                    Ok(_) => continue, // Keep reading
++                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
++                    Err(e) => panic!("Bad read on self-pipe: {}", e),
++                }
+             }
+         }
+ 
+-        self.receiver.registration().clear_readiness(ev);
++        shared.clear_readiness(ReadyEvent { tick, ready });
++
++        globals().storage().for_each(|event_info| {
++            if !event_info.pending.swap(false, Ordering::SeqCst) {
++                return;
++            }
++
++            // Ignore errors if there are no listeners
++            let _ = event_info.tx.send(());
++        });
+ 
+-        // Broadcast any signals which were received
+-        globals().broadcast();
++        // Keep the I/O driver alive for the duration of drain and dispatch.
++        drop(io_handle);
+     }
+ }
+ 
+diff --git a/tokio/src/signal/windows/sys.rs b/tokio/src/signal/windows/sys.rs
+index 8d29c357..fed4e82e 100644
+--- a/tokio/src/signal/windows/sys.rs
++++ b/tokio/src/signal/windows/sys.rs
+@@ -92,7 +92,7 @@ unsafe extern "system" fn handler(ty: DWORD) -> BOOL {
+     // the handler routine is always invoked in a new thread, thus we don't
+     // have the same restrictions as in Unix signal handlers, meaning we can
+     // go ahead and perform the broadcast here.
+-    if globals.broadcast() {
++    if globals.registry().broadcast() {
+         TRUE
+     } else {
+         // No one is listening for this notification any more

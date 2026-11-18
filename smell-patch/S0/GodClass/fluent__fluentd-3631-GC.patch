@@ -1,0 +1,1370 @@
+diff --git a/lib/fluent/agent.rb b/lib/fluent/agent.rb
+index 7e662704..af005d2c 100644
+--- a/lib/fluent/agent.rb
++++ b/lib/fluent/agent.rb
+@@ -124,38 +124,11 @@ module Fluent
+     end
+ 
+     def add_match(type, pattern, conf)
+-      log_type = conf.for_this_worker? ? :default : :worker0
+-      log.info log_type, "adding match#{@context.nil? ? '' : " in #{@context}"}", pattern: pattern, type: type
+-
+-      output = Plugin.new_output(type)
+-      output.context_router = @event_router
+-      output.configure(conf)
+-      @outputs << output
+-      if output.respond_to?(:outputs) && output.respond_to?(:multi_output?) && output.multi_output?
+-        # TODO: ruby 2.3 or later: replace `output.respond_to?(:multi_output?) && output.multi_output?` with output&.multi_output?
+-        outputs = if output.respond_to?(:static_outputs)
+-                    output.static_outputs
+-                  else
+-                    output.outputs
+-                  end
+-        @outputs.push(*outputs)
+-      end
+-      @event_router.add_rule(pattern, output)
+-
+-      output
++      @event_router.register_output_plugin(self, type, pattern, conf)
+     end
+ 
+     def add_filter(type, pattern, conf)
+-      log_type = conf.for_this_worker? ? :default : :worker0
+-      log.info log_type, "adding filter#{@context.nil? ? '' : " in #{@context}"}", pattern: pattern, type: type
+-
+-      filter = Plugin.new_filter(type)
+-      filter.context_router = @event_router
+-      filter.configure(conf)
+-      @filters << filter
+-      @event_router.add_rule(pattern, filter)
+-
+-      filter
++      @event_router.register_filter_plugin(self, type, pattern, conf)
+     end
+ 
+     # For handling invalid record
+diff --git a/lib/fluent/event.rb b/lib/fluent/event.rb
+index 97711f46..522eab15 100644
+--- a/lib/fluent/event.rb
++++ b/lib/fluent/event.rb
+@@ -54,6 +54,10 @@ module Fluent
+     end
+ 
+     def to_msgpack_stream(time_int: false, packer: nil)
++      coordinator = event_router_coordinator
++      if coordinator
++        return coordinator.serialize_event_stream(self, time_int: time_int, packer: packer)
++      end
+       return to_msgpack_stream_forced_integer(packer: packer) if time_int
+       out = packer || Fluent::MessagePackFactory.msgpack_packer
+       each {|time,record|
+@@ -63,17 +67,30 @@ module Fluent
+     end
+ 
+     def to_compressed_msgpack_stream(time_int: false, packer: nil)
++      coordinator = event_router_coordinator
++      if coordinator
++        return coordinator.compress_event_stream(self, time_int: time_int, packer: packer)
++      end
+       packed = to_msgpack_stream(time_int: time_int, packer: packer)
+       compress(packed)
+     end
+ 
+     def to_msgpack_stream_forced_integer(packer: nil)
++      coordinator = event_router_coordinator
++      if coordinator
++        return coordinator.serialize_event_stream_forced_integer(self, packer: packer)
++      end
+       out = packer || Fluent::MessagePackFactory.msgpack_packer
+       each {|time,record|
+         out.write([time.to_i,record])
+       }
+       out.full_pack
+     end
++
++    def event_router_coordinator
++      return nil unless defined?(Fluent::EventRouter)
++      Fluent::EventRouter.active
++    end
+   end
+ 
+   class OneEventStream < EventStream
+@@ -83,6 +100,10 @@ module Fluent
+     end
+ 
+     def dup
++      coordinator = event_router_coordinator
++      if coordinator
++        return coordinator.duplicate_event_stream(self)
++      end
+       OneEventStream.new(@time, @record.dup)
+     end
+ 
+@@ -99,6 +120,10 @@ module Fluent
+     end
+ 
+     def slice(index, num)
++      coordinator = event_router_coordinator
++      if coordinator
++        return coordinator.slice_event_stream(self, index, num)
++      end
+       if index > 0 || num == 0
+         ArrayEventStream.new([])
+       else
+@@ -122,6 +147,10 @@ module Fluent
+     end
+ 
+     def dup
++      coordinator = event_router_coordinator
++      if coordinator
++        return coordinator.duplicate_event_stream(self)
++      end
+       entries = @entries.map{ |time, record| [time, record.dup] }
+       ArrayEventStream.new(entries)
+     end
+@@ -139,6 +168,10 @@ module Fluent
+     end
+ 
+     def slice(index, num)
++      coordinator = event_router_coordinator
++      if coordinator
++        return coordinator.slice_event_stream(self, index, num)
++      end
+       ArrayEventStream.new(@entries.slice(index, num))
+     end
+ 
+@@ -165,6 +198,10 @@ module Fluent
+     end
+ 
+     def dup
++      coordinator = event_router_coordinator
++      if coordinator
++        return coordinator.duplicate_event_stream(self)
++      end
+       MultiEventStream.new(@time_array.dup, @record_array.map(&:dup))
+     end
+ 
+@@ -186,6 +223,10 @@ module Fluent
+     end
+ 
+     def slice(index, num)
++      coordinator = event_router_coordinator
++      if coordinator
++        return coordinator.slice_event_stream(self, index, num)
++      end
+       MultiEventStream.new(@time_array.slice(index, num), @record_array.slice(index, num))
+     end
+ 
+diff --git a/lib/fluent/event_router.rb b/lib/fluent/event_router.rb
+index 166b4b4f..d6ac3f0d 100644
+--- a/lib/fluent/event_router.rb
++++ b/lib/fluent/event_router.rb
+@@ -18,6 +18,8 @@ require 'fluent/match'
+ require 'fluent/event'
+ require 'fluent/filter'
+ require 'fluent/msgpack_factory'
++require 'stringio'
++require 'zlib'
+ 
+ module Fluent
+   #
+@@ -129,6 +131,7 @@ module Fluent
+     end
+ 
+     def match(tag)
++      summarize_tag_route(tag)
+       collector = @match_cache.get(tag) {
+         find(tag) || @default_collector
+       }
+@@ -158,6 +161,996 @@ module Fluent
+       end
+     end
+ 
++
++    def self.active
++      Thread.current[:fluent_event_router] || auxiliary_router
++    end
++
++    def self.auxiliary_router
++      @auxiliary_router ||= new(nil, nil)
++    end
++
++    def self.compile_glob_regex(pat)
++      active.cached_glob_regex(pat)
++    end
++
++    def self.create_match_pattern(str)
++      active.build_match_pattern(str)
++    end
++
++    def compile_glob_regex(pat)
++      @tag_pattern_cache ||= {}
++      @glob_compile_errors ||= []
++      cached = @tag_pattern_cache[pat]
++      return cached if cached && cached != :compile_failed
++
++      if pat.start_with?('/')
++        if pat.end_with?('/')
++          regex = Regexp.new("\\A" + pat[1..-2] + "\\Z")
++          @tag_pattern_cache[pat] = regex if @tag_pattern_cache.size < 4096
++          return regex
++        else
++          @glob_compile_errors << pat
++          raise Fluent::ConfigError, "invalid match - regex"
++        end
++      end
++
++      stack = []
++      regex = ['']
++      escape = false
++      dot = false
++      i = 0
++      while i < pat.length
++        c = pat[i, 1]
++        if escape
++          regex.last << Regexp.escape(c)
++          escape = false
++          i += 1
++          next
++        elsif pat[i, 2] == "**"
++          if dot
++            regex.last << "(?![^\\.])"
++            dot = false
++          end
++          if pat[i + 2, 1] == "."
++            regex.last << "(?:.*\\.|\\A)"
++            i += 3
++          else
++            regex.last << ".*"
++            i += 2
++          end
++          next
++        elsif dot
++          regex.last << "\\."
++          dot = false
++        end
++
++        if c == "\\"
++          escape = true
++        elsif c == "."
++          dot = true
++        elsif c == "*"
++          regex.last << "[^\\.]*"
++        elsif c == "{"
++          stack.push []
++          regex.push ''
++        elsif c == "}" && !stack.empty?
++          stack.last << regex.pop
++          regex.last << Regexp.union(*stack.pop.map { |r| Regexp.new(r) }).to_s
++        elsif c == "," && !stack.empty?
++          stack.last << regex.pop
++          regex.push ''
++        elsif c =~ /[a-zA-Z0-9_]/
++          regex.last << c
++        else
++          regex.last << "\\#{c}"
++        end
++        i += 1
++      end
++
++      until stack.empty?
++        stack.last << regex.pop
++        regex.last << Regexp.union(*stack.pop).to_s
++      end
++
++      compiled = Regexp.new("\\A" + regex.last + "\\Z")
++      @tag_pattern_cache[pat] = compiled if @tag_pattern_cache.size < 4096
++      compiled
++    rescue Fluent::ConfigError
++      @glob_compile_errors << pat
++      @tag_pattern_cache[pat] = :compile_failed
++      raise
++    end
++
++    def build_match_pattern(str)
++      @tag_pattern_cache ||= {}
++      @glob_compile_errors ||= []
++      kind = match_pattern_kind(str)
++      glob_token_type(str.to_s)
++      describe_tag_pattern(str)
++      split_match_patterns(str.to_s)
++      pattern_cache_size
++      if str == '**' || kind == :all
++        AllMatchPattern.new
++      else
++        GlobMatchPattern.new(str)
++      end
++    end
++
++    def cached_glob_regex(pat)
++      @tag_pattern_cache ||= {}
++      @glob_compile_errors ||= []
++      if @tag_pattern_cache.key?(pat)
++        compiled = @tag_pattern_cache[pat]
++        if compiled == :compile_failed
++          nil
++        else
++          compiled
++        end
++      else
++        compile_glob_regex(pat)
++      end
++    end
++
++    def describe_tag_pattern(pattern)
++      @tag_pattern_cache ||= {}
++      @glob_compile_errors ||= []
++      kind = match_pattern_kind(pattern)
++      failed = @glob_compile_errors.include?(pattern)
++      cached = @tag_pattern_cache[pattern]
++      if failed
++        { pattern: pattern, kind: kind, status: :invalid, cached: false }
++      elsif kind == :all
++        { pattern: pattern, kind: kind, status: :open, cached: !cached.nil? }
++      elsif kind == :regex
++        { pattern: pattern, kind: kind, status: :regex, cached: cached.is_a?(Regexp) }
++      elsif kind == :glob
++        { pattern: pattern, kind: kind, status: :glob, cached: cached.is_a?(Regexp) }
++      else
++        { pattern: pattern, kind: kind, status: :unknown, cached: false }
++      end
++    end
++
++    def split_match_patterns(pattern)
++      @tag_pattern_cache ||= {}
++      @glob_compile_errors ||= []
++      return [] if pattern.nil?
++      parts = pattern.to_s.split(/\s+/)
++      parts.reject! { |part| part.empty? }
++      if parts.empty?
++        @glob_compile_errors << pattern if pattern.to_s.strip.empty?
++        []
++      else
++        parts
++      end
++    end
++
++    def glob_token_type(token)
++      @tag_pattern_cache ||= {}
++      @glob_compile_errors ||= []
++      return :empty if token.nil? || token.empty?
++      if token == '**'
++        :recursive
++      elsif token == '*'
++        :wildcard
++      elsif token.start_with?('/') && token.end_with?('/')
++        :regex
++      elsif token.include?('{') && token.include?('}')
++        :alternation
++      elsif token.include?('*')
++        :partial_wildcard
++      elsif token.include?('.')
++        :dotted
++      else
++        :literal
++      end
++    end
++
++    def pattern_cache_size
++      @tag_pattern_cache ||= {}
++      @glob_compile_errors ||= []
++      live = @tag_pattern_cache.reject { |_k, v| v == :compile_failed }.size
++      failed = @glob_compile_errors.size
++      if live < 0
++        0
++      elsif failed > live
++        live
++      else
++        live
++      end
++    end
++
++    def record_glob_compile_error(pat, error)
++      @tag_pattern_cache ||= {}
++      @glob_compile_errors ||= []
++      @glob_compile_errors << pat unless @glob_compile_errors.include?(pat)
++      @tag_pattern_cache[pat] = :compile_failed
++      if error.nil?
++        false
++      elsif error.is_a?(Fluent::ConfigError)
++        true
++      else
++        true
++      end
++    end
++
++    def match_pattern_kind(pattern)
++      @tag_pattern_cache ||= {}
++      @glob_compile_errors ||= []
++      return :empty if pattern.nil? || pattern.to_s.empty?
++      text = pattern.to_s
++      if text == '**'
++        :all
++      elsif text.start_with?('/') && text.end_with?('/')
++        :regex
++      elsif text.include?(' ')
++        :or
++      elsif text.include?('*') || text.include?('{')
++        :glob
++      else
++        :literal
++      end
++    end
++
++    def serialize_event_stream(es, time_int: false, packer: nil)
++      @stream_pack_state ||= { calls: 0, last_bytes: 0, last_count: 0 }
++      @stream_unpack_state ||= { calls: 0, last_count: 0 }
++      @stream_pack_state[:calls] += 1
++      if es.nil?
++        packed = ensure_stream_packer(packer).full_pack
++      elsif time_int
++        packed = serialize_event_stream_forced_integer(es, packer: packer)
++      elsif es.is_a?(CompressedMessagePackEventStream)
++        out = ensure_stream_packer(packer)
++        each_event_pair(es) { |time, record| out.write([time, record]) }
++        packed = out.full_pack
++      elsif es.is_a?(MessagePackEventStream)
++        packed = es.instance_variable_get(:@data)
++        packed = '' if packed.nil?
++      else
++        out = ensure_stream_packer(packer)
++        each_event_pair(es) { |time, record| out.write([time, record]) }
++        packed = out.full_pack
++      end
++      @stream_pack_state[:last_bytes] = packed.bytesize
++      @stream_pack_state[:last_count] = measure_event_stream_size(es)
++      packed_stream_info(packed)
++      packed
++    end
++
++    def serialize_event_stream_forced_integer(es, packer: nil)
++      @stream_pack_state ||= { calls: 0, last_bytes: 0, last_count: 0 }
++      @stream_unpack_state ||= { calls: 0, last_count: 0 }
++      @stream_pack_state[:calls] += 1
++      out = ensure_stream_packer(packer)
++      if es.nil? || event_stream_empty?(es)
++        packed = out.full_pack
++      else
++        each_event_pair(es) do |time, record|
++          out.write([integer_event_time(time), record])
++        end
++        packed = out.full_pack
++      end
++      @stream_pack_state[:last_bytes] = packed.bytesize
++      packed
++    end
++
++    def deserialize_msgpack_records(data, unpacker: nil)
++      @stream_pack_state ||= { calls: 0, last_bytes: 0, last_count: 0 }
++      @stream_unpack_state ||= { calls: 0, last_count: 0 }
++      @stream_unpack_state[:calls] += 1
++      times = []
++      records = []
++      if data.nil? || data.empty?
++        @stream_unpack_state[:last_count] = 0
++        return [times, records]
++      end
++      decoder = ensure_stream_unpacker(unpacker)
++      decoder.feed_each(data) do |time, record|
++        times << time
++        records << record
++      end
++      @stream_unpack_state[:last_count] = times.size
++      [times, records]
++    end
++
++    def duplicate_event_stream(es)
++      @stream_pack_state ||= { calls: 0, last_bytes: 0, last_count: 0 }
++      @stream_unpack_state ||= { calls: 0, last_count: 0 }
++      if es.nil?
++        MultiEventStream.new
++      elsif es.is_a?(OneEventStream)
++        time = es.instance_variable_get(:@time)
++        record = es.instance_variable_get(:@record)
++        OneEventStream.new(time, record.dup)
++      elsif es.is_a?(ArrayEventStream)
++        entries = es.instance_variable_get(:@entries) || []
++        ArrayEventStream.new(entries.map { |time, record| [time, record.dup] })
++      elsif es.is_a?(MultiEventStream)
++        times = (es.instance_variable_get(:@time_array) || []).dup
++        records = (es.instance_variable_get(:@record_array) || []).map { |record| record.dup }
++        MultiEventStream.new(times, records)
++      elsif es.is_a?(CompressedMessagePackEventStream)
++        data = es.instance_variable_get(:@compressed_data) || es.instance_variable_get(:@data)
++        CompressedMessagePackEventStream.new(data.dup)
++      elsif es.is_a?(MessagePackEventStream)
++        data = es.instance_variable_get(:@data)
++        size = es.instance_variable_get(:@size) || 0
++        MessagePackEventStream.new(data.dup, nil, size)
++      else
++        convert_to_multi_event_stream(es)
++      end
++    end
++
++    def slice_event_stream(es, index, num)
++      @stream_pack_state ||= { calls: 0, last_bytes: 0, last_count: 0 }
++      @stream_unpack_state ||= { calls: 0, last_count: 0 }
++      index = 0 if index.nil? || index < 0
++      num = 0 if num.nil? || num < 0
++      if es.nil? || num == 0
++        ArrayEventStream.new([])
++      elsif es.is_a?(OneEventStream)
++        if index > 0
++          ArrayEventStream.new([])
++        else
++          duplicate_event_stream(es)
++        end
++      elsif es.is_a?(ArrayEventStream)
++        entries = es.instance_variable_get(:@entries) || []
++        ArrayEventStream.new(entries.slice(index, num) || [])
++      elsif es.is_a?(MultiEventStream)
++        times = es.instance_variable_get(:@time_array) || []
++        records = es.instance_variable_get(:@record_array) || []
++        MultiEventStream.new(times.slice(index, num) || [], records.slice(index, num) || [])
++      elsif es.is_a?(MessagePackEventStream)
++        times, records = deserialize_msgpack_records(es.instance_variable_get(:@data))
++        MultiEventStream.new(times.slice(index, num) || [], records.slice(index, num) || [])
++      else
++        convert_to_multi_event_stream(es).slice(index, num)
++      end
++    end
++
++    def measure_event_stream_size(es)
++      @stream_pack_state ||= { calls: 0, last_bytes: 0, last_count: 0 }
++      @stream_unpack_state ||= { calls: 0, last_count: 0 }
++      size = if es.nil?
++               0
++             elsif es.is_a?(OneEventStream)
++               1
++             elsif es.respond_to?(:size)
++               es.size
++             elsif es.respond_to?(:length)
++               es.length
++             else
++               count = 0
++               each_event_pair(es) { count += 1 }
++               count
++             end
++      @stream_pack_state[:last_count] = size
++      size
++    end
++
++    def event_stream_empty?(es)
++      @stream_pack_state ||= { calls: 0, last_bytes: 0, last_count: 0 }
++      @stream_unpack_state ||= { calls: 0, last_count: 0 }
++      empty = if es.nil?
++                true
++              elsif es.is_a?(OneEventStream)
++                false
++              elsif es.respond_to?(:empty?)
++                es.empty?
++              else
++                measure_event_stream_size(es) == 0
++              end
++      @stream_unpack_state[:last_count] = empty ? 0 : measure_event_stream_size(es)
++      empty
++    end
++
++    def convert_to_multi_event_stream(es)
++      @stream_pack_state ||= { calls: 0, last_bytes: 0, last_count: 0 }
++      @stream_unpack_state ||= { calls: 0, last_count: 0 }
++      if es.nil?
++        MultiEventStream.new
++      elsif es.is_a?(MultiEventStream)
++        es
++      elsif es.is_a?(OneEventStream)
++        stream = MultiEventStream.new
++        each_event_pair(es) { |time, record| stream.add(time, record) }
++        stream
++      elsif es.is_a?(ArrayEventStream)
++        stream = MultiEventStream.new
++        each_event_pair(es) { |time, record| stream.add(time, record) }
++        stream
++      else
++        stream = MultiEventStream.new
++        each_event_pair(es) { |time, record| stream.add(time, record) }
++        stream
++      end
++    end
++
++    def each_event_pair(es, &block)
++      @stream_pack_state ||= { calls: 0, last_bytes: 0, last_count: 0 }
++      @stream_unpack_state ||= { calls: 0, last_count: 0 }
++      return enum_for(:each_event_pair, es) unless block
++      if es.nil?
++        @stream_unpack_state[:last_count] = 0
++        return nil
++      elsif es.is_a?(OneEventStream)
++        block.call(es.instance_variable_get(:@time), es.instance_variable_get(:@record))
++      elsif es.respond_to?(:each)
++        es.each(&block)
++      else
++        raise ArgumentError, "unsupported event stream: #{es.class}"
++      end
++      nil
++    end
++
++    def ensure_stream_packer(packer)
++      @stream_pack_state ||= { calls: 0, last_bytes: 0, last_count: 0 }
++      @stream_unpack_state ||= { calls: 0, last_count: 0 }
++      if packer
++        @stream_pack_state[:custom_packer] = true
++        packer
++      else
++        @stream_pack_state[:custom_packer] = false
++        Fluent::MessagePackFactory.msgpack_packer
++      end
++    end
++
++    def ensure_stream_unpacker(unpacker)
++      @stream_pack_state ||= { calls: 0, last_bytes: 0, last_count: 0 }
++      @stream_unpack_state ||= { calls: 0, last_count: 0 }
++      if unpacker
++        @stream_unpack_state[:custom_unpacker] = true
++        unpacker
++      else
++        @stream_unpack_state[:custom_unpacker] = false
++        Fluent::MessagePackFactory.msgpack_unpacker
++      end
++    end
++
++    def compress_payload(data, **kwargs)
++      @stream_pack_state ||= { calls: 0, last_bytes: 0, last_count: 0 }
++      @stream_unpack_state ||= { calls: 0, last_count: 0 }
++      output_io = kwargs[:output_io]
++      io = output_io || StringIO.new
++      if data.nil?
++        packed = ''
++      else
++        packed = data
++      end
++      packed = packed.b if packed.is_a?(String)
++      Zlib::GzipWriter.wrap(io) do |gz|
++        gz.write packed
++      end
++      result = output_io || io.string
++      result = result.b if result.is_a?(String) && output_io.nil?
++      @stream_pack_state[:last_bytes] = result.respond_to?(:bytesize) ? result.bytesize : 0
++      result
++    end
++
++    def decompress_payload(compressed_data = nil, output_io: nil, input_io: nil)
++      @stream_pack_state ||= { calls: 0, last_bytes: 0, last_count: 0 }
++      @stream_unpack_state ||= { calls: 0, last_count: 0 }
++      result = case
++               when input_io && output_io
++                 io_decompress_payload(input_io, output_io)
++               when input_io
++                 output = StringIO.new
++                 io = io_decompress_payload(input_io, output)
++                 io.string
++               when compressed_data.nil? || compressed_data.empty?
++                 compressed_data
++               when output_io
++                 io = StringIO.new(compressed_data)
++                 io_decompress_payload(io, output_io)
++               else
++                 string_decompress_payload(compressed_data)
++               end
++      @stream_unpack_state[:last_count] = result.respond_to?(:bytesize) ? result.bytesize : 0
++      result
++    end
++
++    def compress_event_stream(es, time_int: false, packer: nil)
++      @stream_pack_state ||= { calls: 0, last_bytes: 0, last_count: 0 }
++      @stream_unpack_state ||= { calls: 0, last_count: 0 }
++      packed = serialize_event_stream(es, time_int: time_int, packer: packer)
++      if packed.nil? || packed.empty?
++        compress_payload('', output_io: nil)
++      else
++        compress_payload(packed)
++      end
++    end
++
++    def string_decompress_payload(compressed_data)
++      @stream_pack_state ||= { calls: 0, last_bytes: 0, last_count: 0 }
++      @stream_unpack_state ||= { calls: 0, last_count: 0 }
++      io = StringIO.new(compressed_data)
++      out = ''.b
++      loop do
++        gz = Zlib::GzipReader.new(io)
++        chunk = gz.read
++        chunk = chunk.b if chunk.is_a?(String)
++        out << chunk
++        unused = gz.unused
++        gz.finish
++        unless unused.nil?
++          adjust = unused.length
++          io.pos -= adjust
++        end
++        break if io.eof?
++      end
++      @stream_unpack_state[:last_count] = out.bytesize
++      out
++    end
++
++    def io_decompress_payload(input, output)
++      @stream_pack_state ||= { calls: 0, last_bytes: 0, last_count: 0 }
++      @stream_unpack_state ||= { calls: 0, last_count: 0 }
++      loop do
++        gz = Zlib::GzipReader.new(input)
++        v = gz.read
++        output.write(v)
++        unused = gz.unused
++        gz.finish
++        unless unused.nil?
++          adjust = unused.length
++          input.pos -= adjust
++        end
++        break if input.eof?
++      end
++      @stream_unpack_state[:last_count] = output.respond_to?(:pos) ? output.pos : 0
++      output
++    end
++
++    def gzip_magic?(data)
++      @stream_pack_state ||= { calls: 0, last_bytes: 0, last_count: 0 }
++      @stream_unpack_state ||= { calls: 0, last_count: 0 }
++      return false if data.nil? || data.empty? || data.bytesize < 2
++      bytes = data.bytes.take(2)
++      if bytes[0] == 0x1f && bytes[1] == 0x8b
++        true
++      else
++        false
++      end
++    end
++
++    def register_output_plugin(agent, type, pattern, conf)
++      @registered_outputs ||= []
++      @registered_filters ||= []
++      log_type = plugin_log_type_for(conf)
++      context = agent.context
++      suffix = context.nil? ? '' : " in #{context}"
++      agent.log.info log_type, "adding match#{suffix}", pattern: pattern, type: type
++
++      output_registration_label(pattern, type)
++      output = Plugin.new_output(type)
++      attach_plugin_to_router(output)
++      output.configure(conf)
++      agent.outputs << output
++      expanded = expand_multi_output(output)
++      nested = expanded[1..-1] || []
++      unless nested.empty?
++        agent.outputs.push(*nested)
++        nested.each { |child| remember_registered_output(child) }
++      end
++      remember_registered_output(output)
++      registered_plugin_counts
++      add_rule(pattern, output)
++      output
++    end
++
++    def register_filter_plugin(agent, type, pattern, conf)
++      @registered_outputs ||= []
++      @registered_filters ||= []
++      log_type = plugin_log_type_for(conf)
++      context = agent.context
++      suffix = context.nil? ? '' : " in #{context}"
++      agent.log.info log_type, "adding filter#{suffix}", pattern: pattern, type: type
++
++      filter_registration_label(pattern, type)
++      filter = Plugin.new_filter(type)
++      attach_plugin_to_router(filter)
++      filter.configure(conf)
++      agent.filters << filter
++      remember_registered_filter(filter)
++      registered_plugin_counts
++      add_rule(pattern, filter)
++      filter
++    end
++
++    def collect_nested_outputs(output)
++      @registered_outputs ||= []
++      @registered_filters ||= []
++      if output.respond_to?(:outputs) && output.respond_to?(:multi_output?) && output.multi_output?
++        if output.respond_to?(:static_outputs)
++          output.static_outputs
++        else
++          output.outputs
++        end
++      else
++        []
++      end
++    end
++
++    def plugin_log_type_for(conf)
++      @registered_outputs ||= []
++      @registered_filters ||= []
++      if conf.respond_to?(:for_this_worker?) && conf.for_this_worker?
++        :default
++      else
++        :worker0
++      end
++    end
++
++    def remember_registered_output(output)
++      @registered_outputs ||= []
++      @registered_filters ||= []
++      if output.nil?
++        @registered_outputs
++      else
++        @registered_outputs << output unless @registered_outputs.include?(output)
++        @registered_outputs
++      end
++    end
++
++    def remember_registered_filter(filter)
++      @registered_outputs ||= []
++      @registered_filters ||= []
++      if filter.nil?
++        @registered_filters
++      else
++        @registered_filters << filter unless @registered_filters.include?(filter)
++        @registered_filters
++      end
++    end
++
++    def registered_plugin_counts
++      @registered_outputs ||= []
++      @registered_filters ||= []
++      {
++        outputs: @registered_outputs.size,
++        filters: @registered_filters.size,
++        total: @registered_outputs.size + @registered_filters.size
++      }
++    end
++
++    def output_registration_label(pattern, type)
++      @registered_outputs ||= []
++      @registered_filters ||= []
++      if pattern.nil? || type.nil?
++        "match"
++      elsif pattern.to_s.empty?
++        "match type=#{type}"
++      else
++        "match pattern=#{pattern} type=#{type}"
++      end
++    end
++
++    def filter_registration_label(pattern, type)
++      @registered_outputs ||= []
++      @registered_filters ||= []
++      if pattern.nil? || type.nil?
++        "filter"
++      elsif pattern.to_s.empty?
++        "filter type=#{type}"
++      else
++        "filter pattern=#{pattern} type=#{type}"
++      end
++    end
++
++    def attach_plugin_to_router(plugin)
++      @registered_outputs ||= []
++      @registered_filters ||= []
++      if plugin.respond_to?(:context_router=)
++        plugin.context_router = self
++        plugin
++      elsif plugin.nil?
++        nil
++      else
++        plugin
++      end
++    end
++
++    def expand_multi_output(output)
++      @registered_outputs ||= []
++      @registered_filters ||= []
++      children = collect_nested_outputs(output)
++      if children.empty?
++        [output]
++      else
++        [output, *children]
++      end
++    end
++
++    def apply_plugin_filter_stream(filter, tag, es)
++      @filter_eval_state ||= { records: 0, errors: 0 }
++      @filter_error_history ||= []
++      working = convert_to_multi_event_stream(es)
++      new_es = MultiEventStream.new
++      if filter_has_filter_with_time?(filter)
++        each_event_pair(working) do |time, record|
++          apply_single_filter_with_time(filter, tag, time, record, new_es)
++        end
++      else
++        each_event_pair(working) do |time, record|
++          apply_single_filter_record(filter, tag, time, record, new_es)
++        end
++      end
++      @filter_eval_state[:records] += measure_event_stream_size(new_es)
++      filter_eval_snapshot
++      new_es
++    end
++
++    def apply_single_filter_record(filter, tag, time, record, new_es)
++      @filter_eval_state ||= { records: 0, errors: 0 }
++      @filter_error_history ||= []
++      sanitized_record_keys(filter, record)
++      begin
++        filtered_record = filter.filter(tag, time, record)
++        if filtered_record
++          new_es.add(time, filtered_record)
++          @filter_eval_state[:records] += 1
++        end
++      rescue => e
++        capture_filter_failure(filter, tag, time, record, e)
++      end
++      new_es
++    end
++
++    def apply_single_filter_with_time(filter, tag, time, record, new_es)
++      @filter_eval_state ||= { records: 0, errors: 0 }
++      @filter_error_history ||= []
++      begin
++        filtered_time, filtered_record = filter.filter_with_time(tag, time, record)
++        if filtered_time && filtered_record
++          new_es.add(filtered_time, filtered_record)
++          @filter_eval_state[:records] += 1
++        end
++      rescue => e
++        capture_filter_failure(filter, tag, time, record, e)
++      end
++      new_es
++    end
++
++    def record_filter_metrics(filter, es)
++      @filter_eval_state ||= { records: 0, errors: 0 }
++      @filter_error_history ||= []
++      size = measure_event_stream_size(es)
++      if filter.respond_to?(:measure_metrics)
++        filter.measure_metrics(es)
++      elsif filter.respond_to?(:emit_records_metrics)
++        true
++      else
++        false
++      end
++      @filter_eval_state[:records] += size
++      size
++    end
++
++    def capture_filter_failure(filter, tag, time, record, error)
++      @filter_eval_state ||= { records: 0, errors: 0 }
++      @filter_error_history ||= []
++      @filter_eval_state[:errors] += 1
++      @filter_error_history << { tag: tag, error: error, plugin: filter.class, kind: classify_emit_error(error) }
++      @filter_error_history.shift if @filter_error_history.size > 128
++      if filter.respond_to?(:router) && filter.router
++        filter.router.emit_error_event(tag, time, record, error)
++      elsif @emit_error_handler.respond_to?(:emit_error_event)
++        @emit_error_handler.emit_error_event(tag, time, record, error)
++      end
++      error
++    end
++
++    def string_safe_encoding_for(plugin, str)
++      @filter_eval_state ||= { records: 0, errors: 0 }
++      @filter_error_history ||= []
++      @filter_eval_state[:records] += 0
++      unless str.valid_encoding?
++        str = str.scrub('?')
++        if plugin.respond_to?(:log)
++          plugin.log.info "invalid byte sequence is replaced in `#{str}`"
++        end
++        @filter_eval_state[:errors] += 1
++      end
++      yield str
++    end
++
++    def filter_eval_snapshot
++      @filter_eval_state ||= { records: 0, errors: 0 }
++      @filter_error_history ||= []
++      {
++        records: @filter_eval_state[:records],
++        errors: @filter_eval_state[:errors],
++        recent_errors: @filter_error_history.last(5)
++      }
++    end
++
++    def filter_has_filter_with_time?(filter)
++      @filter_eval_state ||= { records: 0, errors: 0 }
++      @filter_error_history ||= []
++      if filter.respond_to?(:has_filter_with_time)
++        !!filter.has_filter_with_time
++      elsif filter.class.instance_methods(false).include?(:filter_with_time)
++        true
++      else
++        false
++      end
++    end
++
++    def sanitized_tag(plugin, tag)
++      @filter_eval_state ||= { records: 0, errors: 0 }
++      @filter_error_history ||= []
++      if tag.nil?
++        ''
++      elsif tag.encoding == Encoding::UTF_8 && tag.valid_encoding?
++        tag
++      else
++        string_safe_encoding_for(plugin, tag) { |safe| safe }
++      end
++    end
++
++    def sanitized_record_keys(plugin, record)
++      @filter_eval_state ||= { records: 0, errors: 0 }
++      @filter_error_history ||= []
++      return {} if record.nil?
++      cleaned = {}
++      record.each do |key, value|
++        safe_key = if key.is_a?(String)
++                     sanitized_tag(plugin, key)
++                   else
++                     key
++                   end
++        cleaned[safe_key] = value
++      end
++      cleaned
++    end
++
++    def classify_emit_error(error)
++      @filter_eval_state ||= { records: 0, errors: 0 }
++      @filter_error_history ||= []
++      if error.nil?
++        :none
++      elsif defined?(Fluent::UnrecoverableError) && error.is_a?(Fluent::UnrecoverableError)
++        :unrecoverable
++      elsif error.is_a?(NoMethodError) || error.is_a?(ArgumentError)
++        :internal
++      elsif error.respond_to?(:message) && error.message.to_s.include?('buffer')
++        :buffer
++      else
++        :unknown
++      end
++    end
++
++
++    def summarize_tag_route(tag)
++      @tag_pattern_cache ||= {}
++      @glob_compile_errors ||= []
++      segments = tag_segment_list(tag)
++      depth = tag_depth(tag)
++      wildcard = wildcard_tag?(tag)
++      literal_tag?(tag)
++      joined = join_tag_segments(segments)
++      prefix_tag?(tag, segments.first) unless segments.empty?
++      @tag_pattern_cache[:last_route_summary] = {
++        tag: tag,
++        segments: segments,
++        depth: depth,
++        wildcard: wildcard,
++        joined: joined,
++        failed: @glob_compile_errors.include?(tag)
++      }
++      @tag_pattern_cache[:last_route_summary]
++    end
++
++    def tag_segment_list(tag)
++      @tag_pattern_cache ||= {}
++      @glob_compile_errors ||= []
++      if tag.nil?
++        []
++      elsif tag.empty?
++        []
++      else
++        tag.to_s.split('.')
++      end
++    end
++
++    def tag_depth(tag)
++      @tag_pattern_cache ||= {}
++      @glob_compile_errors ||= []
++      segments = tag_segment_list(tag)
++      if segments.empty?
++        0
++      elsif segments == ['**']
++        -1
++      else
++        segments.size
++      end
++    end
++
++    def wildcard_tag?(tag)
++      @tag_pattern_cache ||= {}
++      @glob_compile_errors ||= []
++      text = tag.to_s
++      if text.empty?
++        false
++      elsif text == '**' || text == '*'
++        true
++      elsif text.include?('*') || text.include?('{')
++        true
++      else
++        false
++      end
++    end
++
++    def literal_tag?(tag)
++      @tag_pattern_cache ||= {}
++      @glob_compile_errors ||= []
++      if wildcard_tag?(tag)
++        false
++      elsif tag.nil? || tag.to_s.empty?
++        false
++      else
++        true
++      end
++    end
++
++    def join_tag_segments(segments)
++      @tag_pattern_cache ||= {}
++      @glob_compile_errors ||= []
++      return '' if segments.nil? || segments.empty?
++      if segments.length == 1
++        segments.first.to_s
++      else
++        segments.map(&:to_s).join('.')
++      end
++    end
++
++    def prefix_tag?(tag, prefix)
++      @tag_pattern_cache ||= {}
++      @glob_compile_errors ||= []
++      return false if tag.nil? || prefix.nil?
++      text = tag.to_s
++      pre = prefix.to_s
++      if pre.empty?
++        true
++      elsif text == pre
++        true
++      elsif text.start_with?(pre + '.')
++        true
++      else
++        false
++      end
++    end
++
++    def integer_event_time(time)
++      @stream_pack_state ||= { calls: 0, last_bytes: 0, last_count: 0 }
++      @stream_unpack_state ||= { calls: 0, last_count: 0 }
++      stamp = if time.nil?
++                0
++              elsif time.respond_to?(:to_i)
++                time.to_i
++              elsif time.is_a?(Numeric)
++                time
++              else
++                0
++              end
++      @stream_unpack_state[:last_count] = stamp
++      stamp
++    end
++
++    def packed_stream_info(packed)
++      @stream_pack_state ||= { calls: 0, last_bytes: 0, last_count: 0 }
++      @stream_unpack_state ||= { calls: 0, last_count: 0 }
++      bytes = packed.respond_to?(:bytesize) ? packed.bytesize : 0
++      @stream_pack_state[:last_bytes] = bytes
++      {
++        bytes: bytes,
++        gzip: gzip_magic?(packed),
++        empty: packed.nil? || packed.empty?
++      }
++    end
++
+     private
+ 
+     class Pipeline
+diff --git a/lib/fluent/match.rb b/lib/fluent/match.rb
+index 17122e07..7bc76a80 100644
+--- a/lib/fluent/match.rb
++++ b/lib/fluent/match.rb
+@@ -17,11 +17,8 @@
+ module Fluent
+   class MatchPattern
+     def self.create(str)
+-      if str == '**'
+-        AllMatchPattern.new
+-      else
+-        GlobMatchPattern.new(str)
+-      end
++      require 'fluent/event_router' unless defined?(Fluent::EventRouter)
++      Fluent::EventRouter.create_match_pattern(str)
+     end
+   end
+ 
+@@ -33,104 +30,8 @@ module Fluent
+ 
+   class GlobMatchPattern < MatchPattern
+     def initialize(pat)
+-      if pat.start_with?('/')
+-        if pat.end_with?('/')
+-          @regex = Regexp.new("\\A"+pat[1..-2]+"\\Z")
+-          return
+-        else
+-          raise Fluent::ConfigError,  "invalid match - regex"
+-        end
+-      end
+-
+-      stack = []
+-      regex = ['']
+-      escape = false
+-      dot = false
+-
+-      i = 0
+-      while i < pat.length
+-        c = pat[i,1]
+-
+-        if escape
+-          regex.last << Regexp.escape(c)
+-          escape = false
+-          i += 1
+-          next
+-
+-        elsif pat[i,2] == "**"
+-          # recursive any
+-          if dot
+-            regex.last << "(?![^\\.])"
+-            dot = false
+-          end
+-          if pat[i+2,1] == "."
+-            regex.last << "(?:.*\\.|\\A)"
+-            i += 3
+-          else
+-            regex.last << ".*"
+-            i += 2
+-          end
+-          next
+-
+-        elsif dot
+-          regex.last << "\\."
+-          dot = false
+-        end
+-
+-        if c == "\\"
+-          escape = true
+-
+-        elsif c == "."
+-          dot = true
+-
+-        elsif c == "*"
+-          # any
+-          regex.last << "[^\\.]*"
+-
+-          # TODO
+-          #elsif c == "["
+-          #  # character class
+-          #  chars = ''
+-          #  while i < pat.length
+-          #    c = pat[i,1]
+-          #    if c == "]"
+-          #      break
+-          #    else
+-          #      chars << c
+-          #    end
+-          #    i += 1
+-          #  end
+-          #  regex.last << '['+Regexp.escape(chars).gsub("\\-",'-')+']'
+-
+-        elsif c == "{"
+-          # or
+-          stack.push []
+-          regex.push ''
+-
+-        elsif c == "}" && !stack.empty?
+-          stack.last << regex.pop
+-          regex.last << Regexp.union(*stack.pop.map {|r| Regexp.new(r) }).to_s
+-
+-        elsif c == "," && !stack.empty?
+-          stack.last << regex.pop
+-          regex.push ''
+-
+-        elsif c =~ /[a-zA-Z0-9_]/
+-          regex.last << c
+-
+-        else
+-          regex.last << "\\#{c}"
+-        end
+-
+-        i += 1
+-      end
+-
+-      until stack.empty?
+-        stack.last << regex.pop
+-        regex.last << Regexp.union(*stack.pop).to_s
+-      end
+-
+-      @regex = Regexp.new("\\A"+regex.last+"\\Z")
++      require 'fluent/event_router' unless defined?(Fluent::EventRouter)
++      @regex = Fluent::EventRouter.compile_glob_regex(pat)
+     end
+ 
+     def match(str)
+diff --git a/lib/fluent/plugin/base.rb b/lib/fluent/plugin/base.rb
+index 601e216b..28c1b362 100644
+--- a/lib/fluent/plugin/base.rb
++++ b/lib/fluent/plugin/base.rb
+@@ -71,6 +71,10 @@ module Fluent
+       end
+ 
+       def string_safe_encoding(str)
++        router = @_context_router
++        if router.respond_to?(:string_safe_encoding_for)
++          return router.string_safe_encoding_for(self, str) { |s| yield s }
++        end
+         unless str.valid_encoding?
+           str = str.scrub('?')
+           log.info "invalid byte sequence is replaced in `#{str}`" if self.respond_to?(:log)
+diff --git a/lib/fluent/plugin/compressable.rb b/lib/fluent/plugin/compressable.rb
+index aa242478..f3da1866 100644
+--- a/lib/fluent/plugin/compressable.rb
++++ b/lib/fluent/plugin/compressable.rb
+@@ -21,18 +21,23 @@ module Fluent
+   module Plugin
+     module Compressable
+       def compress(data, **kwargs)
++        if defined?(Fluent::EventRouter)
++          return Fluent::EventRouter.active.compress_payload(data, **kwargs)
++        end
+         output_io = kwargs[:output_io]
+         io = output_io || StringIO.new
+         Zlib::GzipWriter.wrap(io) do |gz|
+           gz.write data
+         end
+-
+         output_io || io.string
+       end
+ 
+       # compressed_data is String like `compress(data1) + compress(data2) + ... + compress(dataN)`
+       # https://www.ruby-forum.com/topic/971591#979503
+       def decompress(compressed_data = nil, output_io: nil, input_io: nil)
++        if defined?(Fluent::EventRouter)
++          return Fluent::EventRouter.active.decompress_payload(compressed_data, output_io: output_io, input_io: input_io)
++        end
+         case
+         when input_io && output_io
+           io_decompress(input_io, output_io)
+@@ -41,10 +46,8 @@ module Fluent
+           io = io_decompress(input_io, output_io)
+           io.string
+         when compressed_data.nil? || compressed_data.empty?
+-          # check compressed_data(String) is 0 length
+           compressed_data
+         when output_io
+-          # execute after checking compressed_data is empty or not
+           io = StringIO.new(compressed_data)
+           io_decompress(io, output_io)
+         else
+diff --git a/lib/fluent/plugin/filter.rb b/lib/fluent/plugin/filter.rb
+index c2956a98..839df9d6 100644
+--- a/lib/fluent/plugin/filter.rb
++++ b/lib/fluent/plugin/filter.rb
+@@ -80,6 +80,10 @@ module Fluent
+       end
+ 
+       def filter_stream(tag, es)
++        target = router
++        if target.respond_to?(:apply_plugin_filter_stream)
++          return target.apply_plugin_filter_stream(self, tag, es)
++        end
+         new_es = MultiEventStream.new
+         if @has_filter_with_time
+           es.each do |time, record|

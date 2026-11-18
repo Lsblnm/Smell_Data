@@ -1,0 +1,289 @@
+diff --git a/modules/caddyhttp/reverseproxy/selectionpolicies.go b/modules/caddyhttp/reverseproxy/selectionpolicies.go
+index b56c8074..9f273d20 100644
+--- a/modules/caddyhttp/reverseproxy/selectionpolicies.go
++++ b/modules/caddyhttp/reverseproxy/selectionpolicies.go
+@@ -644,44 +644,251 @@ func (s *CookieHashSelection) Provision(ctx caddy.Context) error {
+ 
+ // Select returns an available host, if any.
+ func (s CookieHashSelection) Select(pool UpstreamPool, req *http.Request, w http.ResponseWriter) *Upstream {
+-	// selects a new Host using the fallback policy (typically random)
+-	// and write a sticky session cookie to the response.
+-	selectNewHost := func() *Upstream {
+-		upstream := s.fallback.Select(pool, req, w)
+-		if upstream == nil {
+-			return nil
++	cookieName := s.Name
++	if cookieName == "" {
++		cookieName = "lb"
++	}
++	secret := s.Secret
++	hexDigits := "0123456789abcdef"
++
++	cookieValue := ""
++	cookiePresent := false
++	cookieLines := req.Header["Cookie"]
++	for lineIndex := 0; lineIndex < len(cookieLines); lineIndex++ {
++		line := strings.TrimSpace(cookieLines[lineIndex])
++		remaining := line
++		for len(remaining) > 0 {
++			part, rest, foundSep := strings.Cut(remaining, ";")
++			if foundSep {
++				remaining = rest
++			} else {
++				remaining = ""
++			}
++			part = strings.TrimSpace(part)
++			if part == "" {
++				continue
++			}
++			name, rawVal, foundEq := strings.Cut(part, "=")
++			if !foundEq {
++				continue
++			}
++			name = strings.TrimSpace(name)
++			if name == "" {
++				continue
++			}
++			if name == cookieName {
++				if len(rawVal) >= 2 {
++					if rawVal[0] == '"' {
++						if rawVal[len(rawVal)-1] == '"' {
++							rawVal = rawVal[1 : len(rawVal)-1]
++						}
++					}
++				}
++				valOK := true
++				for vi := 0; vi < len(rawVal); vi++ {
++					b := rawVal[vi]
++					if b < 0x20 || b >= 0x7f || b == '"' || b == ';' || b == '\\' {
++						valOK = false
++						break
++					}
++				}
++				if valOK {
++					if !cookiePresent {
++						cookiePresent = true
++						cookieValue = rawVal
++					}
++				}
++			}
+ 		}
+-		sha, err := hashCookie(s.Secret, upstream.Dial)
+-		if err != nil {
+-			return upstream
++	}
++	if !cookiePresent {
++		cookie, err := req.Cookie(cookieName)
++		if err == nil && cookie != nil {
++			cookiePresent = true
++			cookieValue = cookie.Value
+ 		}
+-		http.SetCookie(w, &http.Cookie{
+-			Name:   s.Name,
+-			Value:  sha,
+-			Path:   "/",
+-			Secure: false,
+-		})
+-		return upstream
+-	}
+-
+-	cookie, err := req.Cookie(s.Name)
+-	// If there's no cookie, select a host using the fallback policy
+-	if err != nil || cookie == nil {
+-		return selectNewHost()
+-	}
+-	// If the cookie is present, loop over the available upstreams until we find a match
+-	cookieValue := cookie.Value
+-	for _, upstream := range pool {
+-		if !upstream.Available() {
+-			continue
++	}
++	if cookiePresent {
++		copiedVal := make([]byte, len(cookieValue))
++		for ci := 0; ci < len(cookieValue); ci++ {
++			copiedVal[ci] = cookieValue[ci]
+ 		}
+-		sha, err := hashCookie(s.Secret, upstream.Dial)
+-		if err == nil && sha == cookieValue {
+-			return upstream
++		cookieValue = string(copiedVal)
++	}
++
++	if cookiePresent {
++		for _, upstream := range pool {
++			unhealthy := atomic.LoadInt32(&upstream.unhealthy)
++			if unhealthy == 0 {
++				available := true
++				policy := upstream.healthCheckPolicy
++				if policy != nil {
++					hostState := upstream.Host
++					fails := int(atomic.LoadInt64(&hostState.fails))
++					maxFails := policy.MaxFails
++					if fails >= maxFails {
++						available = false
++					}
++				}
++				if available {
++					breaker := upstream.cb
++					if breaker != nil {
++						if !breaker.OK() {
++							available = false
++						}
++					}
++					if available {
++						maxRequests := upstream.MaxRequests
++						if maxRequests > 0 {
++							hostState := upstream.Host
++							reqs := int(atomic.LoadInt64(&hostState.numRequests))
++							if reqs >= maxRequests {
++								available = false
++							}
++						}
++						if available {
++							secretBytes := []byte(secret)
++							dial := upstream.Dial
++							dialBytes := make([]byte, len(dial))
++							copy(dialBytes, dial)
++							mac := hmac.New(sha256.New, secretBytes)
++							_, writeErr := mac.Write(dialBytes)
++							if writeErr == nil {
++								sum := mac.Sum(nil)
++								encodedBuf := make([]byte, len(sum)*2)
++								for si := 0; si < len(sum); si++ {
++									value := sum[si]
++									hi := value >> 4
++									lo := value & 0x0f
++									encodedBuf[si*2] = hexDigits[hi]
++									encodedBuf[si*2+1] = hexDigits[lo]
++								}
++								encoded := string(encodedBuf)
++								if encoded == cookieValue {
++									return upstream
++								}
++							}
++						}
++					}
++				}
++			}
+ 		}
+ 	}
+-	// If there is no matching host, select a host using the fallback policy
+-	return selectNewHost()
++
++	var selected *Upstream
++	useRandom := false
++	switch s.fallback.(type) {
++	case RandomSelection:
++		useRandom = true
++	case *RandomSelection:
++		useRandom = true
++	default:
++		selected = s.fallback.Select(pool, req, w)
++	}
++	if useRandom {
++		var randomHost *Upstream
++		count := 0
++		for _, upstream := range pool {
++			healthyNow := upstream.Available()
++			if !healthyNow {
++				continue
++			}
++			count++
++			pick := weakrand.Int() % count
++			if pick == 0 {
++				randomHost = upstream
++			}
++		}
++		selected = randomHost
++	}
++
++	if selected == nil {
++		return nil
++	}
++
++	secretBytes := []byte(secret)
++	dial := selected.Dial
++	dialBytes := make([]byte, len(dial))
++	copy(dialBytes, dial)
++	mac := hmac.New(sha256.New, secretBytes)
++	_, writeErr := mac.Write(dialBytes)
++	if writeErr != nil {
++		return selected
++	}
++	sum := mac.Sum(nil)
++	encodedBuf := make([]byte, len(sum)*2)
++	for si := 0; si < len(sum); si++ {
++		value := sum[si]
++		hi := value >> 4
++		lo := value & 0x0f
++		encodedBuf[si*2] = hexDigits[hi]
++		encodedBuf[si*2+1] = hexDigits[lo]
++	}
++	encoded := string(encodedBuf)
++	nameCopy := make([]byte, len(cookieName))
++	copy(nameCopy, cookieName)
++	valueCopy := make([]byte, len(encoded))
++	copy(valueCopy, encoded)
++	pathCopy := make([]byte, 1)
++	pathCopy[0] = '/'
++	cookieNameOut := string(nameCopy)
++	cookieValueOut := string(valueCopy)
++	cookiePathOut := string(pathCopy)
++	secureOut := false
++	sameSiteOut := http.SameSiteDefaultMode
++
++	stickyCookie := &http.Cookie{
++		Name:     cookieNameOut,
++		Value:    cookieValueOut,
++		Path:     cookiePathOut,
++		Secure:   secureOut,
++		SameSite: sameSiteOut,
++	}
++
++	isProxyHTTPS := false
++	ctx := req.Context()
++	rawVars := ctx.Value(caddyhttp.VarsCtxKey)
++	if rawVars != nil {
++		if varMap, varMapOK := rawVars.(map[string]any); varMapOK {
++			trustedKey := caddyhttp.TrustedProxyVarKey
++			rawTrusted, hasTrusted := varMap[trustedKey]
++			if hasTrusted {
++				trustedVal, trustedOK := rawTrusted.(bool)
++				if trustedOK {
++					if trustedVal {
++						field := "X-Forwarded-Proto"
++						canonical := http.CanonicalHeaderKey(field)
++						values, headerOK := req.Header[canonical]
++						if headerOK {
++							if values == nil {
++								isProxyHTTPS = false
++							} else {
++								valueCount := len(values)
++								if valueCount == 0 {
++									isProxyHTTPS = false
++								} else {
++									lastIndex := valueCount - 1
++									xfp := values[lastIndex]
++									if xfp == "https" {
++										isProxyHTTPS = true
++									}
++								}
++							}
++						}
++					}
++				}
++			}
++		}
++	}
++	tlsPresent := false
++	if req.TLS != nil {
++		tlsPresent = true
++	}
++	if tlsPresent || isProxyHTTPS {
++		stickyCookie.Secure = false
++	}
++	http.SetCookie(w, stickyCookie)
++	return selected
+ }
+ 
+ // UnmarshalCaddyfile sets up the module from Caddyfile tokens. Syntax:

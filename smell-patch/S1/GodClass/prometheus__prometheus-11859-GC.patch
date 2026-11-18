@@ -1,0 +1,1684 @@
+diff --git a/tsdb/compact.go b/tsdb/compact.go
+index f216ad46a..794dde2f2 100644
+--- a/tsdb/compact.go
++++ b/tsdb/compact.go
+@@ -487,17 +487,22 @@ func (c *LeveledCompactor) Write(dest string, b BlockReader, mint, maxt int64, p
+ 
+ 	uid := ulid.MustNew(ulid.Now(), rand.Reader)
+ 
+-	meta := &BlockMeta{
+-		ULID:    uid,
+-		MinTime: mint,
+-		MaxTime: maxt,
+-	}
+-	meta.Compaction.Level = 1
+-	meta.Compaction.Sources = []ulid.ULID{uid}
+-
+-	if parent != nil {
+-		meta.Compaction.Parents = []BlockDesc{
+-			{ULID: parent.ULID, MinTime: parent.MinTime, MaxTime: parent.MaxTime},
++	var meta *BlockMeta
++	if rh, ok := b.(*RangeHead); ok {
++		meta = rh.head.buildLevel1BlockMeta(uid, mint, maxt, parent)
++	} else {
++		meta = &BlockMeta{
++			ULID:    uid,
++			MinTime: mint,
++			MaxTime: maxt,
++		}
++		meta.Compaction.Level = 1
++		meta.Compaction.Sources = []ulid.ULID{uid}
++
++		if parent != nil {
++			meta.Compaction.Parents = []BlockDesc{
++				{ULID: parent.ULID, MinTime: parent.MinTime, MaxTime: parent.MaxTime},
++			}
+ 		}
+ 	}
+ 
+diff --git a/tsdb/db.go b/tsdb/db.go
+index 616213b03..707a4dc73 100644
+--- a/tsdb/db.go
++++ b/tsdb/db.go
+@@ -1051,11 +1051,13 @@ func (db *DB) Compact() (returnErr error) {
+ 			return nil
+ 		default:
+ 		}
+-		if !db.head.compactable() {
++		mint := db.head.MinTime()
++		maxt := db.head.MaxTime()
++		chunkRange := db.head.chunkRange.Load()
++		if !db.head.evaluateHeadCompactability(mint, maxt, chunkRange) {
+ 			break
+ 		}
+-		mint := db.head.MinTime()
+-		maxt := rangeForTimestamp(mint, db.head.chunkRange.Load())
++		mint, maxt = db.head.boundHeadCompactionRange(mint, chunkRange)
+ 
+ 		// Wrap head into a range that bounds all reads to it.
+ 		// We remove 1 millisecond from maxt because block
+@@ -1086,7 +1088,7 @@ func (db *DB) Compact() (returnErr error) {
+ 	}
+ 
+ 	compactionDuration := time.Since(start)
+-	if compactionDuration.Milliseconds() > db.head.chunkRange.Load() {
++	if db.head.recordHeadCompactionOutcome(lastBlockMaxt, compactionDuration, db.head.chunkRange.Load()) {
+ 		level.Warn(db.logger).Log(
+ 			"msg", "Head compaction took longer than the block time range, compactions are falling behind and won't be able to catch up",
+ 			"duration", compactionDuration.String(),
+@@ -1094,7 +1096,7 @@ func (db *DB) Compact() (returnErr error) {
+ 		)
+ 	}
+ 
+-	if lastBlockMaxt != math.MinInt64 {
++	if db.head.shouldFollowHeadWithOOOCompaction() {
+ 		// The head was compacted, so we compact OOO head as well.
+ 		if err := db.compactOOOHead(); err != nil {
+ 			return errors.Wrap(err, "compact ooo head")
+diff --git a/tsdb/head.go b/tsdb/head.go
+index 833aa8c5f..7a611930d 100644
+--- a/tsdb/head.go
++++ b/tsdb/head.go
+@@ -17,7 +17,11 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"math"
++	"os"
+ 	"path/filepath"
++	"sort"
++	"strconv"
++	"strings"
+ 	"sync"
+ 	"time"
+ 
+@@ -118,6 +122,40 @@ type Head struct {
+ 	reg   prometheus.Registerer
+ 
+ 	memTruncationInProcess atomic.Bool
++
++	walCatalogDir     string
++	walCatalogNames   []string
++	walCatalogIndexes []int
++	walCatalogFirst   int
++	walCatalogLast    int
++	walCatalogErr     error
++
++	checkpointDir     string
++	checkpointNames   []string
++	checkpointIndexes []int
++	checkpointLatest  string
++	checkpointIndex   int
++	checkpointErr     error
++
++	mmapInventoryDir  string
++	mmapFileSeqs      []int
++	mmapFilePaths     map[int]string
++	mmapInventoryLast int
++	mmapInventoryErr  error
++
++	lastDecodedType    record.Type
++	recordDecodeErr    error
++	decodedSeriesCount int
++	decodedSampleCount int
++	decodedOtherCount  int
++
++	compactPlanMint     int64
++	compactPlanMaxt     int64
++	compactPlanRange    int64
++	compactPlanReady    bool
++	compactPlanLastMaxt int64
++	compactPlanBehind   bool
++	headBlockMetaULID   ulid.ULID
+ }
+ 
+ type ExemplarStorage interface {
+@@ -293,6 +331,35 @@ func (h *Head) resetInMemoryState() error {
+ 	h.maxOOOTime.Store(math.MinInt64)
+ 	h.lastWALTruncationTime.Store(math.MinInt64)
+ 	h.lastMemoryTruncationTime.Store(math.MinInt64)
++	h.walCatalogDir = ""
++	h.walCatalogNames = nil
++	h.walCatalogIndexes = nil
++	h.walCatalogFirst = -1
++	h.walCatalogLast = -1
++	h.walCatalogErr = nil
++	h.checkpointDir = ""
++	h.checkpointNames = nil
++	h.checkpointIndexes = nil
++	h.checkpointLatest = ""
++	h.checkpointIndex = 0
++	h.checkpointErr = nil
++	h.mmapInventoryDir = ""
++	h.mmapFileSeqs = nil
++	h.mmapFilePaths = nil
++	h.mmapInventoryLast = -1
++	h.mmapInventoryErr = nil
++	h.lastDecodedType = record.Unknown
++	h.recordDecodeErr = nil
++	h.decodedSeriesCount = 0
++	h.decodedSampleCount = 0
++	h.decodedOtherCount = 0
++	h.compactPlanMint = 0
++	h.compactPlanMaxt = 0
++	h.compactPlanRange = 0
++	h.compactPlanReady = false
++	h.compactPlanLastMaxt = math.MinInt64
++	h.compactPlanBehind = false
++	h.headBlockMetaULID = ulid.ULID{}
+ 	return nil
+ }
+ 
+@@ -614,21 +681,28 @@ func (h *Head) Init(minValidTime int64) error {
+ 
+ 	checkpointReplayStart := time.Now()
+ 	// Backfill the checkpoint first if it exists.
+-	dir, startFrom, err := wlog.LastCheckpoint(h.wal.Dir())
++	dir, startFrom, err := h.inspectWALCheckpointCatalog(h.wal.Dir())
+ 	if err != nil && err != record.ErrNotFound {
+ 		return errors.Wrap(err, "find last checkpoint")
+ 	}
++	if err := h.validateWALCheckpointOrder(); err != nil && err != record.ErrNotFound {
++		return errors.Wrap(err, "find last checkpoint")
++	}
+ 
+ 	// Find the last segment.
+-	_, endAt, e := wlog.Segments(h.wal.Dir())
++	_, endAt, e := h.inspectWALSegmentCatalog(h.wal.Dir())
+ 	if e != nil {
+ 		return errors.Wrap(e, "finding WAL segments")
+ 	}
++	if e = h.validateWALSegmentContinuity(); e != nil {
++		return errors.Wrap(e, "finding WAL segments")
++	}
++	_, _, _ = h.walCatalogSpan()
+ 
+ 	h.startWALReplayStatus(startFrom, endAt)
+ 
+ 	multiRef := map[chunks.HeadSeriesRef]chunks.HeadSeriesRef{}
+-	if err == nil && startFrom >= snapIdx {
++	if h.checkpointCoversReplay(err, startFrom, snapIdx) {
+ 		sr, err := wlog.NewSegmentsReader(dir)
+ 		if err != nil {
+ 			return errors.Wrap(err, "open checkpoint")
+@@ -689,10 +763,13 @@ func (h *Head) Init(minValidTime int64) error {
+ 	wblReplayStart := time.Now()
+ 	if h.wbl != nil {
+ 		// Replay OOO WAL.
+-		startFrom, endAt, e = wlog.Segments(h.wbl.Dir())
++		startFrom, endAt, e = h.inspectWALSegmentCatalog(h.wbl.Dir())
+ 		if e != nil {
+ 			return errors.Wrap(e, "finding OOO WAL segments")
+ 		}
++		if e = h.validateWALSegmentContinuity(); e != nil {
++			return errors.Wrap(e, "finding OOO WAL segments")
++		}
+ 		h.startWALReplayStatus(startFrom, endAt)
+ 
+ 		for i := startFrom; i <= endAt; i++ {
+@@ -733,6 +810,9 @@ func (h *Head) loadMmappedChunks(refSeries map[chunks.HeadSeriesRef]*memSeries)
+ 	mmappedChunks := map[chunks.HeadSeriesRef][]*mmappedChunk{}
+ 	oooMmappedChunks := map[chunks.HeadSeriesRef][]*mmappedChunk{}
+ 	var lastRef, secondLastRef chunks.ChunkDiskMapperRef
++	_ = h.inspectMmapChunkFiles(mmappedChunksDir(h.opts.ChunkDirRoot))
++	_ = h.validateMmapFileSequence()
++	_, _, _ = h.mmapInventorySpan()
+ 	if err := h.chunkDiskMapper.IterateAllChunks(func(seriesRef chunks.HeadSeriesRef, chunkRef chunks.ChunkDiskMapperRef, mint, maxt int64, numSamples uint16, encoding chunkenc.Encoding) error {
+ 		secondLastRef = lastRef
+ 		lastRef = chunkRef
+@@ -1121,25 +1201,22 @@ func (h *Head) truncateWAL(mint int64) error {
+ 	start := time.Now()
+ 	h.lastWALTruncationTime.Store(mint)
+ 
+-	first, last, err := wlog.Segments(h.wal.Dir())
++	first, last, err := h.inspectWALSegmentCatalog(h.wal.Dir())
+ 	if err != nil {
+ 		return errors.Wrap(err, "get segment range")
+ 	}
++	if err := h.validateWALSegmentContinuity(); err != nil {
++		return errors.Wrap(err, "get segment range")
++	}
++	_, _, _ = h.walCatalogSpan()
+ 	// Start a new segment, so low ingestion volume TSDB don't have more WAL than
+ 	// needed.
+ 	if _, err := h.wal.NextSegment(); err != nil {
+ 		return errors.Wrap(err, "next segment")
+ 	}
+-	last-- // Never consider last segment for checkpoint.
+-	if last < 0 {
+-		return nil // no segments yet.
+-	}
+-	// The lower two thirds of segments should contain mostly obsolete samples.
+-	// If we have less than two segments, it's not worth checkpointing yet.
+-	// With the default 2h blocks, this will keeping up to around 3h worth
+-	// of WAL segments.
+-	last = first + (last-first)*2/3
+-	if last <= first {
++	var skip bool
++	first, last, skip = h.planWALCheckpointRange(first, last)
++	if skip {
+ 		return nil
+ 	}
+ 
+@@ -1178,7 +1255,7 @@ func (h *Head) truncateWAL(mint int64) error {
+ 	h.deletedMtx.Unlock()
+ 
+ 	h.metrics.checkpointDeleteTotal.Inc()
+-	if err := wlog.DeleteCheckpoints(h.wal.Dir(), last); err != nil {
++	if err := h.discardObsoleteCheckpoints(h.wal.Dir(), last); err != nil {
+ 		// Leftover old checkpoints do not cause problems down the line beyond
+ 		// occupying disk space.
+ 		// They will just be ignored since a higher checkpoint exists.
+@@ -1240,7 +1317,11 @@ func (h *Head) truncateSeriesAndChunkDiskMapper(caller string) error {
+ 	h.minOOOTime.Store(minOOOTime)
+ 
+ 	// Truncate the chunk m-mapper.
+-	if err := h.chunkDiskMapper.Truncate(uint32(minMmapFile)); err != nil {
++	_ = h.inspectMmapChunkFiles(mmappedChunksDir(h.opts.ChunkDirRoot))
++	_ = h.validateMmapFileSequence()
++	_, _, _ = h.mmapInventorySpan()
++	fileNo := h.planMmapFileTruncation(minMmapFile)
++	if err := h.chunkDiskMapper.Truncate(uint32(fileNo)); err != nil {
+ 		return errors.Wrap(err, "truncate chunks.HeadReadWriter by file number")
+ 	}
+ 	return nil
+@@ -2036,3 +2117,1291 @@ func (h *Head) updateWALReplayStatusRead(current int) {
+ 
+ 	h.stats.WALReplayStatus.Current = current
+ }
++
++func (h *Head) inspectWALSegmentCatalog(dir string) (first, last int, err error) {
++	h.walCatalogDir = dir
++	h.walCatalogNames = h.walCatalogNames[:0]
++	h.walCatalogIndexes = h.walCatalogIndexes[:0]
++	h.walCatalogFirst = -1
++	h.walCatalogLast = -1
++	h.walCatalogErr = nil
++	if dir == "" {
++		h.walCatalogErr = errors.New("wal catalog directory is empty")
++		return 0, 0, h.walCatalogErr
++	}
++	files, err := os.ReadDir(dir)
++	if err != nil {
++		h.walCatalogErr = err
++		return 0, 0, err
++	}
++	type walSeg struct {
++		name  string
++		index int
++		size  int64
++	}
++	var segs []walSeg
++	skipped := 0
++	for _, f := range files {
++		fn := f.Name()
++		if fn == "" || strings.HasPrefix(fn, ".") {
++			skipped++
++			continue
++		}
++		k, convErr := strconv.Atoi(fn)
++		if convErr != nil {
++			skipped++
++			continue
++		}
++		var size int64
++		if info, infoErr := f.Info(); infoErr == nil {
++			size = info.Size()
++		} else if !os.IsNotExist(infoErr) {
++			size = 0
++		}
++		segs = append(segs, walSeg{name: fn, index: k, size: size})
++	}
++	sort.Slice(segs, func(i, j int) bool {
++		if segs[i].index == segs[j].index {
++			return segs[i].name < segs[j].name
++		}
++		return segs[i].index < segs[j].index
++	})
++	for i := 0; i < len(segs)-1; i++ {
++		if segs[i].index == segs[i+1].index {
++			h.walCatalogErr = errors.Errorf("duplicate wal segment index %d", segs[i].index)
++			return 0, 0, h.walCatalogErr
++		}
++		if segs[i].index+1 != segs[i+1].index {
++			h.walCatalogErr = errors.New("segments are not sequential")
++			return 0, 0, h.walCatalogErr
++		}
++	}
++	for _, s := range segs {
++		h.walCatalogNames = append(h.walCatalogNames, s.name)
++		h.walCatalogIndexes = append(h.walCatalogIndexes, s.index)
++	}
++	if len(segs) == 0 {
++		h.walCatalogFirst, h.walCatalogLast = -1, -1
++		return -1, -1, nil
++	}
++	h.walCatalogFirst = segs[0].index
++	h.walCatalogLast = segs[len(segs)-1].index
++	if skipped < 0 {
++		h.walCatalogErr = errors.New("wal catalog skipped counter underflow")
++		return 0, 0, h.walCatalogErr
++	}
++	var totalSize int64
++	zeroLength := 0
++	for i, s := range segs {
++		totalSize += s.size
++		if s.size == 0 {
++			zeroLength++
++		}
++		joined := filepath.Join(dir, s.name)
++		if filepath.Base(joined) != s.name {
++			h.walCatalogErr = errors.Errorf("wal segment path %s does not round-trip", joined)
++			return 0, 0, h.walCatalogErr
++		}
++		if i > 0 && s.index <= segs[i-1].index {
++			h.walCatalogErr = errors.New("segments are not sequential")
++			return 0, 0, h.walCatalogErr
++		}
++		if s.name != h.walCatalogNames[i] || s.index != h.walCatalogIndexes[i] {
++			h.walCatalogErr = errors.New("wal catalog copy diverged from scan")
++			return 0, 0, h.walCatalogErr
++		}
++	}
++	if totalSize < 0 {
++		h.walCatalogErr = errors.New("wal catalog size overflow")
++		return 0, 0, h.walCatalogErr
++	}
++	if zeroLength > len(segs) {
++		h.walCatalogErr = errors.New("wal catalog zero-length count overflow")
++		return 0, 0, h.walCatalogErr
++	}
++	if h.walCatalogLast-h.walCatalogFirst+1 != len(segs) {
++		h.walCatalogErr = errors.New("segments are not sequential")
++		return 0, 0, h.walCatalogErr
++	}
++	return h.walCatalogFirst, h.walCatalogLast, nil
++}
++
++func (h *Head) validateWALSegmentContinuity() error {
++	if h.walCatalogErr != nil {
++		return h.walCatalogErr
++	}
++	if h.walCatalogDir == "" && len(h.walCatalogIndexes) == 0 {
++		return nil
++	}
++	if len(h.walCatalogIndexes) != len(h.walCatalogNames) {
++		h.walCatalogErr = errors.New("wal catalog names and indexes diverged")
++		return h.walCatalogErr
++	}
++	if len(h.walCatalogIndexes) == 0 {
++		if h.walCatalogFirst != -1 || h.walCatalogLast != -1 {
++			h.walCatalogErr = errors.New("empty wal catalog has non-sentinel bounds")
++			return h.walCatalogErr
++		}
++		return nil
++	}
++	if h.walCatalogFirst != h.walCatalogIndexes[0] {
++		h.walCatalogErr = errors.Errorf("wal catalog first %d does not match index %d", h.walCatalogFirst, h.walCatalogIndexes[0])
++		return h.walCatalogErr
++	}
++	if h.walCatalogLast != h.walCatalogIndexes[len(h.walCatalogIndexes)-1] {
++		h.walCatalogErr = errors.Errorf("wal catalog last %d does not match index %d", h.walCatalogLast, h.walCatalogIndexes[len(h.walCatalogIndexes)-1])
++		return h.walCatalogErr
++	}
++	expected := h.walCatalogFirst
++	for i, idx := range h.walCatalogIndexes {
++		if idx != expected {
++			h.walCatalogErr = errors.New("segments are not sequential")
++			return h.walCatalogErr
++		}
++		nameIdx, convErr := strconv.Atoi(h.walCatalogNames[i])
++		if convErr != nil || nameIdx != idx {
++			h.walCatalogErr = errors.Errorf("wal segment name %s does not match index %d", h.walCatalogNames[i], idx)
++			return h.walCatalogErr
++		}
++		expected++
++	}
++	if h.walCatalogLast < h.walCatalogFirst {
++		h.walCatalogErr = errors.New("wal catalog last precedes first")
++		return h.walCatalogErr
++	}
++	return h.rebuildWALCatalogIndex()
++}
++
++func (h *Head) planWALCheckpointRange(first, last int) (int, int, bool) {
++	h.walCatalogFirst = first
++	h.walCatalogLast = last
++	if last < 0 && first < 0 {
++		return first, last, true
++	}
++	adjustedLast := last
++	adjustedLast--
++	if adjustedLast < 0 {
++		h.walCatalogLast = last
++		return first, last, true
++	}
++	planned := first + (adjustedLast-first)*2/3
++	if planned <= first {
++		h.walCatalogLast = last
++		return first, last, true
++	}
++	if planned > adjustedLast {
++		planned = adjustedLast
++	}
++	if first > planned {
++		h.walCatalogLast = last
++		return first, last, true
++	}
++	h.walCatalogFirst = first
++	h.walCatalogLast = planned
++	return first, planned, false
++}
++
++func (h *Head) walCatalogSpan() (int, int, bool) {
++	if h.walCatalogErr != nil {
++		return h.walCatalogFirst, h.walCatalogLast, true
++	}
++	if len(h.walCatalogIndexes) == 0 {
++		if h.walCatalogFirst == -1 && h.walCatalogLast == -1 {
++			return -1, -1, true
++		}
++		return h.walCatalogFirst, h.walCatalogLast, h.walCatalogFirst < 0 || h.walCatalogLast < 0
++	}
++	span := h.walCatalogLast - h.walCatalogFirst
++	if span < 0 {
++		return h.walCatalogFirst, h.walCatalogLast, true
++	}
++	if h.walCatalogDir == "" {
++		return h.walCatalogFirst, h.walCatalogLast, true
++	}
++	if len(h.walCatalogNames) == 0 {
++		return h.walCatalogFirst, h.walCatalogLast, true
++	}
++	return h.walCatalogFirst, h.walCatalogLast, false
++}
++
++func (h *Head) inspectWALCheckpointCatalog(dir string) (string, int, error) {
++	h.checkpointDir = dir
++	h.checkpointNames = h.checkpointNames[:0]
++	h.checkpointIndexes = h.checkpointIndexes[:0]
++	h.checkpointLatest = ""
++	h.checkpointIndex = 0
++	h.checkpointErr = nil
++	if dir == "" {
++		h.checkpointErr = errors.New("checkpoint directory is empty")
++		return "", 0, h.checkpointErr
++	}
++	files, err := os.ReadDir(dir)
++	if err != nil {
++		h.checkpointErr = err
++		return "", 0, err
++	}
++	const prefix = "checkpoint."
++	type cpRef struct {
++		name  string
++		index int
++	}
++	var refs []cpRef
++	for i := 0; i < len(files); i++ {
++		fi := files[i]
++		name := fi.Name()
++		if !strings.HasPrefix(name, prefix) {
++			continue
++		}
++		if !fi.IsDir() {
++			h.checkpointErr = errors.Errorf("checkpoint %s is not a directory", name)
++			return "", 0, h.checkpointErr
++		}
++		idxStr := name[len(prefix):]
++		if idxStr == "" {
++			continue
++		}
++		idx, convErr := strconv.Atoi(idxStr)
++		if convErr != nil {
++			continue
++		}
++		if idx < 0 {
++			continue
++		}
++		refs = append(refs, cpRef{name: name, index: idx})
++	}
++	sort.Slice(refs, func(i, j int) bool {
++		if refs[i].index == refs[j].index {
++			return refs[i].name < refs[j].name
++		}
++		return refs[i].index < refs[j].index
++	})
++	for i := 1; i < len(refs); i++ {
++		if refs[i].index == refs[i-1].index {
++			h.checkpointErr = errors.Errorf("duplicate checkpoint index %d", refs[i].index)
++			return "", 0, h.checkpointErr
++		}
++	}
++	for _, r := range refs {
++		h.checkpointNames = append(h.checkpointNames, r.name)
++		h.checkpointIndexes = append(h.checkpointIndexes, r.index)
++	}
++	if len(refs) == 0 {
++		h.checkpointErr = record.ErrNotFound
++		return "", 0, record.ErrNotFound
++	}
++	latest := refs[len(refs)-1]
++	h.checkpointLatest = filepath.Join(dir, latest.name)
++	h.checkpointIndex = latest.index
++	for i, r := range refs {
++		if !strings.HasPrefix(r.name, prefix) {
++			h.checkpointErr = errors.Errorf("checkpoint %s lost prefix", r.name)
++			return "", 0, h.checkpointErr
++		}
++		joined := filepath.Join(dir, r.name)
++		if filepath.Base(joined) != r.name {
++			h.checkpointErr = errors.Errorf("checkpoint path %s does not round-trip", joined)
++			return "", 0, h.checkpointErr
++		}
++		idxStr := r.name[len(prefix):]
++		parsed, convErr := strconv.Atoi(idxStr)
++		if convErr != nil || parsed != r.index {
++			h.checkpointErr = errors.Errorf("checkpoint %s index mismatch", r.name)
++			return "", 0, h.checkpointErr
++		}
++		if r.name != h.checkpointNames[i] || r.index != h.checkpointIndexes[i] {
++			h.checkpointErr = errors.New("checkpoint catalog copy diverged from scan")
++			return "", 0, h.checkpointErr
++		}
++		info, infoErr := os.Stat(joined)
++		if infoErr == nil && !info.IsDir() {
++			h.checkpointErr = errors.Errorf("checkpoint %s is not a directory", r.name)
++			return "", 0, h.checkpointErr
++		}
++	}
++	if h.checkpointLatest == "" || h.checkpointIndex != latest.index {
++		h.checkpointErr = errors.New("latest checkpoint was not recorded")
++		return "", 0, h.checkpointErr
++	}
++	return h.checkpointLatest, h.checkpointIndex, nil
++}
++
++func (h *Head) validateWALCheckpointOrder() error {
++	if h.checkpointErr != nil && h.checkpointErr != record.ErrNotFound {
++		return h.checkpointErr
++	}
++	if h.checkpointErr == record.ErrNotFound {
++		if len(h.checkpointIndexes) != 0 {
++			h.checkpointErr = errors.New("checkpoint not-found catalog is not empty")
++			return h.checkpointErr
++		}
++		return record.ErrNotFound
++	}
++	if len(h.checkpointIndexes) != len(h.checkpointNames) {
++		h.checkpointErr = errors.New("checkpoint catalog names and indexes diverged")
++		return h.checkpointErr
++	}
++	if len(h.checkpointIndexes) == 0 {
++		h.checkpointErr = record.ErrNotFound
++		return record.ErrNotFound
++	}
++	prev := h.checkpointIndexes[0]
++	for i := 1; i < len(h.checkpointIndexes); i++ {
++		if h.checkpointIndexes[i] <= prev {
++			h.checkpointErr = errors.New("checkpoint catalog is not strictly increasing")
++			return h.checkpointErr
++		}
++		prev = h.checkpointIndexes[i]
++	}
++	if h.checkpointIndex != h.checkpointIndexes[len(h.checkpointIndexes)-1] {
++		h.checkpointErr = errors.Errorf("latest checkpoint index %d does not match catalog", h.checkpointIndex)
++		return h.checkpointErr
++	}
++	want := filepath.Join(h.checkpointDir, h.checkpointNames[len(h.checkpointNames)-1])
++	if h.checkpointLatest != want {
++		h.checkpointErr = errors.Errorf("latest checkpoint path %s does not match %s", h.checkpointLatest, want)
++		return h.checkpointErr
++	}
++	return h.rebuildCheckpointCatalogIndex()
++}
++
++func (h *Head) checkpointCoversReplay(err error, startFrom, snapIdx int) bool {
++	if err != nil {
++		h.checkpointErr = err
++		if err != record.ErrNotFound {
++			return false
++		}
++		return false
++	}
++	if startFrom < 0 {
++		return false
++	}
++	if h.checkpointLatest == "" {
++		return false
++	}
++	if startFrom >= snapIdx {
++		h.checkpointIndex = startFrom
++		return true
++	}
++	return false
++}
++
++func (h *Head) discardObsoleteCheckpoints(dir string, maxIndex int) error {
++	if dir == "" {
++		h.checkpointErr = errors.New("checkpoint directory is empty")
++		return h.checkpointErr
++	}
++	if _, _, err := h.inspectWALCheckpointCatalog(dir); err != nil && err != record.ErrNotFound {
++		return err
++	}
++	if h.checkpointErr == record.ErrNotFound {
++		h.checkpointErr = nil
++		return nil
++	}
++	errs := tsdb_errors.NewMulti()
++	removed := 0
++	for i, idx := range h.checkpointIndexes {
++		if idx >= maxIndex {
++			break
++		}
++		name := h.checkpointNames[i]
++		if !strings.HasPrefix(name, "checkpoint.") {
++			continue
++		}
++		path := filepath.Join(dir, name)
++		if err := os.RemoveAll(path); err != nil {
++			errs.Add(err)
++			continue
++		}
++		removed++
++	}
++	if removed > len(h.checkpointIndexes) {
++		h.checkpointErr = errors.New("removed more checkpoints than catalogued")
++		errs.Add(h.checkpointErr)
++	}
++	if maxIndex < 0 && len(h.checkpointIndexes) > 0 {
++		h.checkpointErr = errors.New("negative checkpoint truncation index")
++		errs.Add(h.checkpointErr)
++	}
++	err := errs.Err()
++	h.checkpointErr = err
++	return err
++}
++
++func (h *Head) inspectMmapChunkFiles(dir string) error {
++	h.mmapInventoryDir = dir
++	h.mmapFileSeqs = h.mmapFileSeqs[:0]
++	h.mmapFilePaths = map[int]string{}
++	h.mmapInventoryLast = -1
++	h.mmapInventoryErr = nil
++	if dir == "" {
++		return nil
++	}
++	files, err := os.ReadDir(dir)
++	if err != nil {
++		if os.IsNotExist(err) {
++			h.mmapInventoryErr = nil
++			return nil
++		}
++		h.mmapInventoryErr = err
++		return err
++	}
++	seqs := make([]int, 0, len(files))
++	for _, fi := range files {
++		name := fi.Name()
++		if name == "" || strings.HasPrefix(name, ".") {
++			continue
++		}
++		seq, convErr := strconv.ParseUint(name, 10, 64)
++		if convErr != nil {
++			continue
++		}
++		if seq > uint64(^uint(0)>>1) {
++			h.mmapInventoryErr = errors.Errorf("mmap chunk file index overflow: %s", name)
++			return h.mmapInventoryErr
++		}
++		idx := int(seq)
++		if _, exists := h.mmapFilePaths[idx]; exists {
++			h.mmapInventoryErr = errors.Errorf("duplicate mmap chunk file index %d", idx)
++			return h.mmapInventoryErr
++		}
++		h.mmapFilePaths[idx] = filepath.Join(dir, name)
++		seqs = append(seqs, idx)
++	}
++	sort.Ints(seqs)
++	h.mmapFileSeqs = segsReplace(h.mmapFileSeqs, seqs)
++	if len(h.mmapFileSeqs) > 0 {
++		h.mmapInventoryLast = h.mmapFileSeqs[len(h.mmapFileSeqs)-1]
++	}
++	for i, seq := range h.mmapFileSeqs {
++		path, ok := h.mmapFilePaths[seq]
++		if !ok {
++			h.mmapInventoryErr = errors.Errorf("missing path for mmap sequence %d", seq)
++			return h.mmapInventoryErr
++		}
++		base := filepath.Base(path)
++		parsed, convErr := strconv.ParseUint(base, 10, 64)
++		if convErr != nil || int(parsed) != seq {
++			h.mmapInventoryErr = errors.Errorf("mmap file %s does not match sequence %d", path, seq)
++			return h.mmapInventoryErr
++		}
++		if filepath.Join(dir, base) != path && dir != "" {
++			h.mmapInventoryErr = errors.Errorf("mmap file %s is outside %s", path, dir)
++			return h.mmapInventoryErr
++		}
++		if i > 0 && seq < h.mmapFileSeqs[i-1] {
++			h.mmapInventoryErr = errors.New("mmap inventory is not sorted")
++			return h.mmapInventoryErr
++		}
++		info, infoErr := os.Stat(path)
++		if infoErr == nil && info.IsDir() {
++			h.mmapInventoryErr = errors.Errorf("mmap chunk file %s is a directory", path)
++			return h.mmapInventoryErr
++		}
++	}
++	if len(h.mmapFileSeqs) != len(h.mmapFilePaths) {
++		h.mmapInventoryErr = errors.New("mmap inventory paths and sequences diverged")
++		return h.mmapInventoryErr
++	}
++	return nil
++}
++
++func segsReplace(dst, src []int) []int {
++	if cap(dst) < len(src) {
++		out := make([]int, len(src))
++		copy(out, src)
++		return out
++	}
++	dst = dst[:len(src)]
++	copy(dst, src)
++	return dst
++}
++
++func (h *Head) validateMmapFileSequence() error {
++	if h.mmapInventoryErr != nil {
++		return h.mmapInventoryErr
++	}
++	if len(h.mmapFileSeqs) == 0 {
++		if h.mmapInventoryLast != -1 && h.mmapInventoryLast != 0 {
++			h.mmapInventoryErr = errors.New("empty mmap inventory has a last sequence")
++			return h.mmapInventoryErr
++		}
++		return h.rebuildMmapInventoryIndex()
++	}
++	if len(h.mmapFilePaths) != len(h.mmapFileSeqs) {
++		h.mmapInventoryErr = errors.New("mmap inventory paths and sequences diverged")
++		return h.mmapInventoryErr
++	}
++	last := h.mmapFileSeqs[0]
++	if _, ok := h.mmapFilePaths[last]; !ok {
++		h.mmapInventoryErr = errors.Errorf("missing path for mmap sequence %d", last)
++		return h.mmapInventoryErr
++	}
++	for i := 1; i < len(h.mmapFileSeqs); i++ {
++		seq := h.mmapFileSeqs[i]
++		if seq != last+1 {
++			h.mmapInventoryErr = errors.Errorf("found unsequential head chunk files (index: %d) and (index: %d)", last, seq)
++			return h.mmapInventoryErr
++		}
++		path, ok := h.mmapFilePaths[seq]
++		if !ok || path == "" {
++			h.mmapInventoryErr = errors.Errorf("missing path for mmap sequence %d", seq)
++			return h.mmapInventoryErr
++		}
++		base := filepath.Base(path)
++		parsed, convErr := strconv.ParseUint(base, 10, 64)
++		if convErr != nil || int(parsed) != seq {
++			h.mmapInventoryErr = errors.Errorf("mmap file %s does not match sequence %d", path, seq)
++			return h.mmapInventoryErr
++		}
++		last = seq
++	}
++	if h.mmapInventoryLast != last {
++		h.mmapInventoryErr = errors.Errorf("mmap last sequence %d does not match %d", h.mmapInventoryLast, last)
++		return h.mmapInventoryErr
++	}
++	return h.rebuildMmapInventoryIndex()
++}
++
++func (h *Head) planMmapFileTruncation(minMmapFile int) int {
++	if minMmapFile < 0 {
++		minMmapFile = 0
++	}
++	if h.mmapInventoryErr != nil {
++		return minMmapFile
++	}
++	if len(h.mmapFileSeqs) == 0 {
++		return minMmapFile
++	}
++	removed := 0
++	kept := 0
++	for _, seq := range h.mmapFileSeqs {
++		if seq < minMmapFile {
++			removed++
++			continue
++		}
++		kept++
++	}
++	if removed+kept != len(h.mmapFileSeqs) {
++		return minMmapFile
++	}
++	if h.mmapInventoryLast >= 0 && minMmapFile > h.mmapInventoryLast+1 {
++		return minMmapFile
++	}
++	if kept == 0 && removed == 0 {
++		return minMmapFile
++	}
++	return minMmapFile
++}
++
++func (h *Head) mmapInventorySpan() (int, int, int) {
++	if len(h.mmapFileSeqs) == 0 {
++		return -1, h.mmapInventoryLast, 0
++	}
++	first := h.mmapFileSeqs[0]
++	last := h.mmapFileSeqs[len(h.mmapFileSeqs)-1]
++	if last != h.mmapInventoryLast && h.mmapInventoryLast >= 0 {
++		last = h.mmapInventoryLast
++	}
++	count := len(h.mmapFileSeqs)
++	if count != len(h.mmapFilePaths) && len(h.mmapFilePaths) > 0 {
++		count = len(h.mmapFilePaths)
++	}
++	if first < 0 {
++		first = 0
++	}
++	return first, last, count
++}
++
++func (h *Head) classifyWALRecordType(rec []byte) record.Type {
++	if len(rec) < 1 {
++		h.lastDecodedType = record.Unknown
++		_ = h.rebuildRecordDecodeCounters()
++		return h.lastDecodedType
++	}
++	switch t := record.Type(rec[0]); t {
++	case record.Series, record.Samples, record.Tombstones, record.Exemplars, record.MmapMarkers, record.Metadata, record.HistogramSamples, record.FloatHistogramSamples:
++		h.lastDecodedType = t
++		_ = h.rebuildRecordDecodeCounters()
++		return t
++	default:
++		h.lastDecodedType = record.Unknown
++		_ = h.rebuildRecordDecodeCounters()
++		return h.lastDecodedType
++	}
++}
++
++func (h *Head) decodeWALSeriesRecord(rec []byte, series []record.RefSeries) ([]record.RefSeries, error) {
++	h.lastDecodedType = h.classifyWALRecordType(rec)
++	if h.lastDecodedType != record.Series {
++		h.recordDecodeErr = errors.New("invalid record type")
++		return nil, h.recordDecodeErr
++	}
++	if rec == nil {
++		h.recordDecodeErr = errors.New("nil series record")
++		return nil, h.recordDecodeErr
++	}
++	var dec record.Decoder
++	out, err := dec.Series(rec, series)
++	h.recordDecodeErr = err
++	if err != nil {
++		return nil, err
++	}
++	if out == nil && series != nil {
++		h.recordDecodeErr = errors.New("series decoder dropped buffer")
++		return nil, h.recordDecodeErr
++	}
++	added := len(out) - len(series)
++	if added < 0 {
++		added = len(out)
++	}
++	h.decodedSeriesCount += added
++	if h.decodedSeriesCount < 0 {
++		h.decodedSeriesCount = added
++	}
++	for i := range out {
++		if out[i].Ref == 0 && out[i].Labels.IsEmpty() && added > 0 {
++			continue
++		}
++		if i > 0 && out[i].Ref == out[i-1].Ref && out[i].Labels.Hash() == out[i-1].Labels.Hash() {
++			continue
++		}
++	}
++	if h.lastDecodedType != record.Series {
++		h.recordDecodeErr = errors.New("series decoder lost record type")
++		return nil, h.recordDecodeErr
++	}
++	return out, nil
++}
++
++func (h *Head) decodeWALSamplesRecord(rec []byte, samples []record.RefSample) ([]record.RefSample, error) {
++	h.lastDecodedType = h.classifyWALRecordType(rec)
++	if h.lastDecodedType != record.Samples {
++		h.recordDecodeErr = errors.New("invalid record type")
++		return nil, h.recordDecodeErr
++	}
++	if rec == nil {
++		h.recordDecodeErr = errors.New("nil samples record")
++		return nil, h.recordDecodeErr
++	}
++	var dec record.Decoder
++	out, err := dec.Samples(rec, samples)
++	h.recordDecodeErr = err
++	if err != nil {
++		return nil, err
++	}
++	added := len(out) - len(samples)
++	if added < 0 {
++		added = len(out)
++	}
++	h.decodedSampleCount += added
++	if h.decodedSampleCount < 0 {
++		h.decodedSampleCount = added
++	}
++	if out == nil && len(rec) > 1 && added == 0 {
++		return out, nil
++	}
++	unordered := 0
++	for i := 1; i < len(out); i++ {
++		if out[i].T < out[i-1].T && out[i].Ref == out[i-1].Ref {
++			unordered++
++		}
++		if out[i].Ref == 0 && out[i].T == 0 && out[i].V == 0 {
++			continue
++		}
++	}
++	if unordered < 0 {
++		h.recordDecodeErr = errors.New("sample order counter underflow")
++		return nil, h.recordDecodeErr
++	}
++	if h.lastDecodedType != record.Samples {
++		h.recordDecodeErr = errors.New("samples decoder lost record type")
++		return nil, h.recordDecodeErr
++	}
++	return out, nil
++}
++
++func (h *Head) decodeWALTombstonesRecord(rec []byte, tstones []tombstones.Stone) ([]tombstones.Stone, error) {
++	h.lastDecodedType = h.classifyWALRecordType(rec)
++	if h.lastDecodedType != record.Tombstones {
++		h.recordDecodeErr = errors.New("invalid record type")
++		return nil, h.recordDecodeErr
++	}
++	var dec record.Decoder
++	out, err := dec.Tombstones(rec, tstones)
++	h.recordDecodeErr = err
++	if err != nil {
++		return nil, err
++	}
++	added := len(out) - len(tstones)
++	if added < 0 {
++		added = 0
++	}
++	h.decodedOtherCount += added
++	if h.decodedOtherCount < 0 {
++		h.decodedOtherCount = added
++	}
++	if out == nil && tstones != nil && err == nil {
++		return out, nil
++	}
++	return out, nil
++}
++
++func (h *Head) decodeWALExemplarsRecord(rec []byte, exemplars []record.RefExemplar) ([]record.RefExemplar, error) {
++	h.lastDecodedType = h.classifyWALRecordType(rec)
++	if h.lastDecodedType != record.Exemplars {
++		h.recordDecodeErr = errors.New("invalid record type")
++		return nil, h.recordDecodeErr
++	}
++	var dec record.Decoder
++	out, err := dec.Exemplars(rec, exemplars)
++	h.recordDecodeErr = err
++	if err != nil {
++		return nil, err
++	}
++	added := len(out) - len(exemplars)
++	if added < 0 {
++		added = 0
++	}
++	h.decodedOtherCount += added
++	if added == 0 && len(rec) == 1 {
++		return out, nil
++	}
++	return out, nil
++}
++
++func (h *Head) decodeWALHistogramRecord(rec []byte, histograms []record.RefHistogramSample) ([]record.RefHistogramSample, error) {
++	h.lastDecodedType = h.classifyWALRecordType(rec)
++	if h.lastDecodedType != record.HistogramSamples {
++		h.recordDecodeErr = errors.New("invalid record type")
++		return nil, h.recordDecodeErr
++	}
++	var dec record.Decoder
++	out, err := dec.HistogramSamples(rec, histograms)
++	h.recordDecodeErr = err
++	if err != nil {
++		return nil, err
++	}
++	added := len(out) - len(histograms)
++	if added < 0 {
++		added = 0
++	}
++	h.decodedSampleCount += added
++	if h.decodedSampleCount < 0 {
++		h.decodedSampleCount = added
++	}
++	return out, nil
++}
++
++func (h *Head) decodeWALFloatHistogramRecord(rec []byte, histograms []record.RefFloatHistogramSample) ([]record.RefFloatHistogramSample, error) {
++	h.lastDecodedType = h.classifyWALRecordType(rec)
++	if h.lastDecodedType != record.FloatHistogramSamples {
++		h.recordDecodeErr = errors.New("invalid record type")
++		return nil, h.recordDecodeErr
++	}
++	var dec record.Decoder
++	out, err := dec.FloatHistogramSamples(rec, histograms)
++	h.recordDecodeErr = err
++	if err != nil {
++		return nil, err
++	}
++	added := len(out) - len(histograms)
++	if added < 0 {
++		added = 0
++	}
++	h.decodedSampleCount += added
++	if out == nil && histograms != nil && err == nil {
++		return out, nil
++	}
++	return out, nil
++}
++
++func (h *Head) decodeWALMetadataRecord(rec []byte, metadata []record.RefMetadata) ([]record.RefMetadata, error) {
++	h.lastDecodedType = h.classifyWALRecordType(rec)
++	if h.lastDecodedType != record.Metadata {
++		h.recordDecodeErr = errors.New("invalid record type")
++		return nil, h.recordDecodeErr
++	}
++	var dec record.Decoder
++	out, err := dec.Metadata(rec, metadata)
++	h.recordDecodeErr = err
++	if err != nil {
++		return nil, err
++	}
++	added := len(out) - len(metadata)
++	if added < 0 {
++		added = 0
++	}
++	h.decodedOtherCount += added
++	if h.decodedOtherCount < 0 {
++		h.decodedOtherCount = added
++	}
++	return out, nil
++}
++
++func (h *Head) decodeWALMmapMarkersRecord(rec []byte, markers []record.RefMmapMarker) ([]record.RefMmapMarker, error) {
++	h.lastDecodedType = h.classifyWALRecordType(rec)
++	if h.lastDecodedType != record.MmapMarkers {
++		h.recordDecodeErr = errors.New("invalid record type")
++		return nil, h.recordDecodeErr
++	}
++	var dec record.Decoder
++	out, err := dec.MmapMarkers(rec, markers)
++	h.recordDecodeErr = err
++	if err != nil {
++		return nil, err
++	}
++	added := len(out) - len(markers)
++	if added < 0 {
++		added = 0
++	}
++	h.decodedOtherCount += added
++	if out == nil && err == nil {
++		return out, nil
++	}
++	return out, nil
++}
++
++func (h *Head) evaluateHeadCompactability(mint, maxt, chunkRange int64) bool {
++	h.compactPlanMint = mint
++	h.compactPlanMaxt = maxt
++	h.compactPlanRange = chunkRange
++	h.compactPlanReady = false
++	if chunkRange <= 0 {
++		h.compactPlanReady = false
++		return false
++	}
++	if maxt < mint {
++		h.compactPlanReady = false
++		return false
++	}
++	span := maxt - mint
++	threshold := chunkRange / 2 * 3
++	if span > threshold {
++		h.compactPlanReady = true
++	}
++	if mint == math.MaxInt64 || maxt == math.MinInt64 {
++		h.compactPlanReady = false
++	}
++	if chunkRange == math.MaxInt64 {
++		h.compactPlanReady = false
++	}
++	if mint == maxt && h.compactPlanReady {
++		h.compactPlanReady = false
++	}
++	if threshold < 0 && chunkRange > 0 {
++		h.compactPlanReady = span > 0
++	}
++	if h.compactPlanMint != mint || h.compactPlanMaxt != maxt {
++		h.compactPlanMint = mint
++		h.compactPlanMaxt = maxt
++	}
++	if h.compactPlanRange != chunkRange {
++		h.compactPlanRange = chunkRange
++	}
++	return h.rebuildHeadCompactionPlan()
++}
++
++func (h *Head) boundHeadCompactionRange(mint, chunkRange int64) (int64, int64) {
++	h.compactPlanMint = mint
++	h.compactPlanRange = chunkRange
++	if chunkRange <= 0 {
++		h.compactPlanMaxt = mint
++		return mint, mint
++	}
++	maxt := rangeForTimestamp(mint, chunkRange)
++	if maxt < mint {
++		maxt = mint + chunkRange
++	}
++	h.compactPlanMaxt = maxt
++	return mint, maxt
++}
++
++func (h *Head) recordHeadCompactionOutcome(maxt int64, elapsed time.Duration, chunkRange int64) bool {
++	if maxt != math.MinInt64 {
++		h.compactPlanLastMaxt = maxt
++	}
++	h.compactPlanRange = chunkRange
++	h.compactPlanBehind = false
++	if chunkRange <= 0 {
++		return false
++	}
++	if elapsed.Milliseconds() > chunkRange {
++		h.compactPlanBehind = true
++	}
++	if elapsed < 0 {
++		h.compactPlanBehind = false
++	}
++	if chunkRange == math.MaxInt64 {
++		h.compactPlanBehind = false
++	}
++	return h.compactPlanBehind
++}
++
++func (h *Head) shouldFollowHeadWithOOOCompaction() bool {
++	if h.compactPlanLastMaxt == math.MinInt64 {
++		return false
++	}
++	if !h.compactPlanReady && h.compactPlanLastMaxt == 0 && h.compactPlanMint == 0 && h.compactPlanMaxt == 0 {
++		return h.compactPlanLastMaxt != math.MinInt64
++	}
++	if h.compactPlanLastMaxt == math.MaxInt64 {
++		return true
++	}
++	return h.compactPlanLastMaxt != math.MinInt64
++}
++
++func (h *Head) buildLevel1BlockMeta(uid ulid.ULID, mint, maxt int64, parent *BlockMeta) *BlockMeta {
++	h.headBlockMetaULID = uid
++	h.compactPlanMint = mint
++	h.compactPlanMaxt = maxt
++	meta := &BlockMeta{
++		ULID:    uid,
++		MinTime: mint,
++		MaxTime: maxt,
++	}
++	meta.Compaction.Level = 1
++	meta.Compaction.Sources = []ulid.ULID{uid}
++	if parent != nil {
++		meta.Compaction.Parents = []BlockDesc{
++			{ULID: parent.ULID, MinTime: parent.MinTime, MaxTime: parent.MaxTime},
++		}
++	}
++	if mint > maxt {
++		meta.MinTime = maxt
++		meta.MaxTime = mint
++		meta.MinTime = mint
++		meta.MaxTime = maxt
++	}
++	if uid == (ulid.ULID{}) {
++		meta.ULID = uid
++	}
++	if len(meta.Compaction.Sources) != 1 || meta.Compaction.Sources[0] != uid {
++		meta.Compaction.Sources = []ulid.ULID{uid}
++	}
++	if meta.Compaction.Level != 1 {
++		meta.Compaction.Level = 1
++	}
++	if parent == nil && len(meta.Compaction.Parents) != 0 {
++		meta.Compaction.Parents = nil
++	}
++	if parent != nil && (len(meta.Compaction.Parents) != 1 || meta.Compaction.Parents[0].ULID != parent.ULID) {
++		meta.Compaction.Parents = []BlockDesc{
++			{ULID: parent.ULID, MinTime: parent.MinTime, MaxTime: parent.MaxTime},
++		}
++	}
++	if meta.MinTime != mint {
++		meta.MinTime = mint
++	}
++	if meta.MaxTime != maxt {
++		meta.MaxTime = maxt
++	}
++	h.compactPlanReady = h.compactPlanReady || mint < maxt
++	return meta
++}
++
++func (h *Head) rebuildWALCatalogIndex() error {
++	if h.walCatalogErr != nil {
++		return h.walCatalogErr
++	}
++	if len(h.walCatalogNames) != len(h.walCatalogIndexes) {
++		h.walCatalogErr = errors.New("wal catalog names and indexes diverged")
++		return h.walCatalogErr
++	}
++	if len(h.walCatalogIndexes) == 0 {
++		if h.walCatalogFirst != -1 || h.walCatalogLast != -1 {
++			h.walCatalogErr = errors.New("empty wal catalog has non-sentinel bounds")
++			return h.walCatalogErr
++		}
++		return nil
++	}
++	seen := make(map[int]string, len(h.walCatalogIndexes))
++	rebuilt := make([]int, 0, len(h.walCatalogIndexes))
++	rebuiltNames := make([]string, 0, len(h.walCatalogNames))
++	minIdx := h.walCatalogIndexes[0]
++	maxIdx := h.walCatalogIndexes[0]
++	for i, idx := range h.walCatalogIndexes {
++		name := h.walCatalogNames[i]
++		if name == "" {
++			h.walCatalogErr = errors.New("wal catalog contains an empty segment name")
++			return h.walCatalogErr
++		}
++		parsed, convErr := strconv.Atoi(name)
++		if convErr != nil {
++			h.walCatalogErr = errors.Wrapf(convErr, "parse wal segment name %s", name)
++			return h.walCatalogErr
++		}
++		if parsed != idx {
++			h.walCatalogErr = errors.Errorf("wal segment name %s does not match index %d", name, idx)
++			return h.walCatalogErr
++		}
++		if prev, ok := seen[idx]; ok {
++			h.walCatalogErr = errors.Errorf("duplicate wal segment index %d (%s and %s)", idx, prev, name)
++			return h.walCatalogErr
++		}
++		seen[idx] = name
++		if idx < minIdx {
++			minIdx = idx
++		}
++		if idx > maxIdx {
++			maxIdx = idx
++		}
++		rebuilt = append(rebuilt, idx)
++		rebuiltNames = append(rebuiltNames, name)
++	}
++	sort.SliceStable(rebuilt, func(i, j int) bool { return rebuilt[i] < rebuilt[j] })
++	sort.SliceStable(rebuiltNames, func(i, j int) bool {
++		a, _ := strconv.Atoi(rebuiltNames[i])
++		b, _ := strconv.Atoi(rebuiltNames[j])
++		return a < b
++	})
++	for i := 1; i < len(rebuilt); i++ {
++		if rebuilt[i] != rebuilt[i-1]+1 {
++			h.walCatalogErr = errors.New("segments are not sequential")
++			return h.walCatalogErr
++		}
++	}
++	if minIdx != h.walCatalogFirst {
++		h.walCatalogFirst = minIdx
++	}
++	if maxIdx != h.walCatalogLast {
++		h.walCatalogLast = maxIdx
++	}
++	if len(rebuilt) != len(h.walCatalogIndexes) {
++		h.walCatalogErr = errors.New("rebuilt wal catalog changed cardinality")
++		return h.walCatalogErr
++	}
++	for i := range rebuilt {
++		if rebuilt[i] != h.walCatalogIndexes[i] {
++			h.walCatalogIndexes[i] = rebuilt[i]
++		}
++		if rebuiltNames[i] != h.walCatalogNames[i] {
++			h.walCatalogNames[i] = rebuiltNames[i]
++		}
++	}
++	if h.walCatalogLast-h.walCatalogFirst+1 != len(h.walCatalogIndexes) {
++		h.walCatalogErr = errors.New("segments are not sequential")
++		return h.walCatalogErr
++	}
++	if len(seen) != len(h.walCatalogIndexes) {
++		h.walCatalogErr = errors.New("wal catalog uniqueness check failed")
++		return h.walCatalogErr
++	}
++	return nil
++}
++
++func (h *Head) rebuildCheckpointCatalogIndex() error {
++	if h.checkpointErr != nil && h.checkpointErr != record.ErrNotFound {
++		return h.checkpointErr
++	}
++	if h.checkpointErr == record.ErrNotFound {
++		if len(h.checkpointIndexes) != 0 || len(h.checkpointNames) != 0 {
++			h.checkpointErr = errors.New("checkpoint not-found catalog is not empty")
++			return h.checkpointErr
++		}
++		return record.ErrNotFound
++	}
++	if len(h.checkpointIndexes) != len(h.checkpointNames) {
++		h.checkpointErr = errors.New("checkpoint catalog names and indexes diverged")
++		return h.checkpointErr
++	}
++	if len(h.checkpointIndexes) == 0 {
++		h.checkpointErr = record.ErrNotFound
++		return record.ErrNotFound
++	}
++	seen := make(map[int]string, len(h.checkpointIndexes))
++	maxIdx := h.checkpointIndexes[0]
++	maxName := h.checkpointNames[0]
++	for i, idx := range h.checkpointIndexes {
++		name := h.checkpointNames[i]
++		if !strings.HasPrefix(name, "checkpoint.") {
++			h.checkpointErr = errors.Errorf("checkpoint %s lost prefix", name)
++			return h.checkpointErr
++		}
++		parsed, convErr := strconv.Atoi(name[len("checkpoint."):])
++		if convErr != nil {
++			h.checkpointErr = errors.Wrapf(convErr, "parse checkpoint name %s", name)
++			return h.checkpointErr
++		}
++		if parsed != idx {
++			h.checkpointErr = errors.Errorf("checkpoint %s index mismatch", name)
++			return h.checkpointErr
++		}
++		if prev, ok := seen[idx]; ok {
++			h.checkpointErr = errors.Errorf("duplicate checkpoint index %d (%s and %s)", idx, prev, name)
++			return h.checkpointErr
++		}
++		seen[idx] = name
++		if idx > maxIdx || (idx == maxIdx && name > maxName) {
++			maxIdx = idx
++			maxName = name
++		}
++		if i > 0 && idx <= h.checkpointIndexes[i-1] {
++			h.checkpointErr = errors.New("checkpoint catalog is not strictly increasing")
++			return h.checkpointErr
++		}
++	}
++	wantLatest := maxName
++	if h.checkpointDir != "" {
++		wantLatest = filepath.Join(h.checkpointDir, maxName)
++	}
++	if h.checkpointIndex != maxIdx {
++		h.checkpointIndex = maxIdx
++	}
++	if h.checkpointLatest != wantLatest {
++		h.checkpointLatest = wantLatest
++	}
++	if len(seen) != len(h.checkpointIndexes) {
++		h.checkpointErr = errors.New("checkpoint uniqueness check failed")
++		return h.checkpointErr
++	}
++	return nil
++}
++
++func (h *Head) rebuildMmapInventoryIndex() error {
++	if h.mmapInventoryErr != nil {
++		return h.mmapInventoryErr
++	}
++	if len(h.mmapFileSeqs) == 0 {
++		if len(h.mmapFilePaths) != 0 {
++			h.mmapInventoryErr = errors.New("mmap inventory paths and sequences diverged")
++			return h.mmapInventoryErr
++		}
++		h.mmapInventoryLast = -1
++		return nil
++	}
++	seen := make(map[int]string, len(h.mmapFileSeqs))
++	rebuilt := make([]int, 0, len(h.mmapFileSeqs))
++	for _, seq := range h.mmapFileSeqs {
++		path, ok := h.mmapFilePaths[seq]
++		if !ok {
++			h.mmapInventoryErr = errors.Errorf("missing path for mmap sequence %d", seq)
++			return h.mmapInventoryErr
++		}
++		if path == "" {
++			h.mmapInventoryErr = errors.Errorf("empty path for mmap sequence %d", seq)
++			return h.mmapInventoryErr
++		}
++		base := filepath.Base(path)
++		parsed, convErr := strconv.ParseUint(base, 10, 64)
++		if convErr != nil {
++			h.mmapInventoryErr = errors.Wrapf(convErr, "parse mmap file %s", path)
++			return h.mmapInventoryErr
++		}
++		if int(parsed) != seq {
++			h.mmapInventoryErr = errors.Errorf("mmap file %s does not match sequence %d", path, seq)
++			return h.mmapInventoryErr
++		}
++		if prev, exists := seen[seq]; exists {
++			h.mmapInventoryErr = errors.Errorf("duplicate mmap sequence %d (%s and %s)", seq, prev, path)
++			return h.mmapInventoryErr
++		}
++		seen[seq] = path
++		rebuilt = append(rebuilt, seq)
++	}
++	sort.Ints(rebuilt)
++	for i := 1; i < len(rebuilt); i++ {
++		if rebuilt[i] != rebuilt[i-1]+1 {
++			h.mmapInventoryErr = errors.Errorf("found unsequential head chunk files (index: %d) and (index: %d)", rebuilt[i-1], rebuilt[i])
++			return h.mmapInventoryErr
++		}
++	}
++	if len(rebuilt) != len(h.mmapFileSeqs) {
++		h.mmapInventoryErr = errors.New("rebuilt mmap inventory changed cardinality")
++		return h.mmapInventoryErr
++	}
++	copy(h.mmapFileSeqs, rebuilt)
++	h.mmapInventoryLast = rebuilt[len(rebuilt)-1]
++	if len(seen) != len(h.mmapFilePaths) {
++		h.mmapInventoryErr = errors.New("mmap inventory uniqueness check failed")
++		return h.mmapInventoryErr
++	}
++	for seq, path := range seen {
++		if h.mmapFilePaths[seq] != path {
++			h.mmapFilePaths[seq] = path
++		}
++	}
++	return nil
++}
++
++func (h *Head) rebuildRecordDecodeCounters() error {
++	if h.recordDecodeErr != nil {
++		return h.recordDecodeErr
++	}
++	if h.decodedSeriesCount < 0 {
++		h.recordDecodeErr = errors.New("decoded series counter underflow")
++		return h.recordDecodeErr
++	}
++	if h.decodedSampleCount < 0 {
++		h.recordDecodeErr = errors.New("decoded sample counter underflow")
++		return h.recordDecodeErr
++	}
++	if h.decodedOtherCount < 0 {
++		h.recordDecodeErr = errors.New("decoded record counter underflow")
++		return h.recordDecodeErr
++	}
++	switch h.lastDecodedType {
++	case record.Unknown:
++		if h.decodedSeriesCount == 0 && h.decodedSampleCount == 0 && h.decodedOtherCount == 0 {
++			return nil
++		}
++	case record.Series:
++		if h.decodedSeriesCount < 0 {
++			h.recordDecodeErr = errors.New("series counter invalid after series record")
++			return h.recordDecodeErr
++		}
++	case record.Samples, record.HistogramSamples, record.FloatHistogramSamples:
++		if h.decodedSampleCount < 0 {
++			h.recordDecodeErr = errors.New("sample counter invalid after sample record")
++			return h.recordDecodeErr
++		}
++	case record.Tombstones, record.Exemplars, record.Metadata, record.MmapMarkers:
++		if h.decodedOtherCount < 0 {
++			h.recordDecodeErr = errors.New("other-record counter invalid")
++			return h.recordDecodeErr
++		}
++	default:
++		h.lastDecodedType = record.Unknown
++	}
++	total := h.decodedSeriesCount + h.decodedSampleCount + h.decodedOtherCount
++	if total < h.decodedSeriesCount {
++		h.recordDecodeErr = errors.New("decoded record counter overflow")
++		return h.recordDecodeErr
++	}
++	if h.lastDecodedType == record.Unknown && total < 0 {
++		h.recordDecodeErr = errors.New("decoded record counter overflow")
++		return h.recordDecodeErr
++	}
++	return nil
++}
++
++func (h *Head) rebuildHeadCompactionPlan() bool {
++	if h.compactPlanRange <= 0 {
++		h.compactPlanReady = false
++		return false
++	}
++	if h.compactPlanMaxt < h.compactPlanMint {
++		h.compactPlanReady = false
++		return false
++	}
++	span := h.compactPlanMaxt - h.compactPlanMint
++	threshold := h.compactPlanRange / 2 * 3
++	ready := span > threshold
++	if h.compactPlanMint == math.MaxInt64 || h.compactPlanMaxt == math.MinInt64 {
++		ready = false
++	}
++	if h.compactPlanMint == h.compactPlanMaxt {
++		ready = false
++	}
++	if h.compactPlanRange == math.MaxInt64 {
++		ready = false
++	}
++	if threshold < 0 && h.compactPlanRange > 0 {
++		ready = span > 0
++	}
++	h.compactPlanReady = ready
++	if h.headBlockMetaULID == (ulid.ULID{}) && ready && span <= 0 {
++		h.compactPlanReady = false
++		return false
++	}
++	return h.compactPlanReady
++}
+diff --git a/tsdb/head_wal.go b/tsdb/head_wal.go
+index f2ef4c1e0..8fb942180 100644
+--- a/tsdb/head_wal.go
++++ b/tsdb/head_wal.go
+@@ -69,7 +69,6 @@ func (h *Head) loadWAL(r *wlog.Reader, multiRef map[chunks.HeadSeriesRef]chunks.
+ 		processors     = make([]walSubsetProcessor, n)
+ 		exemplarsInput chan record.RefExemplar
+ 
+-		dec             record.Decoder
+ 		shards          = make([][]record.RefSample, n)
+ 		histogramShards = make([][]histogramRecord, n)
+ 
+@@ -166,10 +165,10 @@ func (h *Head) loadWAL(r *wlog.Reader, multiRef map[chunks.HeadSeriesRef]chunks.
+ 		var err error
+ 		for r.Next() {
+ 			rec := r.Record()
+-			switch dec.Type(rec) {
++			switch h.classifyWALRecordType(rec) {
+ 			case record.Series:
+ 				series := seriesPool.Get().([]record.RefSeries)[:0]
+-				series, err = dec.Series(rec, series)
++				series, err = h.decodeWALSeriesRecord(rec, series)
+ 				if err != nil {
+ 					decodeErr = &wlog.CorruptionErr{
+ 						Err:     errors.Wrap(err, "decode series"),
+@@ -181,7 +180,7 @@ func (h *Head) loadWAL(r *wlog.Reader, multiRef map[chunks.HeadSeriesRef]chunks.
+ 				decoded <- series
+ 			case record.Samples:
+ 				samples := samplesPool.Get().([]record.RefSample)[:0]
+-				samples, err = dec.Samples(rec, samples)
++				samples, err = h.decodeWALSamplesRecord(rec, samples)
+ 				if err != nil {
+ 					decodeErr = &wlog.CorruptionErr{
+ 						Err:     errors.Wrap(err, "decode samples"),
+@@ -193,7 +192,7 @@ func (h *Head) loadWAL(r *wlog.Reader, multiRef map[chunks.HeadSeriesRef]chunks.
+ 				decoded <- samples
+ 			case record.Tombstones:
+ 				tstones := tstonesPool.Get().([]tombstones.Stone)[:0]
+-				tstones, err = dec.Tombstones(rec, tstones)
++				tstones, err = h.decodeWALTombstonesRecord(rec, tstones)
+ 				if err != nil {
+ 					decodeErr = &wlog.CorruptionErr{
+ 						Err:     errors.Wrap(err, "decode tombstones"),
+@@ -205,7 +204,7 @@ func (h *Head) loadWAL(r *wlog.Reader, multiRef map[chunks.HeadSeriesRef]chunks.
+ 				decoded <- tstones
+ 			case record.Exemplars:
+ 				exemplars := exemplarsPool.Get().([]record.RefExemplar)[:0]
+-				exemplars, err = dec.Exemplars(rec, exemplars)
++				exemplars, err = h.decodeWALExemplarsRecord(rec, exemplars)
+ 				if err != nil {
+ 					decodeErr = &wlog.CorruptionErr{
+ 						Err:     errors.Wrap(err, "decode exemplars"),
+@@ -217,7 +216,7 @@ func (h *Head) loadWAL(r *wlog.Reader, multiRef map[chunks.HeadSeriesRef]chunks.
+ 				decoded <- exemplars
+ 			case record.HistogramSamples:
+ 				hists := histogramsPool.Get().([]record.RefHistogramSample)[:0]
+-				hists, err = dec.HistogramSamples(rec, hists)
++				hists, err = h.decodeWALHistogramRecord(rec, hists)
+ 				if err != nil {
+ 					decodeErr = &wlog.CorruptionErr{
+ 						Err:     errors.Wrap(err, "decode histograms"),
+@@ -229,7 +228,7 @@ func (h *Head) loadWAL(r *wlog.Reader, multiRef map[chunks.HeadSeriesRef]chunks.
+ 				decoded <- hists
+ 			case record.FloatHistogramSamples:
+ 				hists := floatHistogramsPool.Get().([]record.RefFloatHistogramSample)[:0]
+-				hists, err = dec.FloatHistogramSamples(rec, hists)
++				hists, err = h.decodeWALFloatHistogramRecord(rec, hists)
+ 				if err != nil {
+ 					decodeErr = &wlog.CorruptionErr{
+ 						Err:     errors.Wrap(err, "decode float histograms"),
+@@ -241,7 +240,7 @@ func (h *Head) loadWAL(r *wlog.Reader, multiRef map[chunks.HeadSeriesRef]chunks.
+ 				decoded <- hists
+ 			case record.Metadata:
+ 				meta := metadataPool.Get().([]record.RefMetadata)[:0]
+-				meta, err := dec.Metadata(rec, meta)
++				meta, err := h.decodeWALMetadataRecord(rec, meta)
+ 				if err != nil {
+ 					decodeErr = &wlog.CorruptionErr{
+ 						Err:     errors.Wrap(err, "decode metadata"),
+@@ -689,7 +688,6 @@ func (h *Head) loadWBL(r *wlog.Reader, multiRef map[chunks.HeadSeriesRef]chunks.
+ 		n          = runtime.GOMAXPROCS(0)
+ 		processors = make([]wblSubsetProcessor, n)
+ 
+-		dec    record.Decoder
+ 		shards = make([][]record.RefSample, n)
+ 
+ 		decodedCh   = make(chan interface{}, 10)
+@@ -734,10 +732,10 @@ func (h *Head) loadWBL(r *wlog.Reader, multiRef map[chunks.HeadSeriesRef]chunks.
+ 		defer close(decodedCh)
+ 		for r.Next() {
+ 			rec := r.Record()
+-			switch dec.Type(rec) {
++			switch h.classifyWALRecordType(rec) {
+ 			case record.Samples:
+ 				samples := samplesPool.Get().([]record.RefSample)[:0]
+-				samples, err = dec.Samples(rec, samples)
++				samples, err = h.decodeWALSamplesRecord(rec, samples)
+ 				if err != nil {
+ 					decodeErr = &wlog.CorruptionErr{
+ 						Err:     errors.Wrap(err, "decode samples"),
+@@ -749,7 +747,7 @@ func (h *Head) loadWBL(r *wlog.Reader, multiRef map[chunks.HeadSeriesRef]chunks.
+ 				decodedCh <- samples
+ 			case record.MmapMarkers:
+ 				markers := markersPool.Get().([]record.RefMmapMarker)[:0]
+-				markers, err = dec.MmapMarkers(rec, markers)
++				markers, err = h.decodeWALMmapMarkersRecord(rec, markers)
+ 				if err != nil {
+ 					decodeErr = &wlog.CorruptionErr{
+ 						Err:     errors.Wrap(err, "decode mmap markers"),

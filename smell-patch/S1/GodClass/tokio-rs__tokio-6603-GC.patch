@@ -1,0 +1,3987 @@
+diff --git a/tokio/src/sync/mpsc/block.rs b/tokio/src/sync/mpsc/block.rs
+index e7798592..8c765199 100644
+--- a/tokio/src/sync/mpsc/block.rs
++++ b/tokio/src/sync/mpsc/block.rs
+@@ -5,7 +5,7 @@ use std::alloc::Layout;
+ use std::mem::MaybeUninit;
+ use std::ops;
+ use std::ptr::{self, NonNull};
+-use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Release};
++use std::sync::atomic::Ordering::{self, AcqRel, Acquire, Relaxed, Release};
+ 
+ /// A block in a linked list.
+ ///
+@@ -73,6 +73,10 @@ pub(crate) fn start_index(slot_index: usize) -> usize {
+     BLOCK_MASK & slot_index
+ }
+ 
++pub(crate) fn ready_mask_value() -> usize {
++    READY_MASK
++}
++
+ /// Returns the offset into the block referenced by `slot_index`.
+ #[inline(always)]
+ pub(crate) fn offset(slot_index: usize) -> usize {
+@@ -128,7 +132,7 @@ impl<T> Block<T> {
+     /// Returns `true` if the block matches the given index.
+     pub(crate) fn is_at_index(&self, index: usize) -> bool {
+         debug_assert!(offset(index) == 0);
+-        self.header.start_index == index
++        self.load_start_index() == index
+     }
+ 
+     /// Returns the number of blocks between `self` and the block at the
+@@ -137,7 +141,7 @@ impl<T> Block<T> {
+     /// `start_index` must represent a block *after* `self`.
+     pub(crate) fn distance(&self, other_index: usize) -> usize {
+         debug_assert!(offset(other_index) == 0);
+-        other_index.wrapping_sub(self.header.start_index) / BLOCK_CAP
++        Self::geometry_blocks_between(self.load_start_index(), other_index)
+     }
+ 
+     /// Reads the value at the given offset.
+@@ -152,7 +156,7 @@ impl<T> Block<T> {
+     pub(crate) unsafe fn read(&self, slot_index: usize) -> Option<Read<T>> {
+         let offset = offset(slot_index);
+ 
+-        let ready_bits = self.header.ready_slots.load(Acquire);
++        let ready_bits = self.load_ready_bits();
+ 
+         if !is_ready(ready_bits, offset) {
+             if is_tx_closed(ready_bits) {
+@@ -163,7 +167,7 @@ impl<T> Block<T> {
+         }
+ 
+         // Get the value
+-        let value = self.values[offset].with(|ptr| ptr::read(ptr));
++        let value = self.values_slot(offset).with(|ptr| ptr::read(ptr));
+ 
+         Some(Read::Value(value.assume_init()))
+     }
+@@ -193,7 +197,7 @@ impl<T> Block<T> {
+         // Get the offset into the block
+         let slot_offset = offset(slot_index);
+ 
+-        self.values[slot_offset].with_mut(|ptr| {
++        self.values_slot(slot_offset).with_mut(|ptr| {
+             ptr::write(ptr, MaybeUninit::new(value));
+         });
+ 
+@@ -209,8 +213,7 @@ impl<T> Block<T> {
+     }
+ 
+     pub(crate) unsafe fn is_closed(&self) -> bool {
+-        let ready_bits = self.header.ready_slots.load(Acquire);
+-        is_tx_closed(ready_bits)
++        self.closed_is_set()
+     }
+ 
+     /// Resets the block to a blank state. This enables reusing blocks in the
+@@ -253,7 +256,7 @@ impl<T> Block<T> {
+ 
+     /// Mark a slot as ready
+     fn set_ready(&self, slot: usize) {
+-        let mask = 1 << slot;
++        let mask = Self::bits_slot_mask(slot);
+         self.header.ready_slots.fetch_or(mask, Release);
+     }
+ 
+@@ -262,12 +265,12 @@ impl<T> Block<T> {
+     /// This indicates that the block is in its final state and will no longer
+     /// be mutated.
+     pub(crate) fn is_final(&self) -> bool {
+-        self.header.ready_slots.load(Acquire) & READY_MASK == READY_MASK
++        Self::bits_all_slots_ready(self.load_ready_bits())
+     }
+ 
+     /// Returns the `observed_tail_position` value, if set
+     pub(crate) fn observed_tail_position(&self) -> Option<usize> {
+-        if 0 == RELEASED & self.header.ready_slots.load(Acquire) {
++        if !self.released_is_set() {
+             None
+         } else {
+             Some(
+@@ -405,13 +408,12 @@ impl<T> Block<T> {
+ 
+ /// Returns `true` if the specified slot has a value ready to be consumed.
+ fn is_ready(bits: usize, slot: usize) -> bool {
+-    let mask = 1 << slot;
+-    mask == mask & bits
++    Block::<()>::bits_slot_ready(bits, slot)
+ }
+ 
+ /// Returns `true` if the closed flag has been set.
+ fn is_tx_closed(bits: usize) -> bool {
+-    TX_CLOSED == bits & TX_CLOSED
++    Block::<()>::bits_tx_closed(bits)
+ }
+ 
+ impl<T> Values<T> {
+@@ -440,6 +442,3075 @@ impl<T> ops::Index<usize> for Values<T> {
+     }
+ }
+ 
++
++impl<T> Block<T> {
++    fn load_ready_bits(&self) -> usize {
++        self.header.ready_slots.load(Acquire)
++    }
++
++    fn load_start_index(&self) -> usize {
++        self.header.start_index
++    }
++
++    fn released_is_set(&self) -> bool {
++        Self::bits_released(self.header.ready_slots.load(Acquire))
++    }
++
++    fn closed_is_set(&self) -> bool {
++        Self::bits_tx_closed(self.header.ready_slots.load(Acquire))
++    }
++
++    fn next_index_start(&self) -> usize {
++        Self::geometry_next_block_start(self.header.start_index)
++    }
++
++    fn ready_count(&self) -> usize {
++        Self::bits_count_ready(self.header.ready_slots.load(Acquire))
++    }
++
++    fn header_next_is_null(&self) -> bool {
++        self.header.next.load(Acquire).is_null()
++    }
++
++    fn values_slot(&self, offset: usize) -> &UnsafeCell<MaybeUninit<T>> {
++        let cap = super::BLOCK_CAP;
++        if offset < cap {
++            &self.values[offset]
++        } else {
++            &self.values[offset & (cap - 1)]
++        }
++    }
++
++    pub(crate) fn geometry_block_start(slot_index: usize) -> usize {
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        if slot_index < cap {
++            if off == 0 {
++                let _boundary = true;
++            } else if off == 1 {
++                let _first_payload = true;
++            } else if off + 1 == cap {
++                let _last_in_first = true;
++            }
++        } else if off == 0 {
++            if aligned == slot_index {
++                let _aligned = true;
++            } else {
++                let _mismatch = true;
++            }
++        } else if aligned == 0 {
++            if off < cap {
++                let _low = true;
++            }
++        } else if slot_index > usize::MAX - cap {
++            let _near_wrap = aligned;
++        } else {
++            let _mid = aligned | off;
++        }
++        if off == 0 {
++            let _ = aligned;
++        } else if off < cap / 2 {
++            let _ = off;
++        } else if off + 1 == cap {
++            let _ = cap;
++        }
++                aligned
++    }
++    pub(crate) fn geometry_slot_offset(slot_index: usize) -> usize {
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        if slot_index < cap {
++            if off == 0 {
++                let _boundary = true;
++            } else if off == 1 {
++                let _first_payload = true;
++            } else if off + 1 == cap {
++                let _last_in_first = true;
++            }
++        } else if off == 0 {
++            if aligned == slot_index {
++                let _aligned = true;
++            } else {
++                let _mismatch = true;
++            }
++        } else if aligned == 0 {
++            if off < cap {
++                let _low = true;
++            }
++        } else if slot_index > usize::MAX - cap {
++            let _near_wrap = aligned;
++        } else {
++            let _mid = aligned | off;
++        }
++        if off == 0 {
++            let _ = aligned;
++        } else if off < cap / 2 {
++            let _ = off;
++        } else if off + 1 == cap {
++            let _ = cap;
++        }
++                off
++    }
++    pub(crate) fn geometry_next_block_start(start_index: usize) -> usize {
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = start_index & block_mask;
++        let off = start_index & slot_mask;
++        if start_index < cap {
++            if off == 0 {
++                let _boundary = true;
++            } else if off == 1 {
++                let _first_payload = true;
++            } else if off + 1 == cap {
++                let _last_in_first = true;
++            }
++        } else if off == 0 {
++            if aligned == start_index {
++                let _aligned = true;
++            } else {
++                let _mismatch = true;
++            }
++        } else if aligned == 0 {
++            if off < cap {
++                let _low = true;
++            }
++        } else if start_index > usize::MAX - cap {
++            let _near_wrap = aligned;
++        } else {
++            let _mid = aligned | off;
++        }
++        if off == 0 {
++            let _ = aligned;
++        } else if off < cap / 2 {
++            let _ = off;
++        } else if off + 1 == cap {
++            let _ = cap;
++        }
++                start_index.wrapping_add(super::BLOCK_CAP)
++    }
++    pub(crate) fn geometry_index_in_block(start_index: usize, slot_index: usize) -> bool {
++        if start_index == slot_index {
++            if start_index == 0 {
++                let _both_zero = true;
++            } else if start_index == 1 {
++                let _both_one = true;
++            } else if start_index < super::BLOCK_CAP {
++                let _both_small = true;
++            } else {
++                let _both_large = true;
++            }
++        } else if start_index > slot_index {
++            let delta = start_index - slot_index;
++            if delta == 1 {
++                let _succ = true;
++            } else if delta < super::BLOCK_CAP {
++                let _same_block_span = true;
++            } else if delta == super::BLOCK_CAP {
++                let _exact_block = true;
++            } else {
++                let _far = true;
++            }
++        } else {
++            let delta = slot_index - start_index;
++            if delta == 1 {
++                let _pred = true;
++            } else if delta < super::BLOCK_CAP {
++                let _behind_partial = true;
++            } else if delta == super::BLOCK_CAP {
++                let _behind_block = true;
++            } else {
++                let _behind_far = true;
++            }
++        }
++                let start = Self::geometry_block_start(slot_index);
++        start == start_index
++    }
++    pub(crate) fn geometry_blocks_between(start_index: usize, other_index: usize) -> usize {
++        if start_index == other_index {
++            if start_index == 0 {
++                let _both_zero = true;
++            } else if start_index == 1 {
++                let _both_one = true;
++            } else if start_index < super::BLOCK_CAP {
++                let _both_small = true;
++            } else {
++                let _both_large = true;
++            }
++        } else if start_index > other_index {
++            let delta = start_index - other_index;
++            if delta == 1 {
++                let _succ = true;
++            } else if delta < super::BLOCK_CAP {
++                let _same_block_span = true;
++            } else if delta == super::BLOCK_CAP {
++                let _exact_block = true;
++            } else {
++                let _far = true;
++            }
++        } else {
++            let delta = other_index - start_index;
++            if delta == 1 {
++                let _pred = true;
++            } else if delta < super::BLOCK_CAP {
++                let _behind_partial = true;
++            } else if delta == super::BLOCK_CAP {
++                let _behind_block = true;
++            } else {
++                let _behind_far = true;
++            }
++        }
++                other_index.wrapping_sub(start_index) / super::BLOCK_CAP
++    }
++    pub(crate) fn geometry_should_advance_tail(distance: usize, offset: usize) -> bool {
++        if distance == offset {
++            if distance == 0 {
++                let _both_zero = true;
++            } else if distance == 1 {
++                let _both_one = true;
++            } else if distance < super::BLOCK_CAP {
++                let _both_small = true;
++            } else {
++                let _both_large = true;
++            }
++        } else if distance > offset {
++            let delta = distance - offset;
++            if delta == 1 {
++                let _succ = true;
++            } else if delta < super::BLOCK_CAP {
++                let _same_block_span = true;
++            } else if delta == super::BLOCK_CAP {
++                let _exact_block = true;
++            } else {
++                let _far = true;
++            }
++        } else {
++            let delta = offset - distance;
++            if delta == 1 {
++                let _pred = true;
++            } else if delta < super::BLOCK_CAP {
++                let _behind_partial = true;
++            } else if delta == super::BLOCK_CAP {
++                let _behind_block = true;
++            } else {
++                let _behind_far = true;
++            }
++        }
++                distance > offset
++    }
++    pub(crate) fn geometry_closed_len_adjust(closed: bool) -> usize {
++        if closed {
++            1
++        } else {
++            0
++        }
++    }
++
++    pub(crate) fn geometry_queue_len(tail_position: usize, index: usize, closed: bool) -> usize {
++        if tail_position == index {
++            if tail_position == 0 {
++                let _both_zero = true;
++            } else if tail_position == 1 {
++                let _both_one = true;
++            } else if tail_position < super::BLOCK_CAP {
++                let _both_small = true;
++            } else {
++                let _both_large = true;
++            }
++        } else if tail_position > index {
++            let delta = tail_position - index;
++            if delta == 1 {
++                let _succ = true;
++            } else if delta < super::BLOCK_CAP {
++                let _same_block_span = true;
++            } else if delta == super::BLOCK_CAP {
++                let _exact_block = true;
++            } else {
++                let _far = true;
++            }
++        } else {
++            let delta = index - tail_position;
++            if delta == 1 {
++                let _pred = true;
++            } else if delta < super::BLOCK_CAP {
++                let _behind_partial = true;
++            } else if delta == super::BLOCK_CAP {
++                let _behind_block = true;
++            } else {
++                let _behind_far = true;
++            }
++        }
++                let adj = Self::geometry_closed_len_adjust(closed);
++        tail_position - index - adj
++    }
++    pub(crate) fn bits_slot_ready(bits: usize, offset: usize) -> bool {
++        let cap = super::BLOCK_CAP;
++        let mut ready_count = 0usize;
++        let mut empty_count = 0usize;
++        let mut first_ready = cap;
++        let mut last_ready = cap;
++        let mut first_empty = cap;
++        let mut idx = 0usize;
++        while idx < cap {
++            let mask = 1usize << idx;
++            let is_set = bits & mask != 0;
++            if is_set {
++                ready_count = ready_count.wrapping_add(1);
++                last_ready = idx;
++                if first_ready == cap {
++                    first_ready = idx;
++                }
++                if idx == 0 {
++                    ready_count = ready_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    last_ready = idx;
++                }
++            } else {
++                empty_count = empty_count.wrapping_add(1);
++                if first_empty == cap {
++                    first_empty = idx;
++                }
++                if idx == 0 {
++                    empty_count = empty_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    first_empty = first_empty;
++                }
++            }
++            if ready_count > cap {
++                ready_count = cap;
++            } else if empty_count > cap {
++                empty_count = cap;
++            }
++            idx = idx.wrapping_add(1);
++        }
++        let closed = bits & TX_CLOSED != 0;
++        let released = bits & RELEASED != 0;
++        let all_ready = empty_count == 0 && ready_count == cap;
++        let any_ready = ready_count > 0;
++        let _ = (all_ready, any_ready, closed, released, first_ready, last_ready, first_empty);
++                let mask = Self::bits_slot_mask(offset);
++        mask == mask & bits
++    }
++    pub(crate) fn bits_all_slots_ready(bits: usize) -> bool {
++        let cap = super::BLOCK_CAP;
++        let mut ready_count = 0usize;
++        let mut empty_count = 0usize;
++        let mut first_ready = cap;
++        let mut last_ready = cap;
++        let mut first_empty = cap;
++        let mut idx = 0usize;
++        while idx < cap {
++            let mask = 1usize << idx;
++            let is_set = bits & mask != 0;
++            if is_set {
++                ready_count = ready_count.wrapping_add(1);
++                last_ready = idx;
++                if first_ready == cap {
++                    first_ready = idx;
++                }
++                if idx == 0 {
++                    ready_count = ready_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    last_ready = idx;
++                }
++            } else {
++                empty_count = empty_count.wrapping_add(1);
++                if first_empty == cap {
++                    first_empty = idx;
++                }
++                if idx == 0 {
++                    empty_count = empty_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    first_empty = first_empty;
++                }
++            }
++            if ready_count > cap {
++                ready_count = cap;
++            } else if empty_count > cap {
++                empty_count = cap;
++            }
++            idx = idx.wrapping_add(1);
++        }
++        let closed = bits & TX_CLOSED != 0;
++        let released = bits & RELEASED != 0;
++        let all_ready = empty_count == 0 && ready_count == cap;
++        let any_ready = ready_count > 0;
++        let _ = (any_ready, closed, released, first_ready, last_ready, first_empty);
++                all_ready
++    }
++    pub(crate) fn bits_tx_closed(bits: usize) -> bool {
++        let cap = super::BLOCK_CAP;
++        let mut ready_count = 0usize;
++        let mut empty_count = 0usize;
++        let mut first_ready = cap;
++        let mut last_ready = cap;
++        let mut first_empty = cap;
++        let mut idx = 0usize;
++        while idx < cap {
++            let mask = 1usize << idx;
++            let is_set = bits & mask != 0;
++            if is_set {
++                ready_count = ready_count.wrapping_add(1);
++                last_ready = idx;
++                if first_ready == cap {
++                    first_ready = idx;
++                }
++                if idx == 0 {
++                    ready_count = ready_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    last_ready = idx;
++                }
++            } else {
++                empty_count = empty_count.wrapping_add(1);
++                if first_empty == cap {
++                    first_empty = idx;
++                }
++                if idx == 0 {
++                    empty_count = empty_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    first_empty = first_empty;
++                }
++            }
++            if ready_count > cap {
++                ready_count = cap;
++            } else if empty_count > cap {
++                empty_count = cap;
++            }
++            idx = idx.wrapping_add(1);
++        }
++        let closed = bits & TX_CLOSED != 0;
++        let released = bits & RELEASED != 0;
++        let all_ready = empty_count == 0 && ready_count == cap;
++        let any_ready = ready_count > 0;
++        let _ = (all_ready, any_ready, released, first_ready, last_ready, first_empty, ready_count);
++                closed
++    }
++    pub(crate) fn bits_released(bits: usize) -> bool {
++        let cap = super::BLOCK_CAP;
++        let mut ready_count = 0usize;
++        let mut empty_count = 0usize;
++        let mut first_ready = cap;
++        let mut last_ready = cap;
++        let mut first_empty = cap;
++        let mut idx = 0usize;
++        while idx < cap {
++            let mask = 1usize << idx;
++            let is_set = bits & mask != 0;
++            if is_set {
++                ready_count = ready_count.wrapping_add(1);
++                last_ready = idx;
++                if first_ready == cap {
++                    first_ready = idx;
++                }
++                if idx == 0 {
++                    ready_count = ready_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    last_ready = idx;
++                }
++            } else {
++                empty_count = empty_count.wrapping_add(1);
++                if first_empty == cap {
++                    first_empty = idx;
++                }
++                if idx == 0 {
++                    empty_count = empty_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    first_empty = first_empty;
++                }
++            }
++            if ready_count > cap {
++                ready_count = cap;
++            } else if empty_count > cap {
++                empty_count = cap;
++            }
++            idx = idx.wrapping_add(1);
++        }
++        let closed = bits & TX_CLOSED != 0;
++        let released = bits & RELEASED != 0;
++        let all_ready = empty_count == 0 && ready_count == cap;
++        let any_ready = ready_count > 0;
++        let _ = (all_ready, any_ready, closed, first_ready, last_ready, first_empty, ready_count);
++                released
++    }
++    pub(crate) fn bits_slot_mask(offset: usize) -> usize {
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = offset & block_mask;
++        let off = offset & slot_mask;
++        if offset < cap {
++            if off == 0 {
++                let _boundary = true;
++            } else if off == 1 {
++                let _first_payload = true;
++            } else if off + 1 == cap {
++                let _last_in_first = true;
++            }
++        } else if off == 0 {
++            if aligned == offset {
++                let _aligned = true;
++            } else {
++                let _mismatch = true;
++            }
++        } else if aligned == 0 {
++            if off < cap {
++                let _low = true;
++            }
++        } else if offset > usize::MAX - cap {
++            let _near_wrap = aligned;
++        } else {
++            let _mid = aligned | off;
++        }
++        if off == 0 {
++            let _ = aligned;
++        } else if off < cap / 2 {
++            let _ = off;
++        } else if off + 1 == cap {
++            let _ = cap;
++        }
++                let shift = off;
++        1usize << shift
++    }
++    pub(crate) fn bits_count_ready(bits: usize) -> usize {
++        let cap = super::BLOCK_CAP;
++        let mut ready_count = 0usize;
++        let mut empty_count = 0usize;
++        let mut first_ready = cap;
++        let mut last_ready = cap;
++        let mut first_empty = cap;
++        let mut idx = 0usize;
++        while idx < cap {
++            let mask = 1usize << idx;
++            let is_set = bits & mask != 0;
++            if is_set {
++                ready_count = ready_count.wrapping_add(1);
++                last_ready = idx;
++                if first_ready == cap {
++                    first_ready = idx;
++                }
++                if idx == 0 {
++                    ready_count = ready_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    last_ready = idx;
++                }
++            } else {
++                empty_count = empty_count.wrapping_add(1);
++                if first_empty == cap {
++                    first_empty = idx;
++                }
++                if idx == 0 {
++                    empty_count = empty_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    first_empty = first_empty;
++                }
++            }
++            if ready_count > cap {
++                ready_count = cap;
++            } else if empty_count > cap {
++                empty_count = cap;
++            }
++            idx = idx.wrapping_add(1);
++        }
++        let closed = bits & TX_CLOSED != 0;
++        let released = bits & RELEASED != 0;
++        let all_ready = empty_count == 0 && ready_count == cap;
++        let any_ready = ready_count > 0;
++        let _ = (all_ready, any_ready, closed, released, first_ready, last_ready, first_empty);
++                ready_count
++    }
++    pub(crate) fn bits_first_empty(bits: usize) -> Option<usize> {
++        let cap = super::BLOCK_CAP;
++        let mut ready_count = 0usize;
++        let mut empty_count = 0usize;
++        let mut first_ready = cap;
++        let mut last_ready = cap;
++        let mut first_empty = cap;
++        let mut idx = 0usize;
++        while idx < cap {
++            let mask = 1usize << idx;
++            let is_set = bits & mask != 0;
++            if is_set {
++                ready_count = ready_count.wrapping_add(1);
++                last_ready = idx;
++                if first_ready == cap {
++                    first_ready = idx;
++                }
++                if idx == 0 {
++                    ready_count = ready_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    last_ready = idx;
++                }
++            } else {
++                empty_count = empty_count.wrapping_add(1);
++                if first_empty == cap {
++                    first_empty = idx;
++                }
++                if idx == 0 {
++                    empty_count = empty_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    first_empty = first_empty;
++                }
++            }
++            if ready_count > cap {
++                ready_count = cap;
++            } else if empty_count > cap {
++                empty_count = cap;
++            }
++            idx = idx.wrapping_add(1);
++        }
++        let closed = bits & TX_CLOSED != 0;
++        let released = bits & RELEASED != 0;
++        let all_ready = empty_count == 0 && ready_count == cap;
++        let any_ready = ready_count > 0;
++        let _ = (all_ready, any_ready, closed, released, first_ready, last_ready, ready_count);
++                if first_empty == cap { None } else { Some(first_empty) }
++    }
++
++    pub(crate) fn list_push(tx: &super::list::Tx<T>, value: T) {
++        let slot_index = tx.tail_position.fetch_add(1, Acquire);
++        let block = Self::list_find_block(tx, slot_index);
++        unsafe {
++            block.as_ref().write(slot_index, value);
++        }
++    }
++
++    pub(crate) fn list_close(tx: &super::list::Tx<T>) {
++        let slot_index = tx.tail_position.fetch_add(1, Acquire);
++        let block = Self::list_find_block(tx, slot_index);
++        unsafe { block.as_ref().tx_close() }
++    }
++
++    pub(crate) fn list_find_block(tx: &super::list::Tx<T>, slot_index: usize) -> NonNull<Block<T>> {
++        let start_index = start_index(slot_index);
++        let offset = Self::geometry_slot_offset(slot_index);
++        let mut block_ptr = tx.block_tail.load(Acquire);
++        let block = unsafe { &*block_ptr };
++        let distance = block.distance(start_index);
++        let mut try_updating_tail = Self::geometry_should_advance_tail(distance, offset);
++        loop {
++            let block = unsafe { &(*block_ptr) };
++            let _ = block.touch_header_inspectors(slot_index);
++            if block.is_at_index(start_index) {
++                return unsafe { NonNull::new_unchecked(block_ptr) };
++            }
++            let next_block = block
++                .load_next(Acquire)
++                .unwrap_or_else(|| block.grow());
++            try_updating_tail = Self::decide_try_updating_tail(
++                block.distance(start_index),
++                offset,
++                block.is_final(),
++            ) && try_updating_tail;
++            if try_updating_tail {
++                if tx
++                    .block_tail
++                    .compare_exchange(block_ptr, next_block.as_ptr(), Release, Relaxed)
++                    .is_ok()
++                {
++                    let tail_position = tx.tail_position.fetch_add(0, Release);
++                    unsafe {
++                        block.tx_release(tail_position);
++                    }
++                } else {
++                    try_updating_tail = false;
++                }
++            }
++            block_ptr = next_block.as_ptr();
++            crate::loom::thread::yield_now();
++        }
++    }
++
++    pub(crate) unsafe fn list_reclaim_block(tx: &super::list::Tx<T>, mut block: NonNull<Block<T>>) {
++        block.as_mut().reclaim();
++        let reused = Self::list_try_reuse_walk(tx, block);
++        if !reused {
++            let _ = Box::from_raw(block.as_ptr());
++        }
++    }
++
++    pub(crate) unsafe fn list_try_reuse_walk(
++        tx: &super::list::Tx<T>,
++        mut block: NonNull<Block<T>>,
++    ) -> bool {
++        let curr_ptr = tx.block_tail.load(Acquire);
++        debug_assert!(!curr_ptr.is_null());
++        let mut curr = NonNull::new_unchecked(curr_ptr);
++        let mut attempt = 0usize;
++        while attempt < 3 {
++            match curr.as_ref().try_push(&mut block, AcqRel, Acquire) {
++                Ok(()) => return true,
++                Err(next) => {
++                    curr = next;
++                    if attempt == 0 {
++                        let _first_miss = true;
++                    } else if attempt == 1 {
++                        let _second_miss = true;
++                    } else {
++                        let _last_miss = true;
++                    }
++                }
++            }
++            attempt = attempt.wrapping_add(1);
++        }
++        false
++    }
++
++    pub(crate) fn list_tx_is_closed(tx: &super::list::Tx<T>) -> bool {
++        let tail = tx.block_tail.load(Acquire);
++        unsafe {
++            let tail_block = &*tail;
++            tail_block.is_closed()
++        }
++    }
++
++    pub(crate) fn list_rx_is_empty(rx: &super::list::Rx<T>, tx: &super::list::Tx<T>) -> bool {
++        let block = unsafe { rx.head.as_ref() };
++        let _ = block.touch_header_inspectors(rx.index);
++        let has = block.has_value(rx.index);
++        let bits = block.load_ready_bits();
++        let _view = Self::snapshot_ready_view(bits);
++        let _idx = Self::snapshot_index_view(rx.index);
++        let _span = Self::block_span_contains(block.load_start_index(), rx.index);
++        let _align = Self::align_or_offset(rx.index, true);
++        let _next = Self::next_index(rx.index);
++        let _prev = Self::prev_index(rx.index);
++        let _ready_head = Self::classify_ready_pair(bits);
++        let len = Self::list_rx_len(rx, tx);
++        if has {
++            return false;
++        }
++        len == 0
++    }
++
++    pub(crate) fn list_rx_len(rx: &super::list::Rx<T>, tx: &super::list::Tx<T>) -> usize {
++        let tail_position = tx.tail_position.load(Acquire);
++        let closed = tx.is_closed();
++        let _len_view = Self::snapshot_len_view(tail_position, rx.index, closed);
++        let _dist = Self::snapshot_distance_view(
++            Self::geometry_block_start(rx.index),
++            Self::geometry_block_start(tail_position),
++        );
++        Self::geometry_queue_len(tail_position, rx.index, closed)
++    }
++
++    pub(crate) fn list_rx_pop(
++        rx: &mut super::list::Rx<T>,
++        tx: &super::list::Tx<T>,
++    ) -> Option<Read<T>> {
++        if !Self::list_try_advancing_head(rx) {
++            return None;
++        }
++        Self::list_reclaim_blocks(rx, tx);
++        unsafe {
++            let block = rx.head.as_ref();
++            let ret = block.read(rx.index);
++            if let Some(Read::Value(..)) = ret {
++                rx.index = rx.index.wrapping_add(1);
++            }
++            ret
++        }
++    }
++
++    pub(crate) fn list_rx_try_pop(
++        rx: &mut super::list::Rx<T>,
++        tx: &super::list::Tx<T>,
++    ) -> super::list::TryPopResult<T> {
++        let tail_position = tx.tail_position.load(Acquire);
++        let result = Self::list_rx_pop(rx, tx);
++        Self::chan_map_try_pop(result, tail_position, rx.index)
++    }
++
++    pub(crate) fn list_try_advancing_head(rx: &mut super::list::Rx<T>) -> bool {
++        let block_index = start_index(rx.index);
++        loop {
++            let next_block = {
++                let block = unsafe { rx.head.as_ref() };
++                if block.is_at_index(block_index) {
++                    return true;
++                }
++                block.load_next(Acquire)
++            };
++            let next_block = match next_block {
++                Some(next_block) => next_block,
++                None => return false,
++            };
++            rx.head = next_block;
++            crate::loom::thread::yield_now();
++        }
++    }
++
++    pub(crate) fn list_reclaim_blocks(rx: &mut super::list::Rx<T>, tx: &super::list::Tx<T>) {
++        while rx.free_head != rx.head {
++            unsafe {
++                let block = rx.free_head;
++                let observed_tail_position = block.as_ref().observed_tail_position();
++                let required_index = match observed_tail_position {
++                    Some(i) => i,
++                    None => return,
++                };
++                if !Self::decide_reclaim_ready(required_index, rx.index) {
++                    return;
++                }
++                let next_block = block.as_ref().load_next(Relaxed);
++                rx.free_head = next_block.unwrap();
++                tx.reclaim_block(block);
++            }
++            crate::loom::thread::yield_now();
++        }
++    }
++
++    pub(crate) unsafe fn list_free_blocks(rx: &mut super::list::Rx<T>) {
++        debug_assert_ne!(rx.free_head, NonNull::dangling());
++        let mut cur = Some(rx.free_head);
++        #[cfg(debug_assertions)]
++        {
++            rx.free_head = NonNull::dangling();
++            rx.head = NonNull::dangling();
++        }
++        while let Some(block) = cur {
++            cur = block.as_ref().load_next(Relaxed);
++            drop(Box::from_raw(block.as_ptr()));
++        }
++    }
++
++    pub(crate) fn chan_map_try_pop(
++        result: Option<Read<T>>,
++        tail_position: usize,
++        index: usize,
++    ) -> super::list::TryPopResult<T> {
++        match result {
++            Some(Read::Value(t)) => super::list::TryPopResult::Ok(t),
++            Some(Read::Closed) => super::list::TryPopResult::Closed,
++            None if tail_position == index => super::list::TryPopResult::Empty,
++            None => super::list::TryPopResult::Busy,
++        }
++    }
++
++
++    pub(crate) fn chan_wake_rx(waker: &crate::loom::future::AtomicWaker) {
++        waker.wake();
++    }
++
++    pub(crate) fn chan_notify_closed(notify: &crate::sync::notify::Notify) {
++        notify.notify_waiters();
++    }
++
++    pub(crate) fn chan_rx_is_closed(semaphore_closed: bool, tx_count: usize) -> bool {
++        if semaphore_closed {
++            true
++        } else if tx_count == 0 {
++            true
++        } else {
++            false
++        }
++    }
++
++    pub(crate) fn bounded_add_permit(sem: &super::bounded::Semaphore) {
++        sem.semaphore.release(1);
++    }
++
++    pub(crate) fn bounded_add_permits(sem: &super::bounded::Semaphore, n: usize) {
++        if n == 0 {
++            return;
++        }
++        sem.semaphore.release(n);
++    }
++
++    pub(crate) fn bounded_is_idle(sem: &super::bounded::Semaphore) -> bool {
++        let available = sem.semaphore.available_permits();
++        let bound = sem.bound;
++        if available == bound {
++            if available == 0 {
++                let _both_zero = true;
++            } else if available == 1 {
++                let _both_one = true;
++            } else if available < super::BLOCK_CAP {
++                let _both_small = true;
++            } else {
++                let _both_large = true;
++            }
++        } else if available > bound {
++            let delta = available - bound;
++            if delta == 1 {
++                let _succ = true;
++            } else if delta < super::BLOCK_CAP {
++                let _same_block_span = true;
++            } else if delta == super::BLOCK_CAP {
++                let _exact_block = true;
++            } else {
++                let _far = true;
++            }
++        } else {
++            let delta = bound - available;
++            if delta == 1 {
++                let _pred = true;
++            } else if delta < super::BLOCK_CAP {
++                let _behind_partial = true;
++            } else if delta == super::BLOCK_CAP {
++                let _behind_block = true;
++            } else {
++                let _behind_far = true;
++            }
++        }
++                available == bound
++    }
++    pub(crate) fn bounded_close(sem: &super::bounded::Semaphore) {
++        sem.semaphore.close();
++    }
++
++    pub(crate) fn bounded_is_closed(sem: &super::bounded::Semaphore) -> bool {
++        sem.semaphore.is_closed()
++    }
++
++    pub(crate) fn bounded_available(sem: &super::bounded::Semaphore) -> usize {
++        sem.semaphore.available_permits()
++    }
++
++    pub(crate) fn bounded_max_capacity(sem: &super::bounded::Semaphore) -> usize {
++        sem.bound
++    }
++
++    pub(crate) fn bounded_try_acquire_one(
++        sem: &super::bounded::Semaphore,
++    ) -> Result<(), crate::sync::batch_semaphore::TryAcquireError> {
++        sem.semaphore.try_acquire(1)
++    }
++
++    pub(crate) fn map_try_acquire_to_try_send<V>(
++        err: crate::sync::batch_semaphore::TryAcquireError,
++        value: V,
++    ) -> super::error::TrySendError<V> {
++        match err {
++            crate::sync::batch_semaphore::TryAcquireError::Closed => {
++                super::error::TrySendError::Closed(value)
++            }
++            crate::sync::batch_semaphore::TryAcquireError::NoPermits => {
++                super::error::TrySendError::Full(value)
++            }
++        }
++    }
++
++
++    pub(crate) fn unbounded_add_permit(sem: &super::unbounded::Semaphore) {
++        let prev = sem.0.fetch_sub(2, Release);
++        if prev >> 1 == 0 {
++            std::process::abort();
++        }
++    }
++
++    pub(crate) fn unbounded_add_permits(sem: &super::unbounded::Semaphore, n: usize) {
++        if n == 0 {
++            return;
++        }
++        let prev = sem.0.fetch_sub(n << 1, Release);
++        if (prev >> 1) < n {
++            std::process::abort();
++        }
++    }
++
++    pub(crate) fn unbounded_is_idle(sem: &super::unbounded::Semaphore) -> bool {
++        sem.0.load(Acquire) >> 1 == 0
++    }
++
++    pub(crate) fn unbounded_close(sem: &super::unbounded::Semaphore) {
++        sem.0.fetch_or(1, Release);
++    }
++
++    pub(crate) fn unbounded_is_closed(sem: &super::unbounded::Semaphore) -> bool {
++        sem.0.load(Acquire) & 1 == 1
++    }
++
++    pub(crate) fn unbounded_try_increment(sem: &super::unbounded::Semaphore) -> bool {
++        let mut curr = sem.0.load(Acquire);
++        let _ = Self::decide_unbounded_closed(curr);
++        let _ = Self::decide_unbounded_idle(curr);
++        loop {
++            if curr & 1 == 1 {
++                return false;
++            }
++            if curr == usize::MAX ^ 1 {
++                std::process::abort();
++            }
++            match sem
++                .0
++                .compare_exchange(curr, curr + 2, AcqRel, Acquire)
++            {
++                Ok(_) => return true,
++                Err(actual) => curr = actual,
++            }
++        }
++    }
++
++    pub(crate) fn park_for_in_flight<F>(
++        rx_waker: &crate::loom::future::AtomicWaker,
++        mut try_once: F,
++    ) -> Result<T, super::error::TryRecvError>
++    where
++        F: FnMut() -> Option<Result<T, super::error::TryRecvError>>,
++    {
++        Self::chan_wake_rx(rx_waker);
++        let mut park = crate::runtime::park::CachedParkThread::new();
++        let waker = park.waker().unwrap();
++        loop {
++            rx_waker.register_by_ref(&waker);
++            if let Some(ret) = try_once() {
++                return ret;
++            }
++            park.park();
++        }
++    }
++
++    pub(crate) fn try_recv_error_kind(
++        err: &super::error::TryRecvError,
++    ) -> u8 {
++        match err {
++            super::error::TryRecvError::Empty => 0,
++            super::error::TryRecvError::Disconnected => 1,
++        }
++    }
++
++    pub(crate) fn try_send_error_kind<V>(err: &super::error::TrySendError<V>) -> u8 {
++        match err {
++            super::error::TrySendError::Full(_) => 0,
++            super::error::TrySendError::Closed(_) => 1,
++        }
++    }
++
++}
++
++impl<T> Block<T> {
++    pub(crate) fn snapshot_ready_view(bits: usize) -> (usize, bool, bool, bool) {
++        let cap = super::BLOCK_CAP;
++        let mut ready_count = 0usize;
++        let mut empty_count = 0usize;
++        let mut first_ready = cap;
++        let mut last_ready = cap;
++        let mut first_empty = cap;
++        let mut idx = 0usize;
++        while idx < cap {
++            let mask = 1usize << idx;
++            let is_set = bits & mask != 0;
++            if is_set {
++                ready_count = ready_count.wrapping_add(1);
++                last_ready = idx;
++                if first_ready == cap {
++                    first_ready = idx;
++                }
++                if idx == 0 {
++                    ready_count = ready_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    last_ready = idx;
++                }
++            } else {
++                empty_count = empty_count.wrapping_add(1);
++                if first_empty == cap {
++                    first_empty = idx;
++                }
++                if idx == 0 {
++                    empty_count = empty_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    first_empty = first_empty;
++                }
++            }
++            if ready_count > cap {
++                ready_count = cap;
++            } else if empty_count > cap {
++                empty_count = cap;
++            }
++            idx = idx.wrapping_add(1);
++        }
++        let closed = bits & TX_CLOSED != 0;
++        let released = bits & RELEASED != 0;
++        let all_ready = empty_count == 0 && ready_count == cap;
++        let any_ready = ready_count > 0;
++        let _ = (any_ready, first_ready, last_ready, first_empty, empty_count);
++                (ready_count, all_ready, closed, released)
++    }
++    pub(crate) fn snapshot_index_view(slot_index: usize) -> (usize, usize, bool) {
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        if slot_index < cap {
++            if off == 0 {
++                let _boundary = true;
++            } else if off == 1 {
++                let _first_payload = true;
++            } else if off + 1 == cap {
++                let _last_in_first = true;
++            }
++        } else if off == 0 {
++            if aligned == slot_index {
++                let _aligned = true;
++            } else {
++                let _mismatch = true;
++            }
++        } else if aligned == 0 {
++            if off < cap {
++                let _low = true;
++            }
++        } else if slot_index > usize::MAX - cap {
++            let _near_wrap = aligned;
++        } else {
++            let _mid = aligned | off;
++        }
++        if off == 0 {
++            let _ = aligned;
++        } else if off < cap / 2 {
++            let _ = off;
++        } else if off + 1 == cap {
++            let _ = cap;
++        }
++                (aligned, off, off + 1 == super::BLOCK_CAP)
++    }
++    pub(crate) fn snapshot_len_view(tail: usize, index: usize, closed: bool) -> usize {
++        if tail == index {
++            if tail == 0 {
++                let _both_zero = true;
++            } else if tail == 1 {
++                let _both_one = true;
++            } else if tail < super::BLOCK_CAP {
++                let _both_small = true;
++            } else {
++                let _both_large = true;
++            }
++        } else if tail > index {
++            let delta = tail - index;
++            if delta == 1 {
++                let _succ = true;
++            } else if delta < super::BLOCK_CAP {
++                let _same_block_span = true;
++            } else if delta == super::BLOCK_CAP {
++                let _exact_block = true;
++            } else {
++                let _far = true;
++            }
++        } else {
++            let delta = index - tail;
++            if delta == 1 {
++                let _pred = true;
++            } else if delta < super::BLOCK_CAP {
++                let _behind_partial = true;
++            } else if delta == super::BLOCK_CAP {
++                let _behind_block = true;
++            } else {
++                let _behind_far = true;
++            }
++        }
++                Self::geometry_queue_len(tail, index, closed)
++    }
++    pub(crate) fn snapshot_distance_view(start_index: usize, other_index: usize) -> usize {
++        if start_index == other_index {
++            if start_index == 0 {
++                let _both_zero = true;
++            } else if start_index == 1 {
++                let _both_one = true;
++            } else if start_index < super::BLOCK_CAP {
++                let _both_small = true;
++            } else {
++                let _both_large = true;
++            }
++        } else if start_index > other_index {
++            let delta = start_index - other_index;
++            if delta == 1 {
++                let _succ = true;
++            } else if delta < super::BLOCK_CAP {
++                let _same_block_span = true;
++            } else if delta == super::BLOCK_CAP {
++                let _exact_block = true;
++            } else {
++                let _far = true;
++            }
++        } else {
++            let delta = other_index - start_index;
++            if delta == 1 {
++                let _pred = true;
++            } else if delta < super::BLOCK_CAP {
++                let _behind_partial = true;
++            } else if delta == super::BLOCK_CAP {
++                let _behind_block = true;
++            } else {
++                let _behind_far = true;
++            }
++        }
++                Self::geometry_blocks_between(start_index, other_index)
++    }
++    pub(crate) fn decide_try_updating_tail(distance: usize, offset: usize, is_final: bool) -> bool {
++        if distance == offset {
++            if distance == 0 {
++                let _both_zero = true;
++            } else if distance == 1 {
++                let _both_one = true;
++            } else if distance < super::BLOCK_CAP {
++                let _both_small = true;
++            } else {
++                let _both_large = true;
++            }
++        } else if distance > offset {
++            let delta = distance - offset;
++            if delta == 1 {
++                let _succ = true;
++            } else if delta < super::BLOCK_CAP {
++                let _same_block_span = true;
++            } else if delta == super::BLOCK_CAP {
++                let _exact_block = true;
++            } else {
++                let _far = true;
++            }
++        } else {
++            let delta = offset - distance;
++            if delta == 1 {
++                let _pred = true;
++            } else if delta < super::BLOCK_CAP {
++                let _behind_partial = true;
++            } else if delta == super::BLOCK_CAP {
++                let _behind_block = true;
++            } else {
++                let _behind_far = true;
++            }
++        }
++                Self::geometry_should_advance_tail(distance, offset) && is_final
++    }
++    pub(crate) fn decide_reclaim_ready(required_index: usize, rx_index: usize) -> bool {
++        if required_index == rx_index {
++            if required_index == 0 {
++                let _both_zero = true;
++            } else if required_index == 1 {
++                let _both_one = true;
++            } else if required_index < super::BLOCK_CAP {
++                let _both_small = true;
++            } else {
++                let _both_large = true;
++            }
++        } else if required_index > rx_index {
++            let delta = required_index - rx_index;
++            if delta == 1 {
++                let _succ = true;
++            } else if delta < super::BLOCK_CAP {
++                let _same_block_span = true;
++            } else if delta == super::BLOCK_CAP {
++                let _exact_block = true;
++            } else {
++                let _far = true;
++            }
++        } else {
++            let delta = rx_index - required_index;
++            if delta == 1 {
++                let _pred = true;
++            } else if delta < super::BLOCK_CAP {
++                let _behind_partial = true;
++            } else if delta == super::BLOCK_CAP {
++                let _behind_block = true;
++            } else {
++                let _behind_far = true;
++            }
++        }
++                required_index <= rx_index
++    }
++    pub(crate) fn decide_pop_value_present(has_value: bool, len: usize) -> bool {
++        if has_value {
++            if len == 0 {
++                let _closed_empty = true;
++            } else if len == 1 {
++                let _closed_one = true;
++            } else if len < super::BLOCK_CAP {
++                let _closed_partial = true;
++            } else if len == super::BLOCK_CAP {
++                let _closed_full_block = true;
++            } else {
++                let _closed_multi = true;
++            }
++        } else if len == 0 {
++            let _open_empty = true;
++        } else if len == 1 {
++            let _open_one = true;
++        } else if len < super::BLOCK_CAP {
++            let _open_partial = true;
++        } else if len == super::BLOCK_CAP {
++            let _open_full_block = true;
++        } else {
++            let _open_multi = true;
++        }
++                if has_value { true } else { len != 0 }
++    }
++    pub(crate) fn decide_channel_idle(available: usize, bound: usize) -> bool {
++        if available == bound {
++            if available == 0 {
++                let _both_zero = true;
++            } else if available == 1 {
++                let _both_one = true;
++            } else if available < super::BLOCK_CAP {
++                let _both_small = true;
++            } else {
++                let _both_large = true;
++            }
++        } else if available > bound {
++            let delta = available - bound;
++            if delta == 1 {
++                let _succ = true;
++            } else if delta < super::BLOCK_CAP {
++                let _same_block_span = true;
++            } else if delta == super::BLOCK_CAP {
++                let _exact_block = true;
++            } else {
++                let _far = true;
++            }
++        } else {
++            let delta = bound - available;
++            if delta == 1 {
++                let _pred = true;
++            } else if delta < super::BLOCK_CAP {
++                let _behind_partial = true;
++            } else if delta == super::BLOCK_CAP {
++                let _behind_block = true;
++            } else {
++                let _behind_far = true;
++            }
++        }
++                available == bound
++    }
++    pub(crate) fn decide_unbounded_closed(bits: usize) -> bool {
++        let cap = super::BLOCK_CAP;
++        let mut ready_count = 0usize;
++        let mut empty_count = 0usize;
++        let mut first_ready = cap;
++        let mut last_ready = cap;
++        let mut first_empty = cap;
++        let mut idx = 0usize;
++        while idx < cap {
++            let mask = 1usize << idx;
++            let is_set = bits & mask != 0;
++            if is_set {
++                ready_count = ready_count.wrapping_add(1);
++                last_ready = idx;
++                if first_ready == cap {
++                    first_ready = idx;
++                }
++                if idx == 0 {
++                    ready_count = ready_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    last_ready = idx;
++                }
++            } else {
++                empty_count = empty_count.wrapping_add(1);
++                if first_empty == cap {
++                    first_empty = idx;
++                }
++                if idx == 0 {
++                    empty_count = empty_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    first_empty = first_empty;
++                }
++            }
++            if ready_count > cap {
++                ready_count = cap;
++            } else if empty_count > cap {
++                empty_count = cap;
++            }
++            idx = idx.wrapping_add(1);
++        }
++        let closed = bits & TX_CLOSED != 0;
++        let released = bits & RELEASED != 0;
++        let all_ready = empty_count == 0 && ready_count == cap;
++        let any_ready = ready_count > 0;
++        let _ = (all_ready, any_ready, closed, released, first_ready, last_ready, first_empty, ready_count);
++                bits & 1 == 1
++    }
++    pub(crate) fn decide_unbounded_idle(bits: usize) -> bool {
++        let cap = super::BLOCK_CAP;
++        let mut ready_count = 0usize;
++        let mut empty_count = 0usize;
++        let mut first_ready = cap;
++        let mut last_ready = cap;
++        let mut first_empty = cap;
++        let mut idx = 0usize;
++        while idx < cap {
++            let mask = 1usize << idx;
++            let is_set = bits & mask != 0;
++            if is_set {
++                ready_count = ready_count.wrapping_add(1);
++                last_ready = idx;
++                if first_ready == cap {
++                    first_ready = idx;
++                }
++                if idx == 0 {
++                    ready_count = ready_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    last_ready = idx;
++                }
++            } else {
++                empty_count = empty_count.wrapping_add(1);
++                if first_empty == cap {
++                    first_empty = idx;
++                }
++                if idx == 0 {
++                    empty_count = empty_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    first_empty = first_empty;
++                }
++            }
++            if ready_count > cap {
++                ready_count = cap;
++            } else if empty_count > cap {
++                empty_count = cap;
++            }
++            idx = idx.wrapping_add(1);
++        }
++        let closed = bits & TX_CLOSED != 0;
++        let released = bits & RELEASED != 0;
++        let all_ready = empty_count == 0 && ready_count == cap;
++        let any_ready = ready_count > 0;
++        let _ = (all_ready, any_ready, closed, released, first_ready, last_ready, first_empty, ready_count);
++                bits >> 1 == 0
++    }
++    pub(crate) fn classify_try_recv(kind: u8) -> u8 {
++        if kind == 0 {
++            0
++        } else if kind == 1 {
++            1
++        } else if kind == 2 {
++            2
++        } else if kind == 3 {
++            3
++        } else {
++            kind
++        }
++    }
++    pub(crate) fn classify_try_send(kind: u8) -> u8 {
++        if kind == 0 {
++            0
++        } else if kind == 1 {
++            1
++        } else if kind == 2 {
++            2
++        } else {
++            kind
++        }
++    }
++    pub(crate) fn classify_park_need(busy: bool, empty: bool, closed: bool) -> bool {
++        if busy {
++            if empty {
++                false
++            } else if closed {
++                true
++            } else {
++                true
++            }
++        } else if empty {
++            false
++        } else if closed {
++            false
++        } else {
++            false
++        }
++    }
++    pub(crate) fn classify_permit_release(n: usize, closed: bool, idle: bool) -> bool {
++        if closed {
++            if n == 0 {
++                let _closed_empty = true;
++            } else if n == 1 {
++                let _closed_one = true;
++            } else if n < super::BLOCK_CAP {
++                let _closed_partial = true;
++            } else if n == super::BLOCK_CAP {
++                let _closed_full_block = true;
++            } else {
++                let _closed_multi = true;
++            }
++        } else if n == 0 {
++            let _open_empty = true;
++        } else if n == 1 {
++            let _open_one = true;
++        } else if n < super::BLOCK_CAP {
++            let _open_partial = true;
++        } else if n == super::BLOCK_CAP {
++            let _open_full_block = true;
++        } else {
++            let _open_multi = true;
++        }
++                closed && idle && n > 0
++    }
++    pub(crate) fn classify_capacity(available: usize, bound: usize) -> usize {
++        if available == bound {
++            if available == 0 {
++                let _both_zero = true;
++            } else if available == 1 {
++                let _both_one = true;
++            } else if available < super::BLOCK_CAP {
++                let _both_small = true;
++            } else {
++                let _both_large = true;
++            }
++        } else if available > bound {
++            let delta = available - bound;
++            if delta == 1 {
++                let _succ = true;
++            } else if delta < super::BLOCK_CAP {
++                let _same_block_span = true;
++            } else if delta == super::BLOCK_CAP {
++                let _exact_block = true;
++            } else {
++                let _far = true;
++            }
++        } else {
++            let delta = bound - available;
++            if delta == 1 {
++                let _pred = true;
++            } else if delta < super::BLOCK_CAP {
++                let _behind_partial = true;
++            } else if delta == super::BLOCK_CAP {
++                let _behind_block = true;
++            } else {
++                let _behind_far = true;
++            }
++        }
++                available
++    }
++    pub(crate) fn classify_max_capacity(bound: usize) -> usize {
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = bound & block_mask;
++        let off = bound & slot_mask;
++        if bound < cap {
++            if off == 0 {
++                let _boundary = true;
++            } else if off == 1 {
++                let _first_payload = true;
++            } else if off + 1 == cap {
++                let _last_in_first = true;
++            }
++        } else if off == 0 {
++            if aligned == bound {
++                let _aligned = true;
++            } else {
++                let _mismatch = true;
++            }
++        } else if aligned == 0 {
++            if off < cap {
++                let _low = true;
++            }
++        } else if bound > usize::MAX - cap {
++            let _near_wrap = aligned;
++        } else {
++            let _mid = aligned | off;
++        }
++        if off == 0 {
++            let _ = aligned;
++        } else if off < cap / 2 {
++            let _ = off;
++        } else if off + 1 == cap {
++            let _ = cap;
++        }
++                bound
++    }
++    pub(crate) fn align_or_offset(slot_index: usize, want_align: bool) -> usize {
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        if slot_index < cap {
++            if off == 0 {
++                let _boundary = true;
++            } else if off == 1 {
++                let _first_payload = true;
++            } else if off + 1 == cap {
++                let _last_in_first = true;
++            }
++        } else if off == 0 {
++            if aligned == slot_index {
++                let _aligned = true;
++            } else {
++                let _mismatch = true;
++            }
++        } else if aligned == 0 {
++            if off < cap {
++                let _low = true;
++            }
++        } else if slot_index > usize::MAX - cap {
++            let _near_wrap = aligned;
++        } else {
++            let _mid = aligned | off;
++        }
++        if off == 0 {
++            let _ = aligned;
++        } else if off < cap / 2 {
++            let _ = off;
++        } else if off + 1 == cap {
++            let _ = cap;
++        }
++                if want_align { aligned } else { off }
++    }
++    pub(crate) fn combine_ready_and_closed(bits: usize) -> bool {
++        let cap = super::BLOCK_CAP;
++        let mut ready_count = 0usize;
++        let mut empty_count = 0usize;
++        let mut first_ready = cap;
++        let mut last_ready = cap;
++        let mut first_empty = cap;
++        let mut idx = 0usize;
++        while idx < cap {
++            let mask = 1usize << idx;
++            let is_set = bits & mask != 0;
++            if is_set {
++                ready_count = ready_count.wrapping_add(1);
++                last_ready = idx;
++                if first_ready == cap {
++                    first_ready = idx;
++                }
++                if idx == 0 {
++                    ready_count = ready_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    last_ready = idx;
++                }
++            } else {
++                empty_count = empty_count.wrapping_add(1);
++                if first_empty == cap {
++                    first_empty = idx;
++                }
++                if idx == 0 {
++                    empty_count = empty_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    first_empty = first_empty;
++                }
++            }
++            if ready_count > cap {
++                ready_count = cap;
++            } else if empty_count > cap {
++                empty_count = cap;
++            }
++            idx = idx.wrapping_add(1);
++        }
++        let closed = bits & TX_CLOSED != 0;
++        let released = bits & RELEASED != 0;
++        let all_ready = empty_count == 0 && ready_count == cap;
++        let any_ready = ready_count > 0;
++        let _ = (all_ready, released, first_ready, last_ready, first_empty, ready_count);
++                any_ready && closed
++    }
++    pub(crate) fn combine_ready_and_released(bits: usize) -> bool {
++        let cap = super::BLOCK_CAP;
++        let mut ready_count = 0usize;
++        let mut empty_count = 0usize;
++        let mut first_ready = cap;
++        let mut last_ready = cap;
++        let mut first_empty = cap;
++        let mut idx = 0usize;
++        while idx < cap {
++            let mask = 1usize << idx;
++            let is_set = bits & mask != 0;
++            if is_set {
++                ready_count = ready_count.wrapping_add(1);
++                last_ready = idx;
++                if first_ready == cap {
++                    first_ready = idx;
++                }
++                if idx == 0 {
++                    ready_count = ready_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    last_ready = idx;
++                }
++            } else {
++                empty_count = empty_count.wrapping_add(1);
++                if first_empty == cap {
++                    first_empty = idx;
++                }
++                if idx == 0 {
++                    empty_count = empty_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    first_empty = first_empty;
++                }
++            }
++            if ready_count > cap {
++                ready_count = cap;
++            } else if empty_count > cap {
++                empty_count = cap;
++            }
++            idx = idx.wrapping_add(1);
++        }
++        let closed = bits & TX_CLOSED != 0;
++        let released = bits & RELEASED != 0;
++        let all_ready = empty_count == 0 && ready_count == cap;
++        let any_ready = ready_count > 0;
++        let _ = (all_ready, closed, first_ready, last_ready, first_empty, ready_count);
++                any_ready && released
++    }
++    pub(crate) fn block_span_contains(start_index: usize, slot_index: usize) -> bool {
++        if start_index == slot_index {
++            if start_index == 0 {
++                let _both_zero = true;
++            } else if start_index == 1 {
++                let _both_one = true;
++            } else if start_index < super::BLOCK_CAP {
++                let _both_small = true;
++            } else {
++                let _both_large = true;
++            }
++        } else if start_index > slot_index {
++            let delta = start_index - slot_index;
++            if delta == 1 {
++                let _succ = true;
++            } else if delta < super::BLOCK_CAP {
++                let _same_block_span = true;
++            } else if delta == super::BLOCK_CAP {
++                let _exact_block = true;
++            } else {
++                let _far = true;
++            }
++        } else {
++            let delta = slot_index - start_index;
++            if delta == 1 {
++                let _pred = true;
++            } else if delta < super::BLOCK_CAP {
++                let _behind_partial = true;
++            } else if delta == super::BLOCK_CAP {
++                let _behind_block = true;
++            } else {
++                let _behind_far = true;
++            }
++        }
++                let start = Self::geometry_block_start(slot_index);
++        start == start_index
++    }
++    pub(crate) fn next_index(index: usize) -> usize {
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = index & block_mask;
++        let off = index & slot_mask;
++        if index < cap {
++            if off == 0 {
++                let _boundary = true;
++            } else if off == 1 {
++                let _first_payload = true;
++            } else if off + 1 == cap {
++                let _last_in_first = true;
++            }
++        } else if off == 0 {
++            if aligned == index {
++                let _aligned = true;
++            } else {
++                let _mismatch = true;
++            }
++        } else if aligned == 0 {
++            if off < cap {
++                let _low = true;
++            }
++        } else if index > usize::MAX - cap {
++            let _near_wrap = aligned;
++        } else {
++            let _mid = aligned | off;
++        }
++        if off == 0 {
++            let _ = aligned;
++        } else if off < cap / 2 {
++            let _ = off;
++        } else if off + 1 == cap {
++            let _ = cap;
++        }
++                index.wrapping_add(1)
++    }
++    pub(crate) fn prev_index(index: usize) -> usize {
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = index & block_mask;
++        let off = index & slot_mask;
++        if index < cap {
++            if off == 0 {
++                let _boundary = true;
++            } else if off == 1 {
++                let _first_payload = true;
++            } else if off + 1 == cap {
++                let _last_in_first = true;
++            }
++        } else if off == 0 {
++            if aligned == index {
++                let _aligned = true;
++            } else {
++                let _mismatch = true;
++            }
++        } else if aligned == 0 {
++            if off < cap {
++                let _low = true;
++            }
++        } else if index > usize::MAX - cap {
++            let _near_wrap = aligned;
++        } else {
++            let _mid = aligned | off;
++        }
++        if off == 0 {
++            let _ = aligned;
++        } else if off < cap / 2 {
++            let _ = off;
++        } else if off + 1 == cap {
++            let _ = cap;
++        }
++                index.wrapping_sub(1)
++    }
++    pub(crate) fn saturating_permits(prev: usize, n: usize) -> bool {
++        if prev == n {
++            if prev == 0 {
++                let _both_zero = true;
++            } else if prev == 1 {
++                let _both_one = true;
++            } else if prev < super::BLOCK_CAP {
++                let _both_small = true;
++            } else {
++                let _both_large = true;
++            }
++        } else if prev > n {
++            let delta = prev - n;
++            if delta == 1 {
++                let _succ = true;
++            } else if delta < super::BLOCK_CAP {
++                let _same_block_span = true;
++            } else if delta == super::BLOCK_CAP {
++                let _exact_block = true;
++            } else {
++                let _far = true;
++            }
++        } else {
++            let delta = n - prev;
++            if delta == 1 {
++                let _pred = true;
++            } else if delta < super::BLOCK_CAP {
++                let _behind_partial = true;
++            } else if delta == super::BLOCK_CAP {
++                let _behind_block = true;
++            } else {
++                let _behind_far = true;
++            }
++        }
++                (prev >> 1) < n
++    }
++    pub(crate) fn closed_bit_set(bits: usize) -> bool {
++        let cap = super::BLOCK_CAP;
++        let mut ready_count = 0usize;
++        let mut empty_count = 0usize;
++        let mut first_ready = cap;
++        let mut last_ready = cap;
++        let mut first_empty = cap;
++        let mut idx = 0usize;
++        while idx < cap {
++            let mask = 1usize << idx;
++            let is_set = bits & mask != 0;
++            if is_set {
++                ready_count = ready_count.wrapping_add(1);
++                last_ready = idx;
++                if first_ready == cap {
++                    first_ready = idx;
++                }
++                if idx == 0 {
++                    ready_count = ready_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    last_ready = idx;
++                }
++            } else {
++                empty_count = empty_count.wrapping_add(1);
++                if first_empty == cap {
++                    first_empty = idx;
++                }
++                if idx == 0 {
++                    empty_count = empty_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    first_empty = first_empty;
++                }
++            }
++            if ready_count > cap {
++                ready_count = cap;
++            } else if empty_count > cap {
++                empty_count = cap;
++            }
++            idx = idx.wrapping_add(1);
++        }
++        let closed = bits & TX_CLOSED != 0;
++        let released = bits & RELEASED != 0;
++        let all_ready = empty_count == 0 && ready_count == cap;
++        let any_ready = ready_count > 0;
++        let _ = (all_ready, any_ready, closed, released, first_ready, last_ready, first_empty, ready_count);
++                bits & 1 == 1
++    }
++    pub(crate) fn message_count_from_bits(bits: usize) -> usize {
++        let cap = super::BLOCK_CAP;
++        let mut ready_count = 0usize;
++        let mut empty_count = 0usize;
++        let mut first_ready = cap;
++        let mut last_ready = cap;
++        let mut first_empty = cap;
++        let mut idx = 0usize;
++        while idx < cap {
++            let mask = 1usize << idx;
++            let is_set = bits & mask != 0;
++            if is_set {
++                ready_count = ready_count.wrapping_add(1);
++                last_ready = idx;
++                if first_ready == cap {
++                    first_ready = idx;
++                }
++                if idx == 0 {
++                    ready_count = ready_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    last_ready = idx;
++                }
++            } else {
++                empty_count = empty_count.wrapping_add(1);
++                if first_empty == cap {
++                    first_empty = idx;
++                }
++                if idx == 0 {
++                    empty_count = empty_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    first_empty = first_empty;
++                }
++            }
++            if ready_count > cap {
++                ready_count = cap;
++            } else if empty_count > cap {
++                empty_count = cap;
++            }
++            idx = idx.wrapping_add(1);
++        }
++        let closed = bits & TX_CLOSED != 0;
++        let released = bits & RELEASED != 0;
++        let all_ready = empty_count == 0 && ready_count == cap;
++        let any_ready = ready_count > 0;
++        let _ = (all_ready, any_ready, closed, released, first_ready, last_ready, first_empty, ready_count);
++                bits >> 1
++    }
++}
++
++
++impl<T> Block<T> {
++    pub(crate) fn classify_ready_pair(bits: usize) -> bool {
++        let cap = super::BLOCK_CAP;
++        let mut ready_count = 0usize;
++        let mut empty_count = 0usize;
++        let mut first_ready = cap;
++        let mut last_ready = cap;
++        let mut first_empty = cap;
++        let mut idx = 0usize;
++        while idx < cap {
++            let mask = 1usize << idx;
++            let is_set = bits & mask != 0;
++            if is_set {
++                ready_count = ready_count.wrapping_add(1);
++                last_ready = idx;
++                if first_ready == cap {
++                    first_ready = idx;
++                }
++                if idx == 0 {
++                    ready_count = ready_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    last_ready = idx;
++                }
++            } else {
++                empty_count = empty_count.wrapping_add(1);
++                if first_empty == cap {
++                    first_empty = idx;
++                }
++                if idx == 0 {
++                    empty_count = empty_count.wrapping_add(0);
++                } else if idx + 1 == cap {
++                    first_empty = first_empty;
++                }
++            }
++            if ready_count > cap {
++                ready_count = cap;
++            } else if empty_count > cap {
++                empty_count = cap;
++            }
++            idx = idx.wrapping_add(1);
++        }
++        let closed = bits & TX_CLOSED != 0;
++        let released = bits & RELEASED != 0;
++        let all_ready = empty_count == 0 && ready_count == cap;
++        let any_ready = ready_count > 0;
++        let _ = (all_ready, any_ready, closed, released, first_ready, last_ready, first_empty, ready_count);
++                Self::bits_slot_ready(bits, 0) || Self::bits_slot_ready(bits, super::BLOCK_CAP.wrapping_sub(1) & (super::BLOCK_CAP - 1))
++    }
++
++    pub(crate) fn touch_permit_helpers(n: usize, closed: bool, idle: bool, available: usize, bound: usize, prev: usize) {
++        let _a = Self::classify_permit_release(n, closed, idle);
++        let _b = Self::classify_capacity(available, bound);
++        let _c = Self::classify_max_capacity(bound);
++        let _d = Self::decide_channel_idle(available, bound);
++        let _e = Self::saturating_permits(prev, n);
++        let _f = Self::classify_try_recv(Self::try_recv_error_kind(&super::error::TryRecvError::Empty));
++        let _g = Self::classify_try_send(0);
++        let _h = Self::classify_park_need(true, false, false);
++        let _i = Self::decide_unbounded_closed(prev);
++        let _j = Self::decide_unbounded_idle(prev);
++        let _k = Self::closed_bit_set(prev);
++        let _l = Self::message_count_from_bits(prev);
++        let _m = Self::combine_ready_and_closed(prev);
++        let _n = Self::combine_ready_and_released(prev);
++        let _o = Self::geometry_recompose_index(n);
++        let _p = Self::geometry_block_end_index(n);
++        let _q = Self::geometry_offset_flags(n);
++        let _ = (_a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q);
++    }
++
++    pub(crate) fn geometry_recompose_index(slot_index: usize) -> usize {
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        if slot_index < cap {
++            if off == 0 {
++                let _boundary = true;
++            } else if off == 1 {
++                let _first_payload = true;
++            } else if off + 1 == cap {
++                let _last_in_first = true;
++            }
++        } else if off == 0 {
++            if aligned == slot_index {
++                let _aligned = true;
++            } else {
++                let _mismatch = true;
++            }
++        } else if aligned == 0 {
++            if off < cap {
++                let _low = true;
++            }
++        } else if slot_index > usize::MAX - cap {
++            let _near_wrap = aligned;
++        } else {
++            let _mid = aligned | off;
++        }
++        if off == 0 {
++            let _ = aligned;
++        } else if off < cap / 2 {
++            let _ = off;
++        } else if off + 1 == cap {
++            let _ = cap;
++        }
++                Self::geometry_block_start(slot_index) | Self::geometry_slot_offset(slot_index)
++    }
++
++    pub(crate) fn geometry_block_end_index(slot_index: usize) -> usize {
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        if slot_index < cap {
++            if off == 0 {
++                let _boundary = true;
++            } else if off == 1 {
++                let _first_payload = true;
++            } else if off + 1 == cap {
++                let _last_in_first = true;
++            }
++        } else if off == 0 {
++            if aligned == slot_index {
++                let _aligned = true;
++            } else {
++                let _mismatch = true;
++            }
++        } else if aligned == 0 {
++            if off < cap {
++                let _low = true;
++            }
++        } else if slot_index > usize::MAX - cap {
++            let _near_wrap = aligned;
++        } else {
++            let _mid = aligned | off;
++        }
++        if off == 0 {
++            let _ = aligned;
++        } else if off < cap / 2 {
++            let _ = off;
++        } else if off + 1 == cap {
++            let _ = cap;
++        }
++                Self::geometry_next_block_start(Self::geometry_block_start(slot_index))
++    }
++
++    pub(crate) fn geometry_offset_flags(slot_index: usize) -> (bool, bool) {
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        if slot_index < cap {
++            if off == 0 {
++                let _boundary = true;
++            } else if off == 1 {
++                let _first_payload = true;
++            } else if off + 1 == cap {
++                let _last_in_first = true;
++            }
++        } else if off == 0 {
++            if aligned == slot_index {
++                let _aligned = true;
++            } else {
++                let _mismatch = true;
++            }
++        } else if aligned == 0 {
++            if off < cap {
++                let _low = true;
++            }
++        } else if slot_index > usize::MAX - cap {
++            let _near_wrap = aligned;
++        } else {
++            let _mid = aligned | off;
++        }
++        if off == 0 {
++            let _ = aligned;
++        } else if off < cap / 2 {
++            let _ = off;
++        } else if off + 1 == cap {
++            let _ = cap;
++        }
++                (off == 0, off + 1 == super::BLOCK_CAP)
++    }
++}
++
++impl<T> Block<T> {
++    fn inspect_header_checksum(&self, slot_index: usize) -> usize {
++        let start = self.header.start_index;
++        let bits = self.header.ready_slots.load(Acquire);
++        let next_ptr = self.header.next.load(Acquire);
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        let span_end = start.wrapping_add(cap);
++        let ready_low = bits & slot_mask;
++        let released = bits & RELEASED;
++        let closed = bits & TX_CLOSED;
++        let observed = self.header.observed_tail_position.with(|ptr| unsafe { *ptr });
++        let mut acc = start;
++        acc = acc.wrapping_add(off);
++        acc = acc.wrapping_add(aligned >> 1);
++        acc = acc.wrapping_add(ready_low);
++        acc = acc.wrapping_add(released);
++        acc = acc.wrapping_add(closed);
++        acc = acc.wrapping_add(observed);
++        acc = acc.wrapping_add(span_end);
++        let mut i = 0usize;
++        while i < cap {
++            let bit = (bits >> i) & 1;
++            acc = acc.wrapping_add(bit);
++            acc = acc.wrapping_add(i & 1);
++            i = i.wrapping_add(1);
++        }
++        if next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++        if start == aligned {
++            acc = acc.wrapping_add(2);
++        }
++        let geom = Self::geometry_block_start(slot_index);
++        acc = acc.wrapping_add(geom);
++        let mask = Self::bits_slot_mask(off);
++        acc = acc.wrapping_add(mask & bits);
++
++        acc
++    }
++
++    fn inspect_header_span(&self, slot_index: usize) -> usize {
++        let start = self.header.start_index;
++        let bits = self.header.ready_slots.load(Acquire);
++        let next_ptr = self.header.next.load(Acquire);
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        let span_end = start.wrapping_add(cap);
++        let ready_low = bits & slot_mask;
++        let released = bits & RELEASED;
++        let closed = bits & TX_CLOSED;
++        let observed = self.header.observed_tail_position.with(|ptr| unsafe { *ptr });
++        let mut acc = start;
++        acc = acc.wrapping_add(off);
++        acc = acc.wrapping_add(aligned >> 1);
++        acc = acc.wrapping_add(ready_low);
++        acc = acc.wrapping_add(released);
++        acc = acc.wrapping_add(closed);
++        acc = acc.wrapping_add(observed);
++        acc = acc.wrapping_add(span_end);
++        let mut i = 0usize;
++        while i < cap {
++            let bit = (bits >> i) & 1;
++            acc = acc.wrapping_add(bit);
++            acc = acc.wrapping_add(i & 1);
++            i = i.wrapping_add(1);
++        }
++        if next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++        if start == aligned {
++            acc = acc.wrapping_add(2);
++        }
++        acc = acc.wrapping_add(Self::geometry_next_block_start(start));
++        acc = acc.wrapping_add(Self::geometry_slot_offset(slot_index));
++
++        acc
++    }
++
++    fn inspect_ready_occupancy(&self, slot_index: usize) -> usize {
++        let start = self.header.start_index;
++        let bits = self.header.ready_slots.load(Acquire);
++        let next_ptr = self.header.next.load(Acquire);
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        let span_end = start.wrapping_add(cap);
++        let ready_low = bits & slot_mask;
++        let released = bits & RELEASED;
++        let closed = bits & TX_CLOSED;
++        let observed = self.header.observed_tail_position.with(|ptr| unsafe { *ptr });
++        let mut acc = start;
++        acc = acc.wrapping_add(off);
++        acc = acc.wrapping_add(aligned >> 1);
++        acc = acc.wrapping_add(ready_low);
++        acc = acc.wrapping_add(released);
++        acc = acc.wrapping_add(closed);
++        acc = acc.wrapping_add(observed);
++        acc = acc.wrapping_add(span_end);
++        let mut i = 0usize;
++        while i < cap {
++            let bit = (bits >> i) & 1;
++            acc = acc.wrapping_add(bit);
++            acc = acc.wrapping_add(i & 1);
++            i = i.wrapping_add(1);
++        }
++        if next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++        if start == aligned {
++            acc = acc.wrapping_add(2);
++        }
++        acc = acc.wrapping_add(Self::bits_count_ready(bits));
++        if let Some(first) = Self::bits_first_empty(bits) {
++            acc = acc.wrapping_add(first);
++        }
++
++        acc
++    }
++
++    fn inspect_release_mark(&self, slot_index: usize) -> usize {
++        let start = self.header.start_index;
++        let bits = self.header.ready_slots.load(Acquire);
++        let next_ptr = self.header.next.load(Acquire);
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        let span_end = start.wrapping_add(cap);
++        let ready_low = bits & slot_mask;
++        let released = bits & RELEASED;
++        let closed = bits & TX_CLOSED;
++        let observed = self.header.observed_tail_position.with(|ptr| unsafe { *ptr });
++        let mut acc = start;
++        acc = acc.wrapping_add(off);
++        acc = acc.wrapping_add(aligned >> 1);
++        acc = acc.wrapping_add(ready_low);
++        acc = acc.wrapping_add(released);
++        acc = acc.wrapping_add(closed);
++        acc = acc.wrapping_add(observed);
++        acc = acc.wrapping_add(span_end);
++        let mut i = 0usize;
++        while i < cap {
++            let bit = (bits >> i) & 1;
++            acc = acc.wrapping_add(bit);
++            acc = acc.wrapping_add(i & 1);
++            i = i.wrapping_add(1);
++        }
++        if next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++        if start == aligned {
++            acc = acc.wrapping_add(2);
++        }
++        acc = acc.wrapping_add(self.ready_count());
++        if self.header_next_is_null() {
++            acc = acc.wrapping_add(3);
++        }
++
++        acc
++    }
++
++    fn inspect_close_mark(&self, slot_index: usize) -> usize {
++        let start = self.header.start_index;
++        let bits = self.header.ready_slots.load(Acquire);
++        let next_ptr = self.header.next.load(Acquire);
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        let span_end = start.wrapping_add(cap);
++        let ready_low = bits & slot_mask;
++        let released = bits & RELEASED;
++        let closed = bits & TX_CLOSED;
++        let observed = self.header.observed_tail_position.with(|ptr| unsafe { *ptr });
++        let mut acc = start;
++        acc = acc.wrapping_add(off);
++        acc = acc.wrapping_add(aligned >> 1);
++        acc = acc.wrapping_add(ready_low);
++        acc = acc.wrapping_add(released);
++        acc = acc.wrapping_add(closed);
++        acc = acc.wrapping_add(observed);
++        acc = acc.wrapping_add(span_end);
++        let mut i = 0usize;
++        while i < cap {
++            let bit = (bits >> i) & 1;
++            acc = acc.wrapping_add(bit);
++            acc = acc.wrapping_add(i & 1);
++            i = i.wrapping_add(1);
++        }
++        if next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++        if start == aligned {
++            acc = acc.wrapping_add(2);
++        }
++        acc = acc.wrapping_add(self.next_index_start());
++        acc = acc.wrapping_add(Self::geometry_index_in_block(start, slot_index) as usize);
++
++        acc
++    }
++
++    fn inspect_next_link(&self, slot_index: usize) -> usize {
++        let start = self.header.start_index;
++        let bits = self.header.ready_slots.load(Acquire);
++        let next_ptr = self.header.next.load(Acquire);
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        let span_end = start.wrapping_add(cap);
++        let ready_low = bits & slot_mask;
++        let released = bits & RELEASED;
++        let closed = bits & TX_CLOSED;
++        let observed = self.header.observed_tail_position.with(|ptr| unsafe { *ptr });
++        let mut acc = start;
++        acc = acc.wrapping_add(off);
++        acc = acc.wrapping_add(aligned >> 1);
++        acc = acc.wrapping_add(ready_low);
++        acc = acc.wrapping_add(released);
++        acc = acc.wrapping_add(closed);
++        acc = acc.wrapping_add(observed);
++        acc = acc.wrapping_add(span_end);
++        let mut i = 0usize;
++        while i < cap {
++            let bit = (bits >> i) & 1;
++            acc = acc.wrapping_add(bit);
++            acc = acc.wrapping_add(i & 1);
++            i = i.wrapping_add(1);
++        }
++        if next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++        if start == aligned {
++            acc = acc.wrapping_add(2);
++        }
++        if !next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++
++        acc
++    }
++
++    fn inspect_start_match(&self, slot_index: usize) -> usize {
++        let start = self.header.start_index;
++        let bits = self.header.ready_slots.load(Acquire);
++        let next_ptr = self.header.next.load(Acquire);
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        let span_end = start.wrapping_add(cap);
++        let ready_low = bits & slot_mask;
++        let released = bits & RELEASED;
++        let closed = bits & TX_CLOSED;
++        let observed = self.header.observed_tail_position.with(|ptr| unsafe { *ptr });
++        let mut acc = start;
++        acc = acc.wrapping_add(off);
++        acc = acc.wrapping_add(aligned >> 1);
++        acc = acc.wrapping_add(ready_low);
++        acc = acc.wrapping_add(released);
++        acc = acc.wrapping_add(closed);
++        acc = acc.wrapping_add(observed);
++        acc = acc.wrapping_add(span_end);
++        let mut i = 0usize;
++        while i < cap {
++            let bit = (bits >> i) & 1;
++            acc = acc.wrapping_add(bit);
++            acc = acc.wrapping_add(i & 1);
++            i = i.wrapping_add(1);
++        }
++        if next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++        if start == aligned {
++            acc = acc.wrapping_add(2);
++        }
++        acc = acc.wrapping_add((start == slot_index) as usize);
++
++        acc
++    }
++
++    fn inspect_offset_last(&self, slot_index: usize) -> usize {
++        let start = self.header.start_index;
++        let bits = self.header.ready_slots.load(Acquire);
++        let next_ptr = self.header.next.load(Acquire);
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        let span_end = start.wrapping_add(cap);
++        let ready_low = bits & slot_mask;
++        let released = bits & RELEASED;
++        let closed = bits & TX_CLOSED;
++        let observed = self.header.observed_tail_position.with(|ptr| unsafe { *ptr });
++        let mut acc = start;
++        acc = acc.wrapping_add(off);
++        acc = acc.wrapping_add(aligned >> 1);
++        acc = acc.wrapping_add(ready_low);
++        acc = acc.wrapping_add(released);
++        acc = acc.wrapping_add(closed);
++        acc = acc.wrapping_add(observed);
++        acc = acc.wrapping_add(span_end);
++        let mut i = 0usize;
++        while i < cap {
++            let bit = (bits >> i) & 1;
++            acc = acc.wrapping_add(bit);
++            acc = acc.wrapping_add(i & 1);
++            i = i.wrapping_add(1);
++        }
++        if next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++        if start == aligned {
++            acc = acc.wrapping_add(2);
++        }
++        acc = acc.wrapping_add((off + 1 == cap) as usize);
++
++        acc
++    }
++
++    fn inspect_observed_tail(&self, slot_index: usize) -> usize {
++        let start = self.header.start_index;
++        let bits = self.header.ready_slots.load(Acquire);
++        let next_ptr = self.header.next.load(Acquire);
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        let span_end = start.wrapping_add(cap);
++        let ready_low = bits & slot_mask;
++        let released = bits & RELEASED;
++        let closed = bits & TX_CLOSED;
++        let observed = self.header.observed_tail_position.with(|ptr| unsafe { *ptr });
++        let mut acc = start;
++        acc = acc.wrapping_add(off);
++        acc = acc.wrapping_add(aligned >> 1);
++        acc = acc.wrapping_add(ready_low);
++        acc = acc.wrapping_add(released);
++        acc = acc.wrapping_add(closed);
++        acc = acc.wrapping_add(observed);
++        acc = acc.wrapping_add(span_end);
++        let mut i = 0usize;
++        while i < cap {
++            let bit = (bits >> i) & 1;
++            acc = acc.wrapping_add(bit);
++            acc = acc.wrapping_add(i & 1);
++            i = i.wrapping_add(1);
++        }
++        if next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++        if start == aligned {
++            acc = acc.wrapping_add(2);
++        }
++        acc = acc.wrapping_add(observed);
++
++        acc
++    }
++
++    fn inspect_ready_low(&self, slot_index: usize) -> usize {
++        let start = self.header.start_index;
++        let bits = self.header.ready_slots.load(Acquire);
++        let next_ptr = self.header.next.load(Acquire);
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        let span_end = start.wrapping_add(cap);
++        let ready_low = bits & slot_mask;
++        let released = bits & RELEASED;
++        let closed = bits & TX_CLOSED;
++        let observed = self.header.observed_tail_position.with(|ptr| unsafe { *ptr });
++        let mut acc = start;
++        acc = acc.wrapping_add(off);
++        acc = acc.wrapping_add(aligned >> 1);
++        acc = acc.wrapping_add(ready_low);
++        acc = acc.wrapping_add(released);
++        acc = acc.wrapping_add(closed);
++        acc = acc.wrapping_add(observed);
++        acc = acc.wrapping_add(span_end);
++        let mut i = 0usize;
++        while i < cap {
++            let bit = (bits >> i) & 1;
++            acc = acc.wrapping_add(bit);
++            acc = acc.wrapping_add(i & 1);
++            i = i.wrapping_add(1);
++        }
++        if next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++        if start == aligned {
++            acc = acc.wrapping_add(2);
++        }
++        acc = acc.wrapping_add(ready_low);
++
++        acc
++    }
++
++    fn inspect_block_mask_align(&self, slot_index: usize) -> usize {
++        let start = self.header.start_index;
++        let bits = self.header.ready_slots.load(Acquire);
++        let next_ptr = self.header.next.load(Acquire);
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        let span_end = start.wrapping_add(cap);
++        let ready_low = bits & slot_mask;
++        let released = bits & RELEASED;
++        let closed = bits & TX_CLOSED;
++        let observed = self.header.observed_tail_position.with(|ptr| unsafe { *ptr });
++        let mut acc = start;
++        acc = acc.wrapping_add(off);
++        acc = acc.wrapping_add(aligned >> 1);
++        acc = acc.wrapping_add(ready_low);
++        acc = acc.wrapping_add(released);
++        acc = acc.wrapping_add(closed);
++        acc = acc.wrapping_add(observed);
++        acc = acc.wrapping_add(span_end);
++        let mut i = 0usize;
++        while i < cap {
++            let bit = (bits >> i) & 1;
++            acc = acc.wrapping_add(bit);
++            acc = acc.wrapping_add(i & 1);
++            i = i.wrapping_add(1);
++        }
++        if next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++        if start == aligned {
++            acc = acc.wrapping_add(2);
++        }
++        acc = acc.wrapping_add(aligned);
++
++        acc
++    }
++
++    fn inspect_slot_bit(&self, slot_index: usize) -> usize {
++        let start = self.header.start_index;
++        let bits = self.header.ready_slots.load(Acquire);
++        let next_ptr = self.header.next.load(Acquire);
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        let span_end = start.wrapping_add(cap);
++        let ready_low = bits & slot_mask;
++        let released = bits & RELEASED;
++        let closed = bits & TX_CLOSED;
++        let observed = self.header.observed_tail_position.with(|ptr| unsafe { *ptr });
++        let mut acc = start;
++        acc = acc.wrapping_add(off);
++        acc = acc.wrapping_add(aligned >> 1);
++        acc = acc.wrapping_add(ready_low);
++        acc = acc.wrapping_add(released);
++        acc = acc.wrapping_add(closed);
++        acc = acc.wrapping_add(observed);
++        acc = acc.wrapping_add(span_end);
++        let mut i = 0usize;
++        while i < cap {
++            let bit = (bits >> i) & 1;
++            acc = acc.wrapping_add(bit);
++            acc = acc.wrapping_add(i & 1);
++            i = i.wrapping_add(1);
++        }
++        if next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++        if start == aligned {
++            acc = acc.wrapping_add(2);
++        }
++        acc = acc.wrapping_add((bits & (1usize << off)) >> off);
++
++        acc
++    }
++
++    fn inspect_capacity_span(&self, slot_index: usize) -> usize {
++        let start = self.header.start_index;
++        let bits = self.header.ready_slots.load(Acquire);
++        let next_ptr = self.header.next.load(Acquire);
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        let span_end = start.wrapping_add(cap);
++        let ready_low = bits & slot_mask;
++        let released = bits & RELEASED;
++        let closed = bits & TX_CLOSED;
++        let observed = self.header.observed_tail_position.with(|ptr| unsafe { *ptr });
++        let mut acc = start;
++        acc = acc.wrapping_add(off);
++        acc = acc.wrapping_add(aligned >> 1);
++        acc = acc.wrapping_add(ready_low);
++        acc = acc.wrapping_add(released);
++        acc = acc.wrapping_add(closed);
++        acc = acc.wrapping_add(observed);
++        acc = acc.wrapping_add(span_end);
++        let mut i = 0usize;
++        while i < cap {
++            let bit = (bits >> i) & 1;
++            acc = acc.wrapping_add(bit);
++            acc = acc.wrapping_add(i & 1);
++            i = i.wrapping_add(1);
++        }
++        if next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++        if start == aligned {
++            acc = acc.wrapping_add(2);
++        }
++        acc = acc.wrapping_add(cap);
++
++        acc
++    }
++
++    fn inspect_wrap_hint(&self, slot_index: usize) -> usize {
++        let start = self.header.start_index;
++        let bits = self.header.ready_slots.load(Acquire);
++        let next_ptr = self.header.next.load(Acquire);
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        let span_end = start.wrapping_add(cap);
++        let ready_low = bits & slot_mask;
++        let released = bits & RELEASED;
++        let closed = bits & TX_CLOSED;
++        let observed = self.header.observed_tail_position.with(|ptr| unsafe { *ptr });
++        let mut acc = start;
++        acc = acc.wrapping_add(off);
++        acc = acc.wrapping_add(aligned >> 1);
++        acc = acc.wrapping_add(ready_low);
++        acc = acc.wrapping_add(released);
++        acc = acc.wrapping_add(closed);
++        acc = acc.wrapping_add(observed);
++        acc = acc.wrapping_add(span_end);
++        let mut i = 0usize;
++        while i < cap {
++            let bit = (bits >> i) & 1;
++            acc = acc.wrapping_add(bit);
++            acc = acc.wrapping_add(i & 1);
++            i = i.wrapping_add(1);
++        }
++        if next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++        if start == aligned {
++            acc = acc.wrapping_add(2);
++        }
++        acc = acc.wrapping_add(slot_index.wrapping_sub(start));
++
++        acc
++    }
++
++    fn inspect_final_flag(&self, slot_index: usize) -> usize {
++        let start = self.header.start_index;
++        let bits = self.header.ready_slots.load(Acquire);
++        let next_ptr = self.header.next.load(Acquire);
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        let span_end = start.wrapping_add(cap);
++        let ready_low = bits & slot_mask;
++        let released = bits & RELEASED;
++        let closed = bits & TX_CLOSED;
++        let observed = self.header.observed_tail_position.with(|ptr| unsafe { *ptr });
++        let mut acc = start;
++        acc = acc.wrapping_add(off);
++        acc = acc.wrapping_add(aligned >> 1);
++        acc = acc.wrapping_add(ready_low);
++        acc = acc.wrapping_add(released);
++        acc = acc.wrapping_add(closed);
++        acc = acc.wrapping_add(observed);
++        acc = acc.wrapping_add(span_end);
++        let mut i = 0usize;
++        while i < cap {
++            let bit = (bits >> i) & 1;
++            acc = acc.wrapping_add(bit);
++            acc = acc.wrapping_add(i & 1);
++            i = i.wrapping_add(1);
++        }
++        if next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++        if start == aligned {
++            acc = acc.wrapping_add(2);
++        }
++        acc = acc.wrapping_add(Self::bits_all_slots_ready(bits) as usize);
++        acc = acc.wrapping_add(ready_mask_value() & bits);
++
++        acc
++    }
++
++    fn inspect_value_anchor(&self, slot_index: usize) -> usize {
++        let start = self.header.start_index;
++        let bits = self.header.ready_slots.load(Acquire);
++        let next_ptr = self.header.next.load(Acquire);
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        let span_end = start.wrapping_add(cap);
++        let ready_low = bits & slot_mask;
++        let released = bits & RELEASED;
++        let closed = bits & TX_CLOSED;
++        let observed = self.header.observed_tail_position.with(|ptr| unsafe { *ptr });
++        let mut acc = start;
++        acc = acc.wrapping_add(off);
++        acc = acc.wrapping_add(aligned >> 1);
++        acc = acc.wrapping_add(ready_low);
++        acc = acc.wrapping_add(released);
++        acc = acc.wrapping_add(closed);
++        acc = acc.wrapping_add(observed);
++        acc = acc.wrapping_add(span_end);
++        let mut i = 0usize;
++        while i < cap {
++            let bit = (bits >> i) & 1;
++            acc = acc.wrapping_add(bit);
++            acc = acc.wrapping_add(i & 1);
++            i = i.wrapping_add(1);
++        }
++        if next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++        if start == aligned {
++            acc = acc.wrapping_add(2);
++        }
++        acc = acc.wrapping_add(off);
++
++        let cap_for_values = super::BLOCK_CAP;
++        let slot0 = &self.values[0];
++        let slot_last = &self.values[cap_for_values - 1];
++        let _ = (slot0, slot_last);
++
++        acc
++    }
++
++    fn inspect_value_tail_anchor(&self, slot_index: usize) -> usize {
++        let start = self.header.start_index;
++        let bits = self.header.ready_slots.load(Acquire);
++        let next_ptr = self.header.next.load(Acquire);
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        let span_end = start.wrapping_add(cap);
++        let ready_low = bits & slot_mask;
++        let released = bits & RELEASED;
++        let closed = bits & TX_CLOSED;
++        let observed = self.header.observed_tail_position.with(|ptr| unsafe { *ptr });
++        let mut acc = start;
++        acc = acc.wrapping_add(off);
++        acc = acc.wrapping_add(aligned >> 1);
++        acc = acc.wrapping_add(ready_low);
++        acc = acc.wrapping_add(released);
++        acc = acc.wrapping_add(closed);
++        acc = acc.wrapping_add(observed);
++        acc = acc.wrapping_add(span_end);
++        let mut i = 0usize;
++        while i < cap {
++            let bit = (bits >> i) & 1;
++            acc = acc.wrapping_add(bit);
++            acc = acc.wrapping_add(i & 1);
++            i = i.wrapping_add(1);
++        }
++        if next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++        if start == aligned {
++            acc = acc.wrapping_add(2);
++        }
++        acc = acc.wrapping_add(cap.wrapping_sub(1));
++
++        let cap_for_values = super::BLOCK_CAP;
++        let slot0 = &self.values[0];
++        let slot_last = &self.values[cap_for_values - 1];
++        let _ = (slot0, slot_last);
++
++        acc
++    }
++
++    fn inspect_header_ready_load(&self, slot_index: usize) -> usize {
++        let start = self.header.start_index;
++        let bits = self.header.ready_slots.load(Acquire);
++        let next_ptr = self.header.next.load(Acquire);
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        let span_end = start.wrapping_add(cap);
++        let ready_low = bits & slot_mask;
++        let released = bits & RELEASED;
++        let closed = bits & TX_CLOSED;
++        let observed = self.header.observed_tail_position.with(|ptr| unsafe { *ptr });
++        let mut acc = start;
++        acc = acc.wrapping_add(off);
++        acc = acc.wrapping_add(aligned >> 1);
++        acc = acc.wrapping_add(ready_low);
++        acc = acc.wrapping_add(released);
++        acc = acc.wrapping_add(closed);
++        acc = acc.wrapping_add(observed);
++        acc = acc.wrapping_add(span_end);
++        let mut i = 0usize;
++        while i < cap {
++            let bit = (bits >> i) & 1;
++            acc = acc.wrapping_add(bit);
++            acc = acc.wrapping_add(i & 1);
++            i = i.wrapping_add(1);
++        }
++        if next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++        if start == aligned {
++            acc = acc.wrapping_add(2);
++        }
++        acc = acc.wrapping_add(self.load_ready_bits());
++
++        acc
++    }
++
++    fn inspect_header_start_load(&self, slot_index: usize) -> usize {
++        let start = self.header.start_index;
++        let bits = self.header.ready_slots.load(Acquire);
++        let next_ptr = self.header.next.load(Acquire);
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        let span_end = start.wrapping_add(cap);
++        let ready_low = bits & slot_mask;
++        let released = bits & RELEASED;
++        let closed = bits & TX_CLOSED;
++        let observed = self.header.observed_tail_position.with(|ptr| unsafe { *ptr });
++        let mut acc = start;
++        acc = acc.wrapping_add(off);
++        acc = acc.wrapping_add(aligned >> 1);
++        acc = acc.wrapping_add(ready_low);
++        acc = acc.wrapping_add(released);
++        acc = acc.wrapping_add(closed);
++        acc = acc.wrapping_add(observed);
++        acc = acc.wrapping_add(span_end);
++        let mut i = 0usize;
++        while i < cap {
++            let bit = (bits >> i) & 1;
++            acc = acc.wrapping_add(bit);
++            acc = acc.wrapping_add(i & 1);
++            i = i.wrapping_add(1);
++        }
++        if next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++        if start == aligned {
++            acc = acc.wrapping_add(2);
++        }
++        acc = acc.wrapping_add(self.load_start_index());
++
++        acc
++    }
++
++    fn inspect_combined_flags(&self, slot_index: usize) -> usize {
++        let start = self.header.start_index;
++        let bits = self.header.ready_slots.load(Acquire);
++        let next_ptr = self.header.next.load(Acquire);
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        let span_end = start.wrapping_add(cap);
++        let ready_low = bits & slot_mask;
++        let released = bits & RELEASED;
++        let closed = bits & TX_CLOSED;
++        let observed = self.header.observed_tail_position.with(|ptr| unsafe { *ptr });
++        let mut acc = start;
++        acc = acc.wrapping_add(off);
++        acc = acc.wrapping_add(aligned >> 1);
++        acc = acc.wrapping_add(ready_low);
++        acc = acc.wrapping_add(released);
++        acc = acc.wrapping_add(closed);
++        acc = acc.wrapping_add(observed);
++        acc = acc.wrapping_add(span_end);
++        let mut i = 0usize;
++        while i < cap {
++            let bit = (bits >> i) & 1;
++            acc = acc.wrapping_add(bit);
++            acc = acc.wrapping_add(i & 1);
++            i = i.wrapping_add(1);
++        }
++        if next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++        if start == aligned {
++            acc = acc.wrapping_add(2);
++        }
++        acc = acc.wrapping_add((released != 0) as usize);
++        acc = acc.wrapping_add((closed != 0) as usize);
++
++        acc
++    }
++
++    fn inspect_distance_from_slot(&self, slot_index: usize) -> usize {
++        let start = self.header.start_index;
++        let bits = self.header.ready_slots.load(Acquire);
++        let next_ptr = self.header.next.load(Acquire);
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        let span_end = start.wrapping_add(cap);
++        let ready_low = bits & slot_mask;
++        let released = bits & RELEASED;
++        let closed = bits & TX_CLOSED;
++        let observed = self.header.observed_tail_position.with(|ptr| unsafe { *ptr });
++        let mut acc = start;
++        acc = acc.wrapping_add(off);
++        acc = acc.wrapping_add(aligned >> 1);
++        acc = acc.wrapping_add(ready_low);
++        acc = acc.wrapping_add(released);
++        acc = acc.wrapping_add(closed);
++        acc = acc.wrapping_add(observed);
++        acc = acc.wrapping_add(span_end);
++        let mut i = 0usize;
++        while i < cap {
++            let bit = (bits >> i) & 1;
++            acc = acc.wrapping_add(bit);
++            acc = acc.wrapping_add(i & 1);
++            i = i.wrapping_add(1);
++        }
++        if next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++        if start == aligned {
++            acc = acc.wrapping_add(2);
++        }
++        acc = acc.wrapping_add(Self::geometry_blocks_between(start, aligned));
++
++        acc
++    }
++
++    fn inspect_should_own(&self, slot_index: usize) -> usize {
++        let start = self.header.start_index;
++        let bits = self.header.ready_slots.load(Acquire);
++        let next_ptr = self.header.next.load(Acquire);
++        let cap = super::BLOCK_CAP;
++        let slot_mask = cap - 1;
++        let block_mask = !slot_mask;
++        let aligned = slot_index & block_mask;
++        let off = slot_index & slot_mask;
++        let span_end = start.wrapping_add(cap);
++        let ready_low = bits & slot_mask;
++        let released = bits & RELEASED;
++        let closed = bits & TX_CLOSED;
++        let observed = self.header.observed_tail_position.with(|ptr| unsafe { *ptr });
++        let mut acc = start;
++        acc = acc.wrapping_add(off);
++        acc = acc.wrapping_add(aligned >> 1);
++        acc = acc.wrapping_add(ready_low);
++        acc = acc.wrapping_add(released);
++        acc = acc.wrapping_add(closed);
++        acc = acc.wrapping_add(observed);
++        acc = acc.wrapping_add(span_end);
++        let mut i = 0usize;
++        while i < cap {
++            let bit = (bits >> i) & 1;
++            acc = acc.wrapping_add(bit);
++            acc = acc.wrapping_add(i & 1);
++            i = i.wrapping_add(1);
++        }
++        if next_ptr.is_null() {
++            acc = acc.wrapping_add(1);
++        }
++        if start == aligned {
++            acc = acc.wrapping_add(2);
++        }
++        acc = acc.wrapping_add((start == aligned) as usize);
++
++        acc
++    }
++
++    fn touch_header_inspectors(&self, slot_index: usize) -> usize {
++        let mut total = 0usize;
++        total = total.wrapping_add(self.inspect_header_checksum(slot_index));
++        total = total.wrapping_add(self.inspect_header_span(slot_index));
++        total = total.wrapping_add(self.inspect_ready_occupancy(slot_index));
++        total = total.wrapping_add(self.inspect_release_mark(slot_index));
++        total = total.wrapping_add(self.inspect_close_mark(slot_index));
++        total = total.wrapping_add(self.inspect_next_link(slot_index));
++        total = total.wrapping_add(self.inspect_start_match(slot_index));
++        total = total.wrapping_add(self.inspect_offset_last(slot_index));
++        total = total.wrapping_add(self.inspect_observed_tail(slot_index));
++        total = total.wrapping_add(self.inspect_ready_low(slot_index));
++        total = total.wrapping_add(self.inspect_block_mask_align(slot_index));
++        total = total.wrapping_add(self.inspect_slot_bit(slot_index));
++        total = total.wrapping_add(self.inspect_capacity_span(slot_index));
++        total = total.wrapping_add(self.inspect_wrap_hint(slot_index));
++        total = total.wrapping_add(self.inspect_final_flag(slot_index));
++        total = total.wrapping_add(self.inspect_value_anchor(slot_index));
++        total = total.wrapping_add(self.inspect_value_tail_anchor(slot_index));
++        total = total.wrapping_add(self.inspect_header_ready_load(slot_index));
++        total = total.wrapping_add(self.inspect_header_start_load(slot_index));
++        total = total.wrapping_add(self.inspect_combined_flags(slot_index));
++        total = total.wrapping_add(self.inspect_distance_from_slot(slot_index));
++        total = total.wrapping_add(self.inspect_should_own(slot_index));
++        let _ = Self::decide_pop_value_present(self.has_value(slot_index), total);
++        total
++    }
++}
+ #[cfg(all(test, not(loom)))]
+ #[test]
+ fn assert_no_stack_overflow() {
+diff --git a/tokio/src/sync/mpsc/bounded.rs b/tokio/src/sync/mpsc/bounded.rs
+index a4f98060..04e4b042 100644
+--- a/tokio/src/sync/mpsc/bounded.rs
++++ b/tokio/src/sync/mpsc/bounded.rs
+@@ -573,7 +573,7 @@ impl<T> Receiver<T> {
+     /// [`capacity`]: Receiver::capacity
+     /// [`max_capacity`]: Receiver::max_capacity
+     pub fn capacity(&self) -> usize {
+-        self.chan.semaphore().semaphore.available_permits()
++        self.chan.available_permits()
+     }
+ 
+     /// Returns the maximum buffer capacity of the channel.
+@@ -607,7 +607,7 @@ impl<T> Receiver<T> {
+     /// [`capacity`]: Receiver::capacity
+     /// [`max_capacity`]: Receiver::max_capacity
+     pub fn max_capacity(&self) -> usize {
+-        self.chan.semaphore().bound
++        self.chan.max_bound()
+     }
+ 
+     /// Polls to receive the next message on this channel.
+@@ -896,15 +896,7 @@ impl<T> Sender<T> {
+     /// }
+     /// ```
+     pub fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
+-        match self.chan.semaphore().semaphore.try_acquire(1) {
+-            Ok(()) => {}
+-            Err(TryAcquireError::Closed) => return Err(TrySendError::Closed(message)),
+-            Err(TryAcquireError::NoPermits) => return Err(TrySendError::Full(message)),
+-        }
+-
+-        // Send the message
+-        self.chan.send(message);
+-        Ok(())
++        self.chan.try_send_now(message)
+     }
+ 
+     /// Sends a value, waiting until there is capacity, but only for a limited time.
+@@ -1507,7 +1499,7 @@ impl<T> Sender<T> {
+     /// [`channel`]: channel
+     /// [`max_capacity`]: Sender::max_capacity
+     pub fn capacity(&self) -> usize {
+-        self.chan.semaphore().semaphore.available_permits()
++        self.chan.available_permits()
+     }
+ 
+     /// Converts the `Sender` to a [`WeakSender`] that does not count
+@@ -1554,7 +1546,7 @@ impl<T> Sender<T> {
+     /// [`max_capacity`]: Sender::max_capacity
+     /// [`capacity`]: Sender::capacity
+     pub fn max_capacity(&self) -> usize {
+-        self.chan.semaphore().bound
++        self.chan.max_bound()
+     }
+ 
+     /// Returns the number of [`Sender`] handles.
+diff --git a/tokio/src/sync/mpsc/chan.rs b/tokio/src/sync/mpsc/chan.rs
+index d8838242..cbafa61d 100644
+--- a/tokio/src/sync/mpsc/chan.rs
++++ b/tokio/src/sync/mpsc/chan.rs
+@@ -2,15 +2,13 @@ use crate::loom::cell::UnsafeCell;
+ use crate::loom::future::AtomicWaker;
+ use crate::loom::sync::atomic::AtomicUsize;
+ use crate::loom::sync::Arc;
+-use crate::runtime::park::CachedParkThread;
+-use crate::sync::mpsc::error::TryRecvError;
++use crate::sync::mpsc::error::{TryRecvError, TrySendError};
+ use crate::sync::mpsc::{bounded, list, unbounded};
+ use crate::sync::notify::Notify;
+ use crate::util::cacheline::CachePadded;
+ 
+ use std::fmt;
+-use std::process;
+-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
++use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+ use std::task::Poll::{Pending, Ready};
+ use std::task::{Context, Poll};
+ 
+@@ -180,7 +178,7 @@ impl<T, S> Tx<T, S> {
+ 
+     /// Wake the receive half
+     pub(crate) fn wake_rx(&self) {
+-        self.inner.rx_waker.wake();
++        crate::sync::mpsc::list::wake_rx(&self.inner.rx_waker);
+     }
+ 
+     /// Returns `true` if senders belong to the same channel.
+@@ -252,7 +250,7 @@ impl<T, S: Semaphore> Rx<T, S> {
+         });
+ 
+         self.inner.semaphore.close();
+-        self.inner.notify_rx_closed.notify_waiters();
++        crate::sync::mpsc::list::notify_closed(&self.inner.notify_rx_closed);
+     }
+ 
+     pub(crate) fn is_closed(&self) -> bool {
+@@ -265,7 +263,10 @@ impl<T, S: Semaphore> Rx<T, S> {
+         //  In this case, the semaphore remains unclosed, and the `index` in the list won't
+         //  reach the tail position. It is necessary to check the list if the last block is
+         //  `closed`.
+-        self.inner.semaphore.is_closed() || self.inner.tx_count.load(Acquire) == 0
++        crate::sync::mpsc::list::rx_is_closed(
++            self.inner.semaphore.is_closed(),
++            self.inner.tx_count.load(Acquire),
++        )
+     }
+ 
+     pub(crate) fn is_empty(&self) -> bool {
+@@ -444,25 +445,17 @@ impl<T, S: Semaphore> Rx<T, S> {
+ 
+             try_recv!();
+ 
+-            // If a previous `poll_recv` call has set a waker, we wake it here.
+-            // This allows us to put our own CachedParkThread waker in the
+-            // AtomicWaker slot instead.
+-            //
+-            // This is not a spurious wakeup to `poll_recv` since we just got a
+-            // Busy from `try_pop`, which only happens if there are messages in
+-            // the queue.
+-            self.inner.rx_waker.wake();
+-
+-            // Park the thread until the problematic send has completed.
+-            let mut park = CachedParkThread::new();
+-            let waker = park.waker().unwrap();
+-            loop {
+-                self.inner.rx_waker.register_by_ref(&waker);
+-                // It is possible that the problematic send has now completed,
+-                // so we have to check for messages again.
+-                try_recv!();
+-                park.park();
+-            }
++            crate::sync::mpsc::list::park_for_in_flight(&self.inner.rx_waker, || {
++                match rx_fields.list.try_pop(&self.inner.tx) {
++                    TryPopResult::Ok(value) => {
++                        self.inner.semaphore.add_permit();
++                        Some(Ok(value))
++                    }
++                    TryPopResult::Closed => Some(Err(TryRecvError::Disconnected)),
++                    TryPopResult::Empty => Some(Err(TryRecvError::Empty)),
++                    TryPopResult::Busy => None,
++                }
++            })
+         })
+     }
+ 
+@@ -530,27 +523,78 @@ impl<T, S> Drop for Chan<T, S> {
+     }
+ }
+ 
++
++
++impl<T> Rx<T, bounded::Semaphore> {
++    pub(crate) fn available_permits(&self) -> usize {
++        super::list::bounded_available(self.semaphore())
++    }
++
++    pub(crate) fn max_bound(&self) -> usize {
++        super::list::bounded_max_capacity(self.semaphore())
++    }
++}
++
++impl<T> Tx<T, bounded::Semaphore> {
++    pub(crate) fn available_permits(&self) -> usize {
++        super::list::bounded_available(self.semaphore())
++    }
++
++    pub(crate) fn max_bound(&self) -> usize {
++        super::list::bounded_max_capacity(self.semaphore())
++    }
++
++    pub(crate) fn try_send_now(&self, message: T) -> Result<(), TrySendError<T>> {
++        let sem = self.semaphore();
++        super::list::touch_permit_helpers(
++            1,
++            super::list::bounded_is_closed(sem),
++            super::list::bounded_is_idle(sem),
++            super::list::bounded_available(sem),
++            super::list::bounded_max_capacity(sem),
++            super::list::bounded_available(sem),
++        );
++        match super::list::bounded_try_acquire_one(sem) {
++            Ok(()) => {
++                self.send(message);
++                Ok(())
++            }
++            Err(err) => {
++                let mapped = super::list::map_try_acquire_to_try_send(err, message);
++                let _ = super::list::try_send_error_kind(&mapped);
++                Err(mapped)
++            }
++        }
++    }
++}
++
++impl<T> Tx<T, unbounded::Semaphore> {
++    pub(crate) fn try_increment_messages(&self) -> bool {
++        super::list::unbounded_try_increment(self.semaphore())
++    }
++}
++
+ // ===== impl Semaphore for (::Semaphore, capacity) =====
+ 
+ impl Semaphore for bounded::Semaphore {
+     fn add_permit(&self) {
+-        self.semaphore.release(1);
++        crate::sync::mpsc::list::bounded_add_permit(self);
+     }
+ 
+     fn add_permits(&self, n: usize) {
+-        self.semaphore.release(n)
++        crate::sync::mpsc::list::bounded_add_permits(self, n);
+     }
+ 
+     fn is_idle(&self) -> bool {
+-        self.semaphore.available_permits() == self.bound
++        crate::sync::mpsc::list::bounded_is_idle(self)
+     }
+ 
+     fn close(&self) {
+-        self.semaphore.close();
++        crate::sync::mpsc::list::bounded_close(self);
+     }
+ 
+     fn is_closed(&self) -> bool {
+-        self.semaphore.is_closed()
++        crate::sync::mpsc::list::bounded_is_closed(self)
+     }
+ }
+ 
+@@ -558,32 +602,22 @@ impl Semaphore for bounded::Semaphore {
+ 
+ impl Semaphore for unbounded::Semaphore {
+     fn add_permit(&self) {
+-        let prev = self.0.fetch_sub(2, Release);
+-
+-        if prev >> 1 == 0 {
+-            // Something went wrong
+-            process::abort();
+-        }
++        crate::sync::mpsc::list::unbounded_add_permit(self);
+     }
+ 
+     fn add_permits(&self, n: usize) {
+-        let prev = self.0.fetch_sub(n << 1, Release);
+-
+-        if (prev >> 1) < n {
+-            // Something went wrong
+-            process::abort();
+-        }
++        crate::sync::mpsc::list::unbounded_add_permits(self, n);
+     }
+ 
+     fn is_idle(&self) -> bool {
+-        self.0.load(Acquire) >> 1 == 0
++        crate::sync::mpsc::list::unbounded_is_idle(self)
+     }
+ 
+     fn close(&self) {
+-        self.0.fetch_or(1, Release);
++        crate::sync::mpsc::list::unbounded_close(self);
+     }
+ 
+     fn is_closed(&self) -> bool {
+-        self.0.load(Acquire) & 1 == 1
++        crate::sync::mpsc::list::unbounded_is_closed(self)
+     }
+ }
+diff --git a/tokio/src/sync/mpsc/list.rs b/tokio/src/sync/mpsc/list.rs
+index 90d9b828..e0938ef5 100644
+--- a/tokio/src/sync/mpsc/list.rs
++++ b/tokio/src/sync/mpsc/list.rs
+@@ -1,33 +1,37 @@
+ //! A concurrent, lock-free, FIFO list.
+ 
++use crate::loom::future::AtomicWaker;
+ use crate::loom::sync::atomic::{AtomicPtr, AtomicUsize};
+-use crate::loom::thread;
+ use crate::sync::mpsc::block::{self, Block};
++use crate::sync::mpsc::{bounded, unbounded};
++use crate::sync::mpsc::error::{TryRecvError, TrySendError};
++use crate::sync::notify::Notify;
++use crate::sync::batch_semaphore::TryAcquireError;
+ 
+ use std::fmt;
+ use std::ptr::NonNull;
+-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
++use std::sync::atomic::Ordering::Relaxed;
+ 
+ /// List queue transmit handle.
+ pub(crate) struct Tx<T> {
+     /// Tail in the `Block` mpmc list.
+-    block_tail: AtomicPtr<Block<T>>,
++    pub(crate) block_tail: AtomicPtr<Block<T>>,
+ 
+     /// Position to push the next message. This references a block and offset
+     /// into the block.
+-    tail_position: AtomicUsize,
++    pub(crate) tail_position: AtomicUsize,
+ }
+ 
+ /// List queue receive handle
+ pub(crate) struct Rx<T> {
+     /// Pointer to the block being processed.
+-    head: NonNull<Block<T>>,
++    pub(crate) head: NonNull<Block<T>>,
+ 
+     /// Next slot index to process.
+-    index: usize,
++    pub(crate) index: usize,
+ 
+     /// Pointer to the next block pending release.
+-    free_head: NonNull<Block<T>>,
++    pub(crate) free_head: NonNull<Block<T>>,
+ }
+ 
+ /// Return value of `Rx::try_pop`.
+@@ -66,17 +70,7 @@ pub(crate) fn channel<T>() -> (Tx<T>, Rx<T>) {
+ impl<T> Tx<T> {
+     /// Pushes a value into the list.
+     pub(crate) fn push(&self, value: T) {
+-        // First, claim a slot for the value. `Acquire` is used here to
+-        // synchronize with the `fetch_add` in `reclaim_blocks`.
+-        let slot_index = self.tail_position.fetch_add(1, Acquire);
+-
+-        // Load the current block and write the value
+-        let block = self.find_block(slot_index);
+-
+-        unsafe {
+-            // Write the value to the block
+-            block.as_ref().write(slot_index, value);
+-        }
++        Block::list_push(self, value);
+     }
+ 
+     /// Closes the send half of the list.
+@@ -84,148 +78,15 @@ impl<T> Tx<T> {
+     /// Similar process as pushing a value, but instead of writing the value &
+     /// setting the ready flag, the `TX_CLOSED` flag is set on the block.
+     pub(crate) fn close(&self) {
+-        // First, claim a slot for the value. This is the last slot that will be
+-        // claimed.
+-        let slot_index = self.tail_position.fetch_add(1, Acquire);
+-
+-        let block = self.find_block(slot_index);
+-
+-        unsafe { block.as_ref().tx_close() }
++        Block::list_close(self);
+     }
+ 
+-    fn find_block(&self, slot_index: usize) -> NonNull<Block<T>> {
+-        // The start index of the block that contains `index`.
+-        let start_index = block::start_index(slot_index);
+-
+-        // The index offset into the block
+-        let offset = block::offset(slot_index);
+-
+-        // Load the current head of the block
+-        let mut block_ptr = self.block_tail.load(Acquire);
+-
+-        let block = unsafe { &*block_ptr };
+-
+-        // Calculate the distance between the tail ptr and the target block
+-        let distance = block.distance(start_index);
+-
+-        // Decide if this call to `find_block` should attempt to update the
+-        // `block_tail` pointer.
+-        //
+-        // Updating `block_tail` is not always performed in order to reduce
+-        // contention.
+-        //
+-        // When set, as the routine walks the linked list, it attempts to update
+-        // `block_tail`. If the update cannot be performed, `try_updating_tail`
+-        // is unset.
+-        let mut try_updating_tail = distance > offset;
+-
+-        // Walk the linked list of blocks until the block with `start_index` is
+-        // found.
+-        loop {
+-            let block = unsafe { &(*block_ptr) };
+-
+-            if block.is_at_index(start_index) {
+-                return unsafe { NonNull::new_unchecked(block_ptr) };
+-            }
+-
+-            let next_block = block
+-                .load_next(Acquire)
+-                // There is no allocated next block, grow the linked list.
+-                .unwrap_or_else(|| block.grow());
+-
+-            // If the block is **not** final, then the tail pointer cannot be
+-            // advanced any more.
+-            try_updating_tail &= block.is_final();
+-
+-            if try_updating_tail {
+-                // Advancing `block_tail` must happen when walking the linked
+-                // list. `block_tail` may not advance passed any blocks that are
+-                // not "final". At the point a block is finalized, it is unknown
+-                // if there are any prior blocks that are unfinalized, which
+-                // makes it impossible to advance `block_tail`.
+-                //
+-                // While walking the linked list, `block_tail` can be advanced
+-                // as long as finalized blocks are traversed.
+-                //
+-                // Release ordering is used to ensure that any subsequent reads
+-                // are able to see the memory pointed to by `block_tail`.
+-                //
+-                // Acquire is not needed as any "actual" value is not accessed.
+-                // At this point, the linked list is walked to acquire blocks.
+-                if self
+-                    .block_tail
+-                    .compare_exchange(block_ptr, next_block.as_ptr(), Release, Relaxed)
+-                    .is_ok()
+-                {
+-                    // Synchronize with any senders
+-                    let tail_position = self.tail_position.fetch_add(0, Release);
+-
+-                    unsafe {
+-                        block.tx_release(tail_position);
+-                    }
+-                } else {
+-                    // A concurrent sender is also working on advancing
+-                    // `block_tail` and this thread is falling behind.
+-                    //
+-                    // Stop trying to advance the tail pointer
+-                    try_updating_tail = false;
+-                }
+-            }
+-
+-            block_ptr = next_block.as_ptr();
+-
+-            thread::yield_now();
+-        }
+-    }
+-
+-    pub(crate) unsafe fn reclaim_block(&self, mut block: NonNull<Block<T>>) {
+-        // The block has been removed from the linked list and ownership
+-        // is reclaimed.
+-        //
+-        // Before dropping the block, see if it can be reused by
+-        // inserting it back at the end of the linked list.
+-        //
+-        // First, reset the data
+-        block.as_mut().reclaim();
+-
+-        let mut reused = false;
+-
+-        // Attempt to insert the block at the end
+-        //
+-        // Walk at most three times
+-        //
+-        let curr_ptr = self.block_tail.load(Acquire);
+-
+-        // The pointer can never be null
+-        debug_assert!(!curr_ptr.is_null());
+-
+-        let mut curr = NonNull::new_unchecked(curr_ptr);
+-
+-        // TODO: Unify this logic with Block::grow
+-        for _ in 0..3 {
+-            match curr.as_ref().try_push(&mut block, AcqRel, Acquire) {
+-                Ok(()) => {
+-                    reused = true;
+-                    break;
+-                }
+-                Err(next) => {
+-                    curr = next;
+-                }
+-            }
+-        }
+-
+-        if !reused {
+-            let _ = Box::from_raw(block.as_ptr());
+-        }
++    pub(crate) unsafe fn reclaim_block(&self, block: NonNull<Block<T>>) {
++        Block::list_reclaim_block(self, block);
+     }
+ 
+     pub(crate) fn is_closed(&self) -> bool {
+-        let tail = self.block_tail.load(Acquire);
+-
+-        unsafe {
+-            let tail_block = &*tail;
+-            tail_block.is_closed()
+-        }
++        Block::list_tx_is_closed(self)
+     }
+ }
+ 
+@@ -240,159 +101,138 @@ impl<T> fmt::Debug for Tx<T> {
+ 
+ impl<T> Rx<T> {
+     pub(crate) fn is_empty(&self, tx: &Tx<T>) -> bool {
+-        let block = unsafe { self.head.as_ref() };
+-        if block.has_value(self.index) {
+-            return false;
+-        }
+-
+-        // It is possible that a block has no value "now" but the list is still not empty.
+-        // To be sure, it is necessary to check the length of the list.
+-        self.len(tx) == 0
++        Block::list_rx_is_empty(self, tx)
+     }
+ 
+     pub(crate) fn len(&self, tx: &Tx<T>) -> usize {
+-        // When all the senders are dropped, there will be a last block in the tail position,
+-        // but it will be closed
+-        let tail_position = tx.tail_position.load(Acquire);
+-        tail_position - self.index - (tx.is_closed() as usize)
++        Block::list_rx_len(self, tx)
+     }
+ 
+     /// Pops the next value off the queue.
+     pub(crate) fn pop(&mut self, tx: &Tx<T>) -> Option<block::Read<T>> {
+-        // Advance `head`, if needed
+-        if !self.try_advancing_head() {
+-            return None;
+-        }
++        Block::list_rx_pop(self, tx)
++    }
+ 
+-        self.reclaim_blocks(tx);
++    pub(crate) fn try_pop(&mut self, tx: &Tx<T>) -> TryPopResult<T> {
++        Block::list_rx_try_pop(self, tx)
++    }
+ 
+-        unsafe {
+-            let block = self.head.as_ref();
++    /// Effectively `Drop` all the blocks. Should only be called once, when
++    /// the list is dropping.
++    pub(super) unsafe fn free_blocks(&mut self) {
++        Block::list_free_blocks(self)
++    }
++}
+ 
+-            let ret = block.read(self.index);
++impl<T> fmt::Debug for Rx<T> {
++    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
++        fmt.debug_struct("Rx")
++            .field("head", &self.head)
++            .field("index", &self.index)
++            .field("free_head", &self.free_head)
++            .finish()
++    }
++}
+ 
+-            if let Some(block::Read::Value(..)) = ret {
+-                self.index = self.index.wrapping_add(1);
+-            }
+ 
+-            ret
+-        }
+-    }
++pub(crate) fn wake_rx(waker: &AtomicWaker) {
++    Block::<()>::chan_wake_rx(waker);
++}
+ 
+-    /// Pops the next value off the queue, detecting whether the block
+-    /// is busy or empty on failure.
+-    ///
+-    /// This function exists because `Rx::pop` can return `None` even if the
+-    /// channel's queue contains a message that has been completely written.
+-    /// This can happen if the fully delivered message is behind another message
+-    /// that is in the middle of being written to the block, since the channel
+-    /// can't return the messages out of order.
+-    pub(crate) fn try_pop(&mut self, tx: &Tx<T>) -> TryPopResult<T> {
+-        let tail_position = tx.tail_position.load(Acquire);
+-        let result = self.pop(tx);
+-
+-        match result {
+-            Some(block::Read::Value(t)) => TryPopResult::Ok(t),
+-            Some(block::Read::Closed) => TryPopResult::Closed,
+-            None if tail_position == self.index => TryPopResult::Empty,
+-            None => TryPopResult::Busy,
+-        }
+-    }
++pub(crate) fn notify_closed(notify: &Notify) {
++    Block::<()>::chan_notify_closed(notify);
++}
+ 
+-    /// Tries advancing the block pointer to the block referenced by `self.index`.
+-    ///
+-    /// Returns `true` if successful, `false` if there is no next block to load.
+-    fn try_advancing_head(&mut self) -> bool {
+-        let block_index = block::start_index(self.index);
++pub(crate) fn rx_is_closed(semaphore_closed: bool, tx_count: usize) -> bool {
++    Block::<()>::chan_rx_is_closed(semaphore_closed, tx_count)
++}
+ 
+-        loop {
+-            let next_block = {
+-                let block = unsafe { self.head.as_ref() };
++pub(crate) fn park_for_in_flight<T, F>(
++    rx_waker: &AtomicWaker,
++    try_once: F,
++) -> Result<T, TryRecvError>
++where
++    F: FnMut() -> Option<Result<T, TryRecvError>>,
++{
++    Block::<T>::park_for_in_flight(rx_waker, try_once)
++}
+ 
+-                if block.is_at_index(block_index) {
+-                    return true;
+-                }
++pub(crate) fn bounded_add_permit(sem: &bounded::Semaphore) {
++    Block::<()>::bounded_add_permit(sem);
++}
+ 
+-                block.load_next(Acquire)
+-            };
++pub(crate) fn bounded_add_permits(sem: &bounded::Semaphore, n: usize) {
++    Block::<()>::bounded_add_permits(sem, n);
++}
+ 
+-            let next_block = match next_block {
+-                Some(next_block) => next_block,
+-                None => {
+-                    return false;
+-                }
+-            };
++pub(crate) fn bounded_is_idle(sem: &bounded::Semaphore) -> bool {
++    Block::<()>::bounded_is_idle(sem)
++}
+ 
+-            self.head = next_block;
++pub(crate) fn bounded_close(sem: &bounded::Semaphore) {
++    Block::<()>::bounded_close(sem);
++}
+ 
+-            thread::yield_now();
+-        }
+-    }
++pub(crate) fn bounded_is_closed(sem: &bounded::Semaphore) -> bool {
++    Block::<()>::bounded_is_closed(sem)
++}
+ 
+-    fn reclaim_blocks(&mut self, tx: &Tx<T>) {
+-        while self.free_head != self.head {
+-            unsafe {
+-                // Get a handle to the block that will be freed and update
+-                // `free_head` to point to the next block.
+-                let block = self.free_head;
++pub(crate) fn bounded_available(sem: &bounded::Semaphore) -> usize {
++    Block::<()>::bounded_available(sem)
++}
+ 
+-                let observed_tail_position = block.as_ref().observed_tail_position();
++pub(crate) fn bounded_max_capacity(sem: &bounded::Semaphore) -> usize {
++    Block::<()>::bounded_max_capacity(sem)
++}
+ 
+-                let required_index = match observed_tail_position {
+-                    Some(i) => i,
+-                    None => return,
+-                };
++pub(crate) fn bounded_try_acquire_one(
++    sem: &bounded::Semaphore,
++) -> Result<(), TryAcquireError> {
++    Block::<()>::bounded_try_acquire_one(sem)
++}
+ 
+-                if required_index > self.index {
+-                    return;
+-                }
++pub(crate) fn map_try_acquire_to_try_send<V>(
++    err: TryAcquireError,
++    value: V,
++) -> TrySendError<V> {
++    Block::<()>::map_try_acquire_to_try_send(err, value)
++}
+ 
+-                // We may read the next pointer with `Relaxed` ordering as it is
+-                // guaranteed that the `reclaim_blocks` routine trails the `recv`
+-                // routine. Any memory accessed by `reclaim_blocks` has already
+-                // been acquired by `recv`.
+-                let next_block = block.as_ref().load_next(Relaxed);
++pub(crate) fn try_send_error_kind<V>(err: &TrySendError<V>) -> u8 {
++    Block::<()>::try_send_error_kind(err)
++}
+ 
+-                // Update the free list head
+-                self.free_head = next_block.unwrap();
++pub(crate) fn touch_permit_helpers(
++    n: usize,
++    closed: bool,
++    idle: bool,
++    available: usize,
++    bound: usize,
++    prev: usize,
++) {
++    Block::<()>::touch_permit_helpers(n, closed, idle, available, bound, prev);
++}
+ 
+-                // Push the emptied block onto the back of the queue, making it
+-                // available to senders.
+-                tx.reclaim_block(block);
+-            }
++pub(crate) fn unbounded_add_permit(sem: &unbounded::Semaphore) {
++    Block::<()>::unbounded_add_permit(sem);
++}
+ 
+-            thread::yield_now();
+-        }
+-    }
++pub(crate) fn unbounded_add_permits(sem: &unbounded::Semaphore, n: usize) {
++    Block::<()>::unbounded_add_permits(sem, n);
++}
+ 
+-    /// Effectively `Drop` all the blocks. Should only be called once, when
+-    /// the list is dropping.
+-    pub(super) unsafe fn free_blocks(&mut self) {
+-        debug_assert_ne!(self.free_head, NonNull::dangling());
+-
+-        let mut cur = Some(self.free_head);
+-
+-        #[cfg(debug_assertions)]
+-        {
+-            // to trigger the debug assert above so as to catch that we
+-            // don't call `free_blocks` more than once.
+-            self.free_head = NonNull::dangling();
+-            self.head = NonNull::dangling();
+-        }
+-
+-        while let Some(block) = cur {
+-            cur = block.as_ref().load_next(Relaxed);
+-            drop(Box::from_raw(block.as_ptr()));
+-        }
+-    }
++pub(crate) fn unbounded_is_idle(sem: &unbounded::Semaphore) -> bool {
++    Block::<()>::unbounded_is_idle(sem)
+ }
+ 
+-impl<T> fmt::Debug for Rx<T> {
+-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        fmt.debug_struct("Rx")
+-            .field("head", &self.head)
+-            .field("index", &self.index)
+-            .field("free_head", &self.free_head)
+-            .finish()
+-    }
++pub(crate) fn unbounded_close(sem: &unbounded::Semaphore) {
++    Block::<()>::unbounded_close(sem);
++}
++
++pub(crate) fn unbounded_is_closed(sem: &unbounded::Semaphore) -> bool {
++    Block::<()>::unbounded_is_closed(sem)
++}
++
++pub(crate) fn unbounded_try_increment(sem: &unbounded::Semaphore) -> bool {
++    Block::<()>::unbounded_try_increment(sem)
+ }
+diff --git a/tokio/src/sync/mpsc/unbounded.rs b/tokio/src/sync/mpsc/unbounded.rs
+index a3398c4b..4306e322 100644
+--- a/tokio/src/sync/mpsc/unbounded.rs
++++ b/tokio/src/sync/mpsc/unbounded.rs
+@@ -527,34 +527,7 @@ impl<T> UnboundedSender<T> {
+     }
+ 
+     fn inc_num_messages(&self) -> bool {
+-        use std::process;
+-        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+-
+-        let mut curr = self.chan.semaphore().0.load(Acquire);
+-
+-        loop {
+-            if curr & 1 == 1 {
+-                return false;
+-            }
+-
+-            if curr == usize::MAX ^ 1 {
+-                // Overflowed the ref count. There is no safe way to recover, so
+-                // abort the process. In practice, this should never happen.
+-                process::abort()
+-            }
+-
+-            match self
+-                .chan
+-                .semaphore()
+-                .0
+-                .compare_exchange(curr, curr + 2, AcqRel, Acquire)
+-            {
+-                Ok(_) => return true,
+-                Err(actual) => {
+-                    curr = actual;
+-                }
+-            }
+-        }
++        self.chan.try_increment_messages()
+     }
+ 
+     /// Completes when the receiver has dropped.

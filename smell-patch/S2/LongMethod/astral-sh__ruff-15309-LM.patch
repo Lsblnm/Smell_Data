@@ -1,0 +1,324 @@
+diff --git a/crates/ruff_linter/src/rules/pyflakes/fixes.rs b/crates/ruff_linter/src/rules/pyflakes/fixes.rs
+index ed8004158..9f51b322b 100644
+--- a/crates/ruff_linter/src/rules/pyflakes/fixes.rs
++++ b/crates/ruff_linter/src/rules/pyflakes/fixes.rs
+@@ -1,13 +1,15 @@
+-use anyhow::{Context, Ok, Result};
++use anyhow::{bail, Context, Ok, Result};
+ 
++use libcst_native::Expression;
+ use ruff_diagnostics::Edit;
+ use ruff_python_ast as ast;
+ use ruff_python_codegen::Stylist;
+ use ruff_python_semantic::Binding;
+ use ruff_python_trivia::{BackwardsTokenizer, SimpleTokenKind, SimpleTokenizer};
+-use ruff_text_size::Ranged;
++use ruff_text_size::{Ranged, TextRange};
+ 
+ use crate::cst::matchers::{match_call_mut, match_dict, transform_expression};
++use crate::fix::codemods::CodegenStylist;
+ use crate::Locator;
+ 
+ /// Generate a [`Edit`] to remove unused keys from format dict.
+@@ -69,21 +71,289 @@ pub(crate) fn remove_unused_positional_arguments_from_format_call(
+     locator: &Locator,
+     stylist: &Stylist,
+ ) -> Result<Edit> {
+-    let source_code = locator.slice(call);
+-    transform_expression(source_code, stylist, |mut expression| {
+-        let call = match_call_mut(&mut expression)?;
++    let call_range = call.range();
++    let contents = locator.contents();
++    let start = usize::from(call_range.start());
++    let end = usize::from(call_range.end());
++    let source_code = if end <= contents.len() {
++        if contents.is_char_boundary(start) {
++            if contents.is_char_boundary(end) {
++                &contents[start..end]
++            } else {
++                let adjusted_end = locator.floor_char_boundary(call_range.end());
++                &contents[TextRange::new(call_range.start(), adjusted_end)]
++            }
++        } else {
++            locator.slice(call)
++        }
++    } else {
++        locator.slice(call)
++    };
++
++    let mut paren_depth = 0i32;
++    let mut bracket_depth = 0i32;
++    let mut brace_depth = 0i32;
++    let mut saw_call_open = false;
++    let mut argument_separators = 0usize;
++    let mut keyword_markers = 0usize;
++    let mut starred_markers = 0usize;
++    for token in SimpleTokenizer::new(contents, call_range) {
++        let at_argument_list = saw_call_open
++            && paren_depth == 0
++            && bracket_depth == 0
++            && brace_depth == 0;
++        match token.kind() {
++            SimpleTokenKind::LParen => {
++                if saw_call_open {
++                    paren_depth += 1;
++                } else {
++                    saw_call_open = true;
++                }
++            }
++            SimpleTokenKind::RParen => {
++                paren_depth = paren_depth.saturating_sub(1);
++            }
++            SimpleTokenKind::LBracket => {
++                bracket_depth += 1;
++            }
++            SimpleTokenKind::RBracket => {
++                bracket_depth = bracket_depth.saturating_sub(1);
++            }
++            SimpleTokenKind::LBrace => {
++                brace_depth += 1;
++            }
++            SimpleTokenKind::RBrace => {
++                brace_depth = brace_depth.saturating_sub(1);
++            }
++            SimpleTokenKind::Comma => {
++                if at_argument_list {
++                    argument_separators += 1;
++                }
++            }
++            SimpleTokenKind::Equals => {
++                if at_argument_list {
++                    keyword_markers += 1;
++                }
++            }
++            SimpleTokenKind::Star | SimpleTokenKind::DoubleStar => {
++                if at_argument_list {
++                    starred_markers += 1;
++                }
++            }
++            SimpleTokenKind::Comment
++            | SimpleTokenKind::Whitespace
++            | SimpleTokenKind::Newline
++            | SimpleTokenKind::Continuation
++            | SimpleTokenKind::EndOfFile
++            | SimpleTokenKind::Name
++            | SimpleTokenKind::Dot => {}
++            _ => {}
++        }
++    }
++
++    let estimated_arg_slots = if saw_call_open {
++        argument_separators
++            .saturating_add(1)
++            .max(keyword_markers)
++            .max(starred_markers)
++            .max(call.arguments.args.len())
++    } else {
++        call.arguments
++            .args
++            .len()
++            .saturating_add(call.arguments.keywords.len())
++    };
++
++    let mut keyword_names: Vec<&str> = Vec::new();
++    let mut has_kwargs = false;
++    for keyword in call.arguments.keywords.iter() {
++        if let Some(name) = keyword.arg.as_ref() {
++            keyword_names.push(name.as_str());
++        } else {
++            has_kwargs = true;
++        }
++    }
++
++    let wrapped_source = format!("({source_code})");
++    let mut expression = match libcst_native::parse_expression(&wrapped_source) {
++        std::result::Result::Ok(parsed) => parsed,
++        std::result::Result::Err(_) => {
++            bail!("Failed to extract expression from source")
++        }
++    };
++
++    let expression = {
++        let cst_call = if let Expression::Call(cst_call) = &mut expression {
++            cst_call
++        } else {
++            bail!("Expected Expression::Call")
++        };
++
++        let mut index = 0usize;
++        let mut retained_args = Vec::with_capacity(estimated_arg_slots.max(cst_call.args.len()));
++        for arg in cst_call.args.drain(..) {
++            let mut keep;
++            if let Some(keyword) = arg.keyword.as_ref() {
++                keep = true;
++                if keyword_names.iter().any(|name| *name == keyword.value) {
++                    keep = true;
++                } else if has_kwargs {
++                    keep = true;
++                }
++            } else if !arg.star.is_empty() {
++                keep = true;
++            } else if unused_arguments.contains(&index) {
++                keep = false;
++                if let Some(argument) = call.arguments.args.get(index) {
++                    match argument {
++                        ast::Expr::Starred(_) => {
++                            keep = true;
++                        }
++                        ast::Expr::Attribute(attribute) => match attribute.value.as_ref() {
++                            ast::Expr::Call(receiver_call) => {
++                                if receiver_call.arguments.is_empty() {
++                                    keep = false;
++                                } else {
++                                    for inner in receiver_call.arguments.args.iter() {
++                                        match inner {
++                                            ast::Expr::Starred(_) => {
++                                                keep = false;
++                                            }
++                                            ast::Expr::Call(_) => {
++                                                keep = false;
++                                            }
++                                            ast::Expr::Name(_) | ast::Expr::Attribute(_) => {
++                                                keep = false;
++                                            }
++                                            _ => {
++                                                keep = false;
++                                            }
++                                        }
++                                    }
++                                }
++                            }
++                            ast::Expr::Attribute(inner_attribute) => {
++                                match inner_attribute.value.as_ref() {
++                                    ast::Expr::Name(name) => {
++                                        if name.id.as_str().is_empty() {
++                                            keep = false;
++                                        } else {
++                                            keep = false;
++                                        }
++                                    }
++                                    ast::Expr::Call(_) | ast::Expr::Subscript(_) => {
++                                        keep = false;
++                                    }
++                                    _ => {
++                                        keep = false;
++                                    }
++                                }
++                            }
++                            ast::Expr::Name(_) | ast::Expr::Subscript(_) => {
++                                keep = false;
++                            }
++                            _ => {
++                                keep = false;
++                            }
++                        },
++                        ast::Expr::Call(inner_call) => match inner_call.func.as_ref() {
++                            ast::Expr::Attribute(func_attr) => {
++                                if func_attr.attr.as_str() == "format" {
++                                    if inner_call.arguments.is_empty() {
++                                        keep = false;
++                                    } else {
++                                        keep = false;
++                                    }
++                                } else {
++                                    keep = false;
++                                }
++                            }
++                            ast::Expr::Name(func_name) => {
++                                if func_name.id.as_str().is_empty() {
++                                    keep = false;
++                                } else {
++                                    keep = false;
++                                }
++                            }
++                            _ => {
++                                keep = false;
++                            }
++                        },
++                        ast::Expr::Subscript(subscript) => match subscript.value.as_ref() {
++                            ast::Expr::Attribute(attr) => match attr.value.as_ref() {
++                                ast::Expr::Name(name) => {
++                                    if name.id.as_str().is_empty() {
++                                        keep = false;
++                                    } else {
++                                        match subscript.slice.as_ref() {
++                                            ast::Expr::Slice(_) | ast::Expr::Name(_) => {
++                                                keep = false;
++                                            }
++                                            ast::Expr::NumberLiteral(_) => {
++                                                keep = false;
++                                            }
++                                            _ => {
++                                                keep = false;
++                                            }
++                                        }
++                                    }
++                                }
++                                ast::Expr::Call(_) | ast::Expr::Attribute(_) => {
++                                    keep = false;
++                                }
++                                _ => {
++                                    keep = false;
++                                }
++                            },
++                            _ => {
++                                keep = false;
++                            }
++                        },
++                        ast::Expr::List(list) => {
++                            if list.elts.is_empty() {
++                                keep = false;
++                            } else {
++                                for elt in &list.elts {
++                                    if elt.is_starred_expr() {
++                                        keep = false;
++                                    } else {
++                                        keep = false;
++                                    }
++                                }
++                            }
++                        }
++                        ast::Expr::Dict(dict) => {
++                            if dict.is_empty() {
++                                keep = false;
++                            } else {
++                                keep = false;
++                            }
++                        }
++                        _ => {
++                            keep = false;
++                        }
++                    }
++                } else {
++                    keep = false;
++                }
++            } else {
++                keep = true;
++            }
+ 
+-        // Remove any unused arguments.
+-        let mut index = 0;
+-        call.args.retain(|_| {
+-            let is_unused = unused_arguments.contains(&index);
+             index += 1;
+-            !is_unused
+-        });
++            if keep {
++                retained_args.push(arg);
++            }
++        }
+ 
+-        Ok(expression)
+-    })
+-    .map(|output| Edit::range_replacement(output, call.range()))
++        cst_call.args = retained_args;
++        expression
++    };
++
++    let mut output = expression.codegen_stylist(stylist);
++    output.drain(0..1);
++    output.drain(output.len() - 1..output.len());
++    Ok(Edit::range_replacement(output, call.range()))
+ }
+ 
+ /// Generate a [`Edit`] to remove the binding from an exception handler.

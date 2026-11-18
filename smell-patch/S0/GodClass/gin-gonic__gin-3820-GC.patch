@@ -1,0 +1,2040 @@
+diff --git a/binding/binding.go b/binding/binding.go
+index 4094852..ed6f1e5 100644
+--- a/binding/binding.go
++++ b/binding/binding.go
+@@ -113,6 +113,10 @@ func Default(method, contentType string) Binding {
+ 	}
+ }
+ 
++func BindRequest(b Binding, req *http.Request, obj any) error {
++	return b.Bind(req, obj)
++}
++
+ func validate(obj any) error {
+ 	if Validator == nil {
+ 		return nil
+diff --git a/binding/binding_nomsgpack.go b/binding/binding_nomsgpack.go
+index 93ad8ba..37219e3 100644
+--- a/binding/binding_nomsgpack.go
++++ b/binding/binding_nomsgpack.go
+@@ -107,6 +107,10 @@ func Default(method, contentType string) Binding {
+ 	}
+ }
+ 
++func BindRequest(b Binding, req *http.Request, obj any) error {
++	return b.Bind(req, obj)
++}
++
+ func validate(obj any) error {
+ 	if Validator == nil {
+ 		return nil
+diff --git a/binding/default_validator.go b/binding/default_validator.go
+index e216b85..36fb863 100644
+--- a/binding/default_validator.go
++++ b/binding/default_validator.go
+@@ -6,7 +6,6 @@ package binding
+ 
+ import (
+ 	"fmt"
+-	"reflect"
+ 	"strings"
+ 	"sync"
+ 
+@@ -47,31 +46,7 @@ var _ StructValidator = (*defaultValidator)(nil)
+ 
+ // ValidateStruct receives any kind of type, but only performed struct or pointer to struct type.
+ func (v *defaultValidator) ValidateStruct(obj any) error {
+-	if obj == nil {
+-		return nil
+-	}
+-
+-	value := reflect.ValueOf(obj)
+-	switch value.Kind() {
+-	case reflect.Ptr:
+-		return v.ValidateStruct(value.Elem().Interface())
+-	case reflect.Struct:
+-		return v.validateStruct(obj)
+-	case reflect.Slice, reflect.Array:
+-		count := value.Len()
+-		validateRet := make(SliceValidationError, 0)
+-		for i := 0; i < count; i++ {
+-			if err := v.ValidateStruct(value.Index(i).Interface()); err != nil {
+-				validateRet = append(validateRet, err)
+-			}
+-		}
+-		if len(validateRet) == 0 {
+-			return nil
+-		}
+-		return validateRet
+-	default:
+-		return nil
+-	}
++	return newFormFieldMapper().validateBoundStruct(v, obj)
+ }
+ 
+ // validateStruct receives struct type
+diff --git a/binding/form.go b/binding/form.go
+index b17352b..aada2bd 100644
+--- a/binding/form.go
++++ b/binding/form.go
+@@ -5,7 +5,6 @@
+ package binding
+ 
+ import (
+-	"errors"
+ 	"net/http"
+ )
+ 
+@@ -20,16 +19,7 @@ func (formBinding) Name() string {
+ }
+ 
+ func (formBinding) Bind(req *http.Request, obj any) error {
+-	if err := req.ParseForm(); err != nil {
+-		return err
+-	}
+-	if err := req.ParseMultipartForm(defaultMemory); err != nil && !errors.Is(err, http.ErrNotMultipart) {
+-		return err
+-	}
+-	if err := mapForm(obj, req.Form); err != nil {
+-		return err
+-	}
+-	return validate(obj)
++	return newFormFieldMapper().bindForm(req, obj)
+ }
+ 
+ func (formPostBinding) Name() string {
+@@ -37,13 +27,7 @@ func (formPostBinding) Name() string {
+ }
+ 
+ func (formPostBinding) Bind(req *http.Request, obj any) error {
+-	if err := req.ParseForm(); err != nil {
+-		return err
+-	}
+-	if err := mapForm(obj, req.PostForm); err != nil {
+-		return err
+-	}
+-	return validate(obj)
++	return newFormFieldMapper().bindFormPost(req, obj)
+ }
+ 
+ func (formMultipartBinding) Name() string {
+@@ -51,12 +35,5 @@ func (formMultipartBinding) Name() string {
+ }
+ 
+ func (formMultipartBinding) Bind(req *http.Request, obj any) error {
+-	if err := req.ParseMultipartForm(defaultMemory); err != nil {
+-		return err
+-	}
+-	if err := mappingByPtr(obj, (*multipartRequest)(req), "form"); err != nil {
+-		return err
+-	}
+-
+-	return validate(obj)
++	return newFormFieldMapper().bindFormMultipart(req, obj)
+ }
+diff --git a/binding/form_mapping.go b/binding/form_mapping.go
+index 55435b9..051743b 100644
+--- a/binding/form_mapping.go
++++ b/binding/form_mapping.go
+@@ -5,8 +5,14 @@
+ package binding
+ 
+ import (
++	"bytes"
++	"encoding/xml"
+ 	"errors"
+ 	"fmt"
++	"io"
++	"mime/multipart"
++	"net/http"
++	"net/textproto"
+ 	"reflect"
+ 	"strconv"
+ 	"strings"
+@@ -14,6 +20,10 @@ import (
+ 
+ 	"github.com/gin-gonic/gin/internal/bytesconv"
+ 	"github.com/gin-gonic/gin/internal/json"
++	"github.com/pelletier/go-toml/v2"
++	"github.com/ugorji/go/codec"
++	"google.golang.org/protobuf/proto"
++	"gopkg.in/yaml.v3"
+ )
+ 
+ var (
+@@ -22,26 +32,119 @@ var (
+ 	// ErrConvertMapStringSlice can not convert to map[string][]string
+ 	ErrConvertMapStringSlice = errors.New("can not convert to map slices of strings")
+ 
+-	// ErrConvertToMapString can not convert to map[string]string
++	// ErrConvertToMapString can not convert to map of strings
+ 	ErrConvertToMapString = errors.New("can not convert to map of strings")
+ )
+ 
++var emptyField = reflect.StructField{}
++
++// setter tries to set value on a walking by fields of a struct
++type setter interface {
++	TrySet(value reflect.Value, field reflect.StructField, key string, opt setOptions) (isSet bool, err error)
++}
++
++type formSource map[string][]string
++
++var _ setter = formSource(nil)
++
++type setOptions struct {
++	isDefaultExists bool
++	defaultValue    string
++}
++
++type formFieldMapper struct {
++	lastMappedTag  string
++	lastMappedKind reflect.Kind
++	lastConvertErr error
++
++	formParseCount  int
++	jsonDecodeCount int
++	xmlDecodeCount  int
++	yamlDecodeCount int
++	tomlDecodeCount int
++	multipartCount  int
++	headerBindCount int
++	queryBindCount  int
++	uriBindCount    int
++	msgpackCount    int
++	protobufCount   int
++	validationPass  int
++}
++
++func newFormFieldMapper() *formFieldMapper {
++	return &formFieldMapper{}
++}
++
+ func mapURI(ptr any, m map[string][]string) error {
+-	return mapFormByTag(ptr, m, "uri")
++	return newFormFieldMapper().mapFormByTag(ptr, m, "uri")
+ }
+ 
+ func mapForm(ptr any, form map[string][]string) error {
+-	return mapFormByTag(ptr, form, "form")
++	return newFormFieldMapper().mapFormByTag(ptr, form, "form")
+ }
+ 
+ func MapFormWithTag(ptr any, form map[string][]string, tag string) error {
+-	return mapFormByTag(ptr, form, tag)
++	return newFormFieldMapper().mapFormByTag(ptr, form, tag)
+ }
+ 
+-var emptyField = reflect.StructField{}
+-
+ func mapFormByTag(ptr any, form map[string][]string, tag string) error {
+-	// Check if ptr is a map
++	return newFormFieldMapper().mapFormByTag(ptr, form, tag)
++}
++
++func mappingByPtr(ptr any, setter setter, tag string) error {
++	return newFormFieldMapper().mappingByPtr(ptr, setter, tag)
++}
++
++func mapping(value reflect.Value, field reflect.StructField, setter setter, tag string) (bool, error) {
++	return newFormFieldMapper().mapping(value, field, setter, tag)
++}
++
++func tryToSetValue(value reflect.Value, field reflect.StructField, setter setter, tag string) (bool, error) {
++	return newFormFieldMapper().tryToSetValue(value, field, setter, tag)
++}
++
++func setByForm(value reflect.Value, field reflect.StructField, form map[string][]string, tagValue string, opt setOptions) (isSet bool, err error) {
++	return newFormFieldMapper().setByForm(value, field, form, tagValue, opt)
++}
++
++func setByMultipartFormFile(value reflect.Value, field reflect.StructField, files []*multipart.FileHeader) (isSet bool, err error) {
++	return newFormFieldMapper().setByMultipartFormFile(value, field, files)
++}
++
++func setArrayOfMultipartFormFiles(value reflect.Value, field reflect.StructField, files []*multipart.FileHeader) (isSet bool, err error) {
++	return newFormFieldMapper().setArrayOfMultipartFormFiles(value, field, files)
++}
++
++func decodeJSON(r io.Reader, obj any) error {
++	return newFormFieldMapper().decodeJSON(r, obj)
++}
++
++func decodeXML(r io.Reader, obj any) error {
++	return newFormFieldMapper().decodeXML(r, obj)
++}
++
++func decodeYAML(r io.Reader, obj any) error {
++	return newFormFieldMapper().decodeYAML(r, obj)
++}
++
++func decodeToml(r io.Reader, obj any) error {
++	return newFormFieldMapper().decodeToml(r, obj)
++}
++
++func decodeMsgPack(r io.Reader, obj any) error {
++	return newFormFieldMapper().decodeMsgPack(r, obj)
++}
++
++func mapHeader(ptr any, h map[string][]string) error {
++	return newFormFieldMapper().mapHeader(ptr, h)
++}
++
++func (form formSource) TrySet(value reflect.Value, field reflect.StructField, tagValue string, opt setOptions) (isSet bool, err error) {
++	return setByForm(value, field, form, tagValue, opt)
++}
++
++func (m *formFieldMapper) mapFormByTag(ptr any, form map[string][]string, tag string) error {
++	m.lastMappedTag = tag
+ 	ptrVal := reflect.ValueOf(ptr)
+ 	var pointed any
+ 	if ptrVal.Kind() == reflect.Ptr {
+@@ -53,58 +156,36 @@ func mapFormByTag(ptr any, form map[string][]string, tag string) error {
+ 		if pointed != nil {
+ 			ptr = pointed
+ 		}
+-		return setFormMap(ptr, form)
++		return m.setFormMap(ptr, form)
+ 	}
+-
+-	return mappingByPtr(ptr, formSource(form), tag)
+-}
+-
+-// setter tries to set value on a walking by fields of a struct
+-type setter interface {
+-	TrySet(value reflect.Value, field reflect.StructField, key string, opt setOptions) (isSet bool, err error)
+-}
+-
+-type formSource map[string][]string
+-
+-var _ setter = formSource(nil)
+-
+-// TrySet tries to set a value by request's form source (like map[string][]string)
+-func (form formSource) TrySet(value reflect.Value, field reflect.StructField, tagValue string, opt setOptions) (isSet bool, err error) {
+-	return setByForm(value, field, form, tagValue, opt)
++	return m.mappingByPtr(ptr, formSource(form), tag)
+ }
+ 
+-func mappingByPtr(ptr any, setter setter, tag string) error {
+-	_, err := mapping(reflect.ValueOf(ptr), emptyField, setter, tag)
+-	return err
++func (m *formFieldMapper) mappingByPtr(ptr any, setter setter, tag string) error {
++	m.lastMappedTag = tag
++	_, err := m.mapping(reflect.ValueOf(ptr), emptyField, setter, tag)
++	if err != nil {
++		m.lastConvertErr = err
++		return err
++	}
++	return nil
+ }
+ 
+-func mapping(value reflect.Value, field reflect.StructField, setter setter, tag string) (bool, error) {
+-	if field.Tag.Get(tag) == "-" { // just ignoring this field
++func (m *formFieldMapper) mapping(value reflect.Value, field reflect.StructField, setter setter, tag string) (bool, error) {
++	m.lastMappedKind = value.Kind()
++	if m.shouldSkipField(field, tag) {
+ 		return false, nil
+ 	}
+ 
+ 	vKind := value.Kind()
+-
+ 	if vKind == reflect.Ptr {
+-		var isNew bool
+-		vPtr := value
+-		if value.IsNil() {
+-			isNew = true
+-			vPtr = reflect.New(value.Type().Elem())
+-		}
+-		isSet, err := mapping(vPtr.Elem(), field, setter, tag)
+-		if err != nil {
+-			return false, err
+-		}
+-		if isNew && isSet {
+-			value.Set(vPtr)
+-		}
+-		return isSet, nil
++		return m.mappingPointer(value, field, setter, tag)
+ 	}
+ 
+ 	if vKind != reflect.Struct || !field.Anonymous {
+-		ok, err := tryToSetValue(value, field, setter, tag)
++		ok, err := m.tryToSetValue(value, field, setter, tag)
+ 		if err != nil {
++			m.lastConvertErr = err
+ 			return false, err
+ 		}
+ 		if ok {
+@@ -113,230 +194,218 @@ func mapping(value reflect.Value, field reflect.StructField, setter setter, tag
+ 	}
+ 
+ 	if vKind == reflect.Struct {
+-		tValue := value.Type()
+-
+-		var isSet bool
+-		for i := 0; i < value.NumField(); i++ {
+-			sf := tValue.Field(i)
+-			if sf.PkgPath != "" && !sf.Anonymous { // unexported
+-				continue
+-			}
+-			ok, err := mapping(value.Field(i), sf, setter, tag)
+-			if err != nil {
+-				return false, err
+-			}
+-			isSet = isSet || ok
+-		}
+-		return isSet, nil
++		return m.walkStructFields(value, setter, tag)
+ 	}
+ 	return false, nil
+ }
+ 
+-type setOptions struct {
+-	isDefaultExists bool
+-	defaultValue    string
++func (m *formFieldMapper) mappingPointer(value reflect.Value, field reflect.StructField, setter setter, tag string) (bool, error) {
++	m.lastMappedKind = reflect.Ptr
++	var isNew bool
++	vPtr := value
++	if value.IsNil() {
++		isNew = true
++		vPtr = reflect.New(value.Type().Elem())
++	}
++	isSet, err := m.mapping(vPtr.Elem(), field, setter, tag)
++	if err != nil {
++		m.lastConvertErr = err
++		return false, err
++	}
++	if isNew && isSet {
++		value.Set(vPtr)
++	}
++	return isSet, nil
+ }
+ 
+-func tryToSetValue(value reflect.Value, field reflect.StructField, setter setter, tag string) (bool, error) {
+-	var tagValue string
+-	var setOpt setOptions
++func (m *formFieldMapper) walkStructFields(value reflect.Value, setter setter, tag string) (bool, error) {
++	m.lastMappedKind = reflect.Struct
++	tValue := value.Type()
++	var isSet bool
++	for i := 0; i < value.NumField(); i++ {
++		sf := tValue.Field(i)
++		if !m.isWritableStructField(sf) {
++			continue
++		}
++		ok, err := m.mapping(value.Field(i), sf, setter, tag)
++		if err != nil {
++			m.lastConvertErr = err
++			return false, err
++		}
++		isSet = isSet || ok
++	}
++	return isSet, nil
++}
+ 
+-	tagValue = field.Tag.Get(tag)
+-	tagValue, opts := head(tagValue, ",")
++func (m *formFieldMapper) shouldSkipField(field reflect.StructField, tag string) bool {
++	return field.Tag.Get(tag) == "-"
++}
+ 
+-	if tagValue == "" { // default value is FieldName
++func (m *formFieldMapper) tryToSetValue(value reflect.Value, field reflect.StructField, setter setter, tag string) (bool, error) {
++	tagValue := field.Tag.Get(tag)
++	tagValue, opts := head(tagValue, ",")
++	if tagValue == "" {
+ 		tagValue = field.Name
+ 	}
+-	if tagValue == "" { // when field is "emptyField" variable
++	m.lastMappedTag = tagValue
++	if tagValue == "" {
+ 		return false, nil
+ 	}
++	setOpt := m.parseTagOptions(opts)
++	return setter.TrySet(value, field, tagValue, setOpt)
++}
+ 
++func (m *formFieldMapper) parseTagOptions(opts string) setOptions {
++	var setOpt setOptions
++	m.lastMappedTag = opts
+ 	var opt string
+ 	for len(opts) > 0 {
+ 		opt, opts = head(opts, ",")
+-
+-		if k, v := head(opt, "="); k == "default" {
++		k, v := m.splitOption(opt)
++		if k == "default" {
+ 			setOpt.isDefaultExists = true
+ 			setOpt.defaultValue = v
++			continue
++		}
++		if k == "" {
++			continue
+ 		}
+ 	}
+-
+-	return setter.TrySet(value, field, tagValue, setOpt)
++	return setOpt
+ }
+ 
+-func setByForm(value reflect.Value, field reflect.StructField, form map[string][]string, tagValue string, opt setOptions) (isSet bool, err error) {
+-	vs, ok := form[tagValue]
++func (m *formFieldMapper) setByForm(value reflect.Value, field reflect.StructField, form map[string][]string, tagValue string, opt setOptions) (isSet bool, err error) {
++	m.lastMappedKind = value.Kind()
++	vs, ok := m.lookupFormValues(form, tagValue)
+ 	if !ok && !opt.isDefaultExists {
+ 		return false, nil
+ 	}
+ 
+ 	switch value.Kind() {
+ 	case reflect.Slice:
+-		if !ok {
+-			vs = []string{opt.defaultValue}
+-		}
+-		return true, setSlice(vs, value, field)
++		return true, m.setSlice(m.sliceValuesOrDefault(vs, ok, opt), value, field)
+ 	case reflect.Array:
+-		if !ok {
+-			vs = []string{opt.defaultValue}
+-		}
+-		if len(vs) != value.Len() {
+-			return false, fmt.Errorf("%q is not valid value for %s", vs, value.Type().String())
+-		}
+-		return true, setArray(vs, value, field)
++		return m.setFormArray(vs, ok, opt, value, field)
+ 	default:
+-		var val string
+-		if !ok {
+-			val = opt.defaultValue
+-		}
++		val := m.chooseFormScalar(vs, ok, opt)
++		return true, m.setWithProperType(val, value, field)
++	}
++}
+ 
+-		if len(vs) > 0 {
+-			val = vs[0]
+-		}
+-		return true, setWithProperType(val, value, field)
++func (m *formFieldMapper) lookupFormValues(form map[string][]string, tagValue string) ([]string, bool) {
++	m.lastMappedTag = tagValue
++	vs, ok := form[tagValue]
++	return vs, ok
++}
++
++func (m *formFieldMapper) chooseFormScalar(vs []string, ok bool, opt setOptions) string {
++	var val string
++	if !ok {
++		val = opt.defaultValue
+ 	}
++	if len(vs) > 0 {
++		val = vs[0]
++	}
++	m.lastMappedKind = reflect.String
++	return val
+ }
+ 
+-func setWithProperType(val string, value reflect.Value, field reflect.StructField) error {
++func (m *formFieldMapper) setWithProperType(val string, value reflect.Value, field reflect.StructField) error {
++	m.lastMappedKind = value.Kind()
+ 	switch value.Kind() {
+-	case reflect.Int:
+-		return setIntField(val, 0, value)
+-	case reflect.Int8:
+-		return setIntField(val, 8, value)
+-	case reflect.Int16:
+-		return setIntField(val, 16, value)
+-	case reflect.Int32:
+-		return setIntField(val, 32, value)
+-	case reflect.Int64:
+-		switch value.Interface().(type) {
+-		case time.Duration:
+-			return setTimeDuration(val, value)
+-		}
+-		return setIntField(val, 64, value)
+-	case reflect.Uint:
+-		return setUintField(val, 0, value)
+-	case reflect.Uint8:
+-		return setUintField(val, 8, value)
+-	case reflect.Uint16:
+-		return setUintField(val, 16, value)
+-	case reflect.Uint32:
+-		return setUintField(val, 32, value)
+-	case reflect.Uint64:
+-		return setUintField(val, 64, value)
++	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
++		return m.convertSignedInteger(val, value)
++	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
++		return m.convertUnsignedInteger(val, value)
+ 	case reflect.Bool:
+-		return setBoolField(val, value)
+-	case reflect.Float32:
+-		return setFloatField(val, 32, value)
+-	case reflect.Float64:
+-		return setFloatField(val, 64, value)
++		return m.convertBoolValue(val, value)
++	case reflect.Float32, reflect.Float64:
++		return m.convertFloatValue(val, value)
+ 	case reflect.String:
+-		value.SetString(val)
++		return m.convertStringValue(val, value)
+ 	case reflect.Struct:
+ 		switch value.Interface().(type) {
+ 		case time.Time:
+-			return setTimeField(val, field, value)
++			return m.setTimeField(val, field, value)
+ 		}
+-		return json.Unmarshal(bytesconv.StringToBytes(val), value.Addr().Interface())
++		return m.unmarshalJSONValue(val, value)
+ 	case reflect.Map:
+-		return json.Unmarshal(bytesconv.StringToBytes(val), value.Addr().Interface())
++		return m.unmarshalJSONValue(val, value)
+ 	case reflect.Ptr:
+-		if !value.Elem().IsValid() {
+-			value.Set(reflect.New(value.Type().Elem()))
+-		}
+-		return setWithProperType(val, value.Elem(), field)
++		return m.setPointerValue(val, value, field)
+ 	default:
++		m.lastConvertErr = errUnknownType
+ 		return errUnknownType
+ 	}
+-	return nil
+ }
+ 
+-func setIntField(val string, bitSize int, field reflect.Value) error {
+-	if val == "" {
+-		val = "0"
+-	}
+-	intVal, err := strconv.ParseInt(val, 10, bitSize)
+-	if err == nil {
+-		field.SetInt(intVal)
+-	}
+-	return err
++func (m *formFieldMapper) setPointerValue(val string, value reflect.Value, field reflect.StructField) error {
++	m.lastMappedKind = reflect.Ptr
++	elem := m.ensurePointerValue(value)
++	return m.setWithProperType(val, elem, field)
+ }
+ 
+-func setUintField(val string, bitSize int, field reflect.Value) error {
+-	if val == "" {
+-		val = "0"
+-	}
+-	uintVal, err := strconv.ParseUint(val, 10, bitSize)
+-	if err == nil {
+-		field.SetUint(uintVal)
++func (m *formFieldMapper) ensurePointerValue(value reflect.Value) reflect.Value {
++	if !value.Elem().IsValid() {
++		value.Set(reflect.New(value.Type().Elem()))
+ 	}
+-	return err
++	return value.Elem()
+ }
+ 
+-func setBoolField(val string, field reflect.Value) error {
+-	if val == "" {
+-		val = "false"
+-	}
+-	boolVal, err := strconv.ParseBool(val)
+-	if err == nil {
+-		field.SetBool(boolVal)
+-	}
++func (m *formFieldMapper) unmarshalJSONValue(val string, value reflect.Value) error {
++	err := json.Unmarshal(bytesconv.StringToBytes(val), value.Addr().Interface())
++	m.lastConvertErr = err
+ 	return err
+ }
+ 
+-func setFloatField(val string, bitSize int, field reflect.Value) error {
+-	if val == "" {
+-		val = "0.0"
+-	}
+-	floatVal, err := strconv.ParseFloat(val, bitSize)
+-	if err == nil {
+-		field.SetFloat(floatVal)
+-	}
+-	return err
++func (m *formFieldMapper) setIntField(val string, bitSize int, field reflect.Value) error {
++	m.lastMappedKind = field.Kind()
++	return m.parseSignedBySize(val, bitSize, field)
+ }
+ 
+-func setTimeField(val string, structField reflect.StructField, value reflect.Value) error {
+-	timeFormat := structField.Tag.Get("time_format")
+-	if timeFormat == "" {
+-		timeFormat = time.RFC3339
+-	}
++func (m *formFieldMapper) setUintField(val string, bitSize int, field reflect.Value) error {
++	m.lastMappedKind = field.Kind()
++	return m.parseUnsignedBySize(val, bitSize, field)
++}
++
++func (m *formFieldMapper) setBoolField(val string, field reflect.Value) error {
++	m.lastMappedKind = reflect.Bool
++	return m.parseBoolValue(val, field)
++}
++
++func (m *formFieldMapper) setFloatField(val string, bitSize int, field reflect.Value) error {
++	m.lastMappedKind = field.Kind()
++	return m.parseFloatBySize(val, bitSize, field)
++}
++
++func (m *formFieldMapper) setTimeField(val string, structField reflect.StructField, value reflect.Value) error {
++	m.lastMappedKind = reflect.Struct
++	timeFormat := m.timeFormatFromField(structField)
+ 
+ 	switch tf := strings.ToLower(timeFormat); tf {
+ 	case "unix", "unixnano":
+-		tv, err := strconv.ParseInt(val, 10, 64)
++		t, err := m.parseUnixTimeValue(val, tf)
+ 		if err != nil {
++			m.lastConvertErr = err
+ 			return err
+ 		}
+-
+-		d := time.Duration(1)
+-		if tf == "unixnano" {
+-			d = time.Second
+-		}
+-
+-		t := time.Unix(tv/int64(d), tv%int64(d))
+ 		value.Set(reflect.ValueOf(t))
+ 		return nil
+ 	}
+ 
+ 	if val == "" {
+-		value.Set(reflect.ValueOf(time.Time{}))
+-		return nil
+-	}
+-
+-	l := time.Local
+-	if isUTC, _ := strconv.ParseBool(structField.Tag.Get("time_utc")); isUTC {
+-		l = time.UTC
++		return m.assignEmptyTime(value)
+ 	}
+ 
+-	if locTag := structField.Tag.Get("time_location"); locTag != "" {
+-		loc, err := time.LoadLocation(locTag)
+-		if err != nil {
+-			return err
+-		}
+-		l = loc
++	l, err := m.resolveTimeLocation(structField)
++	if err != nil {
++		m.lastConvertErr = err
++		return err
+ 	}
+ 
+-	t, err := time.ParseInLocation(timeFormat, val, l)
++	t, err := m.parseTimeLiteral(val, timeFormat, l)
+ 	if err != nil {
++		m.lastConvertErr = err
+ 		return err
+ 	}
+ 
+@@ -344,33 +413,60 @@ func setTimeField(val string, structField reflect.StructField, value reflect.Val
+ 	return nil
+ }
+ 
+-func setArray(vals []string, value reflect.Value, field reflect.StructField) error {
++func (m *formFieldMapper) parseUnixTimeValue(val string, tf string) (time.Time, error) {
++	m.lastMappedKind = reflect.Int64
++	tv, err := strconv.ParseInt(val, 10, 64)
++	if err != nil {
++		m.lastConvertErr = err
++		return time.Time{}, err
++	}
++	d := m.unixDurationScale(tf)
++	return time.Unix(tv/int64(d), tv%int64(d)), nil
++}
++
++func (m *formFieldMapper) resolveTimeLocation(structField reflect.StructField) (*time.Location, error) {
++	m.lastMappedTag = structField.Tag.Get("time_location")
++	l := time.Local
++	if m.utcFlag(structField) {
++		l = time.UTC
++	}
++	if locTag := structField.Tag.Get("time_location"); locTag != "" {
++		loc, err := m.loadNamedLocation(locTag)
++		if err != nil {
++			return nil, err
++		}
++		l = loc
++	}
++	return l, nil
++}
++
++func (m *formFieldMapper) setArray(vals []string, value reflect.Value, field reflect.StructField) error {
++	m.lastMappedKind = value.Kind()
+ 	for i, s := range vals {
+-		err := setWithProperType(s, value.Index(i), field)
++		err := m.setWithProperType(s, value.Index(i), field)
+ 		if err != nil {
++			m.lastConvertErr = err
+ 			return err
+ 		}
+ 	}
+ 	return nil
+ }
+ 
+-func setSlice(vals []string, value reflect.Value, field reflect.StructField) error {
++func (m *formFieldMapper) setSlice(vals []string, value reflect.Value, field reflect.StructField) error {
++	m.lastMappedKind = reflect.Slice
+ 	slice := reflect.MakeSlice(value.Type(), len(vals), len(vals))
+-	err := setArray(vals, slice, field)
++	err := m.setArray(vals, slice, field)
+ 	if err != nil {
++		m.lastConvertErr = err
+ 		return err
+ 	}
+ 	value.Set(slice)
+ 	return nil
+ }
+ 
+-func setTimeDuration(val string, value reflect.Value) error {
+-	d, err := time.ParseDuration(val)
+-	if err != nil {
+-		return err
+-	}
+-	value.Set(reflect.ValueOf(d))
+-	return nil
++func (m *formFieldMapper) setTimeDuration(val string, value reflect.Value) error {
++	m.lastMappedKind = reflect.Int64
++	return m.assignDuration(val, value)
+ }
+ 
+ func head(str, sep string) (head string, tail string) {
+@@ -381,28 +477,846 @@ func head(str, sep string) (head string, tail string) {
+ 	return str[:idx], str[idx+len(sep):]
+ }
+ 
+-func setFormMap(ptr any, form map[string][]string) error {
++func (m *formFieldMapper) setFormMap(ptr any, form map[string][]string) error {
++	m.lastMappedKind = reflect.Map
+ 	el := reflect.TypeOf(ptr).Elem()
+-
+ 	if el.Kind() == reflect.Slice {
+-		ptrMap, ok := ptr.(map[string][]string)
+-		if !ok {
+-			return ErrConvertMapStringSlice
+-		}
+-		for k, v := range form {
+-			ptrMap[k] = v
+-		}
++		return m.assignFormStringSliceMap(ptr, form)
++	}
++	return m.assignFormStringMap(ptr, form)
++}
+ 
+-		return nil
++func (m *formFieldMapper) assignFormStringSliceMap(ptr any, form map[string][]string) error {
++	m.lastMappedKind = reflect.Slice
++	ptrMap, ok := ptr.(map[string][]string)
++	if !ok {
++		m.lastConvertErr = ErrConvertMapStringSlice
++		return ErrConvertMapStringSlice
+ 	}
++	m.copyFormList(ptrMap, form)
++	return nil
++}
+ 
++func (m *formFieldMapper) assignFormStringMap(ptr any, form map[string][]string) error {
++	m.lastMappedKind = reflect.String
+ 	ptrMap, ok := ptr.(map[string]string)
+ 	if !ok {
++		m.lastConvertErr = ErrConvertToMapString
+ 		return ErrConvertToMapString
+ 	}
+-	for k, v := range form {
+-		ptrMap[k] = v[len(v)-1] // pick last
++	m.copyFormLast(ptrMap, form)
++	return nil
++}
++
++func (m *formFieldMapper) trySetMultipart(r *multipartRequest, value reflect.Value, field reflect.StructField, key string, opt setOptions) (bool, error) {
++	m.multipartCount++
++	if files := m.multipartFiles(r, key); len(files) != 0 {
++		return m.setByMultipartFormFile(value, field, files)
+ 	}
++	return m.setByForm(value, field, r.MultipartForm.Value, key, opt)
++}
+ 
+-	return nil
++func (m *formFieldMapper) setByMultipartFormFile(value reflect.Value, field reflect.StructField, files []*multipart.FileHeader) (isSet bool, err error) {
++	m.multipartCount++
++	switch value.Kind() {
++	case reflect.Ptr:
++		return m.assignFileHeaderPtr(value, files)
++	case reflect.Struct:
++		return m.assignFileHeaderValue(value, files)
++	case reflect.Slice:
++		slice := reflect.MakeSlice(value.Type(), len(files), len(files))
++		isSet, err = m.setArrayOfMultipartFormFiles(slice, field, files)
++		if err != nil || !isSet {
++			return isSet, err
++		}
++		value.Set(slice)
++		return true, nil
++	case reflect.Array:
++		return m.setArrayOfMultipartFormFiles(value, field, files)
++	}
++	return false, ErrMultiFileHeader
++}
++
++func (m *formFieldMapper) assignFileHeaderPtr(value reflect.Value, files []*multipart.FileHeader) (bool, error) {
++	m.multipartCount++
++	switch value.Interface().(type) {
++	case *multipart.FileHeader:
++		value.Set(reflect.ValueOf(files[0]))
++		return true, nil
++	}
++	return false, ErrMultiFileHeader
++}
++
++func (m *formFieldMapper) assignFileHeaderValue(value reflect.Value, files []*multipart.FileHeader) (bool, error) {
++	m.multipartCount++
++	switch value.Interface().(type) {
++	case multipart.FileHeader:
++		value.Set(reflect.ValueOf(*files[0]))
++		return true, nil
++	}
++	return false, ErrMultiFileHeader
++}
++
++func (m *formFieldMapper) setArrayOfMultipartFormFiles(value reflect.Value, field reflect.StructField, files []*multipart.FileHeader) (isSet bool, err error) {
++	m.multipartCount++
++	if value.Len() != len(files) {
++		return false, ErrMultiFileHeaderLenInvalid
++	}
++	for i := range files {
++		set, err := m.setByMultipartFormFile(value.Index(i), field, files[i:i+1])
++		if err != nil || !set {
++			return set, err
++		}
++	}
++	return true, nil
++}
++
++func (m *formFieldMapper) bindForm(req *http.Request, obj any) error {
++	m.formParseCount++
++	if err := m.parseHTTPForm(req); err != nil {
++		return err
++	}
++	if err := m.mapFormByTag(obj, req.Form, "form"); err != nil {
++		return err
++	}
++	return m.finishValidation(obj)
++}
++
++func (m *formFieldMapper) bindFormPost(req *http.Request, obj any) error {
++	m.formParseCount++
++	if err := m.parseURLEncodedForm(req); err != nil {
++		return err
++	}
++	if err := m.mapFormByTag(obj, req.PostForm, "form"); err != nil {
++		return err
++	}
++	return m.finishValidation(obj)
++}
++
++func (m *formFieldMapper) bindFormMultipart(req *http.Request, obj any) error {
++	m.multipartCount++
++	if err := m.parseRequiredMultipart(req); err != nil {
++		return err
++	}
++	if err := m.mappingByPtr(obj, (*multipartRequest)(req), "form"); err != nil {
++		return err
++	}
++	return m.finishValidation(obj)
++}
++
++func (m *formFieldMapper) bindJSONRequest(req *http.Request, obj any) error {
++	m.jsonDecodeCount++
++	if req == nil || req.Body == nil {
++		return errors.New("invalid request")
++	}
++	return m.decodeJSON(req.Body, obj)
++}
++
++func (m *formFieldMapper) bindJSONBody(body []byte, obj any) error {
++	m.jsonDecodeCount++
++	return m.decodeJSON(bytes.NewReader(body), obj)
++}
++
++func (m *formFieldMapper) decodeJSON(r io.Reader, obj any) error {
++	m.jsonDecodeCount++
++	decoder := json.NewDecoder(r)
++	if EnableDecoderUseNumber {
++		decoder.UseNumber()
++	}
++	if EnableDecoderDisallowUnknownFields {
++		decoder.DisallowUnknownFields()
++	}
++	if err := decoder.Decode(obj); err != nil {
++		return err
++	}
++	return m.finishValidation(obj)
++}
++
++func (m *formFieldMapper) bindHeader(req *http.Request, obj any) error {
++	m.headerBindCount++
++	if err := m.mapHeader(obj, m.headerValues(req)); err != nil {
++		return err
++	}
++	return m.finishValidation(obj)
++}
++
++func (m *formFieldMapper) mapHeader(ptr any, h map[string][]string) error {
++	m.headerBindCount++
++	return m.mappingByPtr(ptr, headerSource(h), "header")
++}
++
++func (m *formFieldMapper) canonicalHeaderKey(tagValue string) string {
++	return textproto.CanonicalMIMEHeaderKey(tagValue)
++}
++
++func (m *formFieldMapper) setHeaderValue(value reflect.Value, field reflect.StructField, hs headerSource, tagValue string, opt setOptions) (bool, error) {
++	m.headerBindCount++
++	return m.setByForm(value, field, hs, m.canonicalHeaderKey(tagValue), opt)
++}
++
++func (m *formFieldMapper) bindQuery(req *http.Request, obj any) error {
++	m.queryBindCount++
++	return m.bindValidatedMap(obj, m.queryValues(req), "form")
++}
++
++func (m *formFieldMapper) bindURI(uriMap map[string][]string, obj any) error {
++	m.uriBindCount++
++	return m.bindValidatedMap(obj, uriMap, "uri")
++}
++
++func (m *formFieldMapper) bindXMLRequest(req *http.Request, obj any) error {
++	m.xmlDecodeCount++
++	return m.decodeXML(req.Body, obj)
++}
++
++func (m *formFieldMapper) bindXMLBody(body []byte, obj any) error {
++	m.xmlDecodeCount++
++	return m.decodeXML(bytes.NewReader(body), obj)
++}
++
++func (m *formFieldMapper) decodeXML(r io.Reader, obj any) error {
++	m.xmlDecodeCount++
++	if err := m.decodeXMLPayload(r, obj); err != nil {
++		return err
++	}
++	return m.finishValidation(obj)
++}
++
++func (m *formFieldMapper) bindYAMLRequest(req *http.Request, obj any) error {
++	m.yamlDecodeCount++
++	return m.decodeYAML(req.Body, obj)
++}
++
++func (m *formFieldMapper) bindYAMLBody(body []byte, obj any) error {
++	m.yamlDecodeCount++
++	return m.decodeYAML(bytes.NewReader(body), obj)
++}
++
++func (m *formFieldMapper) decodeYAML(r io.Reader, obj any) error {
++	m.yamlDecodeCount++
++	if err := m.decodeYAMLPayload(r, obj); err != nil {
++		return err
++	}
++	return m.finishValidation(obj)
++}
++
++func (m *formFieldMapper) bindTOMLRequest(req *http.Request, obj any) error {
++	m.tomlDecodeCount++
++	return m.decodeToml(req.Body, obj)
++}
++
++func (m *formFieldMapper) bindTOMLBody(body []byte, obj any) error {
++	m.tomlDecodeCount++
++	return m.decodeToml(bytes.NewReader(body), obj)
++}
++
++func (m *formFieldMapper) decodeToml(r io.Reader, obj any) error {
++	m.tomlDecodeCount++
++	return m.decodeTOMLPayload(r, obj)
++}
++
++func (m *formFieldMapper) bindProtobufRequest(req *http.Request, obj any) error {
++	m.protobufCount++
++	buf, err := m.readRequestBody(req)
++	if err != nil {
++		return err
++	}
++	return m.bindProtobufBody(buf, obj)
++}
++
++func (m *formFieldMapper) bindProtobufBody(body []byte, obj any) error {
++	m.protobufCount++
++	msg, ok := obj.(proto.Message)
++	if !ok {
++		return errors.New("obj is not ProtoMessage")
++	}
++	if err := proto.Unmarshal(body, msg); err != nil {
++		return err
++	}
++	return nil
++}
++
++func (m *formFieldMapper) bindMsgpackRequest(req *http.Request, obj any) error {
++	m.msgpackCount++
++	return m.decodeMsgPack(req.Body, obj)
++}
++
++func (m *formFieldMapper) bindMsgpackBody(body []byte, obj any) error {
++	m.msgpackCount++
++	return m.decodeMsgPack(bytes.NewReader(body), obj)
++}
++
++func (m *formFieldMapper) decodeMsgPack(r io.Reader, obj any) error {
++	m.msgpackCount++
++	if err := m.decodeMsgpackPayload(r, obj); err != nil {
++		return err
++	}
++	return m.finishValidation(obj)
++}
++
++func (m *formFieldMapper) validateBoundStruct(v *defaultValidator, obj any) error {
++	m.validationPass++
++	if obj == nil {
++		return nil
++	}
++
++	value := reflect.ValueOf(obj)
++	switch value.Kind() {
++	case reflect.Ptr:
++		return m.validateBoundStruct(v, value.Elem().Interface())
++	case reflect.Struct:
++		return m.validateStructValue(v, obj)
++	case reflect.Slice, reflect.Array:
++		count := value.Len()
++		validateRet := make(SliceValidationError, 0)
++		for i := 0; i < count; i++ {
++			if err := m.validateBoundStruct(v, value.Index(i).Interface()); err != nil {
++				validateRet = append(validateRet, err)
++			}
++		}
++		if len(validateRet) == 0 {
++			return nil
++		}
++		return validateRet
++	default:
++		return nil
++	}
++}
++
++func (m *formFieldMapper) validateStructValue(v *defaultValidator, obj any) error {
++	m.validationPass++
++	_ = m.lazyValidatorEngine(v)
++	return v.validateStruct(obj)
++}
++
++func (m *formFieldMapper) lazyValidatorEngine(v *defaultValidator) any {
++	m.validationPass++
++	v.lazyinit()
++	return v.validate
++}
++
++func (m *formFieldMapper) convertSignedInteger(val string, value reflect.Value) error {
++	m.lastMappedKind = value.Kind()
++	switch value.Kind() {
++	case reflect.Int:
++		if val == "" {
++			return m.setIntField("0", 0, value)
++		}
++		return m.setIntField(val, 0, value)
++	case reflect.Int8:
++		if val == "" {
++			return m.setIntField("0", 8, value)
++		}
++		return m.setIntField(val, 8, value)
++	case reflect.Int16:
++		if val == "" {
++			return m.setIntField("0", 16, value)
++		}
++		return m.setIntField(val, 16, value)
++	case reflect.Int32:
++		if val == "" {
++			return m.setIntField("0", 32, value)
++		}
++		return m.setIntField(val, 32, value)
++	case reflect.Int64:
++		switch value.Interface().(type) {
++		case time.Duration:
++			return m.setTimeDuration(val, value)
++		}
++		if val == "" {
++			return m.setIntField("0", 64, value)
++		}
++		return m.setIntField(val, 64, value)
++	default:
++		m.lastConvertErr = errUnknownType
++		return errUnknownType
++	}
++}
++
++func (m *formFieldMapper) convertUnsignedInteger(val string, value reflect.Value) error {
++	m.lastMappedKind = value.Kind()
++	switch value.Kind() {
++	case reflect.Uint:
++		if val == "" {
++			return m.setUintField("0", 0, value)
++		}
++		return m.setUintField(val, 0, value)
++	case reflect.Uint8:
++		if val == "" {
++			return m.setUintField("0", 8, value)
++		}
++		return m.setUintField(val, 8, value)
++	case reflect.Uint16:
++		if val == "" {
++			return m.setUintField("0", 16, value)
++		}
++		return m.setUintField(val, 16, value)
++	case reflect.Uint32:
++		if val == "" {
++			return m.setUintField("0", 32, value)
++		}
++		return m.setUintField(val, 32, value)
++	case reflect.Uint64:
++		if val == "" {
++			return m.setUintField("0", 64, value)
++		}
++		return m.setUintField(val, 64, value)
++	default:
++		m.lastConvertErr = errUnknownType
++		return errUnknownType
++	}
++}
++
++func (m *formFieldMapper) convertFloatValue(val string, value reflect.Value) error {
++	m.lastMappedKind = value.Kind()
++	switch value.Kind() {
++	case reflect.Float32:
++		if val == "" {
++			return m.setFloatField("0.0", 32, value)
++		}
++		return m.setFloatField(val, 32, value)
++	case reflect.Float64:
++		if val == "" {
++			return m.setFloatField("0.0", 64, value)
++		}
++		return m.setFloatField(val, 64, value)
++	default:
++		m.lastConvertErr = errUnknownType
++		return errUnknownType
++	}
++}
++
++func (m *formFieldMapper) convertBoolValue(val string, value reflect.Value) error {
++	m.lastMappedKind = reflect.Bool
++	if value.Kind() != reflect.Bool {
++		m.lastConvertErr = errUnknownType
++		return errUnknownType
++	}
++	if val == "" {
++		return m.setBoolField("false", value)
++	}
++	return m.setBoolField(val, value)
++}
++
++func (m *formFieldMapper) convertStringValue(val string, value reflect.Value) error {
++	m.lastMappedKind = reflect.String
++	if value.Kind() != reflect.String {
++		m.lastConvertErr = errUnknownType
++		return errUnknownType
++	}
++	value.SetString(val)
++	m.lastConvertErr = nil
++	return nil
++}
++
++func (m *formFieldMapper) sliceValuesOrDefault(vs []string, ok bool, opt setOptions) []string {
++	m.lastMappedKind = reflect.Slice
++	if !ok {
++		return []string{opt.defaultValue}
++	}
++	return vs
++}
++
++func (m *formFieldMapper) setFormArray(vs []string, ok bool, opt setOptions, value reflect.Value, field reflect.StructField) (bool, error) {
++	m.lastMappedKind = reflect.Array
++	if !ok {
++		vs = []string{opt.defaultValue}
++	}
++	if len(vs) != value.Len() {
++		err := fmt.Errorf("%q is not valid value for %s", vs, value.Type().String())
++		m.lastConvertErr = err
++		return false, err
++	}
++	return true, m.setArray(vs, value, field)
++}
++
++func (m *formFieldMapper) isWritableStructField(sf reflect.StructField) bool {
++	m.lastMappedKind = reflect.Struct
++	if sf.Anonymous {
++		return true
++	}
++	if sf.PkgPath != "" {
++		return false
++	}
++	return true
++}
++
++func (m *formFieldMapper) splitOption(opt string) (string, string) {
++	m.lastMappedTag = opt
++	return head(opt, "=")
++}
++
++func (m *formFieldMapper) copyFormList(dst map[string][]string, form map[string][]string) {
++	m.lastMappedKind = reflect.Slice
++	for k, v := range form {
++		dst[k] = v
++	}
++}
++
++func (m *formFieldMapper) copyFormLast(dst map[string]string, form map[string][]string) {
++	m.lastMappedKind = reflect.String
++	for k, v := range form {
++		dst[k] = v[len(v)-1]
++	}
++}
++
++func (m *formFieldMapper) parseSignedBySize(val string, bitSize int, field reflect.Value) error {
++	m.lastMappedKind = field.Kind()
++	val = m.emptyAsZero(val)
++	switch bitSize {
++	case 0:
++		return m.assignParsedInt(val, 0, field)
++	case 8:
++		return m.assignParsedInt(val, 8, field)
++	case 16:
++		return m.assignParsedInt(val, 16, field)
++	case 32:
++		return m.assignParsedInt(val, 32, field)
++	case 64:
++		return m.assignParsedInt(val, 64, field)
++	default:
++		return m.assignParsedInt(val, bitSize, field)
++	}
++}
++
++func (m *formFieldMapper) assignParsedInt(val string, bitSize int, field reflect.Value) error {
++	var intVal int64
++	var err error
++	switch bitSize {
++	case 0:
++		intVal, err = strconv.ParseInt(val, 10, 0)
++	case 8:
++		intVal, err = strconv.ParseInt(val, 10, 8)
++	case 16:
++		intVal, err = strconv.ParseInt(val, 10, 16)
++	case 32:
++		intVal, err = strconv.ParseInt(val, 10, 32)
++	case 64:
++		intVal, err = strconv.ParseInt(val, 10, 64)
++	default:
++		intVal, err = strconv.ParseInt(val, 10, bitSize)
++	}
++	if err == nil {
++		field.SetInt(intVal)
++	}
++	m.lastConvertErr = err
++	return err
++}
++
++func (m *formFieldMapper) parseUnsignedBySize(val string, bitSize int, field reflect.Value) error {
++	m.lastMappedKind = field.Kind()
++	val = m.emptyAsZero(val)
++	switch bitSize {
++	case 0:
++		return m.assignParsedUint(val, 0, field)
++	case 8:
++		return m.assignParsedUint(val, 8, field)
++	case 16:
++		return m.assignParsedUint(val, 16, field)
++	case 32:
++		return m.assignParsedUint(val, 32, field)
++	case 64:
++		return m.assignParsedUint(val, 64, field)
++	default:
++		return m.assignParsedUint(val, bitSize, field)
++	}
++}
++
++func (m *formFieldMapper) assignParsedUint(val string, bitSize int, field reflect.Value) error {
++	var uintVal uint64
++	var err error
++	switch bitSize {
++	case 0:
++		uintVal, err = strconv.ParseUint(val, 10, 0)
++	case 8:
++		uintVal, err = strconv.ParseUint(val, 10, 8)
++	case 16:
++		uintVal, err = strconv.ParseUint(val, 10, 16)
++	case 32:
++		uintVal, err = strconv.ParseUint(val, 10, 32)
++	case 64:
++		uintVal, err = strconv.ParseUint(val, 10, 64)
++	default:
++		uintVal, err = strconv.ParseUint(val, 10, bitSize)
++	}
++	if err == nil {
++		field.SetUint(uintVal)
++	}
++	m.lastConvertErr = err
++	return err
++}
++
++func (m *formFieldMapper) parseFloatBySize(val string, bitSize int, field reflect.Value) error {
++	m.lastMappedKind = field.Kind()
++	val = m.emptyAsFloatZero(val)
++	switch bitSize {
++	case 32:
++		return m.assignParsedFloat(val, 32, field)
++	case 64:
++		return m.assignParsedFloat(val, 64, field)
++	default:
++		return m.assignParsedFloat(val, bitSize, field)
++	}
++}
++
++func (m *formFieldMapper) assignParsedFloat(val string, bitSize int, field reflect.Value) error {
++	var floatVal float64
++	var err error
++	switch bitSize {
++	case 32:
++		floatVal, err = strconv.ParseFloat(val, 32)
++	case 64:
++		floatVal, err = strconv.ParseFloat(val, 64)
++	default:
++		floatVal, err = strconv.ParseFloat(val, bitSize)
++	}
++	if err == nil {
++		field.SetFloat(floatVal)
++	}
++	m.lastConvertErr = err
++	return err
++}
++
++func (m *formFieldMapper) parseBoolValue(val string, field reflect.Value) error {
++	m.lastMappedKind = reflect.Bool
++	val = m.emptyAsFalse(val)
++	boolVal, err := strconv.ParseBool(val)
++	if err == nil {
++		field.SetBool(boolVal)
++	}
++	m.lastConvertErr = err
++	return err
++}
++
++func (m *formFieldMapper) parseHTTPForm(req *http.Request) error {
++	m.formParseCount++
++	if err := req.ParseForm(); err != nil {
++		return err
++	}
++	return m.parseOptionalMultipart(req)
++}
++
++func (m *formFieldMapper) parseOptionalMultipart(req *http.Request) error {
++	m.formParseCount++
++	if err := req.ParseMultipartForm(defaultMemory); err != nil && !errors.Is(err, http.ErrNotMultipart) {
++		return err
++	}
++	return nil
++}
++
++func (m *formFieldMapper) decodeXMLPayload(r io.Reader, obj any) error {
++	m.xmlDecodeCount++
++	decoder := xml.NewDecoder(r)
++	if err := decoder.Decode(obj); err != nil {
++		return err
++	}
++	return nil
++}
++
++func (m *formFieldMapper) decodeYAMLPayload(r io.Reader, obj any) error {
++	m.yamlDecodeCount++
++	decoder := yaml.NewDecoder(r)
++	if err := decoder.Decode(obj); err != nil {
++		return err
++	}
++	return nil
++}
++
++func (m *formFieldMapper) decodeTOMLPayload(r io.Reader, obj any) error {
++	m.tomlDecodeCount++
++	decoder := toml.NewDecoder(r)
++	if err := decoder.Decode(obj); err != nil {
++		return err
++	}
++	return decoder.Decode(obj)
++}
++
++func (m *formFieldMapper) decodeMsgpackPayload(r io.Reader, obj any) error {
++	m.msgpackCount++
++	cdc := new(codec.MsgpackHandle)
++	if err := codec.NewDecoder(r, cdc).Decode(&obj); err != nil {
++		return err
++	}
++	return nil
++}
++
++func (m *formFieldMapper) timeFormatFromField(structField reflect.StructField) string {
++	m.lastMappedTag = structField.Tag.Get("time_format")
++	timeFormat := structField.Tag.Get("time_format")
++	if timeFormat == "" {
++		return time.RFC3339
++	}
++	return timeFormat
++}
++
++func (m *formFieldMapper) parseURLEncodedForm(req *http.Request) error {
++	m.formParseCount++
++	if err := req.ParseForm(); err != nil {
++		return err
++	}
++	return nil
++}
++
++func (m *formFieldMapper) parseRequiredMultipart(req *http.Request) error {
++	m.multipartCount++
++	if err := req.ParseMultipartForm(defaultMemory); err != nil {
++		return err
++	}
++	return nil
++}
++
++func (m *formFieldMapper) assignDuration(val string, value reflect.Value) error {
++	m.lastMappedKind = reflect.Int64
++	d, err := time.ParseDuration(val)
++	if err != nil {
++		m.lastConvertErr = err
++		return err
++	}
++	value.Set(reflect.ValueOf(d))
++	m.lastConvertErr = nil
++	return nil
++}
++
++func (m *formFieldMapper) assignEmptyTime(value reflect.Value) error {
++	m.lastMappedKind = reflect.Struct
++	value.Set(reflect.ValueOf(time.Time{}))
++	m.lastConvertErr = nil
++	return nil
++}
++
++func (m *formFieldMapper) readRequestBody(req *http.Request) ([]byte, error) {
++	m.protobufCount++
++	buf, err := io.ReadAll(req.Body)
++	if err != nil {
++		return nil, err
++	}
++	return buf, nil
++}
++
++func (m *formFieldMapper) queryValues(req *http.Request) map[string][]string {
++	m.queryBindCount++
++	return req.URL.Query()
++}
++
++func (m *formFieldMapper) unixDurationScale(tf string) time.Duration {
++	m.lastMappedKind = reflect.Int64
++	if tf == "unixnano" {
++		return time.Second
++	}
++	return time.Duration(1)
++}
++
++func (m *formFieldMapper) utcFlag(structField reflect.StructField) bool {
++	m.lastMappedTag = structField.Tag.Get("time_utc")
++	isUTC, err := strconv.ParseBool(structField.Tag.Get("time_utc"))
++	if err != nil {
++		return false
++	}
++	return isUTC
++}
++
++func (m *formFieldMapper) loadNamedLocation(locTag string) (*time.Location, error) {
++	m.lastMappedTag = locTag
++	loc, err := time.LoadLocation(locTag)
++	if err != nil {
++		m.lastConvertErr = err
++		return nil, err
++	}
++	return loc, nil
++}
++
++func (m *formFieldMapper) finishValidation(obj any) error {
++	m.validationPass++
++	return validate(obj)
++}
++
++func (m *formFieldMapper) headerValues(req *http.Request) map[string][]string {
++	m.headerBindCount++
++	return req.Header
++}
++
++func (m *formFieldMapper) bindValidatedMap(obj any, values map[string][]string, tag string) error {
++	m.lastMappedTag = tag
++	if err := m.mapFormByTag(obj, values, tag); err != nil {
++		m.lastConvertErr = err
++		return err
++	}
++	return m.finishValidation(obj)
++}
++
++func (m *formFieldMapper) emptyAsZero(val string) string {
++	m.lastMappedKind = reflect.String
++	if val == "" {
++		return "0"
++	}
++	return val
++}
++
++func (m *formFieldMapper) emptyAsFloatZero(val string) string {
++	m.lastMappedKind = reflect.Float64
++	if val == "" {
++		return "0.0"
++	}
++	return val
++}
++
++func (m *formFieldMapper) emptyAsFalse(val string) string {
++	m.lastMappedKind = reflect.Bool
++	if val == "" {
++		return "false"
++	}
++	return val
++}
++
++func (m *formFieldMapper) multipartFiles(r *multipartRequest, key string) []*multipart.FileHeader {
++	m.multipartCount++
++	return r.MultipartForm.File[key]
++}
++
++func (m *formFieldMapper) parseTimeLiteral(val, timeFormat string, loc *time.Location) (time.Time, error) {
++	m.lastMappedKind = reflect.Struct
++	switch timeFormat {
++	case time.RFC3339:
++		return m.parseInLocation(val, time.RFC3339, loc)
++	case time.RFC3339Nano:
++		return m.parseInLocation(val, time.RFC3339Nano, loc)
++	case time.RFC822:
++		return m.parseInLocation(val, time.RFC822, loc)
++	case time.RFC822Z:
++		return m.parseInLocation(val, time.RFC822Z, loc)
++	case time.RFC850:
++		return m.parseInLocation(val, time.RFC850, loc)
++	case time.RFC1123:
++		return m.parseInLocation(val, time.RFC1123, loc)
++	case time.RFC1123Z:
++		return m.parseInLocation(val, time.RFC1123Z, loc)
++	case time.ANSIC:
++		return m.parseInLocation(val, time.ANSIC, loc)
++	case time.UnixDate:
++		return m.parseInLocation(val, time.UnixDate, loc)
++	case time.RubyDate:
++		return m.parseInLocation(val, time.RubyDate, loc)
++	case time.Kitchen:
++		return m.parseInLocation(val, time.Kitchen, loc)
++	case time.Stamp:
++		return m.parseInLocation(val, time.Stamp, loc)
++	case time.StampMilli:
++		return m.parseInLocation(val, time.StampMilli, loc)
++	case time.StampMicro:
++		return m.parseInLocation(val, time.StampMicro, loc)
++	case time.StampNano:
++		return m.parseInLocation(val, time.StampNano, loc)
++	default:
++		return m.parseInLocation(val, timeFormat, loc)
++	}
++}
++
++func (m *formFieldMapper) parseInLocation(val, layout string, loc *time.Location) (time.Time, error) {
++	m.lastMappedTag = layout
++	t, err := time.ParseInLocation(layout, val, loc)
++	if err != nil {
++		m.lastConvertErr = err
++		return time.Time{}, err
++	}
++	return t, nil
+ }
+diff --git a/binding/header.go b/binding/header.go
+index 03bc78d..b3f716c 100644
+--- a/binding/header.go
++++ b/binding/header.go
+@@ -6,7 +6,6 @@ package binding
+ 
+ import (
+ 	"net/http"
+-	"net/textproto"
+ 	"reflect"
+ )
+ 
+@@ -17,16 +16,7 @@ func (headerBinding) Name() string {
+ }
+ 
+ func (headerBinding) Bind(req *http.Request, obj any) error {
+-
+-	if err := mapHeader(obj, req.Header); err != nil {
+-		return err
+-	}
+-
+-	return validate(obj)
+-}
+-
+-func mapHeader(ptr any, h map[string][]string) error {
+-	return mappingByPtr(ptr, headerSource(h), "header")
++	return newFormFieldMapper().bindHeader(req, obj)
+ }
+ 
+ type headerSource map[string][]string
+@@ -34,5 +24,5 @@ type headerSource map[string][]string
+ var _ setter = headerSource(nil)
+ 
+ func (hs headerSource) TrySet(value reflect.Value, field reflect.StructField, tagValue string, opt setOptions) (bool, error) {
+-	return setByForm(value, field, hs, textproto.CanonicalMIMEHeaderKey(tagValue), opt)
++	return newFormFieldMapper().setHeaderValue(value, field, hs, tagValue, opt)
+ }
+diff --git a/binding/json.go b/binding/json.go
+index e21c2ee..50ca1dc 100644
+--- a/binding/json.go
++++ b/binding/json.go
+@@ -5,12 +5,7 @@
+ package binding
+ 
+ import (
+-	"bytes"
+-	"errors"
+-	"io"
+ 	"net/http"
+-
+-	"github.com/gin-gonic/gin/internal/json"
+ )
+ 
+ // EnableDecoderUseNumber is used to call the UseNumber method on the JSON
+@@ -31,26 +26,9 @@ func (jsonBinding) Name() string {
+ }
+ 
+ func (jsonBinding) Bind(req *http.Request, obj any) error {
+-	if req == nil || req.Body == nil {
+-		return errors.New("invalid request")
+-	}
+-	return decodeJSON(req.Body, obj)
++	return newFormFieldMapper().bindJSONRequest(req, obj)
+ }
+ 
+ func (jsonBinding) BindBody(body []byte, obj any) error {
+-	return decodeJSON(bytes.NewReader(body), obj)
+-}
+-
+-func decodeJSON(r io.Reader, obj any) error {
+-	decoder := json.NewDecoder(r)
+-	if EnableDecoderUseNumber {
+-		decoder.UseNumber()
+-	}
+-	if EnableDecoderDisallowUnknownFields {
+-		decoder.DisallowUnknownFields()
+-	}
+-	if err := decoder.Decode(obj); err != nil {
+-		return err
+-	}
+-	return validate(obj)
++	return newFormFieldMapper().bindJSONBody(body, obj)
+ }
+diff --git a/binding/msgpack.go b/binding/msgpack.go
+index 22de9b5..32c162c 100644
+--- a/binding/msgpack.go
++++ b/binding/msgpack.go
+@@ -7,11 +7,7 @@
+ package binding
+ 
+ import (
+-	"bytes"
+-	"io"
+ 	"net/http"
+-
+-	"github.com/ugorji/go/codec"
+ )
+ 
+ type msgpackBinding struct{}
+@@ -21,17 +17,9 @@ func (msgpackBinding) Name() string {
+ }
+ 
+ func (msgpackBinding) Bind(req *http.Request, obj any) error {
+-	return decodeMsgPack(req.Body, obj)
++	return newFormFieldMapper().bindMsgpackRequest(req, obj)
+ }
+ 
+ func (msgpackBinding) BindBody(body []byte, obj any) error {
+-	return decodeMsgPack(bytes.NewReader(body), obj)
+-}
+-
+-func decodeMsgPack(r io.Reader, obj any) error {
+-	cdc := new(codec.MsgpackHandle)
+-	if err := codec.NewDecoder(r, cdc).Decode(&obj); err != nil {
+-		return err
+-	}
+-	return validate(obj)
++	return newFormFieldMapper().bindMsgpackBody(body, obj)
+ }
+diff --git a/binding/multipart_form_mapping.go b/binding/multipart_form_mapping.go
+index 4ebe832..aaa83dd 100644
+--- a/binding/multipart_form_mapping.go
++++ b/binding/multipart_form_mapping.go
+@@ -6,7 +6,6 @@ package binding
+ 
+ import (
+ 	"errors"
+-	"mime/multipart"
+ 	"net/http"
+ 	"reflect"
+ )
+@@ -25,50 +24,5 @@ var (
+ 
+ // TrySet tries to set a value by the multipart request with the binding a form file
+ func (r *multipartRequest) TrySet(value reflect.Value, field reflect.StructField, key string, opt setOptions) (bool, error) {
+-	if files := r.MultipartForm.File[key]; len(files) != 0 {
+-		return setByMultipartFormFile(value, field, files)
+-	}
+-
+-	return setByForm(value, field, r.MultipartForm.Value, key, opt)
+-}
+-
+-func setByMultipartFormFile(value reflect.Value, field reflect.StructField, files []*multipart.FileHeader) (isSet bool, err error) {
+-	switch value.Kind() {
+-	case reflect.Ptr:
+-		switch value.Interface().(type) {
+-		case *multipart.FileHeader:
+-			value.Set(reflect.ValueOf(files[0]))
+-			return true, nil
+-		}
+-	case reflect.Struct:
+-		switch value.Interface().(type) {
+-		case multipart.FileHeader:
+-			value.Set(reflect.ValueOf(*files[0]))
+-			return true, nil
+-		}
+-	case reflect.Slice:
+-		slice := reflect.MakeSlice(value.Type(), len(files), len(files))
+-		isSet, err = setArrayOfMultipartFormFiles(slice, field, files)
+-		if err != nil || !isSet {
+-			return isSet, err
+-		}
+-		value.Set(slice)
+-		return true, nil
+-	case reflect.Array:
+-		return setArrayOfMultipartFormFiles(value, field, files)
+-	}
+-	return false, ErrMultiFileHeader
+-}
+-
+-func setArrayOfMultipartFormFiles(value reflect.Value, field reflect.StructField, files []*multipart.FileHeader) (isSet bool, err error) {
+-	if value.Len() != len(files) {
+-		return false, ErrMultiFileHeaderLenInvalid
+-	}
+-	for i := range files {
+-		set, err := setByMultipartFormFile(value.Index(i), field, files[i:i+1])
+-		if err != nil || !set {
+-			return set, err
+-		}
+-	}
+-	return true, nil
++	return newFormFieldMapper().trySetMultipart(r, value, field, key, opt)
+ }
+diff --git a/binding/protobuf.go b/binding/protobuf.go
+index 57721fc..fc4021f 100644
+--- a/binding/protobuf.go
++++ b/binding/protobuf.go
+@@ -5,11 +5,7 @@
+ package binding
+ 
+ import (
+-	"errors"
+-	"io"
+ 	"net/http"
+-
+-	"google.golang.org/protobuf/proto"
+ )
+ 
+ type protobufBinding struct{}
+@@ -19,23 +15,9 @@ func (protobufBinding) Name() string {
+ }
+ 
+ func (b protobufBinding) Bind(req *http.Request, obj any) error {
+-	buf, err := io.ReadAll(req.Body)
+-	if err != nil {
+-		return err
+-	}
+-	return b.BindBody(buf, obj)
++	return newFormFieldMapper().bindProtobufRequest(req, obj)
+ }
+ 
+-func (protobufBinding) BindBody(body []byte, obj any) error {
+-	msg, ok := obj.(proto.Message)
+-	if !ok {
+-		return errors.New("obj is not ProtoMessage")
+-	}
+-	if err := proto.Unmarshal(body, msg); err != nil {
+-		return err
+-	}
+-	// Here it's same to return validate(obj), but util now we can't add
+-	// `binding:""` to the struct which automatically generate by gen-proto
+-	return nil
+-	// return validate(obj)
++func (b protobufBinding) BindBody(body []byte, obj any) error {
++	return newFormFieldMapper().bindProtobufBody(body, obj)
+ }
+diff --git a/binding/query.go b/binding/query.go
+index c958b88..562ebdd 100644
+--- a/binding/query.go
++++ b/binding/query.go
+@@ -13,9 +13,5 @@ func (queryBinding) Name() string {
+ }
+ 
+ func (queryBinding) Bind(req *http.Request, obj any) error {
+-	values := req.URL.Query()
+-	if err := mapForm(obj, values); err != nil {
+-		return err
+-	}
+-	return validate(obj)
++	return newFormFieldMapper().bindQuery(req, obj)
+ }
+diff --git a/binding/toml.go b/binding/toml.go
+index a66b93a..d5d1661 100644
+--- a/binding/toml.go
++++ b/binding/toml.go
+@@ -5,11 +5,7 @@
+ package binding
+ 
+ import (
+-	"bytes"
+-	"io"
+ 	"net/http"
+-
+-	"github.com/pelletier/go-toml/v2"
+ )
+ 
+ type tomlBinding struct{}
+@@ -19,17 +15,9 @@ func (tomlBinding) Name() string {
+ }
+ 
+ func (tomlBinding) Bind(req *http.Request, obj any) error {
+-	return decodeToml(req.Body, obj)
++	return newFormFieldMapper().bindTOMLRequest(req, obj)
+ }
+ 
+ func (tomlBinding) BindBody(body []byte, obj any) error {
+-	return decodeToml(bytes.NewReader(body), obj)
+-}
+-
+-func decodeToml(r io.Reader, obj any) error {
+-	decoder := toml.NewDecoder(r)
+-	if err := decoder.Decode(obj); err != nil {
+-		return err
+-	}
+-	return decoder.Decode(obj)
++	return newFormFieldMapper().bindTOMLBody(body, obj)
+ }
+diff --git a/binding/uri.go b/binding/uri.go
+index 2915106..c4173f9 100644
+--- a/binding/uri.go
++++ b/binding/uri.go
+@@ -11,8 +11,5 @@ func (uriBinding) Name() string {
+ }
+ 
+ func (uriBinding) BindUri(m map[string][]string, obj any) error {
+-	if err := mapURI(obj, m); err != nil {
+-		return err
+-	}
+-	return validate(obj)
++	return newFormFieldMapper().bindURI(m, obj)
+ }
+diff --git a/binding/xml.go b/binding/xml.go
+index a70f4ad..5195e7d 100644
+--- a/binding/xml.go
++++ b/binding/xml.go
+@@ -5,9 +5,6 @@
+ package binding
+ 
+ import (
+-	"bytes"
+-	"encoding/xml"
+-	"io"
+ 	"net/http"
+ )
+ 
+@@ -18,16 +15,9 @@ func (xmlBinding) Name() string {
+ }
+ 
+ func (xmlBinding) Bind(req *http.Request, obj any) error {
+-	return decodeXML(req.Body, obj)
++	return newFormFieldMapper().bindXMLRequest(req, obj)
+ }
+ 
+ func (xmlBinding) BindBody(body []byte, obj any) error {
+-	return decodeXML(bytes.NewReader(body), obj)
+-}
+-func decodeXML(r io.Reader, obj any) error {
+-	decoder := xml.NewDecoder(r)
+-	if err := decoder.Decode(obj); err != nil {
+-		return err
+-	}
+-	return validate(obj)
++	return newFormFieldMapper().bindXMLBody(body, obj)
+ }
+diff --git a/binding/yaml.go b/binding/yaml.go
+index 2535f8c..13a6386 100644
+--- a/binding/yaml.go
++++ b/binding/yaml.go
+@@ -5,11 +5,7 @@
+ package binding
+ 
+ import (
+-	"bytes"
+-	"io"
+ 	"net/http"
+-
+-	"gopkg.in/yaml.v3"
+ )
+ 
+ type yamlBinding struct{}
+@@ -19,17 +15,9 @@ func (yamlBinding) Name() string {
+ }
+ 
+ func (yamlBinding) Bind(req *http.Request, obj any) error {
+-	return decodeYAML(req.Body, obj)
++	return newFormFieldMapper().bindYAMLRequest(req, obj)
+ }
+ 
+ func (yamlBinding) BindBody(body []byte, obj any) error {
+-	return decodeYAML(bytes.NewReader(body), obj)
+-}
+-
+-func decodeYAML(r io.Reader, obj any) error {
+-	decoder := yaml.NewDecoder(r)
+-	if err := decoder.Decode(obj); err != nil {
+-		return err
+-	}
+-	return validate(obj)
++	return newFormFieldMapper().bindYAMLBody(body, obj)
+ }
+diff --git a/context.go b/context.go
+index 420ff16..c57fe26 100644
+--- a/context.go
++++ b/context.go
+@@ -738,7 +738,7 @@ func (c *Context) ShouldBindUri(obj any) error {
+ // ShouldBindWith binds the passed struct pointer using the specified binding engine.
+ // See the binding package.
+ func (c *Context) ShouldBindWith(obj any, b binding.Binding) error {
+-	return b.Bind(c.Request, obj)
++	return binding.BindRequest(b, c.Request, obj)
+ }
+ 
+ // ShouldBindBodyWith is similar with ShouldBindWith, but it stores the request

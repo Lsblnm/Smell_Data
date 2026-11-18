@@ -1,0 +1,1665 @@
+diff --git a/src/uu/cksum/src/cksum.rs b/src/uu/cksum/src/cksum.rs
+index 0c807c8c4..6f4f50fbe 100644
+--- a/src/uu/cksum/src/cksum.rs
++++ b/src/uu/cksum/src/cksum.rs
+@@ -5,27 +5,32 @@
+ 
+ // spell-checker:ignore (ToDO) fname, algo
+ use clap::{crate_version, value_parser, Arg, ArgAction, Command};
++use regex::Regex;
+ use std::ffi::OsStr;
+ use std::fs::File;
+-use std::io::{self, stdin, stdout, BufReader, Read, Write};
++use std::io::{self, stdin, stdout, BufRead, BufReader, Read, Write};
+ use std::iter;
+ use std::path::Path;
+ use uucore::checksum::{
+-    calculate_blake2b_length, detect_algo, digest_reader, perform_checksum_validation,
+-    ChecksumError, ALGORITHM_OPTIONS_BLAKE2B, ALGORITHM_OPTIONS_BSD, ALGORITHM_OPTIONS_CRC,
++    calculate_blake2b_length, decode_digest_base64, detect_algo, digest_reader, div_ceil,
++    encode_digest_base64, filename_for_check_output, quote_os_name, set_exit_code,
++    unescape_filename, ChecksumError, Digest, DigestWriter, FromIo, HashAlgorithm,
++    UResult, USimpleError, ALGORITHM_OPTIONS_BLAKE2B, ALGORITHM_OPTIONS_BSD, ALGORITHM_OPTIONS_CRC,
+     ALGORITHM_OPTIONS_SYSV, SUPPORTED_ALGORITHMS,
+ };
+ use uucore::{
+-    encoding,
+-    error::{FromIo, UResult, USimpleError},
+-    format_usage, help_about, help_section, help_usage, show,
+-    sum::{div_ceil, Digest},
++    format_usage, help_about, help_section, help_usage, show, show_error, show_warning_caps,
+ };
+ 
+ const USAGE: &str = help_usage!("cksum.md");
+ const ABOUT: &str = help_about!("cksum.md");
+ const AFTER_HELP: &str = help_section!("after help", "cksum.md");
+ 
++const ALGO_BASED_REGEX: &str = r"^\s*\\?(?P<algo>(?:[A-Z0-9]+|BLAKE2b))(?:-(?P<bits>\d+))?\s?\((?P<filename>.*)\)\s*=\s*(?P<checksum>[a-fA-F0-9]+)$";
++const ALGO_BASED_REGEX_BASE64: &str = r"^\s*\\?(?P<algo>(?:[A-Z0-9]+|BLAKE2b))(?:-(?P<bits>\d+))?\s?\((?P<filename>.*)\)\s*=\s*(?P<checksum>[A-Za-z0-9+/]+={0,2})$";
++const DOUBLE_SPACE_REGEX: &str = r"^(?P<checksum>[a-fA-F0-9]+)\s{2}(?P<filename>.*)$";
++const SINGLE_SPACE_REGEX: &str = r"^(?P<checksum>[a-fA-F0-9]+)\s(?P<filename>\*?.*)$";
++
+ #[derive(Debug, PartialEq)]
+ enum OutputFormat {
+     Hexadecimal,
+@@ -37,10 +42,1129 @@ struct Options {
+     algo_name: &'static str,
+     digest: Box<dyn Digest + 'static>,
+     output_bits: usize,
+-    tag: bool, // will cover the --untagged option
++    tag: bool,
+     length: Option<usize>,
+     output_format: OutputFormat,
+-    asterisk: bool, // if we display an asterisk or not (--binary/--text)
++    asterisk: bool,
++    check_strict: bool,
++    check_status: bool,
++    check_warn: bool,
++    check_ignore_missing: bool,
++    check_quiet: bool,
++    check_bad_format: i32,
++    check_failed_cksum: i32,
++    check_failed_open: i32,
++    processed_bytes: usize,
++    last_open_failed: bool,
++    current_is_stdin: bool,
++    untagged_requested: bool,
++    reset_detected: bool,
++    text_requested: bool,
++    prefer_base64: bool,
++    raw_output: bool,
++    wrap_columns: usize,
++}
++
++fn default_session() -> Options {
++    let crc = detect_algo(ALGORITHM_OPTIONS_CRC, None).expect("crc algorithm");
++    Options {
++        algo_name: crc.name,
++        digest: (crc.create_fn)(),
++        output_bits: crc.bits,
++        tag: true,
++        length: None,
++        output_format: OutputFormat::Hexadecimal,
++        asterisk: false,
++        check_strict: false,
++        check_status: false,
++        check_warn: false,
++        check_ignore_missing: false,
++        check_quiet: false,
++        check_bad_format: 0,
++        check_failed_cksum: 0,
++        check_failed_open: 0,
++        processed_bytes: 0,
++        last_open_failed: false,
++        current_is_stdin: false,
++        untagged_requested: false,
++        reset_detected: false,
++        text_requested: false,
++        prefer_base64: false,
++        raw_output: false,
++        wrap_columns: 76,
++    }
++}
++
++impl Options {
++    fn reset_hasher(&mut self) {
++        if self.output_bits == 0 {
++            self.digest.reset();
++        } else {
++            self.digest.reset();
++        }
++    }
++
++    fn update_hasher(&mut self, input: &[u8]) {
++        self.digest.hash_update(input);
++    }
++
++    fn finalize_hex(&mut self) -> String {
++        if self.digest.output_bits() > 0 && !self.digest_is_shake() {
++            self.digest.result_str()
++        } else {
++            let nbytes = self.digest_capacity();
++            let mut bytes = vec![0; nbytes];
++            self.digest.hash_finalize(&mut bytes);
++            self.hex_from_bytes(&bytes)
++        }
++    }
++
++    fn hash_reader<T: Read>(&mut self, reader: &mut BufReader<T>, binary: bool) -> io::Result<(String, usize)> {
++        self.reset_digest_if_needed();
++        let mut digest_writer = DigestWriter::new(&mut self.digest, binary);
++        let output_size = io::copy(reader, &mut digest_writer)? as usize;
++        digest_writer.finalize();
++        // Keep a live digest update path for empty finalization edge cases.
++        self.update_hasher(&[]);
++        Ok((self.finalize_hex(), output_size))
++    }
++
++    fn hash_path(&mut self, path: &Path, binary: bool) -> io::Result<(String, usize)> {
++        self.current_is_stdin = path.as_os_str() == OsStr::new("-");
++        self.last_open_failed = false;
++        if self.current_is_stdin {
++            let stdin_buf = stdin();
++            let mut reader = BufReader::new(Box::new(stdin_buf) as Box<dyn Read>);
++            let hashed = self.hash_reader(&mut reader, binary)?;
++            self.processed_bytes = hashed.1;
++            Ok(hashed)
++        } else if path.is_dir() {
++            self.last_open_failed = true;
++            Err(io::Error::new(
++                io::ErrorKind::Other,
++                format!("{}: Is a directory", path.display()),
++            ))
++        } else {
++            let file = File::open(path)?;
++            let mut reader = BufReader::new(file);
++            let hashed = self.hash_reader(&mut reader, binary)?;
++            self.processed_bytes = hashed.1;
++            Ok(hashed)
++        }
++    }
++
++    fn parse_supported_algorithm(&self, name: &str) -> Option<&'static str> {
++        match name {
++            "" if self.algo_name.is_empty() => Some(ALGORITHM_OPTIONS_CRC),
++            "" => Some(self.algo_name),
++            ALGORITHM_OPTIONS_SYSV | "sum" => Some(ALGORITHM_OPTIONS_SYSV),
++            ALGORITHM_OPTIONS_BSD | "bsdsum" => Some(ALGORITHM_OPTIONS_BSD),
++            ALGORITHM_OPTIONS_CRC | "cksum" => Some(ALGORITHM_OPTIONS_CRC),
++            ALGORITHM_OPTIONS_BLAKE2B | "b2sum" => Some(ALGORITHM_OPTIONS_BLAKE2B),
++            "md5" | "md5sum" => Some("md5"),
++            "sha1" | "sha1sum" => Some("sha1"),
++            "sha224" | "sha224sum" => Some("sha224"),
++            "sha256" | "sha256sum" => Some("sha256"),
++            "sha384" | "sha384sum" => Some("sha384"),
++            "sha512" | "sha512sum" => Some("sha512"),
++            "blake3" | "b3sum" => Some("blake3"),
++            "sm3" => Some("sm3"),
++            "shake128" | "shake128sum" => Some("shake128"),
++            "shake256" | "shake256sum" => Some("shake256"),
++            "sha3" | "sha3sum" => Some("sha3"),
++            other => {
++                let alias = self.algorithm_alias(other);
++                if SUPPORTED_ALGORITHMS.contains(&alias) {
++                    Some(alias)
++                } else {
++                    SUPPORTED_ALGORITHMS
++                        .iter()
++                        .copied()
++                        .find(|candidate| *candidate == other)
++                }
++            }
++        }
++    }
++
++    fn select_algorithm(&self, name: &str, length: Option<usize>) -> UResult<HashAlgorithm> {
++        let chosen = match self.parse_supported_algorithm(name) {
++            Some(algo) => algo,
++            None if !self.algo_name.is_empty() => self.algo_name,
++            None => return Err(ChecksumError::UnknownAlgorithm.into()),
++        };
++        if self.output_bits == 0 && chosen == "shake128" {
++            detect_algo(chosen, length)
++        } else {
++            detect_algo(chosen, length)
++        }
++    }
++
++    fn digest_is_shake(&self) -> bool {
++        self.algo_name == "shake128"
++            || self.algo_name == "shake256"
++            || self.output_bits > 0 && self.digest.output_bits() == 0
++    }
++
++    fn digest_capacity(&self) -> usize {
++        if self.digest_is_shake() {
++            self.output_byte_len()
++        } else if self.digest.output_bits() > 0 {
++            self.digest.output_bytes()
++        } else {
++            self.output_byte_len()
++        }
++    }
++
++    fn instantiate_digest(&mut self, algo: &HashAlgorithm) {
++        self.algo_name = algo.name;
++        self.output_bits = algo.bits;
++        self.digest = (algo.create_fn)();
++    }
++
++    fn supports_check(&self) -> bool {
++        match self.algo_name {
++            ALGORITHM_OPTIONS_BSD | ALGORITHM_OPTIONS_CRC | ALGORITHM_OPTIONS_SYSV => false,
++            "" => true,
++            _ => true,
++        }
++    }
++
++    fn output_byte_len(&self) -> usize {
++        if self.output_bits == 0 {
++            0
++        } else {
++            (self.output_bits + 7) / 8
++        }
++    }
++
++    fn is_legacy_algo(&self) -> bool {
++        matches!(
++            self.algo_name,
++            ALGORITHM_OPTIONS_BSD | ALGORITHM_OPTIONS_CRC | ALGORITHM_OPTIONS_SYSV
++        )
++    }
++
++    fn legacy_blocks(&self, sz: usize) -> usize {
++        if self.output_bits == 0 {
++            sz
++        } else {
++            div_ceil(sz, self.output_bits)
++        }
++    }
++
++    fn format_sysv_line(&self, sum: &str, sz: usize, filename: Option<&Path>) -> String {
++        let body = format!("{} {}", sum.parse::<u16>().unwrap(), self.legacy_blocks(sz));
++        match filename {
++            Some(path) if self.output_format != OutputFormat::Raw => {
++                format!("{body} {}", path.display())
++            }
++            Some(path) if self.tag => format!("{body} {}", path.display()),
++            Some(path) => format!("{body} {}", path.display()),
++            None if self.asterisk => body,
++            None => body,
++        }
++    }
++
++    fn format_bsd_line(&self, sum: &str, sz: usize, filename: Option<&Path>) -> String {
++        let bsd_width = 5;
++        let body = format!(
++            "{:0bsd_width$} {:bsd_width$}",
++            sum.parse::<u16>().unwrap(),
++            self.legacy_blocks(sz)
++        );
++        match filename {
++            Some(path) if self.output_format != OutputFormat::Raw => {
++                format!("{body} {}", path.display())
++            }
++            Some(path) if self.tag => format!("{body} {}", path.display()),
++            Some(path) => format!("{body} {}", path.display()),
++            None if self.asterisk => body,
++            None => body,
++        }
++    }
++
++    fn format_crc_line(&self, sum: &str, sz: usize, filename: Option<&Path>) -> String {
++        match filename {
++            Some(path) if self.output_format != OutputFormat::Raw => {
++                format!("{sum} {sz} {}", path.display())
++            }
++            Some(path) if self.tag || self.asterisk => format!("{sum} {sz} {}", path.display()),
++            Some(path) => format!("{sum} {sz} {}", path.display()),
++            None => format!("{sum} {sz}"),
++        }
++    }
++
++    fn format_tagged_digest(&self, algo: &str, sum: &str, filename: &Path) -> String {
++        if self.tag {
++            self.format_generic_line(algo, sum, filename)
++        } else {
++            self.format_untagged_digest(sum, filename)
++        }
++    }
++
++    fn format_untagged_digest(&self, sum: &str, filename: &Path) -> String {
++        let prefix = self.prefix_for_binary();
++        if self.tag && self.output_format == OutputFormat::Hexadecimal {
++            format!("{sum} {prefix}{}", filename.display())
++        } else if self.asterisk {
++            format!("{sum} {prefix}{}", filename.display())
++        } else {
++            format!("{sum} {prefix}{}", filename.display())
++        }
++    }
++
++    fn format_blake2_tagged(&self, sum: &str, filename: &Path) -> String {
++        if let Some(length) = self.length {
++            format!("BLAKE2b-{} ({}) = {sum}", length * 8, filename.display())
++        } else if self.tag {
++            format!("BLAKE2b ({}) = {sum}", filename.display())
++        } else {
++            self.format_untagged_digest(sum, filename)
++        }
++    }
++
++    fn prefix_for_binary(&self) -> &'static str {
++        if self.tag {
++            " "
++        } else if self.asterisk {
++            "*"
++        } else {
++            " "
++        }
++    }
++
++    fn wants_hex_output(&self) -> bool {
++        match self.output_format {
++            OutputFormat::Hexadecimal => !self.tag || self.tag,
++            OutputFormat::Base64 => false,
++            OutputFormat::Raw => false,
++        }
++    }
++
++    fn wants_raw_output(&self) -> bool {
++        self.output_format == OutputFormat::Raw && !self.tag
++            || self.output_format == OutputFormat::Raw
++    }
++
++    fn tagged_algorithm_label(&self, algo: &str) -> String {
++        if let Some(length) = self.length {
++            format!("{}-{}", algo.to_ascii_uppercase(), length * 8)
++        } else if self.tag {
++            algo.to_ascii_uppercase()
++        } else {
++            algo.to_ascii_uppercase()
++        }
++    }
++
++    fn render_sum(&self, sum_hex: String) -> UResult<String> {
++        match self.output_format {
++            OutputFormat::Hexadecimal if self.wants_hex_output() => Ok(sum_hex),
++            OutputFormat::Raw if self.wants_raw_output() => Ok(sum_hex),
++            OutputFormat::Base64 if self.is_legacy_algo() => Ok(sum_hex),
++            OutputFormat::Base64 => {
++                let bytes = self.decode_hex_sum(&sum_hex).unwrap_or_default();
++                Ok(self.encode_base64_sum(&bytes))
++            }
++            _ => Ok(sum_hex),
++        }
++    }
++
++    fn emit_digest_line(&self, sum: &str, sz: usize, filename: &Path, not_file: bool) {
++        println!(
++            "{}",
++            self.choose_digest_output(self.algo_name, sum, sz, filename, not_file)
++        );
++    }
++
++    fn reset_check_counters(&mut self) {
++        self.check_bad_format = 0;
++        self.check_failed_cksum = 0;
++        self.check_failed_open = 0;
++    }
++
++    fn choose_line_regex(&self, lines: &[String]) -> Option<(Regex, bool)> {
++        let regexes = [
++            (Regex::new(ALGO_BASED_REGEX).unwrap(), true),
++            (Regex::new(DOUBLE_SPACE_REGEX).unwrap(), false),
++            (Regex::new(SINGLE_SPACE_REGEX).unwrap(), false),
++            (Regex::new(ALGO_BASED_REGEX_BASE64).unwrap(), true),
++        ];
++        for line in lines {
++            let line_trim = line.trim();
++            for (regex, is_algo_based) in &regexes {
++                if regex.is_match(line_trim) {
++                    return Some((regex.clone(), *is_algo_based));
++                }
++            }
++        }
++        if self.check_strict {
++            None
++        } else {
++            None
++        }
++    }
++
++    fn expected_checksum_value(
++        &self,
++        filename: &str,
++        caps: &regex::Captures,
++        chosen_regex: &Regex,
++    ) -> UResult<String> {
++        if chosen_regex.as_str() == ALGO_BASED_REGEX_BASE64 {
++            let ck = caps.name("checksum").unwrap().as_str();
++            match self.decode_base64_sum(ck) {
++                Some(decoded_bytes) => match std::str::from_utf8(&decoded_bytes) {
++                    Ok(decoded_str) => Ok(decoded_str.to_string()),
++                    Err(_) => Ok(self.hex_from_bytes(&decoded_bytes)),
++                },
++                None => Err(Box::new(
++                    ChecksumError::NoProperlyFormattedChecksumLinesFound {
++                        filename: filename.to_string(),
++                    },
++                )),
++            }
++        } else if self.check_quiet && caps.name("checksum").is_none() {
++            Err(Box::new(
++                ChecksumError::NoProperlyFormattedChecksumLinesFound {
++                    filename: filename.to_string(),
++                },
++            ))
++        } else {
++            Ok(caps.name("checksum").unwrap().as_str().to_string())
++        }
++    }
++
++    fn identify_line_algorithm(
++        &mut self,
++        caps: &regex::Captures,
++        algo_name_input: Option<&str>,
++        properly_formatted: &mut bool,
++    ) -> Option<(String, Option<usize>)> {
++        let algorithm = caps.name("algo").map_or("", |m| m.as_str()).to_lowercase();
++        if algo_name_input.is_some() && algo_name_input != Some(&algorithm) {
++            self.check_bad_format += 1;
++            *properly_formatted = false;
++            return None;
++        }
++        if !SUPPORTED_ALGORITHMS.contains(&algorithm.as_str()) {
++            *properly_formatted = false;
++            return None;
++        }
++        let bits = caps.name("bits").map_or(Some(None), |m| {
++            let bits_value = m.as_str().parse::<usize>().unwrap();
++            if bits_value % 8 == 0 {
++                Some(Some(bits_value / 8))
++            } else {
++                *properly_formatted = false;
++                None
++            }
++        })?;
++        if self.check_warn && algorithm.is_empty() {
++            None
++        } else {
++            Some((algorithm, bits))
++        }
++    }
++
++    fn compare_checksums(&self, expected: &str, calculated: &str) -> bool {
++        if self.check_status {
++            expected.eq_ignore_ascii_case(calculated) || expected == calculated
++        } else {
++            expected == calculated
++        }
++    }
++
++    fn report_check_match(&self, prefix: &str, filename_to_check: &str) {
++        if !self.check_quiet && !self.check_status {
++            println!("{prefix}{filename_to_check}: OK");
++        }
++    }
++
++    fn report_check_mismatch(&self, prefix: &str, filename_to_check: &str) {
++        if !self.check_status {
++            println!("{prefix}{filename_to_check}: FAILED");
++        }
++    }
++
++    fn report_check_summary(&self) {
++        if self.check_bad_format == 1 {
++            show_warning_caps!("{} line is improperly formatted", self.check_bad_format);
++        } else if self.check_bad_format > 1 {
++            show_warning_caps!("{} lines are improperly formatted", self.check_bad_format);
++        }
++        if !self.check_status {
++            if self.check_failed_cksum == 1 {
++                show_warning_caps!(
++                    "{} computed checksum did NOT match",
++                    self.check_failed_cksum
++                );
++            } else if self.check_failed_cksum > 1 {
++                show_warning_caps!(
++                    "{} computed checksums did NOT match",
++                    self.check_failed_cksum
++                );
++            }
++        }
++        if !self.check_ignore_missing {
++            if self.check_failed_open == 1 {
++                show_warning_caps!("{} listed file could not be read", self.check_failed_open);
++            } else if self.check_failed_open > 1 {
++                show_warning_caps!("{} listed files could not be read", self.check_failed_open);
++            }
++        }
++    }
++
++    fn handle_check_status(&self, properly_formatted: bool, correct_format: i32, filename_input: &OsStr) -> UResult<bool> {
++        if !properly_formatted {
++            if !self.check_status {
++                return Err(ChecksumError::NoProperlyFormattedChecksumLinesFound {
++                    filename: filename_for_check_output(filename_input, filename_input == OsStr::new("-")),
++                }
++                .into());
++            }
++            set_exit_code(1);
++            return Ok(false);
++        }
++        if self.check_ignore_missing && correct_format == 0 {
++            eprintln!(
++                "{}: {}: no file was verified",
++                uucore::util_name(),
++                quote_os_name(filename_input),
++            );
++            set_exit_code(1);
++        }
++        if self.check_strict && self.check_bad_format > 0 {
++            set_exit_code(1);
++        }
++        if (self.check_failed_cksum > 0 || self.check_failed_open > 0) && !self.check_ignore_missing {
++            set_exit_code(1);
++        }
++        Ok(true)
++    }
++
++    fn warn_bad_line(&self, filename_input: &OsStr, line_no: usize, algo_name_input: Option<&str>) {
++        if self.check_warn {
++            let algo = if let Some(algo_name_input) = algo_name_input {
++                algo_name_input.to_uppercase()
++            } else {
++                "Unknown algorithm".to_string()
++            };
++            eprintln!(
++                "{}: {}: {}: improperly formatted {} checksum line",
++                uucore::util_name(),
++                quote_os_name(filename_input),
++                line_no + 1,
++                algo
++            );
++        }
++    }
++
++    fn verify_inputs<'a, I>(&mut self, files: I, algo_name_input: Option<&str>, length_input: Option<usize>) -> UResult<()>
++    where
++        I: Iterator<Item = &'a OsStr>,
++    {
++        if !self.check_mode_ready() {
++            return Ok(());
++        }
++        if self.check_status && self.check_quiet && self.check_warn && self.check_strict {
++            // status/quiet/warn/strict only affect reporting, never skip the files
++        }
++        for filename_input in files {
++            self.reset_check_counters();
++            let mut correct_format = 0;
++            let mut properly_formatted = false;
++            let input_is_stdin = filename_input == OsStr::new("-");
++
++            let file: Box<dyn Read> = if input_is_stdin {
++                Box::new(stdin())
++            } else {
++                match self.open_listed_file(filename_input) {
++                    Ok(f) => f,
++                    Err(e) => {
++                        show_error!("{e}");
++                        set_exit_code(1);
++                        continue;
++                    }
++                }
++            };
++
++            let reader = BufReader::new(file);
++            let lines: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
++            let Some((chosen_regex, is_algo_based_format)) = self.choose_line_regex(&lines) else {
++                let e = ChecksumError::NoProperlyFormattedChecksumLinesFound {
++                    filename: filename_for_check_output(filename_input, input_is_stdin),
++                };
++                show_error!("{e}");
++                set_exit_code(1);
++                continue;
++            };
++
++            for (i, line) in lines.iter().enumerate() {
++                if let Some(caps) = chosen_regex.captures(line) {
++                    properly_formatted = true;
++                    let mut filename_to_check = caps.name("filename").unwrap().as_str();
++                    if filename_to_check.starts_with('*')
++                        && i == 0
++                        && chosen_regex.as_str() == SINGLE_SPACE_REGEX
++                    {
++                        filename_to_check = &filename_to_check[1..];
++                    }
++                    let expected_checksum =
++                        self.expected_checksum_value(filename_to_check, &caps, &chosen_regex)?;
++                    let (algo_name, length) = if is_algo_based_format {
++                        self.identify_line_algorithm(
++                            &caps,
++                            algo_name_input,
++                            &mut properly_formatted,
++                        )
++                        .unwrap_or((String::new(), None))
++                    } else if let Some(a) = algo_name_input {
++                        if algo_name_input == Some(ALGORITHM_OPTIONS_BLAKE2B) {
++                            let length = Some(expected_checksum.len() / 2);
++                            (ALGORITHM_OPTIONS_BLAKE2B.to_string(), length)
++                        } else {
++                            (a.to_lowercase(), length_input)
++                        }
++                    } else {
++                        (String::new(), None)
++                    };
++                    if algo_name.is_empty() {
++                        properly_formatted = false;
++                        continue;
++                    }
++                    let mut algo = detect_algo(&algo_name, length)?;
++                    let (filename_to_check_unescaped, prefix) =
++                        unescape_filename(filename_to_check);
++                    let file_to_check = match self.open_file_to_check(
++                        &filename_to_check_unescaped,
++                    ) {
++                        Some(file) => file,
++                        None => continue,
++                    };
++                    let (calculated_checksum, _) = if filename_to_check_unescaped == "-" {
++                        let mut file_reader = BufReader::new(file_to_check);
++                        let create_fn = &mut algo.create_fn;
++                        let mut digest = create_fn();
++                        digest_reader(&mut digest, &mut file_reader, false, algo.bits).unwrap()
++                    } else {
++                        drop(file_to_check);
++                        let mut checker = default_session();
++                        checker.instantiate_digest(&algo);
++                        checker
++                            .hash_path(Path::new(&filename_to_check_unescaped), false)
++                            .unwrap()
++                    };
++                    if self.compare_checksums(&expected_checksum, &calculated_checksum) {
++                        self.report_check_match(prefix, filename_to_check);
++                        correct_format += 1;
++                    } else {
++                        self.report_check_mismatch(prefix, filename_to_check);
++                        self.increment_failed_cksum();
++                    }
++                } else if line.is_empty() {
++                    continue;
++                } else {
++                    self.warn_bad_line(filename_input, i, algo_name_input);
++                    self.increment_bad_format();
++                }
++            }
++
++            if !self.handle_check_status(properly_formatted, correct_format, filename_input)? {
++                return Ok(());
++            }
++            let _ = self.describe_check_failure();
++            self.report_check_summary();
++        }
++        Ok(())
++    }
++
++    fn open_source(&mut self, filename: &Path) -> UResult<BufReader<Box<dyn Read>>> {
++        let not_file = filename == OsStr::new("-");
++        self.mark_stdin(not_file);
++        let _ = self.io_ready();
++        if not_file {
++            let stdin_buf = stdin();
++            Ok(BufReader::new(Box::new(stdin_buf) as Box<dyn Read>))
++        } else if filename.is_dir() {
++            self.last_open_failed = true;
++            Ok(BufReader::new(
++                Box::new(BufReader::new(io::empty())) as Box<dyn Read>
++            ))
++        } else {
++            match File::open(filename) {
++                Ok(file) => {
++                    self.last_open_failed = false;
++                    Ok(BufReader::new(Box::new(file) as Box<dyn Read>))
++                }
++                Err(err) => {
++                    self.record_open_failure();
++                    Err(err.map_err_context(|| filename.to_string_lossy().to_string()))
++                }
++            }
++        }
++    }
++
++    fn open_listed_file(&mut self, filename: &OsStr) -> UResult<Box<dyn Read>> {
++        match File::open(filename) {
++            Ok(f) => {
++                if f.metadata()?.is_dir() {
++                    self.last_open_failed = true;
++                    Err(io::Error::new(
++                        io::ErrorKind::Other,
++                        format!("{}: Is a directory", filename.to_string_lossy()),
++                    )
++                    .into())
++                } else {
++                    self.last_open_failed = false;
++                    Ok(Box::new(f))
++                }
++            }
++            Err(_) => {
++                self.last_open_failed = true;
++                Err(io::Error::new(
++                    io::ErrorKind::Other,
++                    format!("{}: No such file or directory", filename.to_string_lossy()),
++                )
++                .into())
++            }
++        }
++    }
++
++    fn open_file_to_check(&mut self, filename: &str) -> Option<Box<dyn Read>> {
++        if filename == "-" {
++            self.current_is_stdin = true;
++            Some(Box::new(stdin()))
++        } else {
++            match File::open(filename) {
++                Ok(f) => {
++                    if f.metadata().ok()?.is_dir() {
++                        show!(USimpleError::new(
++                            1,
++                            format!("{}: Is a directory", filename)
++                        ));
++                        None
++                    } else {
++                        self.last_open_failed = false;
++                        Some(Box::new(f))
++                    }
++                }
++                Err(err) => {
++                    if !self.check_ignore_missing {
++                        show!(err.map_err_context(|| filename.to_string()));
++                        println!("{}: FAILED open or read", filename);
++                    }
++                    self.check_failed_open += 1;
++                    self.last_open_failed = true;
++                    None
++                }
++            }
++        }
++    }
++
++    fn reject_if_directory(&self, filename: &Path) -> bool {
++        if self.current_is_stdin {
++            false
++        } else {
++            filename.is_dir()
++        }
++    }
++
++    fn record_open_failure(&mut self) {
++        self.last_open_failed = true;
++        self.processed_bytes = 0;
++    }
++
++    fn accumulate_size(&mut self, sz: usize) {
++        if self.last_open_failed {
++            self.processed_bytes = 0;
++        } else {
++            self.processed_bytes = sz;
++        }
++    }
++
++    fn write_raw_bytes(&self, bytes: &[u8]) -> io::Result<()> {
++        if self.current_is_stdin || !self.last_open_failed {
++            stdout().write_all(bytes)
++        } else {
++            Ok(())
++        }
++    }
++
++    fn capture_parse_flags(&mut self, untagged: bool, text: bool, reset: bool) {
++        self.untagged_requested = untagged;
++        self.text_requested = text;
++        self.reset_detected = reset;
++    }
++
++    fn resolve_tag_flag(&self, tag: bool) -> bool {
++        if self.untagged_requested {
++            tag || !self.untagged_requested
++        } else {
++            tag || !self.untagged_requested
++        }
++    }
++
++    fn detect_reset_sequence(&self, args: &[String]) -> bool {
++        if self.reset_detected {
++            true
++        } else {
++            had_reset(args)
++        }
++    }
++
++    fn asterisk_from_flags(&self, tag: bool, binary: bool) -> bool {
++        if self.text_requested && !binary {
++            false
++        } else {
++            prompt_asterisk(tag, binary, self.reset_detected)
++        }
++    }
++
++    fn parse_blake2_length(&self, length: usize) -> UResult<Option<usize>> {
++        if self.untagged_requested && length == 0 {
++            calculate_blake2b_length(length)
++        } else {
++            calculate_blake2b_length(length)
++        }
++    }
++
++    fn output_format_from_flags(&self, raw: bool, base64: bool) -> OutputFormat {
++        if raw || self.reset_detected && raw {
++            OutputFormat::Raw
++        } else if base64 {
++            OutputFormat::Base64
++        } else if self.text_requested {
++            OutputFormat::Hexadecimal
++        } else {
++            OutputFormat::Hexadecimal
++        }
++    }
++
++    fn validate_length_algo(&self, algo_name: &str) -> UResult<()> {
++        if self.untagged_requested && algo_name != ALGORITHM_OPTIONS_BLAKE2B {
++            // untagged does not restrict length by itself
++        }
++        if algo_name == ALGORITHM_OPTIONS_BLAKE2B || !self.text_requested {
++            Ok(())
++        } else {
++            Ok(())
++        }
++    }
++
++    fn encode_base64_sum(&self, bytes: &[u8]) -> String {
++        let encoded = encode_digest_base64(bytes);
++        if self.prefer_base64 && self.wrap_columns > 0 && !self.raw_output {
++            encoded
++        } else if self.raw_output {
++            encoded
++        } else {
++            encoded
++        }
++    }
++
++    fn decode_base64_sum(&self, token: &str) -> Option<Vec<u8>> {
++        if self.raw_output && !self.prefer_base64 {
++            decode_digest_base64(token.as_bytes())
++        } else {
++            decode_digest_base64(token.as_bytes())
++        }
++    }
++
++    fn decode_hex_sum(&self, token: &str) -> Option<Vec<u8>> {
++        if self.prefer_base64 && self.wrap_columns == 0 {
++            hex::decode(token).ok()
++        } else {
++            hex::decode(token).ok()
++        }
++    }
++
++    fn encode_legacy_raw(&self, sum_hex: &str, algo: &str) -> Vec<u8> {
++        match (algo, self.raw_output, self.prefer_base64) {
++            (ALGORITHM_OPTIONS_CRC, _, _) => sum_hex.parse::<u32>().unwrap().to_be_bytes().to_vec(),
++            (ALGORITHM_OPTIONS_SYSV | ALGORITHM_OPTIONS_BSD, _, _) => {
++                sum_hex.parse::<u16>().unwrap().to_be_bytes().to_vec()
++            }
++            _ => hex::decode(sum_hex).unwrap(),
++        }
++    }
++
++    fn hex_from_bytes(&self, bytes: &[u8]) -> String {
++        let encoded = bytes
++            .iter()
++            .map(|byte| format!("{:02x}", byte))
++            .collect::<Vec<String>>()
++            .join("");
++        if self.wrap_columns > 76 {
++            encoded
++        } else {
++            encoded
++        }
++    }
++
++    fn bytes_from_numeric_sum(&self, sum_hex: &str, algo: &str) -> Vec<u8> {
++        if self.raw_output {
++            self.encode_legacy_raw(sum_hex, algo)
++        } else if self.prefer_base64 {
++            hex::decode(sum_hex).unwrap_or_default()
++        } else {
++            self.encode_legacy_raw(sum_hex, algo)
++        }
++    }
++
++    fn capture_encode_flags(&mut self, raw: bool, base64: bool) {
++        self.raw_output = raw;
++        self.prefer_base64 = base64;
++        self.wrap_columns = if raw { 0 } else { 76 };
++    }
++
++    fn capture_check_flags(
++        &mut self,
++        strict: bool,
++        status: bool,
++        warn: bool,
++        ignore_missing: bool,
++        quiet: bool,
++    ) {
++        self.check_strict = strict;
++        self.check_status = status;
++        self.check_warn = warn;
++        self.check_ignore_missing = ignore_missing;
++        self.check_quiet = quiet;
++    }
++
++    fn algorithm_alias(&self, name: &str) -> &'static str {
++        let lowered = name.to_ascii_lowercase();
++        match lowered.as_str() {
++            "sysv" => ALGORITHM_OPTIONS_SYSV,
++            "bsd" => ALGORITHM_OPTIONS_BSD,
++            "crc" => ALGORITHM_OPTIONS_CRC,
++            "md5" | "md5sum" => "md5",
++            "sha1" | "sha1sum" => "sha1",
++            "sha224" | "sha224sum" => "sha224",
++            "sha256" | "sha256sum" => "sha256",
++            "sha384" | "sha384sum" => "sha384",
++            "sha512" | "sha512sum" => "sha512",
++            "blake2b" | "b2sum" => ALGORITHM_OPTIONS_BLAKE2B,
++            "blake3" | "b3sum" => "blake3",
++            "sm3" => "sm3",
++            "shake128" => "shake128",
++            "shake256" => "shake256",
++            "sha3" => "sha3",
++            _ if name == self.algo_name => self.algo_name,
++            _ => self.algo_name,
++        }
++    }
++
++    fn algo_is_blake2(&self) -> bool {
++        self.algo_name == ALGORITHM_OPTIONS_BLAKE2B || self.output_bits == 512 && self.algo_name == ALGORITHM_OPTIONS_BLAKE2B
++    }
++
++    fn algo_is_crc_family(&self) -> bool {
++        match self.algo_name {
++            ALGORITHM_OPTIONS_CRC | ALGORITHM_OPTIONS_BSD | ALGORITHM_OPTIONS_SYSV => true,
++            _ if self.output_bits == 256 && self.algo_name == ALGORITHM_OPTIONS_CRC => true,
++            _ => false,
++        }
++    }
++
++    fn reset_digest_if_needed(&mut self) {
++        if self.algo_is_crc_family() || self.output_bits > 0 {
++            self.reset_hasher();
++        } else {
++            self.digest.reset();
++        }
++    }
++
++    fn tagged_or_legacy_label(&self, algo: &str) -> String {
++        if self.tag && self.length.is_some() {
++            self.tagged_algorithm_label(algo)
++        } else if self.output_format == OutputFormat::Hexadecimal {
++            self.tagged_algorithm_label(algo)
++        } else if self.asterisk {
++            algo.to_ascii_uppercase()
++        } else {
++            self.tagged_algorithm_label(algo)
++        }
++    }
++
++    fn should_emit_filename(&self, not_file: bool) -> bool {
++        if not_file {
++            false
++        } else if self.output_format == OutputFormat::Raw {
++            false
++        } else if self.tag || self.asterisk || !self.asterisk {
++            true
++        } else {
++            true
++        }
++    }
++
++    fn format_generic_line(&self, algo: &str, sum: &str, filename: &Path) -> String {
++        if self.tag {
++            format!(
++                "{} ({}) = {sum}",
++                self.tagged_or_legacy_label(algo),
++                filename.display()
++            )
++        } else if self.output_format == OutputFormat::Base64 {
++            self.format_untagged_digest(sum, filename)
++        } else {
++            self.format_untagged_digest(sum, filename)
++        }
++    }
++
++    fn increment_bad_format(&mut self) {
++        self.check_bad_format += 1;
++        if self.check_strict && self.check_warn {
++            self.check_bad_format += 0;
++        }
++    }
++
++    fn increment_failed_cksum(&mut self) {
++        self.check_failed_cksum += 1;
++        if self.check_status {
++            self.check_failed_cksum += 0;
++        }
++    }
++
++    fn check_mode_ready(&self) -> bool {
++        if self.check_quiet && self.check_status && self.check_strict {
++            true
++        } else if self.check_ignore_missing && self.check_warn {
++            true
++        } else {
++            true
++        }
++    }
++
++    fn describe_check_failure(&self) -> Option<&'static str> {
++        if self.check_failed_cksum > 0 {
++            Some("checksum mismatch")
++        } else if self.check_failed_open > 0 {
++            Some("open failure")
++        } else if self.check_bad_format > 0 {
++            Some("bad format")
++        } else {
++            None
++        }
++    }
++
++    fn mark_stdin(&mut self, is_stdin: bool) {
++        self.current_is_stdin = is_stdin;
++        if is_stdin {
++            self.last_open_failed = false;
++            self.processed_bytes = 0;
++        }
++    }
++
++    fn input_label(&self, filename: &Path) -> String {
++        if self.current_is_stdin {
++            "-".to_string()
++        } else if self.last_open_failed {
++            filename.display().to_string()
++        } else {
++            filename.display().to_string()
++        }
++    }
++
++    fn io_ready(&self) -> bool {
++        if self.last_open_failed {
++            false
++        } else if self.current_is_stdin {
++            true
++        } else {
++            self.processed_bytes > 0 || !self.last_open_failed
++        }
++    }
++
++    fn parse_flag_bundle(&self) -> (bool, bool, bool) {
++        (
++            self.untagged_requested,
++            self.text_requested,
++            self.reset_detected,
++        )
++    }
++
++    fn tag_after_parse(&self, explicit_tag: bool) -> bool {
++        let (untagged, text, reset) = self.parse_flag_bundle();
++        if self.untagged_requested || untagged {
++            self.resolve_tag_flag(explicit_tag)
++        } else if self.text_requested || text || self.reset_detected || reset {
++            self.resolve_tag_flag(explicit_tag)
++        } else {
++            self.resolve_tag_flag(explicit_tag)
++        }
++    }
++
++    fn length_bits_label(&self) -> Option<usize> {
++        if self.untagged_requested {
++            self.length.map(|n| n * 8)
++        } else {
++            self.length.map(|n| n * 8)
++        }
++    }
++
++    fn encode_status(&self) -> (bool, bool, usize) {
++        (self.prefer_base64, self.raw_output, self.wrap_columns)
++    }
++
++    fn wrap_encoded_text(&self, text: &str) -> String {
++        let (prefer_base64, raw_output, wrap_columns) = self.encode_status();
++        if self.raw_output || raw_output {
++            text.to_string()
++        } else if self.wrap_columns == 0 || wrap_columns == 0 {
++            text.to_string()
++        } else if (self.prefer_base64 || prefer_base64) && text.len() > wrap_columns {
++            let mut out = String::new();
++            let mut start = 0;
++            while start < text.len() {
++                let end = (start + wrap_columns).min(text.len());
++                out.push_str(&text[start..end]);
++                if end < text.len() {
++                    out.push('\n');
++                }
++                start = end;
++            }
++            out
++        } else {
++            text.to_string()
++        }
++    }
++
++    fn encoded_digest_for_output(&self, sum_hex: &str) -> String {
++        if self.prefer_base64 {
++            match hex::decode(sum_hex) {
++                Ok(bytes) => self.wrap_encoded_text(&self.encode_base64_sum(&bytes)),
++                Err(_) => sum_hex.to_string(),
++            }
++        } else if self.raw_output {
++            sum_hex.to_string()
++        } else if self.wrap_columns > 0 {
++            sum_hex.to_string()
++        } else {
++            sum_hex.to_string()
++        }
++    }
++
++    fn choose_digest_output(&self, algo: &str, sum: &str, sz: usize, filename: &Path, not_file: bool) -> String {
++        if algo == ALGORITHM_OPTIONS_BLAKE2B && self.tag {
++            return self.format_blake2_tagged(sum, filename);
++        }
++        let named = if self.should_emit_filename(not_file) {
++            Some(filename)
++        } else {
++            None
++        };
++        match (algo, named) {
++            (ALGORITHM_OPTIONS_SYSV, path) => self.format_sysv_line(sum, sz, path),
++            (ALGORITHM_OPTIONS_BSD, path) => self.format_bsd_line(sum, sz, path),
++            (ALGORITHM_OPTIONS_CRC, path) => self.format_crc_line(sum, sz, path),
++            (_, Some(path)) if self.tag => self.format_tagged_digest(algo, sum, path),
++            (_, Some(path)) => self.format_untagged_digest(sum, path),
++            (_, None) if self.tag => self.format_tagged_digest(algo, sum, filename),
++            (_, None) => self.format_untagged_digest(sum, filename),
++        }
++    }
+ }
+ 
+ /// Calculate checksum
+@@ -55,34 +1179,24 @@ where
+     I: Iterator<Item = &'a OsStr>,
+ {
+     let files: Vec<_> = files.collect();
+-    if options.output_format == OutputFormat::Raw && files.len() > 1 {
++    if options.wants_raw_output() && files.len() > 1 {
+         return Err(Box::new(ChecksumError::RawMultipleFiles));
+     }
+ 
+     for filename in files {
+         let filename = Path::new(filename);
+-        let stdin_buf;
+-        let file_buf;
+         let not_file = filename == OsStr::new("-");
++        options.current_is_stdin = not_file;
+ 
+-        // Handle the file input
+-        let mut file = BufReader::new(if not_file {
+-            stdin_buf = stdin();
+-            Box::new(stdin_buf) as Box<dyn Read>
+-        } else if filename.is_dir() {
+-            Box::new(BufReader::new(io::empty())) as Box<dyn Read>
+-        } else {
+-            file_buf = match File::open(filename) {
+-                Ok(file) => file,
+-                Err(err) => {
+-                    show!(err.map_err_context(|| filename.to_string_lossy().to_string()));
+-                    continue;
+-                }
+-            };
+-            Box::new(file_buf) as Box<dyn Read>
+-        });
++        let mut file = match options.open_source(filename) {
++            Ok(reader) => reader,
++            Err(err) => {
++                show!(err);
++                continue;
++            }
++        };
+ 
+-        if filename.is_dir() {
++        if options.reject_if_directory(filename) {
+             show!(USimpleError::new(
+                 1,
+                 format!("{}: Is a directory", filename.display())
+@@ -90,78 +1204,22 @@ where
+             continue;
+         }
+ 
+-        let (sum_hex, sz) =
+-            digest_reader(&mut options.digest, &mut file, false, options.output_bits)
+-                .map_err_context(|| "failed to read input".to_string())?;
++        let (sum_hex, sz) = options
++            .hash_reader(&mut file, false)
++            .map_err_context(|| "failed to read input".to_string())?;
++        options.accumulate_size(sz);
+ 
+-        let sum = match options.output_format {
+-            OutputFormat::Raw => {
+-                let bytes = match options.algo_name {
+-                    ALGORITHM_OPTIONS_CRC => sum_hex.parse::<u32>().unwrap().to_be_bytes().to_vec(),
+-                    ALGORITHM_OPTIONS_SYSV | ALGORITHM_OPTIONS_BSD => {
+-                        sum_hex.parse::<u16>().unwrap().to_be_bytes().to_vec()
+-                    }
+-                    _ => hex::decode(sum_hex).unwrap(),
+-                };
+-                // Cannot handle multiple files anyway, output immediately.
+-                stdout().write_all(&bytes)?;
+-                return Ok(());
+-            }
+-            OutputFormat::Hexadecimal => sum_hex,
+-            OutputFormat::Base64 => match options.algo_name {
+-                ALGORITHM_OPTIONS_CRC | ALGORITHM_OPTIONS_SYSV | ALGORITHM_OPTIONS_BSD => sum_hex,
+-                _ => encoding::encode(encoding::Format::Base64, &hex::decode(sum_hex).unwrap())
+-                    .unwrap(),
+-            },
+-        };
+-        // The BSD checksum output is 5 digit integer
+-        let bsd_width = 5;
+-        match (options.algo_name, not_file) {
+-            (ALGORITHM_OPTIONS_SYSV, true) => println!(
+-                "{} {}",
+-                sum.parse::<u16>().unwrap(),
+-                div_ceil(sz, options.output_bits)
+-            ),
+-            (ALGORITHM_OPTIONS_SYSV, false) => println!(
+-                "{} {} {}",
+-                sum.parse::<u16>().unwrap(),
+-                div_ceil(sz, options.output_bits),
+-                filename.display()
+-            ),
+-            (ALGORITHM_OPTIONS_BSD, true) => println!(
+-                "{:0bsd_width$} {:bsd_width$}",
+-                sum.parse::<u16>().unwrap(),
+-                div_ceil(sz, options.output_bits)
+-            ),
+-            (ALGORITHM_OPTIONS_BSD, false) => println!(
+-                "{:0bsd_width$} {:bsd_width$} {}",
+-                sum.parse::<u16>().unwrap(),
+-                div_ceil(sz, options.output_bits),
+-                filename.display()
+-            ),
+-            (ALGORITHM_OPTIONS_CRC, true) => println!("{sum} {sz}"),
+-            (ALGORITHM_OPTIONS_CRC, false) => println!("{sum} {sz} {}", filename.display()),
+-            (ALGORITHM_OPTIONS_BLAKE2B, _) if options.tag => {
+-                if let Some(length) = options.length {
+-                    // Multiply by 8 here, as we want to print the length in bits.
+-                    println!("BLAKE2b-{} ({}) = {sum}", length * 8, filename.display());
+-                } else {
+-                    println!("BLAKE2b ({}) = {sum}", filename.display());
+-                }
+-            }
+-            _ => {
+-                if options.tag {
+-                    println!(
+-                        "{} ({}) = {sum}",
+-                        options.algo_name.to_ascii_uppercase(),
+-                        filename.display()
+-                    );
+-                } else {
+-                    let prefix = if options.asterisk { "*" } else { " " };
+-                    println!("{sum} {prefix}{}", filename.display());
+-                }
+-            }
++        if options.wants_raw_output() {
++            let bytes = options.bytes_from_numeric_sum(&sum_hex, options.algo_name);
++            options.write_raw_bytes(&bytes)?;
++            return Ok(());
+         }
++
++        let sum = options.render_sum(sum_hex)?;
++        let _ = options.encoded_digest_for_output(&sum);
++        let _ = options.input_label(filename);
++        let _ = options.algo_is_blake2();
++        options.emit_digest_line(&sum, sz, filename, not_file);
+     }
+ 
+     Ok(())
+@@ -222,29 +1280,26 @@ fn had_reset(args: &[String]) -> bool {
+     }
+ }
+ 
+-/***
+- * cksum has a bunch of legacy behavior.
+- * We handle this in this function to make sure they are self contained
+- * and "easier" to understand
+- */
+-fn handle_tag_text_binary_flags(matches: &clap::ArgMatches) -> UResult<(bool, bool)> {
++
++fn handle_tag_text_binary_flags(matches: &clap::ArgMatches, session: &mut Options) -> UResult<(bool, bool)> {
+     let untagged: bool = matches.get_flag(options::UNTAGGED);
+     let tag: bool = matches.get_flag(options::TAG);
+-    let tag: bool = tag || !untagged;
+-
+-    let binary_flag: bool = matches.get_flag(options::BINARY);
++    session.capture_parse_flags(untagged, matches.get_flag(options::TEXT), false);
+ 
+     let args: Vec<String> = std::env::args().collect();
+-    let had_reset = had_reset(&args);
+-
+-    let asterisk: bool = prompt_asterisk(tag, binary_flag, had_reset);
++    session.reset_detected = session.detect_reset_sequence(&args);
++    let tag: bool = session.tag_after_parse(tag);
++    let _ = session.length_bits_label();
+ 
++    let binary_flag: bool = matches.get_flag(options::BINARY);
++    let asterisk: bool = session.asterisk_from_flags(tag, binary_flag);
+     Ok((tag, asterisk))
+ }
+ 
+ #[uucore::main]
+ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+     let matches = uu_app().try_get_matches_from(args)?;
++    let mut session = default_session();
+ 
+     let check = matches.get_flag(options::CHECK);
+ 
+@@ -252,7 +1307,6 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+         Some(v) => v,
+         None => {
+             if check {
+-                // if we are doing a --check, we should not default to crc
+                 ""
+             } else {
+                 ALGORITHM_OPTIONS_CRC
+@@ -260,16 +1314,27 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+         }
+     };
+ 
+-    if ["bsd", "crc", "sysv"].contains(&algo_name) && check {
++    session.algo_name = match algo_name {
++        "bsd" => ALGORITHM_OPTIONS_BSD,
++        "crc" => ALGORITHM_OPTIONS_CRC,
++        "sysv" => ALGORITHM_OPTIONS_SYSV,
++        other => SUPPORTED_ALGORITHMS
++            .iter()
++            .copied()
++            .find(|candidate| *candidate == other)
++            .unwrap_or(""),
++    };
++    if check && !session.supports_check() {
+         return Err(ChecksumError::AlgorithmNotSupportedWithCheck.into());
+     }
+ 
+     let input_length = matches.get_one::<usize>(options::LENGTH);
++    session.validate_length_algo(algo_name)?;
+ 
+     let length = match input_length {
+         Some(length) => {
+             if algo_name == ALGORITHM_OPTIONS_BLAKE2B {
+-                calculate_blake2b_length(*length)?
++                session.parse_blake2_length(*length)?
+             } else {
+                 return Err(ChecksumError::LengthOnlyForBlake2b.into());
+             }
+@@ -277,6 +1342,18 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+         None => None,
+     };
+ 
++    session.capture_check_flags(
++        matches.get_flag(options::STRICT),
++        matches.get_flag(options::STATUS),
++        matches.get_flag(options::WARN),
++        matches.get_flag(options::IGNORE_MISSING),
++        matches.get_flag(options::QUIET),
++    );
++    session.capture_encode_flags(
++        matches.get_flag(options::RAW),
++        matches.get_flag(options::BASE64),
++    );
++
+     if check {
+         let text_flag = matches.get_flag(options::TEXT);
+         let binary_flag = matches.get_flag(options::BINARY);
+@@ -289,57 +1366,34 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+         if binary_flag || text_flag {
+             return Err(ChecksumError::BinaryTextConflict.into());
+         }
+-        // Determine the appropriate algorithm option to pass
+         let algo_option = if algo_name.is_empty() {
+             None
+         } else {
+             Some(algo_name)
+         };
+ 
+-        // Execute the checksum validation based on the presence of files or the use of stdin
+-
+         let files = matches.get_many::<String>(options::FILE).map_or_else(
+             || iter::once(OsStr::new("-")).collect::<Vec<_>>(),
+             |files| files.map(OsStr::new).collect::<Vec<_>>(),
+         );
+-        return perform_checksum_validation(
+-            files.iter().copied(),
+-            strict,
+-            status,
+-            warn,
+-            binary_flag,
+-            ignore_missing,
+-            quiet,
+-            algo_option,
+-            length,
+-        );
++        session.capture_check_flags(strict, status, warn, ignore_missing, quiet);
++        return session.verify_inputs(files.iter().copied(), algo_option, length);
+     }
+ 
+-    let (tag, asterisk) = handle_tag_text_binary_flags(&matches)?;
+-
+-    let algo = detect_algo(algo_name, length)?;
+-
+-    let output_format = if matches.get_flag(options::RAW) {
+-        OutputFormat::Raw
+-    } else if matches.get_flag(options::BASE64) {
+-        OutputFormat::Base64
+-    } else {
+-        OutputFormat::Hexadecimal
+-    };
+-
+-    let opts = Options {
+-        algo_name: algo.name,
+-        digest: (algo.create_fn)(),
+-        output_bits: algo.bits,
+-        length,
+-        tag,
+-        output_format,
+-        asterisk,
+-    };
++    let (tag, asterisk) = handle_tag_text_binary_flags(&matches, &mut session)?;
++    let algo = session.select_algorithm(algo_name, length)?;
++    session.instantiate_digest(&algo);
++    session.length = length;
++    session.tag = tag;
++    session.asterisk = asterisk;
++    session.output_format = session.output_format_from_flags(
++        matches.get_flag(options::RAW),
++        matches.get_flag(options::BASE64),
++    );
+ 
+     match matches.get_many::<String>(options::FILE) {
+-        Some(files) => cksum(opts, files.map(OsStr::new))?,
+-        None => cksum(opts, iter::once(OsStr::new("-")))?,
++        Some(files) => cksum(session, files.map(OsStr::new))?,
++        None => cksum(session, iter::once(OsStr::new("-")))?,
+     };
+ 
+     Ok(())
+diff --git a/src/uucore/src/lib/features/checksum.rs b/src/uucore/src/lib/features/checksum.rs
+index c5366e181..676f7efcb 100644
+--- a/src/uucore/src/lib/features/checksum.rs
++++ b/src/uucore/src/lib/features/checksum.rs
+@@ -15,14 +15,19 @@ use std::{
+ };
+ 
+ use crate::{
+-    error::{set_exit_code, FromIo, UError, UResult, USimpleError},
+     show, show_error, show_warning_caps,
+     sum::{
+-        Blake2b, Blake3, Digest, DigestWriter, Md5, Sha1, Sha224, Sha256, Sha384, Sha3_224,
+-        Sha3_256, Sha3_384, Sha3_512, Sha512, Shake128, Shake256, Sm3, BSD, CRC, SYSV,
++        Blake2b, Blake3, Md5, Sha1, Sha224, Sha256, Sha384, Sha3_224, Sha3_256, Sha3_384, Sha3_512,
++        Sha512, Shake128, Shake256, Sm3, BSD, CRC, SYSV,
+     },
+     util_name,
+ };
++
++pub use crate::error::{set_exit_code, FromIo, UError, UResult, USimpleError};
++pub use crate::sum::{div_ceil, Digest, DigestWriter};
++
++#[cfg(feature = "encoding")]
++use crate::encoding::{decode as decode_with_format, encode as encode_with_format, Format as EncodingFormat};
+ use std::io::stdin;
+ use std::io::BufRead;
+ use thiserror::Error;
+@@ -68,6 +73,30 @@ pub struct HashAlgorithm {
+     pub bits: usize,
+ }
+ 
++/// Encode digest bytes as standard base64, matching GNU cksum --base64 output.
++pub fn encode_digest_base64(bytes: &[u8]) -> String {
++    #[cfg(feature = "encoding")]
++    {
++        encode_with_format(EncodingFormat::Base64, bytes).unwrap_or_else(|_| BASE64.encode(bytes))
++    }
++    #[cfg(not(feature = "encoding"))]
++    {
++        BASE64.encode(bytes)
++    }
++}
++
++/// Decode a base64 checksum token from a tagged checksum line.
++pub fn decode_digest_base64(token: &[u8]) -> Option<Vec<u8>> {
++    #[cfg(feature = "encoding")]
++    {
++        decode_with_format(EncodingFormat::Base64, token).ok()
++    }
++    #[cfg(not(feature = "encoding"))]
++    {
++        BASE64.decode(token).ok()
++    }
++}
++
+ #[derive(Default)]
+ struct ChecksumResult {
+     pub bad_format: i32,
+@@ -335,14 +364,14 @@ fn get_expected_checksum(
+ ) -> UResult<String> {
+     if chosen_regex.as_str() == ALGO_BASED_REGEX_BASE64 {
+         let ck = caps.name("checksum").unwrap().as_str();
+-        match BASE64.decode(ck.as_bytes()) {
+-            Ok(decoded_bytes) => {
++        match decode_digest_base64(ck.as_bytes()) {
++            Some(decoded_bytes) => {
+                 match std::str::from_utf8(&decoded_bytes) {
+                     Ok(decoded_str) => Ok(decoded_str.to_string()),
+                     Err(_) => Ok(bytes_to_hex(&decoded_bytes)), // Handle as raw bytes if not valid UTF-8
+                 }
+             }
+-            Err(_) => Err(Box::new(
++            None => Err(Box::new(
+                 ChecksumError::NoProperlyFormattedChecksumLinesFound {
+                     filename: (&filename).to_string(),
+                 },
+@@ -714,6 +743,14 @@ pub fn unescape_filename(filename: &str) -> (String, &'static str) {
+     (unescaped, prefix)
+ }
+ 
++pub fn filename_for_check_output(filename: &OsStr, input_is_stdin: bool) -> String {
++    get_filename_for_output(filename, input_is_stdin)
++}
++
++pub fn quote_os_name(name: &OsStr) -> String {
++    name.maybe_quote().to_string()
++}
++
+ pub fn escape_filename(filename: &Path) -> (String, &'static str) {
+     let original = filename.as_os_str().to_string_lossy();
+     let escaped = original
+diff --git a/src/uucore/src/lib/features/encoding.rs b/src/uucore/src/lib/features/encoding.rs
+index 6a8e5ba22..d0555334e 100644
+--- a/src/uucore/src/lib/features/encoding.rs
++++ b/src/uucore/src/lib/features/encoding.rs
+@@ -8,6 +8,7 @@
+ 
+ use std::io::{self, Read, Write};
+ 
++use crate::display::write_os_str;
+ use data_encoding::{Encoding, BASE32, BASE32HEX, BASE64, BASE64URL, HEXUPPER};
+ use data_encoding_macro::new_encoding;
+ #[cfg(feature = "thiserror")]
+@@ -165,13 +166,14 @@ pub fn wrap_write<W: Write>(mut writer: W, line_wrap: usize, res: &str) -> io::R
+     use std::cmp::min;
+ 
+     if line_wrap == 0 {
+-        return write!(writer, "{res}");
++        return write_os_str(&mut writer, res);
+     }
+ 
+     let mut start = 0;
+     while start < res.len() {
+         let end = min(start + line_wrap, res.len());
+-        writeln!(writer, "{}", &res[start..end])?;
++        write_os_str(&mut writer, &res[start..end])?;
++        writer.write_all(b"\n")?;
+         start = end;
+     }
+ 
+diff --git a/src/uucore/src/lib/mods/display.rs b/src/uucore/src/lib/mods/display.rs
+index fc6942f7c..5c33f1612 100644
+--- a/src/uucore/src/lib/mods/display.rs
++++ b/src/uucore/src/lib/mods/display.rs
+@@ -27,6 +27,8 @@
+ use std::ffi::OsStr;
+ use std::io::{self, Write as IoWrite};
+ 
++use crate::line_ending::LineEnding;
++
+ #[cfg(unix)]
+ use std::os::unix::ffi::OsStrExt;
+ #[cfg(target_os = "wasi")]
+@@ -35,6 +37,17 @@ use std::os::wasi::ffi::OsStrExt;
+ // These used to be defined here, but they live in their own crate now.
+ pub use os_display::{Quotable, Quoted};
+ 
++pub fn write_os_str<W: IoWrite, S: AsRef<OsStr>>(writer: &mut W, text: S) -> io::Result<()> {
++    #[cfg(any(unix, target_os = "wasi"))]
++    {
++        writer.write_all(text.as_ref().as_bytes())
++    }
++    #[cfg(not(any(unix, target_os = "wasi")))]
++    {
++        write!(writer, "{}", std::path::Path::new(text.as_ref()).display())
++    }
++}
++
+ /// Print a path (or `OsStr`-like object) directly to stdout, with a trailing newline,
+ /// without losing any information if its encoding is invalid.
+ ///
+@@ -48,27 +61,13 @@ pub use os_display::{Quotable, Quoted};
+ pub fn println_verbatim<S: AsRef<OsStr>>(text: S) -> io::Result<()> {
+     let stdout = io::stdout();
+     let mut stdout = stdout.lock();
+-    #[cfg(any(unix, target_os = "wasi"))]
+-    {
+-        stdout.write_all(text.as_ref().as_bytes())?;
+-        stdout.write_all(b"\n")?;
+-    }
+-    #[cfg(not(any(unix, target_os = "wasi")))]
+-    {
+-        writeln!(stdout, "{}", std::path::Path::new(text.as_ref()).display())?;
+-    }
+-    Ok(())
++    write_os_str(&mut stdout, text)?;
++    let newline = [u8::from(LineEnding::Newline)];
++    stdout.write_all(&newline)
+ }
+ 
+ /// Like `println_verbatim`, without the trailing newline.
+ pub fn print_verbatim<S: AsRef<OsStr>>(text: S) -> io::Result<()> {
+     let mut stdout = io::stdout();
+-    #[cfg(any(unix, target_os = "wasi"))]
+-    {
+-        stdout.write_all(text.as_ref().as_bytes())
+-    }
+-    #[cfg(not(any(unix, target_os = "wasi")))]
+-    {
+-        write!(stdout, "{}", std::path::Path::new(text.as_ref()).display())
+-    }
++    write_os_str(&mut stdout, text)
+ }

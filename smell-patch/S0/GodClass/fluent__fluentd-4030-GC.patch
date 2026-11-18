@@ -1,0 +1,1417 @@
+diff --git a/lib/fluent/plugin/out_forward.rb b/lib/fluent/plugin/out_forward.rb
+index a6209b09..789d6205 100644
+--- a/lib/fluent/plugin/out_forward.rb
++++ b/lib/fluent/plugin/out_forward.rb
+@@ -22,9 +22,9 @@ require 'base64'
+ require 'forwardable'
+ 
+ require 'fluent/compat/socket_util'
++require 'digest'
+ require 'fluent/plugin/out_forward/handshake_protocol'
+ require 'fluent/plugin/out_forward/load_balancer'
+-require 'fluent/plugin/out_forward/socket_cache'
+ require 'fluent/plugin/out_forward/failure_detector'
+ require 'fluent/plugin/out_forward/error'
+ require 'fluent/plugin/out_forward/connection_manager'
+@@ -221,18 +221,20 @@ module Fluent::Plugin
+       end
+ 
+       @ack_handler = @require_ack_response ? AckHandler.new(timeout: @ack_response_timeout, log: @log, read_length: @read_length) : nil
+-      socket_cache = @keepalive ? SocketCache.new(@keepalive_timeout, @log) : nil
+       @connection_manager = ConnectionManager.new(
+         log: @log,
+         secure: !!@security,
+         connection_factory: method(:create_transfer_socket),
+-        socket_cache: socket_cache,
++        socket_cache: @keepalive ? @keepalive_timeout : nil,
+       )
++      @connection_manager.bind_output(self)
+ 
++      load_balancer = LoadBalancer.new(log)
++      load_balancer.bind_output(self)
+       service_discovery_configure(
+         :out_forward_service_discovery_watcher,
+         static_default_service_directive: 'server',
+-        load_balancer: LoadBalancer.new(log),
++        load_balancer: load_balancer,
+         custom_build_method: method(:build_node),
+       )
+ 
+@@ -446,6 +448,774 @@ module Fluent::Plugin
+       FORWARD_HEADER
+     end
+ 
++    def bind_transfer_manager(manager)
++      @transfer_runtime ||= {}
++      @transfer_runtime[:manager] = manager
++      cache = manager.instance_variable_get(:@socket_cache)
++      @transfer_runtime[:socket_cache] = cache
++      manager
++    end
++
++    def connection_request_info(manager, existing: false)
++      @transfer_runtime ||= {}
++      @transfer_runtime[:manager] = manager
++      secure = manager.instance_variable_get(:@secure)
++      if existing
++        ConnectionManager::RequestInfo.new(:established)
++      else
++        ConnectionManager::RequestInfo.new(secure ? :helo : :established)
++      end
++    end
++
++    def open_node_connection(manager, host:, port:, hostname:, ack: nil, &block)
++      @transfer_runtime ||= {}
++      bind_transfer_manager(manager)
++      @transfer_runtime[:last_endpoint] = [host, port, hostname]
++      cache = manager.instance_variable_get(:@socket_cache)
++      if cache
++        return manager.connect_keepalive(host: host, port: port, hostname: hostname, ack: ack, &block)
++      end
++
++      log = manager.instance_variable_get(:@log)
++      factory = manager.instance_variable_get(:@connection_factory)
++      log.debug('connect new socket') if log
++      socket = factory.call(host, port, hostname)
++      request_info = connection_request_info(manager, existing: false)
++
++      unless block
++        return [socket, request_info]
++      end
++
++      complete_node_connection(manager, socket, request_info, ack, keepalive: false, &block)
++    end
++
++    def open_keepalive_connection(manager, host:, port:, hostname:, ack: nil, &block)
++      @transfer_runtime ||= {}
++      bind_transfer_manager(manager)
++      @transfer_runtime[:keepalive_endpoint] = [host, port, hostname]
++      cache = manager.instance_variable_get(:@socket_cache)
++      factory = manager.instance_variable_get(:@connection_factory)
++      request_info = connection_request_info(manager, existing: true)
++      socket = cache.checkout_or([host, port, hostname]) do
++        s = factory.call(host, port, hostname)
++        request_info = connection_request_info(manager, existing: false)
++        s
++      end
++
++      unless block
++        return [socket, request_info]
++      end
++
++      ret = nil
++      begin
++        ret = yield(socket, request_info)
++      rescue
++        cache.revoke(socket)
++        raise
++      else
++        if ack
++          ack.enqueue(socket)
++        else
++          cache.checkin(socket)
++        end
++      end
++      ret
++    end
++
++    def complete_node_connection(manager, socket, request_info, ack, keepalive:, &block)
++      @transfer_runtime ||= {}
++      @transfer_runtime[:last_socket] = socket
++      cache = manager.instance_variable_get(:@socket_cache)
++      begin
++        yield(socket, request_info)
++      ensure
++        if ack
++          ack.enqueue(socket)
++        elsif keepalive && cache
++          checkin_transfer_socket(cache, socket)
++        else
++          release_transfer_socket(socket)
++        end
++      end
++    end
++
++    def stop_transfer_connections(manager)
++      @transfer_runtime ||= {}
++      bind_transfer_manager(manager)
++      cache = manager.instance_variable_get(:@socket_cache)
++      cache.clear if cache
++      cache
++    end
++
++    def purge_idle_transfer_sockets(manager)
++      @transfer_runtime ||= {}
++      bind_transfer_manager(manager)
++      cache = manager.instance_variable_get(:@socket_cache)
++      unless cache
++        raise "Do not call this method without keepalive option"
++      end
++      cache.purge_obsolete_socks
++    end
++
++    def release_transfer_socket(sock)
++      @transfer_runtime ||= {}
++      @transfer_runtime[:released] = sock
++      if sock
++        sock.close_write rescue nil
++        sock.close rescue nil
++      end
++    end
++
++    def close_node_socket(manager, sock)
++      @transfer_runtime ||= {}
++      bind_transfer_manager(manager)
++      cache = manager.instance_variable_get(:@socket_cache)
++      if cache
++        cache.checkin(sock)
++      else
++        release_transfer_socket(sock)
++      end
++    end
++
++    def checkout_transfer_socket(cache, key)
++      @transfer_runtime ||= {}
++      @transfer_runtime[:socket_cache] = cache
++      mutex = cache.instance_variable_get(:@mutex)
++      mutex.synchronize do
++        tsock = pick_available_transfer_socket(cache, key)
++        if tsock
++          tsock.sock
++        else
++          wrap_new_transfer_socket(cache, key) { yield }
++        end
++      end
++    end
++
++    def checkin_transfer_socket(cache, sock)
++      @transfer_runtime ||= {}
++      @transfer_runtime[:socket_cache] = cache
++      mutex = cache.instance_variable_get(:@mutex)
++      log = cache.instance_variable_get(:@log)
++      mutex.synchronize do
++        inflight = cache.instance_variable_get(:@inflight_sockets)
++        if (s = inflight.delete(sock))
++          s.timeout = transfer_socket_timeout_at(cache)
++          cache.instance_variable_get(:@available_sockets)[s.key] << s
++        else
++          log.debug("there is no socket #{sock}") if log
++        end
++      end
++    end
++
++    def revoke_transfer_socket(cache, sock)
++      @transfer_runtime ||= {}
++      @transfer_runtime[:socket_cache] = cache
++      mutex = cache.instance_variable_get(:@mutex)
++      log = cache.instance_variable_get(:@log)
++      mutex.synchronize do
++        inflight = cache.instance_variable_get(:@inflight_sockets)
++        if (s = inflight.delete(sock))
++          cache.instance_variable_get(:@inactive_sockets) << s
++        else
++          log.debug("there is no socket #{sock}") if log
++        end
++      end
++    end
++
++    def clear_transfer_sockets(cache)
++      @transfer_runtime ||= {}
++      @transfer_runtime[:socket_cache] = cache
++      sockets = []
++      mutex = cache.instance_variable_get(:@mutex)
++      mutex.synchronize do
++        available = cache.instance_variable_get(:@available_sockets)
++        inflight = cache.instance_variable_get(:@inflight_sockets)
++        inactive = cache.instance_variable_get(:@inactive_sockets)
++        sockets += available.values.flat_map { |v| v }
++        sockets += inflight.values
++        sockets += inactive
++        available.clear
++        inflight.clear
++        inactive.clear
++      end
++      sockets.each do |s|
++        s.sock.close rescue nil
++      end
++    end
++
++    def pick_available_transfer_socket(cache, key)
++      @transfer_runtime ||= {}
++      @transfer_runtime[:socket_cache] = cache
++      available = cache.instance_variable_get(:@available_sockets)
++      inflight = cache.instance_variable_get(:@inflight_sockets)
++      if available[key].empty?
++        return nil
++      end
++
++      t = Time.now
++      if (s = available[key].find { |sock| !transfer_socket_expired?(cache, sock, time: t) })
++        inflight[s.sock] = available[key].delete(s)
++        s.timeout = transfer_socket_timeout_at(cache)
++        s
++      else
++        nil
++      end
++    end
++
++    def transfer_socket_timeout_at(cache)
++      @transfer_runtime ||= {}
++      @transfer_runtime[:socket_cache] = cache
++      timeout = cache.instance_variable_get(:@timeout)
++      timeout && Time.now + timeout
++    end
++
++    def transfer_socket_expired?(cache, sock, time: Time.now)
++      @transfer_runtime ||= {}
++      @transfer_runtime[:socket_cache] = cache
++      sock.timeout ? sock.timeout < time : false
++    end
++
++    def sweep_available_transfer_sockets(cache)
++      @transfer_runtime ||= {}
++      @transfer_runtime[:socket_cache] = cache
++      sockets = []
++      mutex = cache.instance_variable_get(:@mutex)
++      mutex.synchronize do
++        available = cache.instance_variable_get(:@available_sockets)
++        inactive = cache.instance_variable_get(:@inactive_sockets)
++        available.each do |_, socks|
++          socks.each do |sock|
++            if transfer_socket_expired?(cache, sock)
++              sockets << sock
++              socks.delete(sock)
++            end
++          end
++        end
++        available.reject! { |_, v| v.empty? }
++        sockets += inactive
++        inactive.clear
++      end
++      sockets.each do |s|
++        s.sock.close rescue nil
++      end
++    end
++
++    def remember_inflight_transfer_socket(cache, key, sock)
++      @transfer_runtime ||= {}
++      @transfer_runtime[:socket_cache] = cache
++      ts_class = cache.class.const_get(:TimedSocket)
++      new_tsock = ts_class.new(transfer_socket_timeout_at(cache), key, sock)
++      log = cache.instance_variable_get(:@log)
++      log.debug("connect new socket #{new_tsock}") if log
++      cache.instance_variable_get(:@inflight_sockets)[sock] = new_tsock
++      new_tsock.sock
++    end
++
++    def wrap_new_transfer_socket(cache, key)
++      @transfer_runtime ||= {}
++      @transfer_runtime[:socket_cache] = cache
++      sock = yield
++      remember_inflight_transfer_socket(cache, key, sock)
++    end
++
++    def bind_routing_source(source)
++      @routing_runtime ||= {}
++      @routing_runtime[:source] = source
++      source
++    end
++
++    def select_healthy_forward_node(balancer)
++      @routing_runtime ||= {}
++      bind_routing_source(balancer)
++      error = nil
++      weight_array = balancer.instance_variable_get(:@weight_array)
++      mutex = balancer.instance_variable_get(:@mutex)
++      wlen = weight_array.size
++      wlen.times do
++        node = mutex.synchronize do
++          rr = balancer.instance_variable_get(:@rr)
++          r = rr % balancer.instance_variable_get(:@weight_array).size
++          balancer.instance_variable_set(:@rr, (r + 1) % balancer.instance_variable_get(:@weight_array).size)
++          balancer.instance_variable_get(:@weight_array)[r]
++        end
++        next unless node.available?
++
++        begin
++          ret = yield node
++          return ret, node
++        rescue
++          error = $!
++        end
++      end
++
++      raise error if error
++      raise NoNodesAvailable, "no nodes are available"
++    end
++
++    def rebuild_forward_weight_array(balancer, nodes)
++      @routing_runtime ||= {}
++      bind_routing_source(balancer)
++      standby_nodes, regular_nodes = split_nodes_by_standby(balancer, nodes)
++      lost_weight = recover_weight_from_standby(balancer, regular_nodes, standby_nodes)
++      log = balancer.instance_variable_get(:@log)
++      if regular_nodes.empty?
++        log.warn('No nodes are available') if log
++        mutex = balancer.instance_variable_get(:@mutex)
++        mutex.synchronize do
++          balancer.instance_variable_set(:@weight_array, [])
++        end
++        return balancer.instance_variable_get(:@weight_array)
++      end
++      weight_array = materialize_weight_array(balancer, regular_nodes)
++      weight_array = shuffle_weight_array(balancer, weight_array)
++      mutex = balancer.instance_variable_get(:@mutex)
++      mutex.synchronize do
++        balancer.instance_variable_set(:@weight_array, weight_array)
++      end
++      balancer.instance_variable_get(:@weight_array)
++    end
++
++    def split_nodes_by_standby(balancer, nodes)
++      @routing_runtime ||= {}
++      bind_routing_source(balancer)
++      nodes.select { |e| e.weight > 0 }.partition { |n| n.standby? }
++    end
++
++    def recover_weight_from_standby(balancer, regular_nodes, standby_nodes)
++      @routing_runtime ||= {}
++      bind_routing_source(balancer)
++      lost_weight = 0
++      regular_nodes.each do |n|
++        unless n.available?
++          lost_weight += n.weight
++        end
++      end
++      log = balancer.instance_variable_get(:@log)
++      log.debug("rebuilding weight array", lost_weight: lost_weight) if log
++      if lost_weight > 0
++        standby_nodes.each do |n|
++          if n.available?
++            regular_nodes << n
++            log.warn "using standby node #{n.host}:#{n.port}", weight: n.weight if log
++            lost_weight -= n.weight
++            break if lost_weight <= 0
++          end
++        end
++      end
++      lost_weight
++    end
++
++    def materialize_weight_array(balancer, regular_nodes)
++      @routing_runtime ||= {}
++      bind_routing_source(balancer)
++      weight_array = []
++      gcd = regular_nodes.map { |n| n.weight }.inject(0) { |r, w| r.gcd(w) }
++      regular_nodes.each do |n|
++        (n.weight / gcd).times do
++          weight_array << n
++        end
++      end
++      coe = (regular_nodes.size * 6) / weight_array.size
++      weight_array *= coe if coe > 1
++      weight_array
++    end
++
++    def shuffle_weight_array(balancer, weight_array)
++      @routing_runtime ||= {}
++      bind_routing_source(balancer)
++      seed = balancer.instance_variable_get(:@rand_seed)
++      r = Random.new(seed)
++      weight_array.sort_by! { r.rand }
++      weight_array
++    end
++
++    def perform_handshake_step(handshake, sock, ri, data)
++      @routing_runtime ||= {}
++      bind_routing_source(handshake)
++      case ri.state
++      when :helo
++        unless verify_helo_payload(handshake, ri, data)
++          raise HeloError, 'received invalid helo message'
++        end
++        sock.write(compose_ping_payload(handshake, ri).to_msgpack)
++        ri.state = :pingpong
++      when :pingpong
++        succeeded, reason = verify_pong_payload(handshake, ri, data)
++        unless succeeded
++          raise PingpongError, reason
++        end
++        ri.state = :established
++      else
++        raise "BUG: unknown session state: #{ri.state}"
++      end
++    end
++
++    def verify_helo_payload(handshake, ri, message)
++      @routing_runtime ||= {}
++      bind_routing_source(handshake)
++      log = handshake.instance_variable_get(:@log)
++      log.debug('checking helo') if log
++      unless message.size == 2 && message[0] == 'HELO'
++        return false
++      end
++      opts = message[1] || {}
++      ri.shared_key_nonce = opts['nonce'] || ''
++      ri.auth = opts['auth'] || ''
++      true
++    end
++
++    def verify_pong_payload(handshake, ri, message)
++      @routing_runtime ||= {}
++      bind_routing_source(handshake)
++      log = handshake.instance_variable_get(:@log)
++      log.debug('checking pong') if log
++      unless message.size == 5 && message[0] == 'PONG'
++        return false, 'invalid format for PONG message'
++      end
++      _pong, auth_result, reason, hostname, shared_key_hexdigest = message
++      unless auth_result
++        return false, 'authentication failed: ' + reason
++      end
++      if hostname == handshake.instance_variable_get(:@hostname)
++        return false, 'same hostname between input and output: invalid configuration'
++      end
++      salt = handshake.instance_variable_get(:@shared_key_salt)
++      shared_key = handshake.instance_variable_get(:@shared_key)
++      clientside = Digest::SHA512.new.update(salt).update(hostname).update(ri.shared_key_nonce).update(shared_key).hexdigest
++      unless shared_key_hexdigest == clientside
++        return false, 'shared key mismatch'
++      end
++      [true, nil]
++    end
++
++    def compose_ping_payload(handshake, ri)
++      @routing_runtime ||= {}
++      bind_routing_source(handshake)
++      log = handshake.instance_variable_get(:@log)
++      log.debug('generating ping') if log
++      salt = handshake.instance_variable_get(:@shared_key_salt)
++      hostname = handshake.instance_variable_get(:@hostname)
++      shared_key = handshake.instance_variable_get(:@shared_key)
++      username = handshake.instance_variable_get(:@username)
++      password = handshake.instance_variable_get(:@password)
++      shared_key_hexdigest = Digest::SHA512.new.update(salt)
++        .update(hostname)
++        .update(ri.shared_key_nonce)
++        .update(shared_key)
++        .hexdigest
++      ping = ['PING', hostname, salt, shared_key_hexdigest]
++      if !ri.auth.empty?
++        if username.nil? || password.nil?
++          raise PingpongError, "username and password are required"
++        end
++        password_hexdigest = Digest::SHA512.new.update(ri.auth).update(username).update(password).hexdigest
++        ping.push(username, password_hexdigest)
++      else
++        ping.push('', '')
++      end
++      ping
++    end
++
++    def new_handshake_salt(handshake)
++      @routing_runtime ||= {}
++      bind_routing_source(handshake)
++      SecureRandom.hex(16)
++    end
++
++    def failure_hard_timeout?(detector, now)
++      @routing_runtime ||= {}
++      bind_routing_source(detector)
++      last = detector.instance_variable_get(:@last)
++      hard_timeout = detector.instance_variable_get(:@hard_timeout)
++      now - last > hard_timeout
++    end
++
++    def record_node_heartbeat(detector, now)
++      @routing_runtime ||= {}
++      bind_routing_source(detector)
++      window = detector.instance_variable_get(:@window)
++      init_gap = detector.instance_variable_get(:@init_gap)
++      if window.empty?
++        window << init_gap
++        detector.instance_variable_set(:@last, now)
++      else
++        last = detector.instance_variable_get(:@last)
++        gap = now - last
++        window << (gap * 1e6).to_i
++        window.shift if window.length > detector.class::SAMPLE_SIZE
++        detector.instance_variable_set(:@last, now)
++      end
++    end
++
++    def compute_node_phi(detector, now)
++      @routing_runtime ||= {}
++      bind_routing_source(detector)
++      window = detector.instance_variable_get(:@window)
++      size = window.size
++      return 0.0 if size == 0
++      mean_usec = 0
++      fact = 0
++      window.each_with_index do |gap, i|
++        mean_usec += gap * (1 + i)
++        fact += (1 + i)
++      end
++      mean_usec = mean_usec / fact
++      heartbeat_interval = detector.instance_variable_get(:@heartbeat_interval)
++      mean = (mean_usec.to_f / 1e6) - heartbeat_interval + 1
++      last = detector.instance_variable_get(:@last)
++      t = now - last - heartbeat_interval + 1
++      detector.class::PHI_FACTOR * t / mean
++    end
++
++    def reset_failure_window(detector)
++      @routing_runtime ||= {}
++      bind_routing_source(detector)
++      detector.instance_variable_get(:@window).clear
++      detector.instance_variable_set(:@last, 0)
++    end
++
++    def failure_sample_size(detector)
++      @routing_runtime ||= {}
++      bind_routing_source(detector)
++      detector.instance_variable_get(:@window).size
++    end
++
++    def establish_node_session(node, sock, ri)
++      @routing_runtime ||= {}
++      bind_routing_source(node)
++      sender = node.instance_variable_get(:@sender)
++      handshake = node.instance_variable_get(:@handshake)
++      log = node.instance_variable_get(:@log)
++      host = node.instance_variable_get(:@host)
++      port = node.instance_variable_get(:@port)
++      name = node.instance_variable_get(:@name)
++      while ri.state != :established
++        begin
++          buf = sock.read_nonblock(sender.read_length)
++          if buf.empty?
++            sleep sender.read_interval
++            next
++          end
++          Fluent::MessagePackFactory.msgpack_unpacker.feed_each(buf) do |data|
++            if handshake.invoke(sock, ri, data) == :established
++              log.debug "connection established", host: host, port: port if log
++            end
++          end
++        rescue IO::WaitReadable
++          sleep sender.read_interval unless ri.state == :established
++        rescue SystemCallError => e
++          log.warn "disconnected by error", host: host, port: port, error: e if log
++          node.disable!
++          break
++        rescue EOFError
++          log.warn "disconnected", host: host, port: port if log
++          node.disable!
++          break
++        rescue HeloError
++          log.warn "received invalid helo message from #{name}" if log
++          node.disable!
++          break
++        rescue PingpongError => e
++          log.warn "connection refused to #{name || host}: #{e.message}" if log
++          node.disable!
++          break
++        end
++      end
++    end
++
++    def send_node_data_actual(node, sock, tag, chunk)
++      @routing_runtime ||= {}
++      bind_routing_source(node)
++      compress = node.instance_variable_get(:@compress)
++      ack_handler = node.instance_variable_get(:@ack_handler)
++      sender = node.instance_variable_get(:@sender)
++      option = { 'size' => chunk.size, 'compressed' => compress }
++      option['chunk'] = Base64.encode64(chunk.unique_id) if ack_handler
++      tag = tag.dup.force_encoding(Encoding::UTF_8)
++      sock.write sender.forward_header
++      sock.write tag.to_msgpack
++      chunk.open(compressed: compress) do |chunk_io|
++        entries = [0xdb, chunk_io.size].pack('CN')
++        sock.write entries.force_encoding(Encoding::UTF_8)
++        IO.copy_stream(chunk_io, sock)
++      end
++      sock.write option.to_msgpack
++    end
++
++    def send_node_data(node, tag, chunk)
++      @routing_runtime ||= {}
++      bind_routing_source(node)
++      ack_handler = node.instance_variable_get(:@ack_handler)
++      ack = ack_handler && ack_handler.create_ack(chunk.unique_id, node)
++      connect_node_socket(node, nil, ack) do |sock, ri|
++        ensure_node_established(node, sock, ri)
++        send_node_data_actual(node, sock, tag, chunk)
++      end
++      heartbeat_node(node, false)
++      nil
++    end
++
++    def heartbeat_node_packet(node)
++      @routing_runtime ||= {}
++      bind_routing_source(node)
++      sender = node.instance_variable_get(:@sender)
++      log = node.instance_variable_get(:@log)
++      name = node.instance_variable_get(:@name)
++      host = node.instance_variable_get(:@host)
++      port = node.instance_variable_get(:@port)
++      begin
++        dest_addr = resolve_node_host(node)
++        node.instance_variable_set(:@resolved_once, true)
++      rescue ::SocketError => e
++        if !node.instance_variable_get(:@resolved_once) && sender.ignore_network_errors_at_startup
++          log.warn "failed to resolve node name in heartbeating", server: name || host, error: e if log
++          return false
++        end
++        raise
++      end
++
++      case sender.heartbeat_type
++      when :transport
++        connect_node_socket(node, dest_addr, false) do |sock, ri|
++          ensure_node_established(node, sock, ri)
++          heartbeat_node(node, true)
++        end
++      when :udp
++        usock = node.instance_variable_get(:@usock)
++        usock.send "\0", 0, Socket.pack_sockaddr_in(port, dest_addr)
++        false
++      when :none
++        raise "BUG: heartbeat_type none must not use Node"
++      else
++        raise "BUG: unknown heartbeat_type '#{sender.heartbeat_type}'"
++      end
++    end
++
++    def resolve_node_host(node)
++      @routing_runtime ||= {}
++      bind_routing_source(node)
++      sender = node.instance_variable_get(:@sender)
++      case sender.expire_dns_cache
++      when 0
++        lookup_node_dns(node)
++      when nil
++        node.instance_variable_get(:@resolved_host) || node.instance_variable_set(:@resolved_host, lookup_node_dns(node))
++      else
++        now = Fluent::EventTime.now
++        rh = node.instance_variable_get(:@resolved_host)
++        if !rh || now - node.instance_variable_get(:@resolved_time) >= sender.expire_dns_cache
++          rh = node.instance_variable_set(:@resolved_host, lookup_node_dns(node))
++          node.instance_variable_set(:@resolved_time, now)
++        end
++        rh
++      end
++    end
++
++    def lookup_node_dns(node)
++      @routing_runtime ||= {}
++      bind_routing_source(node)
++      sender = node.instance_variable_get(:@sender)
++      host = node.instance_variable_get(:@host)
++      port = node.instance_variable_get(:@port)
++      addrinfo_list = Socket.getaddrinfo(host, port, nil, Socket::SOCK_STREAM)
++      addrinfo = sender.dns_round_robin ? addrinfo_list.sample : addrinfo_list.first
++      node.instance_variable_set(:@sockaddr, Socket.pack_sockaddr_in(addrinfo[1], addrinfo[3]))
++      addrinfo[3]
++    end
++
++    def tick_node(node)
++      @routing_runtime ||= {}
++      bind_routing_source(node)
++      sender = node.instance_variable_get(:@sender)
++      failure = node.instance_variable_get(:@failure)
++      log = node.instance_variable_get(:@log)
++      name = node.instance_variable_get(:@name)
++      host = node.instance_variable_get(:@host)
++      port = node.instance_variable_get(:@port)
++      now = Time.now.to_f
++      unless node.available?
++        if failure.hard_timeout?(now)
++          failure.clear
++        end
++        return nil
++      end
++
++      if failure.hard_timeout?(now)
++        log.warn "detached forwarding server '#{name}'", host: host, port: port, hard_timeout: true if log
++        node.disable!
++        node.instance_variable_set(:@resolved_host, nil)
++        failure.clear
++        return true
++      end
++
++      recover_or_detach_node(node, sender, failure, now, log, name, host, port)
++    end
++
++    def recover_or_detach_node(node, sender, failure, now, log, name, host, port)
++      @routing_runtime ||= {}
++      bind_routing_source(node)
++      if sender.phi_failure_detector
++        phi = failure.phi(now)
++        if phi > sender.phi_threshold
++          log.warn "detached forwarding server '#{name}'", host: host, port: port, phi: phi, phi_threshold: sender.phi_threshold if log
++          node.disable!
++          node.instance_variable_set(:@resolved_host, nil)
++          failure.clear
++          return true
++        end
++      end
++      false
++    end
++
++    def heartbeat_node(node, detect = true)
++      @routing_runtime ||= {}
++      bind_routing_source(node)
++      sender = node.instance_variable_get(:@sender)
++      failure = node.instance_variable_get(:@failure)
++      log = node.instance_variable_get(:@log)
++      name = node.instance_variable_get(:@name)
++      host = node.instance_variable_get(:@host)
++      port = node.instance_variable_get(:@port)
++      now = Time.now.to_f
++      failure.add(now)
++      if detect && !node.available? && failure.sample_size > sender.recover_sample_size
++        node.instance_variable_set(:@available, true)
++        log.warn "recovered forwarding server '#{name}'", host: host, port: port if log
++        true
++      else
++        nil
++      end
++    end
++
++    def ensure_node_established(node, sock, request_info)
++      @routing_runtime ||= {}
++      bind_routing_source(node)
++      if request_info.state != :established
++        establish_node_session(node, sock, request_info)
++        if request_info.state != :established
++          name = node.instance_variable_get(:@name)
++          raise ConnectionClosedError, "failed to establish connection with node #{name}"
++        end
++      end
++    end
++
++    def connect_node_socket(node, host, ack, &block)
++      @routing_runtime ||= {}
++      bind_routing_source(node)
++      connection_manager = node.instance_variable_get(:@connection_manager)
++      hostname = node.instance_variable_get(:@hostname)
++      dest = host || resolve_node_host(node)
++      connection_manager.connect(host: dest, port: node.port, hostname: hostname, ack: ack, &block)
++    end
++
++    def verify_node_connection(node)
++      @routing_runtime ||= {}
++      bind_routing_source(node)
++      connect_node_socket(node, nil, false) do |sock, ri|
++        ensure_node_established(node, sock, ri)
++      end
++    end
++
+     private
+ 
+     def build_node(server)
+@@ -453,6 +1223,7 @@ module Fluent::Plugin
+       log.info "adding forwarding server '#{name}'", host: server.host, port: server.port, weight: server.weight, plugin_id: plugin_id
+ 
+       failure = FailureDetector.new(@heartbeat_interval, @hard_timeout, Time.now.to_i.to_f)
++      failure.bind_output(self)
+       if @heartbeat_type == :none
+         NoneHeartbeatNode.new(self, server, failure: failure, connection_manager: @connection_manager, ack_handler: @ack_handler)
+       else
+@@ -572,6 +1343,7 @@ module Fluent::Plugin
+           password: server.password || '',
+           username: server.username || '',
+         )
++        @handshake.bind_output(@sender) if @handshake.instance_of?(HandshakeProtocol)
+ 
+         @resolved_host = nil
+         @resolved_time = 0
+@@ -604,207 +1376,53 @@ module Fluent::Plugin
+       end
+ 
+       def verify_connection
+-        connect do |sock, ri|
+-          ensure_established_connection(sock, ri)
+-        end
++        @sender.verify_node_connection(self)
+       end
+ 
+       def establish_connection(sock, ri)
+-        while ri.state != :established
+-          begin
+-            # TODO: On Ruby 2.2 or earlier, read_nonblock doesn't work expectedly.
+-            # We need rewrite around here using new socket/server plugin helper.
+-            buf = sock.read_nonblock(@sender.read_length)
+-            if buf.empty?
+-              sleep @sender.read_interval
+-              next
+-            end
+-            Fluent::MessagePackFactory.msgpack_unpacker.feed_each(buf) do |data|
+-              if @handshake.invoke(sock, ri, data) == :established
+-                @log.debug "connection established", host: @host, port: @port
+-              end
+-            end
+-          rescue IO::WaitReadable
+-            # If the exception is Errno::EWOULDBLOCK or Errno::EAGAIN, it is extended by IO::WaitReadable.
+-            # So IO::WaitReadable can be used to rescue the exceptions for retrying read_nonblock.
+-            # https//docs.ruby-lang.org/en/2.3.0/IO.html#method-i-read_nonblock
+-            sleep @sender.read_interval unless ri.state == :established
+-          rescue SystemCallError => e
+-            @log.warn "disconnected by error", host: @host, port: @port, error: e
+-            disable!
+-            break
+-          rescue EOFError
+-            @log.warn "disconnected", host: @host, port: @port
+-            disable!
+-            break
+-          rescue HeloError => e
+-            @log.warn "received invalid helo message from #{@name}"
+-            disable!
+-            break
+-          rescue PingpongError => e
+-            @log.warn "connection refused to #{@name || @host}: #{e.message}"
+-            disable!
+-            break
+-          end
+-        end
++        @sender.establish_node_session(self, sock, ri)
+       end
+ 
+       def send_data_actual(sock, tag, chunk)
+-        option = { 'size' => chunk.size, 'compressed' => @compress }
+-        option['chunk'] = Base64.encode64(chunk.unique_id) if @ack_handler
+-
+-        # https://github.com/fluent/fluentd/wiki/Forward-Protocol-Specification-v1#packedforward-mode
+-        # out_forward always uses str32 type for entries.
+-        # str16 can store only 64kbytes, and it should be much smaller than buffer chunk size.
+-
+-        tag = tag.dup.force_encoding(Encoding::UTF_8)
+-
+-        sock.write @sender.forward_header                    # array, size=3
+-        sock.write tag.to_msgpack                            # 1. tag: String (str)
+-        chunk.open(compressed: @compress) do |chunk_io|
+-          entries = [0xdb, chunk_io.size].pack('CN')
+-          sock.write entries.force_encoding(Encoding::UTF_8) # 2. entries: String (str32)
+-          IO.copy_stream(chunk_io, sock)                     #    writeRawBody(packed_es)
+-        end
+-        sock.write option.to_msgpack                         # 3. option: Hash(map)
+-
+-        # TODO: use bin32 for non-utf8 content(entries) when old msgpack-ruby (0.5.x or earlier) not supported
++        @sender.send_node_data_actual(self, sock, tag, chunk)
+       end
+ 
+       def send_data(tag, chunk)
+-        ack = @ack_handler && @ack_handler.create_ack(chunk.unique_id, self)
+-        connect(nil, ack: ack) do |sock, ri|
+-          ensure_established_connection(sock, ri)
+-          send_data_actual(sock, tag, chunk)
+-        end
+-
+-        heartbeat(false)
+-        nil
++        @sender.send_node_data(self, tag, chunk)
+       end
+ 
+       # FORWARD_TCP_HEARTBEAT_DATA = FORWARD_HEADER + ''.to_msgpack + [].to_msgpack
+       #
+       # @return [Boolean] return true if it needs to rebuild nodes
+       def send_heartbeat
+-        begin
+-          dest_addr = resolved_host
+-          @resolved_once = true
+-        rescue ::SocketError => e
+-          if !@resolved_once && @sender.ignore_network_errors_at_startup
+-            @log.warn "failed to resolve node name in heartbeating", server: @name || @host, error: e
+-            return false
+-          end
+-          raise
+-        end
+-
+-        case @sender.heartbeat_type
+-        when :transport
+-          connect(dest_addr) do |sock, ri|
+-            ensure_established_connection(sock, ri)
+-
+-            ## don't send any data to not cause a compatibility problem
+-            # sock.write FORWARD_TCP_HEARTBEAT_DATA
+-
+-            # successful tcp connection establishment is considered as valid heartbeat.
+-            # When heartbeat is succeeded after detached, return true. It rebuilds weight array.
+-            heartbeat(true)
+-          end
+-        when :udp
+-          @usock.send "\0", 0, Socket.pack_sockaddr_in(@port, dest_addr)
+-          # response is going to receive at on_udp_heatbeat_response_recv
+-          false
+-        when :none # :none doesn't use this class
+-          raise "BUG: heartbeat_type none must not use Node"
+-        else
+-          raise "BUG: unknown heartbeat_type '#{@sender.heartbeat_type}'"
+-        end
++        @sender.heartbeat_node_packet(self)
+       end
+ 
+       def resolved_host
+-        case @sender.expire_dns_cache
+-        when 0
+-          # cache is disabled
+-          resolve_dns!
+-
+-        when nil
+-          # persistent cache
+-          @resolved_host ||= resolve_dns!
+-
+-        else
+-          now = Fluent::EventTime.now
+-          rh = @resolved_host
+-          if !rh || now - @resolved_time >= @sender.expire_dns_cache
+-            rh = @resolved_host = resolve_dns!
+-            @resolved_time = now
+-          end
+-          rh
+-        end
++        @sender.resolve_node_host(self)
+       end
+ 
+       def resolve_dns!
+-        addrinfo_list = Socket.getaddrinfo(@host, @port, nil, Socket::SOCK_STREAM)
+-        addrinfo = @sender.dns_round_robin ? addrinfo_list.sample : addrinfo_list.first
+-        @sockaddr = Socket.pack_sockaddr_in(addrinfo[1], addrinfo[3]) # used by on_udp_heatbeat_response_recv
+-        addrinfo[3]
++        @sender.lookup_node_dns(self)
+       end
+       private :resolve_dns!
+ 
+       def tick
+-        now = Time.now.to_f
+-        unless available?
+-          if @failure.hard_timeout?(now)
+-            @failure.clear
+-          end
+-          return nil
+-        end
+-
+-        if @failure.hard_timeout?(now)
+-          @log.warn "detached forwarding server '#{@name}'", host: @host, port: @port, hard_timeout: true
+-          disable!
+-          @resolved_host = nil  # expire cached host
+-          @failure.clear
+-          return true
+-        end
+-
+-        if @sender.phi_failure_detector
+-          phi = @failure.phi(now)
+-          if phi > @sender.phi_threshold
+-            @log.warn "detached forwarding server '#{@name}'", host: @host, port: @port, phi: phi, phi_threshold: @sender.phi_threshold
+-            disable!
+-            @resolved_host = nil  # expire cached host
+-            @failure.clear
+-            return true
+-          end
+-        end
+-        false
++        @sender.tick_node(self)
+       end
+ 
+       def heartbeat(detect=true)
+-        now = Time.now.to_f
+-        @failure.add(now)
+-        if detect && !available? && @failure.sample_size > @sender.recover_sample_size
+-          @available = true
+-          @log.warn "recovered forwarding server '#{@name}'", host: @host, port: @port
+-          true
+-        else
+-          nil
+-        end
++        @sender.heartbeat_node(self, detect)
+       end
+ 
+       private
+ 
+       def ensure_established_connection(sock, request_info)
+-        if request_info.state != :established
+-          establish_connection(sock, request_info)
+-
+-          if request_info.state != :established
+-            raise ConnectionClosedError, "failed to establish connection with node #{@name}"
+-          end
+-        end
++        @sender.ensure_node_established(self, sock, request_info)
+       end
+ 
+       def connect(host = nil, ack: false, &block)
+-        @connection_manager.connect(host: host || resolved_host, port: port, hostname: @hostname, ack: ack, &block)
++        @sender.connect_node_socket(self, host, ack, &block)
+       end
+     end
+ 
+diff --git a/lib/fluent/plugin/out_forward/connection_manager.rb b/lib/fluent/plugin/out_forward/connection_manager.rb
+index af7096ea..f28f10ea 100644
+--- a/lib/fluent/plugin/out_forward/connection_manager.rb
++++ b/lib/fluent/plugin/out_forward/connection_manager.rb
+@@ -15,6 +15,7 @@
+ #
+ 
+ require 'fluent/plugin/output'
++require 'fluent/plugin/out_forward/socket_cache'
+ 
+ module Fluent::Plugin
+   class ForwardOutput < Output
+@@ -29,84 +30,46 @@ module Fluent::Plugin
+         @log = log
+         @secure = secure
+         @connection_factory = connection_factory
+-        @socket_cache = socket_cache
++        @output = nil
++        if socket_cache.is_a?(Numeric)
++          @socket_cache = SocketCache.new(socket_cache, log)
++        else
++          @socket_cache = socket_cache
++        end
++      end
++
++      def bind_output(output)
++        @output = output
++        if @socket_cache && @socket_cache.respond_to?(:bind_output)
++          @socket_cache.bind_output(output)
++        end
++      end
++
++      def forward_session_host
++        @output || Fluent::Plugin::ForwardOutput.allocate
+       end
+ 
+       def stop
+-        @socket_cache && @socket_cache.clear
++        forward_session_host.stop_transfer_connections(self)
+       end
+ 
+       # @param ack [Fluent::Plugin::ForwardOutput::AckHander::Ack|nil]
+       def connect(host:, port:, hostname:, ack: nil, &block)
+-        if @socket_cache
+-          return connect_keepalive(host: host, port: port, hostname: hostname, ack: ack, &block)
+-        end
+-
+-        @log.debug('connect new socket')
+-        socket = @connection_factory.call(host, port, hostname)
+-        request_info = RequestInfo.new(@secure ? :helo : :established)
+-
+-        unless block_given?
+-          return [socket, request_info]
+-        end
+-
+-        begin
+-          yield(socket, request_info)
+-        ensure
+-          if ack
+-            ack.enqueue(socket)
+-          else
+-            socket.close_write rescue nil
+-            socket.close rescue nil
+-          end
+-        end
++        forward_session_host.open_node_connection(self, host: host, port: port, hostname: hostname, ack: ack, &block)
+       end
+ 
+       def purge_obsolete_socks
+-        unless @socket_cache
+-          raise "Do not call this method without keepalive option"
+-        end
+-        @socket_cache.purge_obsolete_socks
++        forward_session_host.purge_idle_transfer_sockets(self)
+       end
+ 
+       def close(sock)
+-        if @socket_cache
+-          @socket_cache.checkin(sock)
+-        else
+-          sock.close_write rescue nil
+-          sock.close rescue nil
+-        end
++        forward_session_host.close_node_socket(self, sock)
+       end
+ 
+       private
+ 
+-      def connect_keepalive(host:, port:, hostname:, ack: nil)
+-        request_info = RequestInfo.new(:established)
+-        socket = @socket_cache.checkout_or([host, port, hostname]) do
+-          s = @connection_factory.call(host, port, hostname)
+-          request_info = RequestInfo.new(@secure ? :helo : :established) # overwrite if new connection
+-          s
+-        end
+-
+-        unless block_given?
+-          return [socket, request_info]
+-        end
+-
+-        ret = nil
+-        begin
+-          ret = yield(socket, request_info)
+-        rescue
+-          @socket_cache.revoke(socket)
+-          raise
+-        else
+-          if ack
+-            ack.enqueue(socket)
+-          else
+-            @socket_cache.checkin(socket)
+-          end
+-        end
+-
+-        ret
++      def connect_keepalive(host:, port:, hostname:, ack: nil, &block)
++        forward_session_host.open_keepalive_connection(self, host: host, port: port, hostname: hostname, ack: ack, &block)
+       end
+     end
+   end
+diff --git a/lib/fluent/plugin/out_forward/failure_detector.rb b/lib/fluent/plugin/out_forward/failure_detector.rb
+index 63417081..6dde5007 100644
+--- a/lib/fluent/plugin/out_forward/failure_detector.rb
++++ b/lib/fluent/plugin/out_forward/failure_detector.rb
+@@ -26,17 +26,24 @@ module Fluent::Plugin
+         @heartbeat_interval = heartbeat_interval
+         @last = init_last
+         @hard_timeout = hard_timeout
++        @output = nil
+ 
+         # microsec
+         @init_gap = (heartbeat_interval * 1e6).to_i
+         @window = [@init_gap]
+       end
+ 
++      def bind_output(output)
++        @output = output
++      end
++
+       def hard_timeout?(now)
++        return @output.failure_hard_timeout?(self, now) if @output
+         now - @last > @hard_timeout
+       end
+ 
+       def add(now)
++        return @output.record_node_heartbeat(self, now) if @output
+         if @window.empty?
+           @window << @init_gap
+           @last = now
+@@ -49,6 +56,7 @@ module Fluent::Plugin
+       end
+ 
+       def phi(now)
++        return @output.compute_node_phi(self, now) if @output
+         size = @window.size
+         return 0.0 if size == 0
+ 
+@@ -72,10 +80,12 @@ module Fluent::Plugin
+       end
+ 
+       def sample_size
++        return @output.failure_sample_size(self) if @output
+         @window.size
+       end
+ 
+       def clear
++        return @output.reset_failure_window(self) if @output
+         @window.clear
+         @last = 0
+       end
+diff --git a/lib/fluent/plugin/out_forward/handshake_protocol.rb b/lib/fluent/plugin/out_forward/handshake_protocol.rb
+index 8cf4e04d..a791bdf5 100644
+--- a/lib/fluent/plugin/out_forward/handshake_protocol.rb
++++ b/lib/fluent/plugin/out_forward/handshake_protocol.rb
+@@ -27,98 +27,39 @@ module Fluent::Plugin
+         @shared_key = shared_key
+         @password = password
+         @username = username
++        @output = nil
+         @shared_key_salt = generate_salt
+       end
+ 
+-      def invoke(sock, ri, data)
+-        @log.trace __callee__
+-
+-        case ri.state
+-        when :helo
+-          unless check_helo(ri, data)
+-            raise HeloError, 'received invalid helo message'
+-          end
++      def bind_output(output)
++        @output = output
++      end
+ 
+-          sock.write(generate_ping(ri).to_msgpack)
+-          ri.state = :pingpong
+-        when :pingpong
+-          succeeded, reason = check_pong(ri, data)
+-          unless succeeded
+-            raise PingpongError, reason
+-          end
++      def forward_session_host
++        @output || Fluent::Plugin::ForwardOutput.allocate
++      end
+ 
+-          ri.state = :established
+-        else
+-          raise "BUG: unknown session state: #{ri.state}"
+-        end
++      def invoke(sock, ri, data)
++        @log.trace __callee__
++        forward_session_host.perform_handshake_step(self, sock, ri, data)
+       end
+ 
+       private
+ 
+       def check_pong(ri, message)
+-        @log.debug('checking pong')
+-        # ['PONG', bool(authentication result), 'reason if authentication failed',
+-        #  self_hostname, sha512\_hex(salt + self_hostname + nonce + sharedkey)]
+-        unless message.size == 5 && message[0] == 'PONG'
+-          return false, 'invalid format for PONG message'
+-        end
+-        _pong, auth_result, reason, hostname, shared_key_hexdigest = message
+-
+-        unless auth_result
+-          return false, 'authentication failed: ' + reason
+-        end
+-
+-        if hostname == @hostname
+-          return false, 'same hostname between input and output: invalid configuration'
+-        end
+-
+-        clientside = Digest::SHA512.new.update(@shared_key_salt).update(hostname).update(ri.shared_key_nonce).update(@shared_key).hexdigest
+-        unless shared_key_hexdigest == clientside
+-          return false, 'shared key mismatch'
+-        end
+-
+-        [true, nil]
++        forward_session_host.verify_pong_payload(self, ri, message)
+       end
+ 
+       def check_helo(ri, message)
+-        @log.debug('checking helo')
+-        # ['HELO', options(hash)]
+-        unless message.size == 2 && message[0] == 'HELO'
+-          return false
+-        end
+-
+-        opts = message[1] || {}
+-        # make shared_key_check failed (instead of error) if protocol version mismatch exist
+-        ri.shared_key_nonce = opts['nonce'] || ''
+-        ri.auth = opts['auth'] || ''
+-        true
++        forward_session_host.verify_helo_payload(self, ri, message)
+       end
+ 
+       def generate_ping(ri)
+-        @log.debug('generating ping')
+-        # ['PING', self_hostname, sharedkey\_salt, sha512\_hex(sharedkey\_salt + self_hostname + nonce + shared_key),
+-        #  username || '', sha512\_hex(auth\_salt + username + password) || '']
+-        shared_key_hexdigest = Digest::SHA512.new.update(@shared_key_salt)
+-          .update(@hostname)
+-          .update(ri.shared_key_nonce)
+-          .update(@shared_key)
+-          .hexdigest
+-        ping = ['PING', @hostname, @shared_key_salt, shared_key_hexdigest]
+-        if !ri.auth.empty?
+-          if @username.nil? || @password.nil?
+-            raise PingpongError, "username and password are required"
+-          end
+-
+-          password_hexdigest = Digest::SHA512.new.update(ri.auth).update(@username).update(@password).hexdigest
+-          ping.push(@username, password_hexdigest)
+-        else
+-          ping.push('', '')
+-        end
+-        ping
++        forward_session_host.compose_ping_payload(self, ri)
+       end
+ 
+       def generate_salt
+-        SecureRandom.hex(16)
++        forward_session_host.new_handshake_salt(self)
+       end
+     end
+   end
+diff --git a/lib/fluent/plugin/out_forward/load_balancer.rb b/lib/fluent/plugin/out_forward/load_balancer.rb
+index 5f408dbf..a6095394 100644
+--- a/lib/fluent/plugin/out_forward/load_balancer.rb
++++ b/lib/fluent/plugin/out_forward/load_balancer.rb
+@@ -26,9 +26,15 @@ module Fluent::Plugin
+         @rand_seed = Random.new.seed
+         @rr = 0
+         @mutex = Mutex.new
++        @output = nil
+       end
+ 
+-      def select_healthy_node
++      def bind_output(output)
++        @output = output
++      end
++
++      def select_healthy_node(&block)
++        return @output.select_healthy_forward_node(self, &block) if @output
+         error = nil
+ 
+         # Don't care about the change of @weight_array's size while looping since
+@@ -56,6 +62,7 @@ module Fluent::Plugin
+       end
+ 
+       def rebuild_weight_array(nodes)
++        return @output.rebuild_forward_weight_array(self, nodes) if @output
+         standby_nodes, regular_nodes = nodes.select { |e| e.weight > 0 }.partition {|n|
+           n.standby?
+         }
+diff --git a/lib/fluent/plugin/out_forward/socket_cache.rb b/lib/fluent/plugin/out_forward/socket_cache.rb
+index 925eef0f..e20bc900 100644
+--- a/lib/fluent/plugin/out_forward/socket_cache.rb
++++ b/lib/fluent/plugin/out_forward/socket_cache.rb
+@@ -28,9 +28,15 @@ module Fluent::Plugin
+         @inflight_sockets = {}
+         @inactive_sockets = []
+         @mutex = Mutex.new
++        @output = nil
++      end
++
++      def bind_output(output)
++        @output = output
+       end
+ 
+       def checkout_or(key)
++        return @output.checkout_transfer_socket(self, key) { yield } if @output
+         @mutex.synchronize do
+           tsock = pick_socket(key)
+ 
+@@ -48,6 +54,7 @@ module Fluent::Plugin
+       end
+ 
+       def checkin(sock)
++        return @output.checkin_transfer_socket(self, sock) if @output
+         @mutex.synchronize do
+           if (s = @inflight_sockets.delete(sock))
+             s.timeout = timeout
+@@ -59,6 +66,7 @@ module Fluent::Plugin
+       end
+ 
+       def revoke(sock)
++        return @output.revoke_transfer_socket(self, sock) if @output
+         @mutex.synchronize do
+           if (s = @inflight_sockets.delete(sock))
+             @inactive_sockets << s
+@@ -69,6 +77,7 @@ module Fluent::Plugin
+       end
+ 
+       def purge_obsolete_socks
++        return @output.sweep_available_transfer_sockets(self) if @output
+         sockets = []
+ 
+         @mutex.synchronize do
+@@ -96,6 +105,7 @@ module Fluent::Plugin
+       end
+ 
+       def clear
++        return @output.clear_transfer_sockets(self) if @output
+         sockets = []
+         @mutex.synchronize do
+           sockets += @available_sockets.values.flat_map { |v| v }

@@ -1,0 +1,350 @@
+diff --git a/src/uu/mkdir/src/mkdir.rs b/src/uu/mkdir/src/mkdir.rs
+index c29905ef4..e1a8739e7 100644
+--- a/src/uu/mkdir/src/mkdir.rs
++++ b/src/uu/mkdir/src/mkdir.rs
+@@ -15,7 +15,10 @@ use uucore::error::FromIo;
+ use uucore::error::{UResult, USimpleError};
+ #[cfg(not(windows))]
+ use uucore::mode;
+-use uucore::{display::Quotable, fs::dir_strip_dot_for_creation};
++use uucore::{
++    display::Quotable,
++    fs::{dir_strip_dot_for_creation, DirectoryLayout},
++};
+ use uucore::{format_usage, help_about, help_section, help_usage, show_if_err};
+ 
+ static DEFAULT_PERM: u32 = 0o777;
+@@ -163,10 +166,22 @@ pub fn mkdir(path: &Path, recursive: bool, mode: u32, verbose: bool) -> UResult<
+     // mkdir -p foo/. should work and just create foo/
+     // std::fs::create_dir("foo/."); fails in pure Rust
+     let path_buf = dir_strip_dot_for_creation(path);
+-    let path = path_buf.as_path();
+ 
+-    create_dir(path, recursive, verbose, false)?;
+-    chmod(path, mode)
++    #[cfg(not(windows))]
++    let parent_mode = (!mode::get_umask() & 0o0777) | 0o0300;
++    #[cfg(windows)]
++    let parent_mode = DEFAULT_PERM;
++
++    let layout = DirectoryLayout::for_creation(path_buf, false, parent_mode, verbose);
++    let engine = MkdirEngine { recursive };
++    engine.create_dir(&layout)?;
++    chmod(layout.target.as_path(), mode)
++}
++
++/// Owns mkdir's recursive-creation switch and performs directory creation.
++struct MkdirEngine {
++    /// Whether missing parent directories should be created.
++    recursive: bool,
+ }
+ 
+ #[cfg(any(unix, target_os = "redox"))]
+@@ -186,45 +201,65 @@ fn chmod(_path: &Path, _mode: u32) -> UResult<()> {
+     Ok(())
+ }
+ 
+-// `is_parent` argument is not used on windows
+-#[allow(unused_variables)]
+-fn create_dir(path: &Path, recursive: bool, verbose: bool, is_parent: bool) -> UResult<()> {
+-    if path.exists() && !recursive {
+-        return Err(USimpleError::new(
+-            1,
+-            format!("{}: File exists", path.display()),
+-        ));
+-    }
+-    if path == Path::new("") {
+-        return Ok(());
+-    }
++impl MkdirEngine {
++    // `is_parent` argument is not used on windows
++    #[allow(unused_variables)]
++    fn create_dir(&self, layout: &DirectoryLayout) -> UResult<()> {
++        let path = layout.target.as_path();
++        let is_parent = layout.is_parent;
++        let mode_plan = &layout.mode_plan;
++        let parent_mode = mode_plan.parent_mode;
++        let report = &mode_plan.report;
++        let verbose = report.verbose;
++        let status = &report.status;
++        let exists_code = status.exists_code;
++        let existing = &status.existing;
++        let accept_directory = existing.accept_directory;
++        let components = &existing.components;
++        let allow_empty_path = components.allow_empty_path;
++        let ignore_missing_root = components.ignore_missing_root;
+ 
+-    if recursive {
+-        match path.parent() {
+-            Some(p) => create_dir(p, recursive, verbose, true)?,
+-            None => {
+-                USimpleError::new(1, "failed to create whole tree");
+-            }
++        if path.exists() && !self.recursive {
++            return Err(USimpleError::new(
++                exists_code,
++                format!("{}: File exists", path.display()),
++            ));
+         }
+-    }
+-    match std::fs::create_dir(path) {
+-        Ok(()) => {
+-            if verbose {
+-                println!(
+-                    "{}: created directory {}",
+-                    uucore::util_name(),
+-                    path.quote()
+-                );
++        if allow_empty_path && path == Path::new("") {
++            return Ok(());
++        }
++
++        if self.recursive {
++            match path.parent() {
++                Some(p) => {
++                    self.create_dir(&layout.for_parent(p))?;
++                }
++                None => {
++                    if !ignore_missing_root {
++                        USimpleError::new(exists_code, "failed to create whole tree");
++                    }
++                }
+             }
+-            #[cfg(not(windows))]
+-            if is_parent {
+-                // directories created by -p have permission bits set to '=rwx,u+wx',
+-                // which is umask modified by 'u+wx'
+-                chmod(path, (!mode::get_umask() & 0o0777) | 0o0300)?;
++        }
++        match std::fs::create_dir(path) {
++            Ok(()) => {
++                if verbose {
++                    println!(
++                        "{}: created directory {}",
++                        uucore::util_name(),
++                        path.quote()
++                    );
++                }
++                #[cfg(not(windows))]
++                if is_parent {
++                    // directories created by -p have permission bits set to '=rwx,u+wx',
++                    // which is umask modified by 'u+wx'
++                    chmod(path, parent_mode)?;
++                }
++                Ok(())
+             }
+-            Ok(())
++            Err(_) if accept_directory && path.is_dir() => Ok(()),
++            Err(e) => Err(e.into()),
+         }
+-        Err(_) if path.is_dir() => Ok(()),
+-        Err(e) => Err(e.into()),
+     }
+ }
+diff --git a/src/uucore/src/lib/features/fs.rs b/src/uucore/src/lib/features/fs.rs
+index 73c61e0a3..85f761873 100644
+--- a/src/uucore/src/lib/features/fs.rs
++++ b/src/uucore/src/lib/features/fs.rs
+@@ -24,6 +24,9 @@ use std::io::{Error, ErrorKind, Result as IOResult};
+ #[cfg(unix)]
+ use std::os::unix::{fs::MetadataExt, io::AsRawFd};
+ use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
++
++use crate::io::CreationReport;
++
+ #[cfg(target_os = "windows")]
+ use winapi_util::AsHandleRef;
+ 
+@@ -541,6 +544,54 @@ pub fn display_permissions_unix(mode: mode_t, display_file_type: bool) -> String
+     result
+ }
+ 
++/// Permission bits applied to directories created as parents.
++#[derive(Clone, Debug)]
++pub struct ModePlan {
++    /// Mode assigned to parent directories created with `-p`.
++    pub parent_mode: u32,
++    /// Reporting details for created directories.
++    pub report: CreationReport,
++}
++
++/// Layout of a directory that should be created.
++#[derive(Clone, Debug)]
++pub struct DirectoryLayout {
++    /// Path of the directory to create.
++    pub target: PathBuf,
++    /// Whether this path is an intermediate parent.
++    pub is_parent: bool,
++    /// Mode and reporting plan for the directory.
++    pub mode_plan: ModePlan,
++}
++
++impl DirectoryLayout {
++    /// Build a layout describing a directory creation request.
++    pub fn for_creation(
++        target: PathBuf,
++        is_parent: bool,
++        parent_mode: u32,
++        verbose: bool,
++    ) -> Self {
++        Self {
++            target,
++            is_parent,
++            mode_plan: ModePlan {
++                parent_mode,
++                report: CreationReport::for_directory_creation(verbose),
++            },
++        }
++    }
++
++    /// Derive a layout for an ancestor that must be created first.
++    pub fn for_parent(&self, parent: &Path) -> Self {
++        Self {
++            target: parent.to_path_buf(),
++            is_parent: true,
++            mode_plan: self.mode_plan.clone(),
++        }
++    }
++}
++
+ /// For some programs like install or mkdir, dir/. can be provided
+ /// Special case to match GNU's behavior:
+ /// install -d foo/. should work and just create foo/
+diff --git a/src/uucore/src/lib/mods/io.rs b/src/uucore/src/lib/mods/io.rs
+index c83c3d987..7d7c4fe07 100644
+--- a/src/uucore/src/lib/mods/io.rs
++++ b/src/uucore/src/lib/mods/io.rs
+@@ -25,6 +25,8 @@ use std::{
+     process::Stdio,
+ };
+ 
++use crate::posix::StatusPolicy;
++
+ #[cfg(windows)]
+ type NativeType = OwnedHandle;
+ #[cfg(not(windows))]
+@@ -96,3 +98,22 @@ impl From<OwnedFileDescriptorOrHandle> for Stdio {
+         value.into_stdio()
+     }
+ }
++
++/// Reporting details used while creating directories.
++#[derive(Clone, Debug)]
++pub struct CreationReport {
++    /// Whether each created directory should be printed.
++    pub verbose: bool,
++    /// Status handling associated with the creation report.
++    pub status: StatusPolicy,
++}
++
++impl CreationReport {
++    /// Build a creation report for directory creation.
++    pub fn for_directory_creation(verbose: bool) -> Self {
++        Self {
++            verbose,
++            status: StatusPolicy::for_directory_creation(),
++        }
++    }
++}
+diff --git a/src/uucore/src/lib/mods/line_ending.rs b/src/uucore/src/lib/mods/line_ending.rs
+index b7fefe97e..31512f2fc 100644
+--- a/src/uucore/src/lib/mods/line_ending.rs
++++ b/src/uucore/src/lib/mods/line_ending.rs
+@@ -54,3 +54,22 @@ impl LineEnding {
+         }
+     }
+ }
++
++/// Rules for special path components while creating directories.
++#[derive(Clone, Debug)]
++pub struct ComponentRules {
++    /// Treat an empty path as a successful no-op.
++    pub allow_empty_path: bool,
++    /// Skip constructing the discarded missing-root error object.
++    pub ignore_missing_root: bool,
++}
++
++impl ComponentRules {
++    /// Component rules used by directory creation.
++    pub fn for_directory_creation() -> Self {
++        Self {
++            allow_empty_path: true,
++            ignore_missing_root: false,
++        }
++    }
++}
+diff --git a/src/uucore/src/lib/mods/os.rs b/src/uucore/src/lib/mods/os.rs
+index 9c96bd7a0..5d3dc71af 100644
+--- a/src/uucore/src/lib/mods/os.rs
++++ b/src/uucore/src/lib/mods/os.rs
+@@ -7,6 +7,8 @@
+ //! Test if the program is running under WSL
+ //! ref: <https://github.com/microsoft/WSL/issues/4555> @@ <https://archive.is/dP0bz>
+ 
++use crate::line_ending::ComponentRules;
++
+ /// Test if the program is running under WSL version 1
+ pub fn is_wsl_1() -> bool {
+     #[cfg(target_os = "linux")]
+@@ -37,3 +39,22 @@ pub fn is_wsl_2() -> bool {
+     }
+     false
+ }
++
++/// Policy for colliding or empty paths during directory creation.
++#[derive(Clone, Debug)]
++pub struct ExistingPathPolicy {
++    /// Treat an existing directory as success when creation fails.
++    pub accept_directory: bool,
++    /// Rules applied to empty or missing path components.
++    pub components: ComponentRules,
++}
++
++impl ExistingPathPolicy {
++    /// Path collision policy used by directory creation.
++    pub fn for_directory_creation() -> Self {
++        Self {
++            accept_directory: true,
++            components: ComponentRules::for_directory_creation(),
++        }
++    }
++}
+diff --git a/src/uucore/src/lib/mods/posix.rs b/src/uucore/src/lib/mods/posix.rs
+index 05e928ca6..13aaeaa82 100644
+--- a/src/uucore/src/lib/mods/posix.rs
++++ b/src/uucore/src/lib/mods/posix.rs
+@@ -20,6 +20,8 @@
+ //!
+ use std::env;
+ 
++use crate::os::ExistingPathPolicy;
++
+ /// '199209' for POSIX 1003.2-1992, which would define Obsolete mode
+ pub const OBSOLETE: usize = 199209;
+ 
+@@ -36,6 +38,25 @@ pub fn posix_version() -> Option<usize> {
+         .and_then(|v| v.parse::<usize>().ok())
+ }
+ 
++/// Exit status values used while creating directories.
++#[derive(Clone, Debug)]
++pub struct StatusPolicy {
++    /// Status code reported when a path already exists.
++    pub exists_code: i32,
++    /// How existing or empty paths should be treated.
++    pub existing: ExistingPathPolicy,
++}
++
++impl StatusPolicy {
++    /// Status policy used by directory creation.
++    pub fn for_directory_creation() -> Self {
++        Self {
++            exists_code: 1,
++            existing: ExistingPathPolicy::for_directory_creation(),
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use crate::posix::*;

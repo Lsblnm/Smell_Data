@@ -1,0 +1,174 @@
+diff --git a/src/compile.c b/src/compile.c
+index 58d0857..c74ffcf 100644
+--- a/src/compile.c
++++ b/src/compile.c
+@@ -1052,25 +1052,27 @@ block gen_try_handler(block handler) {
+ block gen_try(block exp, block handler) {
+   /*
+    * Produce something like:
+-   *  FORK_OPT <address of handler>
++   *  TRY_BEGIN <address of handler>
+    *  <exp>
++   *  TRY_END
+    *  JUMP <end of handler>
+    *  <handler>
+    *
+    * If this is not an internal try/catch, then catch and re-raise
+    * internal errors to prevent them from leaking.
+    *
+-   * The handler will only execute if we backtrack to the FORK_OPT with
+-   * an error (exception).  If <exp> produces no value then FORK_OPT
+-   * will backtrack (propagate the `empty`, as it were.  If <exp>
+-   * produces a value then we'll execute whatever bytecode follows this
+-   * sequence.
++   * The handler will only execute if we backtrack to the TRY_BEGIN with
++   * an error (exception) raised while evaluating <exp>.  If <exp>
++   * produces no value then TRY_BEGIN will backtrack (propagate the
++   * `empty`, as it were).  If <exp> produces a value then we'll execute
++   * whatever bytecode follows this sequence, and TRY_END marks that
++   * errors from now on are no longer ours to catch.
+    */
+   if (!handler.first && !handler.last)
+     // A hack to deal with `.` as the handler; we could use a real NOOP here
+     handler = BLOCK(gen_op_simple(DUP), gen_op_simple(POP), handler);
+-  exp = BLOCK(exp, gen_op_target(JUMP, handler));
+-  return BLOCK(gen_op_target(FORK_OPT, exp), exp, handler);
++  exp = BLOCK(exp, gen_op_simple(TRY_END), gen_op_target(JUMP, handler));
++  return BLOCK(gen_op_target(TRY_BEGIN, exp), exp, handler);
+ }
+ 
+ block gen_label(const char *label, block exp) {
+diff --git a/src/execute.c b/src/execute.c
+index 34bb63d..2136b9d 100644
+--- a/src/execute.c
++++ b/src/execute.c
+@@ -32,6 +32,10 @@ struct jq_state {
+   stack_ptr curr_frame;
+   stack_ptr stk_top;
+   stack_ptr fork_top;
++  // Set by stack_restore() from the forkpoint just popped, used by the
++  // TRY_BEGIN/TRY_END handlers.
++  stack_ptr pending_try_begin;
++  int pending_try_active;
+ 
+   jv path;
+   jv value_at_path;
+@@ -200,6 +204,11 @@ struct forkpoint {
+   int path_len, subexp_nest;
+   jv value_at_path;
+   uint16_t* return_address;
++  // For TRY_BEGIN forkpoints this says whether an error raised now is
++  // still within the corresponding try expression.  For TRY_END
++  // forkpoints, try_begin points at the matching TRY_BEGIN forkpoint.
++  int active;
++  stack_ptr try_begin;
+ };
+ 
+ struct stack_pos {
+@@ -221,6 +230,8 @@ void stack_save(jq_state *jq, uint16_t* retaddr, struct stack_pos sp){
+   fork->value_at_path = jv_copy(jq->value_at_path);
+   fork->subexp_nest = jq->subexp_nest;
+   fork->return_address = retaddr;
++  fork->active = 1;
++  fork->try_begin = 0;
+   jq->stk_top = sp.saved_data_stack;
+   jq->curr_frame = sp.saved_curr_frame;
+ }
+@@ -287,6 +298,8 @@ uint16_t* stack_restore(jq_state *jq){
+ 
+   struct forkpoint* fork = stack_block(&jq->stk, jq->fork_top);
+   uint16_t* retaddr = fork->return_address;
++  jq->pending_try_begin = fork->try_begin;
++  jq->pending_try_active = fork->active;
+   jq->stk_top = fork->saved_data_stack;
+   jq->curr_frame = fork->saved_curr_frame;
+   int path_len = fork->path_len;
+@@ -808,6 +821,7 @@ jv jq_next(jq_state *jq) {
+       break;
+     }
+ 
++    case TRY_BEGIN:
+     case FORK_OPT:
+     case DESTRUCTURE_ALT:
+     case FORK: {
+@@ -816,6 +830,58 @@ jv jq_next(jq_state *jq) {
+       break;
+     }
+ 
++    case TRY_END: {
++      // Mark the matching TRY_BEGIN as inactive until we backtrack into
++      // the try expression again.  This prevents later errors (from the
++      // rest of the pipeline) from being caught by this try.
++      stack_ptr begin = 0;
++      for (stack_ptr tp = jq->fork_top; tp; tp = *stack_block_next(&jq->stk, tp)) {
++        struct forkpoint* fp = stack_block(&jq->stk, tp);
++        if (fp->return_address && *fp->return_address == TRY_BEGIN && fp->active) {
++          begin = tp;
++          break;
++        }
++      }
++      assert(begin);
++      struct forkpoint* bfp = stack_block(&jq->stk, begin);
++      bfp->active = 0;
++
++      stack_save(jq, pc - 1, stack_get_pos(jq));
++      struct forkpoint* fork = stack_block(&jq->stk, jq->fork_top);
++      fork->try_begin = begin;
++      break;
++    }
++
++    case ON_BACKTRACK(TRY_BEGIN): {
++      if (jv_is_valid(jq->error)) {
++        // `try EXP ...` backtracked here (no value, `empty`), so we backtrack more
++        jv_free(stack_pop(jq));
++        goto do_backtrack;
++      }
++      if (!jq->pending_try_active) {
++        // This error was raised after the try expression had produced a
++        // value, so it isn't ours to catch: keep unwinding.
++        goto do_backtrack;
++      }
++      // `try EXP ...` exception caught in EXP
++      jv_free(stack_pop(jq)); // free the input
++      stack_push(jq, jv_invalid_get_msg(jq->error));  // push the error's message
++      jq->error = jv_null();
++      uint16_t offset = *pc++;
++      pc += offset;
++      break;
++    }
++
++    case ON_BACKTRACK(TRY_END): {
++      // We're backtracking out of a try expression that produced a value.
++      // Re-activate its TRY_BEGIN so that errors in later alternatives of
++      // EXP are caught, but leave it inactive if this backtrack is due to
++      // an error from downstream.
++      struct forkpoint* bfp = stack_block(&jq->stk, jq->pending_try_begin);
++      bfp->active = jv_is_valid(jq->error);
++      goto do_backtrack;
++    }
++
+     case ON_BACKTRACK(FORK_OPT):
+     case ON_BACKTRACK(DESTRUCTURE_ALT): {
+       if (jv_is_valid(jq->error)) {
+@@ -1008,6 +1074,8 @@ jq_state *jq_init(void) {
+   jq->stk_top = 0;
+   jq->fork_top = 0;
+   jq->curr_frame = 0;
++  jq->pending_try_begin = 0;
++  jq->pending_try_active = 1;
+   jq->error = jv_null();
+ 
+   jq->halted = 0;
+diff --git a/src/opcode_list.h b/src/opcode_list.h
+index 886131d..2d3c56e 100644
+--- a/src/opcode_list.h
++++ b/src/opcode_list.h
+@@ -14,6 +14,8 @@ OP(EACH,  NONE,     1, 1)
+ OP(EACH_OPT,  NONE,     1, 1)
+ OP(FORK,  BRANCH,   0, 0)
+ OP(FORK_OPT,  BRANCH,   0, 0)
++OP(TRY_BEGIN,  BRANCH,   0, 0)
++OP(TRY_END,  NONE,   0, 0)
+ OP(JUMP,  BRANCH,   0, 0)
+ OP(JUMP_F,BRANCH,   1, 0)
+ OP(BACKTRACK, NONE, 0, 0)

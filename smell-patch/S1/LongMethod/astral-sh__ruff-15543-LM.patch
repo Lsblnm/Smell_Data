@@ -1,0 +1,244 @@
+diff --git a/crates/ruff_linter/src/rules/pyupgrade/rules/yield_in_for_loop.rs b/crates/ruff_linter/src/rules/pyupgrade/rules/yield_in_for_loop.rs
+index 02c96754b..cdf8fa07f 100644
+--- a/crates/ruff_linter/src/rules/pyupgrade/rules/yield_in_for_loop.rs
++++ b/crates/ruff_linter/src/rules/pyupgrade/rules/yield_in_for_loop.rs
+@@ -1,8 +1,9 @@
+ use ruff_diagnostics::{AlwaysFixableViolation, Diagnostic, Edit, Fix};
+ use ruff_macros::{derive_message_formats, ViolationMetadata};
+-use ruff_python_ast::parenthesize::parenthesized_range;
+ use ruff_python_ast::{self as ast, Expr, Stmt};
+-use ruff_text_size::Ranged;
++use ruff_python_semantic::{BindingKind, ScopeKind};
++use ruff_python_trivia::{BackwardsTokenizer, SimpleTokenKind, SimpleTokenizer};
++use ruff_text_size::{Ranged, TextRange};
+ 
+ use crate::checkers::ast::Checker;
+ 
+@@ -53,9 +54,16 @@ impl AlwaysFixableViolation for YieldInForLoop {
+ 
+ /// UP028
+ pub(crate) fn yield_in_for_loop(checker: &mut Checker, stmt_for: &ast::StmtFor) {
+-    // Intentionally omit async contexts.
+-    if checker.semantic().in_async_context() {
+-        return;
++    {
++        let semantic = checker.semantic();
++        for scope in semantic.scopes.ancestors(semantic.scope_id) {
++            if let ScopeKind::Function(ast::StmtFunctionDef { is_async, .. }) = scope.kind {
++                if *is_async {
++                    return;
++                }
++                break;
++            }
++        }
+     }
+ 
+     let ast::StmtFor {
+@@ -67,94 +75,146 @@ pub(crate) fn yield_in_for_loop(checker: &mut Checker, stmt_for: &ast::StmtFor)
+         range: _,
+     } = stmt_for;
+ 
+-    // If there is an else statement, don't rewrite.
+     if !orelse.is_empty() {
+         return;
+     }
+ 
+-    // If there's any logic besides a yield, don't rewrite.
+     let [body] = body.as_slice() else {
+         return;
+     };
+ 
+-    // If the body is not a yield, don't rewrite.
+-    let Stmt::Expr(ast::StmtExpr { value, range: _ }) = &body else {
++    let Stmt::Expr(ast::StmtExpr { value, range: _ }) = body else {
+         return;
+     };
+     let Expr::Yield(ast::ExprYield {
+-        value: Some(value),
++        value: Some(yielded),
+         range: _,
+     }) = value.as_ref()
+     else {
+         return;
+     };
+ 
+-    // If the target is not the same as the value, don't rewrite. For example, we should rewrite
+-    // `for x in y: yield x` to `yield from y`, but not `for x in y: yield x + 1`.
+-    if !is_same_expr(target, value) {
++    let mut pending_pairs = vec![(target.as_ref(), yielded.as_ref())];
++    let mut same_expr = true;
++    while let Some((left, right)) = pending_pairs.pop() {
++        match (left, right) {
++            (Expr::Name(left_name), Expr::Name(right_name)) => {
++                if left_name.id != right_name.id {
++                    same_expr = false;
++                }
++            }
++            (Expr::Tuple(left_tuple), Expr::Tuple(right_tuple)) => {
++                if left_tuple.len() == right_tuple.len() {
++                    for (left_elt, right_elt) in left_tuple.iter().zip(right_tuple.iter()) {
++                        pending_pairs.push((left_elt, right_elt));
++                    }
++                } else {
++                    same_expr = false;
++                }
++            }
++            _ => {
++                same_expr = false;
++            }
++        }
++        if !same_expr {
++            break;
++        }
++    }
++    if !same_expr {
+         return;
+     }
+ 
+-    // If any of the bound names are used outside of the yield itself, don't rewrite.
+-    if collect_names(value).any(|name| {
+-        checker
+-            .semantic()
+-            .current_scope()
+-            .get_all(name.id.as_str())
+-            // Skip unbound bindings like `del x`
+-            .find(|&id| !checker.semantic().binding(id).is_unbound())
+-            .is_some_and(|binding_id| {
+-                let binding = checker.semantic().binding(binding_id);
+-                binding.references.iter().any(|reference_id| {
+-                    checker.semantic().reference(*reference_id).range() != name.range()
+-                })
+-            })
+-    }) {
++    let mut collected_names = Vec::new();
++    let mut pending_exprs = vec![yielded.as_ref()];
++    while let Some(expr) = pending_exprs.pop() {
++        if let Some(name) = expr.as_name_expr() {
++            collected_names.push(name);
++        } else if let Some(tuple) = expr.as_tuple_expr() {
++            for element in tuple.iter() {
++                pending_exprs.push(element);
++            }
++        }
++    }
++
++    let mut used_outside_yield = false;
++    {
++        let semantic = checker.semantic();
++        let scope = &semantic.scopes[semantic.scope_id];
++        for name in &collected_names {
++            if !used_outside_yield {
++                for binding_id in scope.get_all(name.id.as_str()) {
++                    if !used_outside_yield {
++                        let binding = &semantic.bindings[binding_id];
++                        match &binding.kind {
++                            BindingKind::Annotation
++                            | BindingKind::Deletion
++                            | BindingKind::UnboundException(_) => {}
++                            _ => {
++                                for reference_id in &binding.references {
++                                    used_outside_yield |=
++                                        semantic.reference(*reference_id).range() != name.range();
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++    if used_outside_yield {
+         return;
+     }
+ 
+-    let mut diagnostic = Diagnostic::new(YieldInForLoop, stmt_for.range());
+-    let contents = checker.locator().slice(
+-        parenthesized_range(
+-            iter.as_ref().into(),
+-            stmt_for.into(),
+-            checker.comment_ranges(),
+-            checker.locator().contents(),
+-        )
+-        .unwrap_or(iter.range()),
+-    );
++    let source = checker.locator().contents();
++    let comment_ranges = checker.comment_ranges();
++    let expr_start = iter.start();
++    let expr_end = iter.end();
++    let parent_end = stmt_for.end();
++
++    let mut closing_parens = Vec::new();
++    let tokenizer = SimpleTokenizer::new(source, TextRange::new(expr_end, parent_end));
++    for token in tokenizer.skip_trivia() {
++        if token.kind == SimpleTokenKind::RParen {
++            closing_parens.push(token);
++        } else {
++            break;
++        }
++    }
++
++    let mut opening_parens = Vec::new();
++    let tokenizer = BackwardsTokenizer::up_to(expr_start, source, comment_ranges);
++    for token in tokenizer.skip_trivia() {
++        if token.kind == SimpleTokenKind::LParen {
++            opening_parens.push(token);
++        } else {
++            break;
++        }
++    }
++
++    let mut slice_range = iter.range();
++    let pair_count = closing_parens.len().min(opening_parens.len());
++    if pair_count > 0 {
++        let mut index = 0;
++        while index < pair_count {
++            let left = &opening_parens[index];
++            let right = &closing_parens[index];
++            if left.start() <= expr_start {
++                if right.end() >= expr_end {
++                    if left.start() < right.end() {
++                        slice_range = TextRange::new(left.start(), right.end());
++                    }
++                }
++            }
++            index += 1;
++        }
++    }
++
++    let contents = &source[slice_range];
+     let contents = format!("yield from {contents}");
++    let mut diagnostic = Diagnostic::new(YieldInForLoop, stmt_for.range());
+     diagnostic.set_fix(Fix::unsafe_edit(Edit::range_replacement(
+         contents,
+         stmt_for.range(),
+     )));
+     checker.diagnostics.push(diagnostic);
+ }
+-
+-/// Return `true` if the two expressions are equivalent, and both consistent solely
+-/// of tuples and names.
+-fn is_same_expr(left: &Expr, right: &Expr) -> bool {
+-    match (&left, &right) {
+-        (Expr::Name(left), Expr::Name(right)) => left.id == right.id,
+-        (Expr::Tuple(left), Expr::Tuple(right)) => {
+-            left.len() == right.len()
+-                && left
+-                    .iter()
+-                    .zip(right)
+-                    .all(|(left, right)| is_same_expr(left, right))
+-        }
+-        _ => false,
+-    }
+-}
+-
+-/// Collect all named variables in an expression consisting solely of tuples and
+-/// names.
+-fn collect_names<'a>(expr: &'a Expr) -> Box<dyn Iterator<Item = &'a ast::ExprName> + 'a> {
+-    Box::new(
+-        expr.as_name_expr().into_iter().chain(
+-            expr.as_tuple_expr()
+-                .into_iter()
+-                .flat_map(|tuple| tuple.iter().flat_map(collect_names)),
+-        ),
+-    )
+-}

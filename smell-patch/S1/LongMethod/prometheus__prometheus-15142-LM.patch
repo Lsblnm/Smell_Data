@@ -1,0 +1,248 @@
+diff --git a/tsdb/head_append.go b/tsdb/head_append.go
+index b385758ca..3ed287bdd 100644
+--- a/tsdb/head_append.go
++++ b/tsdb/head_append.go
+@@ -633,116 +633,169 @@ func (a *headAppender) AppendHistogram(ref storage.SeriesRef, lset labels.Labels
+ 		return 0, storage.ErrNativeHistogramsDisabled
+ 	}
+ 
+-	// Fail fast if OOO is disabled and the sample is out of bounds.
+-	// Otherwise a full check will be done later to decide if the sample is in-order or out-of-order.
+-	if (a.oooTimeWindow == 0 || !a.head.opts.EnableOOONativeHistograms.Load()) && t < a.minValidTime {
+-		a.head.metrics.outOfBoundSamples.WithLabelValues(sampleMetricTypeHistogram).Inc()
+-		return 0, storage.ErrOutOfBounds
++	oooTimeWindow := a.oooTimeWindow
++	minValidTime := a.minValidTime
++	headMaxt := a.headMaxt
++	oooNativeEnabled := a.head.opts.EnableOOONativeHistograms.Load()
++	outOfBound := a.head.metrics.outOfBoundSamples
++	outOfOrder := a.head.metrics.outOfOrderSamples
++	tooOld := a.head.metrics.tooOldSamples
++	oooObserver := a.head.metrics.oooHistogram
++	if oooTimeWindow == 0 || !oooNativeEnabled {
++		if t < minValidTime {
++			outOfBound.WithLabelValues(sampleMetricTypeHistogram).Inc()
++			return 0, storage.ErrOutOfBounds
++		}
+ 	}
+ 
+ 	if h != nil {
+-		if err := h.Validate(); err != nil {
+-			return 0, err
++		validationErr := h.Validate()
++		if validationErr != nil {
++			return 0, validationErr
+ 		}
+ 	}
+-
+ 	if fh != nil {
+-		if err := fh.Validate(); err != nil {
+-			return 0, err
++		validationErr := fh.Validate()
++		if validationErr != nil {
++			return 0, validationErr
+ 		}
+ 	}
+ 
+-	s := a.head.series.getByID(chunks.HeadSeriesRef(ref))
++	seriesStripes := a.head.series
++	stripeCount := seriesStripes.size
++	stripeMask := uint64(stripeCount - 1)
++	seriesID := chunks.HeadSeriesRef(ref)
++	idShard := uint64(seriesID) & stripeMask
++	idLock := &seriesStripes.locks[idShard]
++	idLock.RLock()
++	s := seriesStripes.series[idShard][seriesID]
++	idLock.RUnlock()
++
++	var created bool
+ 	if s == nil {
+ 		// Ensure no empty labels have gotten through.
+ 		lset = lset.WithoutEmpty()
+ 		if lset.IsEmpty() {
+ 			return 0, fmt.Errorf("empty labelset: %w", ErrInvalidSample)
+ 		}
+-
+-		if l, dup := lset.HasDuplicateLabelNames(); dup {
+-			return 0, fmt.Errorf(`label name "%s" is not unique: %w`, l, ErrInvalidSample)
+-		}
+-
+-		var created bool
+-		var err error
+-		s, created, err = a.head.getOrCreate(lset.Hash(), lset)
+-		if err != nil {
+-			return 0, err
+-		}
+-		if created {
+-			switch {
+-			case h != nil:
+-				s.lastHistogramValue = &histogram.Histogram{}
+-			case fh != nil:
+-				s.lastFloatHistogramValue = &histogram.FloatHistogram{}
++		var prevName, dupName string
++		var seenLabel, hasDup bool
++		lset.Range(func(l labels.Label) {
++			if seenLabel && l.Name == prevName {
++				hasDup = true
++				dupName = l.Name
+ 			}
+-			a.series = append(a.series, record.RefSeries{
+-				Ref:    s.ref,
+-				Labels: lset,
++			prevName = l.Name
++			seenLabel = true
++		})
++		if hasDup {
++			return 0, fmt.Errorf(`label name "%s" is not unique: %w`, dupName, ErrInvalidSample)
++		}
++
++		seriesHash := lset.Hash()
++		existing := seriesStripes.getByHash(seriesHash, lset)
++		if existing != nil {
++			s = existing
++		} else {
++			newID := chunks.HeadSeriesRef(a.head.lastSeriesID.Inc())
++			isolationDisabled := a.head.opts.IsolationDisabled
++			enableSharding := a.head.opts.EnableSharding
++			var err error
++			s, created, err = seriesStripes.getOrSet(seriesHash, lset, func() *memSeries {
++				shardHash := uint64(0)
++				if enableSharding {
++					shardHash = labels.StableHash(lset)
++				}
++				return newMemSeries(lset, newID, shardHash, isolationDisabled)
+ 			})
++			if err != nil {
++				return 0, err
++			}
++			if created {
++				a.head.metrics.seriesCreated.Inc()
++				a.head.numSeries.Inc()
++				a.head.postings.Add(storage.SeriesRef(newID), lset)
++				if h != nil {
++					s.lastHistogramValue = &histogram.Histogram{}
++				} else {
++					if fh != nil {
++						s.lastFloatHistogramValue = &histogram.FloatHistogram{}
++					}
++				}
++				seriesRec := record.RefSeries{}
++				seriesRec.Ref = s.ref
++				seriesRec.Labels = lset
++				a.series = append(a.series, seriesRec)
++			}
+ 		}
+ 	}
+ 
+-	switch {
+-	case h != nil:
++	if h != nil {
+ 		s.Lock()
+ 		// TODO(codesome): If we definitely know at this point that the sample is ooo, then optimise
+ 		// to skip that sample from the WAL and write only in the WBL.
+-		_, delta, err := s.appendableHistogram(t, h, a.headMaxt, a.minValidTime, a.oooTimeWindow, a.head.opts.EnableOOONativeHistograms.Load())
++		_, delta, err := s.appendableHistogram(t, h, headMaxt, minValidTime, oooTimeWindow, oooNativeEnabled)
+ 		if err != nil {
+ 			s.pendingCommit = true
+ 		}
+ 		s.Unlock()
+ 		if delta > 0 {
+-			a.head.metrics.oooHistogram.Observe(float64(delta) / 1000)
++			oooObserver.Observe(float64(delta) / 1000)
+ 		}
+ 		if err != nil {
+-			switch {
+-			case errors.Is(err, storage.ErrOutOfOrderSample):
+-				fallthrough
+-			case errors.Is(err, storage.ErrOOONativeHistogramsDisabled):
+-				a.head.metrics.outOfOrderSamples.WithLabelValues(sampleMetricTypeHistogram).Inc()
+-			case errors.Is(err, storage.ErrTooOldSample):
+-				a.head.metrics.tooOldSamples.WithLabelValues(sampleMetricTypeHistogram).Inc()
++			if errors.Is(err, storage.ErrOutOfOrderSample) {
++				outOfOrder.WithLabelValues(sampleMetricTypeHistogram).Inc()
++			} else {
++				if errors.Is(err, storage.ErrOOONativeHistogramsDisabled) {
++					outOfOrder.WithLabelValues(sampleMetricTypeHistogram).Inc()
++				} else {
++					if errors.Is(err, storage.ErrTooOldSample) {
++						tooOld.WithLabelValues(sampleMetricTypeHistogram).Inc()
++					}
++				}
+ 			}
+ 			return 0, err
+ 		}
+-		a.histograms = append(a.histograms, record.RefHistogramSample{
+-			Ref: s.ref,
+-			T:   t,
+-			H:   h,
+-		})
++		histSample := record.RefHistogramSample{}
++		histSample.Ref = s.ref
++		histSample.T = t
++		histSample.H = h
++		a.histograms = append(a.histograms, histSample)
+ 		a.histogramSeries = append(a.histogramSeries, s)
+-	case fh != nil:
+-		s.Lock()
+-		// TODO(codesome): If we definitely know at this point that the sample is ooo, then optimise
+-		// to skip that sample from the WAL and write only in the WBL.
+-		_, delta, err := s.appendableFloatHistogram(t, fh, a.headMaxt, a.minValidTime, a.oooTimeWindow, a.head.opts.EnableOOONativeHistograms.Load())
+-		if err == nil {
+-			s.pendingCommit = true
+-		}
+-		s.Unlock()
+-		if delta > 0 {
+-			a.head.metrics.oooHistogram.Observe(float64(delta) / 1000)
+-		}
+-		if err != nil {
+-			switch {
+-			case errors.Is(err, storage.ErrOutOfOrderSample):
+-				fallthrough
+-			case errors.Is(err, storage.ErrOOONativeHistogramsDisabled):
+-				a.head.metrics.outOfOrderSamples.WithLabelValues(sampleMetricTypeHistogram).Inc()
+-			case errors.Is(err, storage.ErrTooOldSample):
+-				a.head.metrics.tooOldSamples.WithLabelValues(sampleMetricTypeHistogram).Inc()
++	} else {
++		if fh != nil {
++			s.Lock()
++			// TODO(codesome): If we definitely know at this point that the sample is ooo, then optimise
++			// to skip that sample from the WAL and write only in the WBL.
++			_, delta, err := s.appendableFloatHistogram(t, fh, headMaxt, minValidTime, oooTimeWindow, oooNativeEnabled)
++			if err == nil {
++				s.pendingCommit = true
+ 			}
+-			return 0, err
++			s.Unlock()
++			if delta > 0 {
++				oooObserver.Observe(float64(delta) / 1000)
++			}
++			if err != nil {
++				if errors.Is(err, storage.ErrOutOfOrderSample) {
++					outOfOrder.WithLabelValues(sampleMetricTypeHistogram).Inc()
++				} else {
++					if errors.Is(err, storage.ErrOOONativeHistogramsDisabled) {
++						outOfOrder.WithLabelValues(sampleMetricTypeHistogram).Inc()
++					} else {
++						if errors.Is(err, storage.ErrTooOldSample) {
++							tooOld.WithLabelValues(sampleMetricTypeHistogram).Inc()
++						}
++					}
++				}
++				return 0, err
++			}
++			floatHistSample := record.RefFloatHistogramSample{}
++			floatHistSample.Ref = s.ref
++			floatHistSample.T = t
++			floatHistSample.FH = fh
++			a.floatHistograms = append(a.floatHistograms, floatHistSample)
++			a.floatHistogramSeries = append(a.floatHistogramSeries, s)
+ 		}
+-		a.floatHistograms = append(a.floatHistograms, record.RefFloatHistogramSample{
+-			Ref: s.ref,
+-			T:   t,
+-			FH:  fh,
+-		})
+-		a.floatHistogramSeries = append(a.floatHistogramSeries, s)
+ 	}
+ 
+ 	if t < a.mint {

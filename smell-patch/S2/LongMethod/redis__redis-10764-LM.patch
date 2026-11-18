@@ -1,0 +1,366 @@
+diff --git a/src/t_zset.c b/src/t_zset.c
+index 2efa73936..64fd87ac1 100644
+--- a/src/t_zset.c
++++ b/src/t_zset.c
+@@ -3996,36 +3996,333 @@ void blockingGenericZpopCommand(client *c, robj **keys, int numkeys, int where,
+     robj *key;
+     mstime_t timeout;
+     int j;
+-
+-    if (getTimeoutFromObjectOrReply(c,c->argv[timeout_idx],&timeout,UNIT_SECONDS)
+-        != C_OK) return;
++    robj *timeout_obj = c->argv[timeout_idx];
++    long double timeout_ld;
++    long long timeout_ms;
++
++    /* Parse the blocking timeout in seconds, converting it to an absolute
++     * millisecond timestamp. A zero timeout means block forever. */
++    if (timeout_obj == NULL) {
++        timeout_ld = 0;
++    } else {
++        serverAssertWithInfo(NULL,timeout_obj,timeout_obj->type == OBJ_STRING);
++        if (sdsEncodedObject(timeout_obj)) {
++            if (!string2ld(timeout_obj->ptr, sdslen(timeout_obj->ptr), &timeout_ld)) {
++                addReplyError(c,"timeout is not a float or out of range");
++                return;
++            }
++        } else if (timeout_obj->encoding == OBJ_ENCODING_INT) {
++            timeout_ld = (long)timeout_obj->ptr;
++        } else {
++            serverPanic("Unknown string encoding");
++        }
++    }
++    timeout_ms = (long long) (timeout_ld * 1000.0);
++    if (timeout_ms < 0) {
++        addReplyError(c,"timeout is negative");
++        return;
++    }
++    if (timeout_ms > 0) {
++        timeout_ms += mstime();
++    }
++    timeout = timeout_ms;
+ 
+     for (j = 0; j < numkeys; j++) {
++        dictEntry *de;
++        robj *val = NULL;
++        int is_ro_replica;
++        int force_delete_expired;
++        int keep_expired_value = 0;
++        int hide_expired_value = 0;
++        long llen = 0;
++        robj *popkey;
++        robj *zobj;
++        sds ele;
++        double score;
++        long pop_count;
++        long pop_llen;
++        long rangelen;
++        long result_count;
++
+         key = keys[j];
+-        o = lookupKeyWrite(c->db,key);
++
++        /* Resolve the key for writing, expire it if needed, and refresh LRU/LFU. */
++        de = dictFind(c->db->dict,key->ptr);
++        if (de) {
++            val = dictGetVal(de);
++            is_ro_replica = server.masterhost && server.repl_slave_ro;
++            force_delete_expired = !is_ro_replica;
++            if (keyIsExpired(c->db,key)) {
++                if (server.masterhost != NULL) {
++                    if (server.current_client == server.master) {
++                        keep_expired_value = 1;
++                    } else if (!force_delete_expired) {
++                        hide_expired_value = 1;
++                    }
++                }
++                if (!keep_expired_value) {
++                    if (hide_expired_value) {
++                        val = NULL;
++                    } else if (checkClientPauseTimeoutAndReturnIfPaused()) {
++                        val = NULL;
++                    } else {
++                        deleteExpiredKeyAndPropagate(c->db,key);
++                        val = NULL;
++                    }
++                }
++            }
++            if (val) {
++                if (!hasActiveChildProcess()) {
++                    if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
++                        unsigned long ldt = val->lru >> 8;
++                        unsigned long counter = val->lru & 255;
++                        unsigned long now_minutes = (server.unixtime/60) & 65535;
++                        unsigned long elapsed;
++                        unsigned long num_periods = 0;
++                        uint8_t next_counter;
++
++                        if (now_minutes >= ldt) {
++                            elapsed = now_minutes - ldt;
++                        } else {
++                            elapsed = 65535 - ldt + now_minutes;
++                        }
++                        if (server.lfu_decay_time) {
++                            num_periods = elapsed / server.lfu_decay_time;
++                            if (num_periods) {
++                                if (num_periods > counter) {
++                                    counter = 0;
++                                } else {
++                                    counter = counter - num_periods;
++                                }
++                            }
++                        }
++                        next_counter = (uint8_t)counter;
++                        if (next_counter == 255) {
++                            next_counter = 255;
++                        } else {
++                            double r = (double)rand()/RAND_MAX;
++                            double baseval = next_counter - LFU_INIT_VAL;
++                            double p;
++                            if (baseval < 0) {
++                                baseval = 0;
++                            }
++                            p = 1.0/(baseval*server.lfu_log_factor+1);
++                            if (r < p) {
++                                next_counter++;
++                            }
++                        }
++                        val->lru = (LFUGetTimeInMinutes()<<8) | next_counter;
++                    } else {
++                        unsigned int lruclock;
++                        if (1000/server.hz <= LRU_CLOCK_RESOLUTION) {
++                            atomicGet(server.lruclock,lruclock);
++                        } else {
++                            lruclock = getLRUClock();
++                        }
++                        val->lru = lruclock;
++                    }
++                }
++            }
++        }
++
++        o = val;
+         /* Non-existing key, move to next key. */
+         if (o == NULL) continue;
+ 
+-        if (checkType(c,o,OBJ_ZSET)) return;
++        if (o->type != OBJ_ZSET) {
++            addReplyErrorObject(c,shared.wrongtypeerr);
++            return;
++        }
+ 
+-        long llen = zsetLength(o);
++        if (o->encoding == OBJ_ENCODING_LISTPACK) {
++            llen = zzlLength(o->ptr);
++        } else if (o->encoding == OBJ_ENCODING_SKIPLIST) {
++            llen = ((const zset*)o->ptr)->zsl->length;
++        } else {
++            serverPanic("Unknown sorted set encoding");
++        }
+         /* Empty zset, move to next key. */
+         if (llen == 0) continue;
+ 
+         /* Non empty zset, this is like a normal ZPOP[MIN|MAX]. */
+-        genericZpopCommand(c, &key, 1, where, 1, count, use_nested_array, reply_nil_when_empty, NULL);
++        popkey = key;
++        zobj = lookupKeyWrite(c->db,popkey);
++        if (zobj) {
++            if (zobj->type != OBJ_ZSET) {
++                addReplyErrorObject(c,shared.wrongtypeerr);
++                return;
++            }
++        }
++
++        if (!zobj) {
++            if (reply_nil_when_empty) {
++                if (c->resp == 2) {
++                    addReplyProto(c,"*-1\r\n",5);
++                } else {
++                    addReplyProto(c,"_\r\n",3);
++                }
++            } else {
++                addReply(c,shared.emptyarray);
++            }
++            return;
++        }
++
++        pop_count = count;
++        result_count = 0;
++        if (pop_count == -1) {
++            pop_count = 1;
++        }
++
++        if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
++            pop_llen = zzlLength(zobj->ptr);
++        } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
++            pop_llen = ((const zset*)zobj->ptr)->zsl->length;
++        } else {
++            serverPanic("Unknown sorted set encoding");
++        }
++        if (pop_count > pop_llen) {
++            rangelen = pop_llen;
++        } else {
++            rangelen = pop_count;
++        }
++
++        if (!use_nested_array) {
++            /* BZPOPMIN/BZPOPMAX in RESP2 and RESP3. */
++            addReplyArrayLen(c, rangelen * 2 + 1);
++            addReplyBulk(c, popkey);
++        } else {
++            /* ZMPOP/BZMPOP in RESP2 and RESP3. */
++            addReplyArrayLen(c, 2);
++            addReplyBulk(c, popkey);
++            addReplyArrayLen(c, rangelen);
++        }
++
++        do {
++            if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
++                unsigned char *zl = zobj->ptr;
++                unsigned char *eptr, *sptr;
++                unsigned char *vstr;
++                unsigned int vlen;
++                long long vlong;
++                unsigned char *score_vstr;
++                unsigned int score_vlen;
++                long long score_vlong;
++                char scorebuf[128];
++                unsigned int copylen;
++
++                eptr = lpSeek(zl,where == ZSET_MAX ? -2 : 0);
++                serverAssertWithInfo(c,zobj,eptr != NULL);
++                vstr = lpGetValue(eptr,&vlen,&vlong);
++                if (vstr == NULL) {
++                    ele = sdsfromlonglong(vlong);
++                } else {
++                    ele = sdsnewlen(vstr,vlen);
++                }
++
++                sptr = lpNext(zl,eptr);
++                serverAssertWithInfo(c,zobj,sptr != NULL);
++                score_vstr = lpGetValue(sptr,&score_vlen,&score_vlong);
++                if (score_vstr) {
++                    copylen = score_vlen;
++                    if (copylen > sizeof(scorebuf) - 1) {
++                        copylen = sizeof(scorebuf) - 1;
++                    }
++                    memcpy(scorebuf,score_vstr,copylen);
++                    scorebuf[copylen] = '\0';
++                    score = strtod(scorebuf,NULL);
++                } else {
++                    score = score_vlong;
++                }
++            } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
++                zset *zs = zobj->ptr;
++                zskiplist *zsl = zs->zsl;
++                zskiplistNode *zln;
++
++                if (where == ZSET_MAX) {
++                    zln = zsl->tail;
++                } else {
++                    zln = zsl->header->level[0].forward;
++                }
++
++                serverAssertWithInfo(c,zobj,zln != NULL);
++                ele = sdsdup(zln->ele);
++                score = zln->score;
++            } else {
++                serverPanic("Unknown sorted set encoding");
++            }
++
++            if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
++                unsigned char *eptr = zzlFind(zobj->ptr,ele,NULL);
++                if (eptr != NULL) {
++                    zobj->ptr = zzlDelete(zobj->ptr,eptr);
++                } else {
++                    serverAssertWithInfo(c,zobj,0);
++                }
++            } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
++                zset *zs = zobj->ptr;
++                if (zsetRemoveFromSkiplist(zs, ele)) {
++                    if (htNeedsResize(zs->dict)) {
++                        dictResize(zs->dict);
++                    }
++                } else {
++                    serverAssertWithInfo(c,zobj,0);
++                }
++            } else {
++                serverPanic("Unknown sorted set encoding");
++            }
++            server.dirty++;
++
++            if (result_count == 0) {
++                if (where == ZSET_MAX) {
++                    notifyKeyspaceEvent(NOTIFY_ZSET,"zpopmax",popkey,c->db->id);
++                } else {
++                    notifyKeyspaceEvent(NOTIFY_ZSET,"zpopmin",popkey,c->db->id);
++                }
++                signalModifiedKey(c,c->db,popkey);
++            }
++
++            if (use_nested_array) {
++                addReplyArrayLen(c,2);
++            }
++            addReplyBulkCBuffer(c,ele,sdslen(ele));
++            addReplyDouble(c,score);
++            sdsfree(ele);
++            ++result_count;
++        } while(--rangelen);
++
++        if (zobj->encoding == OBJ_ENCODING_LISTPACK) {
++            pop_llen = zzlLength(zobj->ptr);
++        } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
++            pop_llen = ((const zset*)zobj->ptr)->zsl->length;
++        } else {
++            serverPanic("Unknown sorted set encoding");
++        }
++        if (pop_llen == 0) {
++            dbDelete(c->db,popkey);
++            notifyKeyspaceEvent(NOTIFY_GENERIC,"del",popkey,c->db->id);
++        }
+ 
+         if (count == -1) {
+             /* Replicate it as ZPOP[MIN|MAX] instead of BZPOP[MIN|MAX]. */
+-            rewriteClientCommandVector(c,2,
+-                                       (where == ZSET_MAX) ? shared.zpopmax : shared.zpopmin,
+-                                       key);
++            if (where == ZSET_MAX) {
++                rewriteClientCommandVector(c,2,shared.zpopmax,key);
++            } else {
++                rewriteClientCommandVector(c,2,shared.zpopmin,key);
++            }
+         } else {
+-            /* Replicate it as ZPOP[MIN|MAX] with COUNT option. */
+-            robj *count_obj = createStringObjectFromLongLong((count > llen) ? llen : count);
+-            rewriteClientCommandVector(c, 3,
+-                                       (where == ZSET_MAX) ? shared.zpopmax : shared.zpopmin,
+-                                       key, count_obj);
++            robj *count_obj;
++            long replicate_count;
++            if (count > llen) {
++                replicate_count = llen;
++            } else {
++                replicate_count = count;
++            }
++            count_obj = createStringObjectFromLongLong(replicate_count);
++            if (where == ZSET_MAX) {
++                rewriteClientCommandVector(c, 3, shared.zpopmax, key, count_obj);
++            } else {
++                rewriteClientCommandVector(c, 3, shared.zpopmin, key, count_obj);
++            }
+             decrRefCount(count_obj);
+         }
+ 
+@@ -4035,7 +4332,11 @@ void blockingGenericZpopCommand(client *c, robj **keys, int numkeys, int where,
+     /* If we are not allowed to block the client and the zset is empty the only thing
+      * we can do is treating it as a timeout (even with timeout 0). */
+     if (c->flags & CLIENT_DENY_BLOCKING) {
+-        addReplyNullArray(c);
++        if (c->resp == 2) {
++            addReplyProto(c,"*-1\r\n",5);
++        } else {
++            addReplyProto(c,"_\r\n",3);
++        }
+         return;
+     }
+ 

@@ -1,0 +1,353 @@
+diff --git a/promql/engine.go b/promql/engine.go
+index 3b1d35757..70c402839 100644
+--- a/promql/engine.go
++++ b/promql/engine.go
+@@ -14,7 +14,6 @@
+ package promql
+ 
+ import (
+-	"bytes"
+ 	"container/heap"
+ 	"context"
+ 	"fmt"
+@@ -957,6 +956,144 @@ func (enh *EvalNodeHelper) DropMetricName(l labels.Labels) labels.Labels {
+ 	return ret
+ }
+ 
++// VectorBinop evaluates a binary operation between two Vectors, excluding set operators.
++func (enh *EvalNodeHelper) VectorBinop(expr *parser.BinaryExpr, lhs, rhs Vector, lhsh, rhsh []EvalSeriesHelper) Vector {
++	matching := expr.VectorMatching
++	op := expr.Op
++	returnBool := expr.ReturnBool
++
++	if matching.Card == parser.CardManyToMany {
++		panic("many-to-many only allowed for set operators")
++	}
++	if len(lhs) == 0 || len(rhs) == 0 {
++		return nil // Short-circuit: nothing is going to match.
++	}
++
++	// The control flow below handles one-to-one or many-to-one matching.
++	// For one-to-many, swap sidedness and account for the swap when calculating
++	// values.
++	if matching.Card == parser.CardOneToMany {
++		lhs, rhs = rhs, lhs
++		lhsh, rhsh = rhsh, lhsh
++	}
++
++	rightSigs := make(map[string]Sample, len(rhs))
++	// Add all rhs samples to a map so we can easily find matches later.
++	for i, rs := range rhs {
++		sig := rhsh[i].signature
++		// The rhs is guaranteed to be the 'one' side. Having multiple samples
++		// with the same signature means that the matching is many-to-many.
++		if duplSample, found := rightSigs[sig]; found {
++			// oneSide represents which side of the vector represents the 'one' in the many-to-one relationship.
++			oneSide := "right"
++			if matching.Card == parser.CardOneToMany {
++				oneSide = "left"
++			}
++			matchedLabels := rs.Metric.MatchLabels(matching.On, matching.MatchingLabels...)
++			// Many-to-many matching not allowed.
++			panic(errors.Errorf("found duplicate series for the match group %s on the %s hand-side of the operation: [%s, %s]"+
++				";many-to-many matching not allowed: matching labels must be unique on one side", matchedLabels.String(), oneSide, rs.Metric.String(), duplSample.Metric.String()))
++		}
++		rightSigs[sig] = rs
++	}
++
++	// Tracks the match-signature. For one-to-one operations the value is nil. For many-to-one
++	// the value is a set of signatures to detect duplicated result elements.
++	matchedSigs := make(map[string]map[uint64]struct{}, len(rightSigs))
++
++	// For all lhs samples find a respective rhs sample and perform
++	// the binary operation.
++	for i, ls := range lhs {
++		sig := lhsh[i].signature
++
++		rs, found := rightSigs[sig] // Look for a match in the rhs Vector.
++		if !found {
++			continue
++		}
++
++		// Account for potentially swapped sidedness.
++		vl, vr := ls.V, rs.V
++		if matching.Card == parser.CardOneToMany {
++			vl, vr = vr, vl
++		}
++		value, keep := vectorElemBinop(op, vl, vr)
++		if returnBool {
++			if keep {
++				value = 1.0
++			} else {
++				value = 0.0
++			}
++		} else if !keep {
++			continue
++		}
++
++		lb := labels.NewBuilder(ls.Metric)
++		if shouldDropMetricName(op) {
++			lb.Del(labels.MetricName)
++		}
++		if matching.Card == parser.CardOneToOne {
++			if matching.On {
++			Outer:
++				for _, l := range ls.Metric {
++					for _, n := range matching.MatchingLabels {
++						if l.Name == n {
++							continue Outer
++						}
++					}
++					lb.Del(l.Name)
++				}
++			} else {
++				lb.Del(matching.MatchingLabels...)
++			}
++		}
++		for _, ln := range matching.Include {
++			// Included labels from the `group_x` modifier are taken from the "one"-side.
++			foundVal := ""
++			for _, l := range rs.Metric {
++				if l.Name == ln {
++					foundVal = l.Value
++					break
++				}
++			}
++			if foundVal != "" {
++				lb.Set(ln, foundVal)
++			} else {
++				lb.Del(ln)
++			}
++		}
++		metric := lb.Labels()
++		if returnBool {
++			metric = dropMetricName(metric)
++		}
++		insertedSigs, exists := matchedSigs[sig]
++		if matching.Card == parser.CardOneToOne {
++			if exists {
++				panic(errors.Errorf("multiple matches for labels: many-to-one matching must be explicit (group_left/group_right)"))
++			}
++			matchedSigs[sig] = nil // Set existence to true.
++		} else {
++			// In many-to-one matching the grouping labels have to ensure a unique metric
++			// for the result Vector. Check whether those labels have already been added for
++			// the same matching labels.
++			insertSig := metric.Hash()
++
++			if !exists {
++				insertedSigs = map[uint64]struct{}{}
++				matchedSigs[sig] = insertedSigs
++			} else if _, duplicate := insertedSigs[insertSig]; duplicate {
++				panic(errors.Errorf("multiple matches for labels: grouping labels must ensure unique matches"))
++			}
++			insertedSigs[insertSig] = struct{}{}
++		}
++
++		enh.Out = append(enh.Out, Sample{
++			Metric: metric,
++			Point:  Point{V: value, T: ls.T},
++		})
++	}
++	return enh.Out
++}
++
+ // rangeEval evaluates the given expressions, and then for each step calls
+ // the given funcCall with the values computed for each expression at that
+ // step. The return value is the combination into time series of all the
+@@ -1436,7 +1573,7 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, storage.Warnings) {
+ 				}, e.LHS, e.RHS)
+ 			default:
+ 				return ev.rangeEval(initSignatures, func(v []parser.Value, sh [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, storage.Warnings) {
+-					return ev.VectorBinop(e.Op, v[0].(Vector), v[1].(Vector), e.VectorMatching, e.ReturnBool, sh[0], sh[1], enh), nil
++					return enh.VectorBinop(e, v[0].(Vector), v[1].(Vector), sh[0], sh[1]), nil
+ 				}, e.LHS, e.RHS)
+ 			}
+ 
+@@ -1835,121 +1972,6 @@ func (ev *evaluator) VectorUnless(lhs, rhs Vector, matching *parser.VectorMatchi
+ 	return enh.Out
+ }
+ 
+-// VectorBinop evaluates a binary operation between two Vectors, excluding set operators.
+-func (ev *evaluator) VectorBinop(op parser.ItemType, lhs, rhs Vector, matching *parser.VectorMatching, returnBool bool, lhsh, rhsh []EvalSeriesHelper, enh *EvalNodeHelper) Vector {
+-	if matching.Card == parser.CardManyToMany {
+-		panic("many-to-many only allowed for set operators")
+-	}
+-	if len(lhs) == 0 || len(rhs) == 0 {
+-		return nil // Short-circuit: nothing is going to match.
+-	}
+-
+-	// The control flow below handles one-to-one or many-to-one matching.
+-	// For one-to-many, swap sidedness and account for the swap when calculating
+-	// values.
+-	if matching.Card == parser.CardOneToMany {
+-		lhs, rhs = rhs, lhs
+-		lhsh, rhsh = rhsh, lhsh
+-	}
+-
+-	// All samples from the rhs hashed by the matching label/values.
+-	if enh.rightSigs == nil {
+-		enh.rightSigs = make(map[string]Sample, len(enh.Out))
+-	} else {
+-		for k := range enh.rightSigs {
+-			delete(enh.rightSigs, k)
+-		}
+-	}
+-	rightSigs := enh.rightSigs
+-
+-	// Add all rhs samples to a map so we can easily find matches later.
+-	for i, rs := range rhs {
+-		sig := rhsh[i].signature
+-		// The rhs is guaranteed to be the 'one' side. Having multiple samples
+-		// with the same signature means that the matching is many-to-many.
+-		if duplSample, found := rightSigs[sig]; found {
+-			// oneSide represents which side of the vector represents the 'one' in the many-to-one relationship.
+-			oneSide := "right"
+-			if matching.Card == parser.CardOneToMany {
+-				oneSide = "left"
+-			}
+-			matchedLabels := rs.Metric.MatchLabels(matching.On, matching.MatchingLabels...)
+-			// Many-to-many matching not allowed.
+-			ev.errorf("found duplicate series for the match group %s on the %s hand-side of the operation: [%s, %s]"+
+-				";many-to-many matching not allowed: matching labels must be unique on one side", matchedLabels.String(), oneSide, rs.Metric.String(), duplSample.Metric.String())
+-		}
+-		rightSigs[sig] = rs
+-	}
+-
+-	// Tracks the match-signature. For one-to-one operations the value is nil. For many-to-one
+-	// the value is a set of signatures to detect duplicated result elements.
+-	if enh.matchedSigs == nil {
+-		enh.matchedSigs = make(map[string]map[uint64]struct{}, len(rightSigs))
+-	} else {
+-		for k := range enh.matchedSigs {
+-			delete(enh.matchedSigs, k)
+-		}
+-	}
+-	matchedSigs := enh.matchedSigs
+-
+-	// For all lhs samples find a respective rhs sample and perform
+-	// the binary operation.
+-	for i, ls := range lhs {
+-		sig := lhsh[i].signature
+-
+-		rs, found := rightSigs[sig] // Look for a match in the rhs Vector.
+-		if !found {
+-			continue
+-		}
+-
+-		// Account for potentially swapped sidedness.
+-		vl, vr := ls.V, rs.V
+-		if matching.Card == parser.CardOneToMany {
+-			vl, vr = vr, vl
+-		}
+-		value, keep := vectorElemBinop(op, vl, vr)
+-		if returnBool {
+-			if keep {
+-				value = 1.0
+-			} else {
+-				value = 0.0
+-			}
+-		} else if !keep {
+-			continue
+-		}
+-		metric := resultMetric(ls.Metric, rs.Metric, op, matching, enh)
+-		if returnBool {
+-			metric = enh.DropMetricName(metric)
+-		}
+-		insertedSigs, exists := matchedSigs[sig]
+-		if matching.Card == parser.CardOneToOne {
+-			if exists {
+-				ev.errorf("multiple matches for labels: many-to-one matching must be explicit (group_left/group_right)")
+-			}
+-			matchedSigs[sig] = nil // Set existence to true.
+-		} else {
+-			// In many-to-one matching the grouping labels have to ensure a unique metric
+-			// for the result Vector. Check whether those labels have already been added for
+-			// the same matching labels.
+-			insertSig := metric.Hash()
+-
+-			if !exists {
+-				insertedSigs = map[uint64]struct{}{}
+-				matchedSigs[sig] = insertedSigs
+-			} else if _, duplicate := insertedSigs[insertSig]; duplicate {
+-				ev.errorf("multiple matches for labels: grouping labels must ensure unique matches")
+-			}
+-			insertedSigs[insertSig] = struct{}{}
+-		}
+-
+-		enh.Out = append(enh.Out, Sample{
+-			Metric: metric,
+-			Point:  Point{V: value},
+-		})
+-	}
+-	return enh.Out
+-}
+-
+ func signatureFunc(on bool, b []byte, names ...string) func(labels.Labels) string {
+ 	sort.Strings(names)
+ 	if on {
+@@ -1962,64 +1984,6 @@ func signatureFunc(on bool, b []byte, names ...string) func(labels.Labels) strin
+ 	}
+ }
+ 
+-// resultMetric returns the metric for the given sample(s) based on the Vector
+-// binary operation and the matching options.
+-func resultMetric(lhs, rhs labels.Labels, op parser.ItemType, matching *parser.VectorMatching, enh *EvalNodeHelper) labels.Labels {
+-	if enh.resultMetric == nil {
+-		enh.resultMetric = make(map[string]labels.Labels, len(enh.Out))
+-	}
+-
+-	if enh.lb == nil {
+-		enh.lb = labels.NewBuilder(lhs)
+-	} else {
+-		enh.lb.Reset(lhs)
+-	}
+-
+-	buf := bytes.NewBuffer(enh.lblResultBuf[:0])
+-	enh.lblBuf = lhs.Bytes(enh.lblBuf)
+-	buf.Write(enh.lblBuf)
+-	enh.lblBuf = rhs.Bytes(enh.lblBuf)
+-	buf.Write(enh.lblBuf)
+-	enh.lblResultBuf = buf.Bytes()
+-
+-	if ret, ok := enh.resultMetric[string(enh.lblResultBuf)]; ok {
+-		return ret
+-	}
+-	str := string(enh.lblResultBuf)
+-
+-	if shouldDropMetricName(op) {
+-		enh.lb.Del(labels.MetricName)
+-	}
+-
+-	if matching.Card == parser.CardOneToOne {
+-		if matching.On {
+-		Outer:
+-			for _, l := range lhs {
+-				for _, n := range matching.MatchingLabels {
+-					if l.Name == n {
+-						continue Outer
+-					}
+-				}
+-				enh.lb.Del(l.Name)
+-			}
+-		} else {
+-			enh.lb.Del(matching.MatchingLabels...)
+-		}
+-	}
+-	for _, ln := range matching.Include {
+-		// Included labels from the `group_x` modifier are taken from the "one"-side.
+-		if v := rhs.Get(ln); v != "" {
+-			enh.lb.Set(ln, v)
+-		} else {
+-			enh.lb.Del(ln)
+-		}
+-	}
+-
+-	ret := enh.lb.Labels()
+-	enh.resultMetric[str] = ret
+-	return ret
+-}
+-
+ // VectorscalarBinop evaluates a binary operation between a Vector and a Scalar.
+ func (ev *evaluator) VectorscalarBinop(op parser.ItemType, lhs Vector, rhs Scalar, swap, returnBool bool, enh *EvalNodeHelper) Vector {
+ 	for _, lhsSample := range lhs {

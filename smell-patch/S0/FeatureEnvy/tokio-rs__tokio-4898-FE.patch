@@ -1,0 +1,205 @@
+diff --git a/tokio/src/io/driver/mod.rs b/tokio/src/io/driver/mod.rs
+index 9801a22c..a61d753f 100644
+--- a/tokio/src/io/driver/mod.rs
++++ b/tokio/src/io/driver/mod.rs
+@@ -31,20 +31,20 @@ use std::time::Duration;
+ pub(crate) struct Driver {
+     /// Tracks the number of times `turn` is called. It is safe for this to wrap
+     /// as it is mostly used to determine when to call `compact()`.
+-    tick: u8,
++    pub(crate) tick: u8,
+ 
+     /// Reuse the `mio::Events` value across calls to poll.
+-    events: Option<mio::Events>,
++    pub(crate) events: Option<mio::Events>,
+ 
+     /// Primary slab handle containing the state for each resource registered
+     /// with this driver.
+-    resources: Slab<ScheduledIo>,
++    pub(crate) resources: Slab<ScheduledIo>,
+ 
+     /// The system event queue.
+-    poll: mio::Poll,
++    pub(crate) poll: mio::Poll,
+ 
+     /// State shared between the reactor and the handles.
+-    inner: Arc<Inner>,
++    pub(crate) inner: Arc<Inner>,
+ }
+ 
+ /// A reference to an I/O driver.
+@@ -64,7 +64,7 @@ struct IoDispatcher {
+     is_shutdown: bool,
+ }
+ 
+-pub(super) struct Inner {
++pub(crate) struct Inner {
+     /// Registers I/O resources.
+     registry: mio::Registry,
+ 
+@@ -76,7 +76,7 @@ pub(super) struct Inner {
+     #[cfg(not(tokio_wasi))]
+     waker: mio::Waker,
+ 
+-    metrics: IoDriverMetrics,
++    pub(crate) metrics: IoDriverMetrics,
+ }
+ 
+ #[derive(Debug, Eq, PartialEq, Clone, Copy)]
+@@ -92,7 +92,7 @@ enum Tick {
+ 
+ // TODO: Don't use a fake token. Instead, reserve a slot entry for the wakeup
+ // token.
+-const TOKEN_WAKEUP: mio::Token = mio::Token(1 << 31);
++pub(crate) const TOKEN_WAKEUP: mio::Token = mio::Token(1 << 31);
+ 
+ const ADDRESS: bit::Pack = bit::Pack::least_significant(24);
+ 
+@@ -151,6 +151,7 @@ impl Driver {
+         }
+     }
+ 
++    #[cfg(not(all(unix, feature = "signal")))]
+     fn turn(&mut self, max_wait: Option<Duration>) -> io::Result<()> {
+         // How often to call `compact()` on the resource slab
+         const COMPACT_INTERVAL: u8 = 255;
+@@ -194,7 +195,7 @@ impl Driver {
+         Ok(())
+     }
+ 
+-    fn dispatch(&mut self, token: mio::Token, ready: Ready) {
++    pub(crate) fn dispatch(&mut self, token: mio::Token, ready: Ready) {
+         let addr = slab::Address::from_usize(ADDRESS.unpack(token.0));
+ 
+         let resources = &mut self.resources;
+@@ -230,12 +231,16 @@ impl Park for Driver {
+     }
+ 
+     fn park(&mut self) -> io::Result<()> {
++        #[cfg(not(all(unix, feature = "signal")))]
+         self.turn(None)?;
+         Ok(())
+     }
+ 
+     fn park_timeout(&mut self, duration: Duration) -> io::Result<()> {
++        #[cfg(not(all(unix, feature = "signal")))]
+         self.turn(Some(duration))?;
++        #[cfg(all(unix, feature = "signal"))]
++        let _ = duration;
+         Ok(())
+     }
+ 
+diff --git a/tokio/src/signal/unix/driver.rs b/tokio/src/signal/unix/driver.rs
+index e14a6d77..88ba65c9 100644
+--- a/tokio/src/signal/unix/driver.rs
++++ b/tokio/src/signal/unix/driver.rs
+@@ -2,7 +2,7 @@
+ 
+ //! Signal driver
+ 
+-use crate::io::driver::{Driver as IoDriver, Interest};
++use crate::io::driver::{Driver as IoDriver, Interest, Ready, TOKEN_WAKEUP};
+ use crate::io::PollEvented;
+ use crate::park::Park;
+ use crate::signal::registry::globals;
+@@ -95,7 +95,55 @@ impl Driver {
+         }
+     }
+ 
+-    fn process(&self) {
++    fn turn(&mut self, max_wait: Option<Duration>) -> io::Result<()> {
++        // How often to call `compact()` on the resource slab
++        const COMPACT_INTERVAL: u8 = 255;
++
++        self.park.tick = self.park.tick.wrapping_add(1);
++
++        if self.park.tick == COMPACT_INTERVAL {
++            self.park.resources.compact()
++        }
++
++        let mut events = self
++            .park
++            .events
++            .take()
++            .expect("i/o driver event store missing");
++
++        // Block waiting for an event to happen, peeling out how many events
++        // happened.
++        match self.park.poll.poll(&mut events, max_wait) {
++            Ok(_) => {}
++            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
++            #[cfg(tokio_wasi)]
++            Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
++                // In case of wasm32_wasi this error happens, when trying to poll without subscriptions
++                // just return from the park, as there would be nothing, which wakes us up.
++            }
++            Err(e) => return Err(e),
++        }
++
++        // Process all the events that came in, dispatching appropriately
++        let mut ready_count = 0;
++        for event in events.iter() {
++            let token = event.token();
++
++            if token != TOKEN_WAKEUP {
++                self.park.dispatch(token, Ready::from_mio(event));
++                ready_count += 1;
++            }
++        }
++
++        self.park.inner.metrics.incr_ready_count_by(ready_count);
++
++        self.park.events = Some(events);
++
++        Self::process(&self.receiver);
++        Ok(())
++    }
++
++    fn process(receiver: &PollEvented<UnixStream>) {
+         // Check if the pipe is ready to read and therefore has "woken" us up
+         //
+         // To do so, we will `poll_read_ready` with a noop waker, since we don't
+@@ -103,7 +151,7 @@ impl Driver {
+         let waker = unsafe { Waker::from_raw(RawWaker::new(ptr::null(), &NOOP_WAKER_VTABLE)) };
+         let mut cx = Context::from_waker(&waker);
+ 
+-        let ev = match self.receiver.registration().poll_read_ready(&mut cx) {
++        let ev = match receiver.registration().poll_read_ready(&mut cx) {
+             Poll::Ready(Ok(ev)) => ev,
+             Poll::Ready(Err(e)) => panic!("reactor gone: {}", e),
+             Poll::Pending => return, // No wake has arrived, bail
+@@ -113,7 +161,7 @@ impl Driver {
+         // if another signal has come in.
+         let mut buf = [0; 128];
+         loop {
+-            match (&*self.receiver).read(&mut buf) {
++            match (&**receiver).read(&mut buf) {
+                 Ok(0) => panic!("EOF on self-pipe"),
+                 Ok(_) => continue, // Keep reading
+                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+@@ -121,7 +169,7 @@ impl Driver {
+             }
+         }
+ 
+-        self.receiver.registration().clear_readiness(ev);
++        receiver.registration().clear_readiness(ev);
+ 
+         // Broadcast any signals which were received
+         globals().broadcast();
+@@ -147,14 +195,12 @@ impl Park for Driver {
+     }
+ 
+     fn park(&mut self) -> Result<(), Self::Error> {
+-        self.park.park()?;
+-        self.process();
++        self.turn(None)?;
+         Ok(())
+     }
+ 
+     fn park_timeout(&mut self, duration: Duration) -> Result<(), Self::Error> {
+-        self.park.park_timeout(duration)?;
+-        self.process();
++        self.turn(Some(duration))?;
+         Ok(())
+     }
+ 

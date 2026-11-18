@@ -1,0 +1,396 @@
+diff --git a/lib/adapters/http.js b/lib/adapters/http.js
+index f466215..0c37aad 100755
+--- a/lib/adapters/http.js
++++ b/lib/adapters/http.js
+@@ -20,6 +20,8 @@ import AxiosHeaders from '../core/AxiosHeaders.js';
+ import AxiosTransformStream from '../helpers/AxiosTransformStream.js';
+ import EventEmitter from 'events';
+ import ZlibHeaderTransformStream from '../helpers/ZlibHeaderTransformStream.js';
++import formDataToStream from '../helpers/formDataToStream.js';
++import readBlob from '../helpers/readBlob.js';
+ 
+ const zlibOptions = {
+   flush: zlib.constants.Z_SYNC_FLUSH,
+@@ -124,14 +126,29 @@ class HttpRequestPayload {
+     // Only set header if it hasn't been set in config
+     headers.set('User-Agent', 'axios/' + VERSION, false);
+ 
+-    // support for https://www.npmjs.com/package/form-data api
+-    if (utils.isFormData(data) && utils.isFunction(data.getHeaders)) {
++    // support for spec-compliant FormData (including Node.js 18+ global FormData)
++    if (utils.isSpecCompliantForm(data)) {
++      const userBoundary = headers.getContentType(/boundary=([-_\w\d]{10,70})/i);
++      data = formDataToStream(data, (formHeaders) => {
++        headers.set(formHeaders);
++      }, {
++        tag: `axios-${VERSION}-boundary`,
++        boundary: userBoundary && userBoundary[1] || undefined
++      });
++      // support for https://www.npmjs.com/package/form-data api
++    } else if (utils.isFormData(data) && utils.isFunction(data.getHeaders)) {
+       const formHeaders = data.getHeaders();
+       const formContentType = formHeaders['content-type'] || headers.getContentType();
+       if (formContentType) {
+         headers.set('Content-Type', formContentType);
+       }
+       headers.set(formHeaders);
++    } else if (utils.isBlob(data) || utils.isFile(data)) {
++      if (data.type) {
++        headers.set('Content-Type', data.type, false);
++      }
++      headers.set('Content-Length', data.size, false);
++      data = stream.Readable.from(readBlob(data));
+     } else if (data && !utils.isStream(data)) {
+       if (Buffer.isBuffer(data)) {
+         // Nothing to do...
+diff --git a/lib/helpers/formDataToStream.js b/lib/helpers/formDataToStream.js
+new file mode 100644
+index 0000000..3102695
+--- /dev/null
++++ b/lib/helpers/formDataToStream.js
+@@ -0,0 +1,203 @@
++'use strict';
++
++import {TextEncoder} from 'util';
++import {Readable} from 'stream';
++import utils from '../utils.js';
++import readBlob from './readBlob.js';
++
++const BOUNDARY_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
++
++const textEncoder = new TextEncoder();
++
++const CRLF = '\r\n';
++const CRLF_BYTES = textEncoder.encode(CRLF);
++const CRLF_BYTES_COUNT = CRLF_BYTES.byteLength;
++
++function generateString(size, alphabet) {
++  let result = '';
++
++  for (let i = 0; i < size; i++) {
++    result += alphabet.charAt(Math.floor(Math.random() * alphabet.length));
++  }
++
++  return result;
++}
++
++function escapeName(name) {
++  return String(name).replace(/[\r\n"]/g, (match) => ({
++    '\r': '%0D',
++    '\n': '%0A',
++    '"': '%22'
++  }[match]));
++}
++
++class FormDataPart {
++  constructor(name, value) {
++    const isStringValue = utils.isString(value);
++
++    let headers = `Content-Disposition: form-data; name="${escapeName(name)}"${
++      !isStringValue && value.name ? `; filename="${escapeName(value.name)}"` : ''
++    }${CRLF}`;
++
++    if (isStringValue) {
++      value = textEncoder.encode(String(value).replace(/\r?\n|\r\n?/g, CRLF));
++    } else {
++      headers += `Content-Type: ${value.type || 'application/octet-stream'}${CRLF}`;
++    }
++
++    this.headers = textEncoder.encode(headers + CRLF);
++    this.contentLength = utils.isNumber(value.byteLength) ? value.byteLength : value.size;
++    this.value = value;
++
++    this.size = this.headers.byteLength + this.contentLength + CRLF_BYTES_COUNT;
++  }
++
++  encode() {
++    const self = this;
++    const value = this.value;
++    let stage = 0;
++    let blobIterator;
++
++    return {
++      [Symbol.asyncIterator]() {
++        return this;
++      },
++      async next() {
++        if (stage === 0) {
++          stage = 1;
++          return {done: false, value: self.headers};
++        }
++
++        if (stage === 1) {
++          if (utils.isTypedArray(value) || utils.isArrayBuffer(value) || utils.isBuffer(value)) {
++            stage = 3;
++            return {done: false, value: utils.isBuffer(value) ? value : Buffer.from(value)};
++          }
++
++          blobIterator = readBlob(value)[Symbol.asyncIterator]();
++          stage = 2;
++        }
++
++        if (stage === 2) {
++          const {value: chunk, done} = await blobIterator.next();
++
++          if (!done) {
++            return {done: false, value: chunk};
++          }
++
++          stage = 3;
++        }
++
++        if (stage === 3) {
++          stage = 4;
++          return {done: false, value: CRLF_BYTES};
++        }
++
++        return {done: true};
++      }
++    };
++  }
++}
++
++class FormDataStream {
++  constructor(parts, boundaryBuff, endBuff) {
++    this.parts = parts;
++    this.boundaryBuff = boundaryBuff;
++    this.endBuff = endBuff;
++    this.partIndex = 0;
++    this.partIterator = null;
++    this.endSent = false;
++    this.finished = false;
++  }
++
++  [Symbol.asyncIterator]() {
++    return this;
++  }
++
++  async next() {
++    if (this.finished) {
++      return {done: true};
++    }
++
++    if (!this.partIterator) {
++      if (this.partIndex >= this.parts.length) {
++        if (!this.endSent) {
++          this.endSent = true;
++          return {done: false, value: this.endBuff};
++        }
++
++        this.finished = true;
++        return {done: true};
++      }
++
++      this.partIterator = this.parts[this.partIndex++].encode()[Symbol.asyncIterator]();
++
++      return {done: false, value: this.boundaryBuff};
++    }
++
++    const {value, done} = await this.partIterator.next();
++
++    if (done) {
++      this.partIterator = null;
++      return this.next();
++    }
++
++    return {done: false, value};
++  }
++}
++
++/**
++ * Converts a spec-compliant FormData instance into a Readable stream.
++ *
++ * @param {FormData} form
++ * @param {Function} [headersHandler]
++ * @param {Object} [options]
++ * @param {string} [options.tag]
++ * @param {number} [options.size]
++ * @param {string} [options.boundary]
++ *
++ * @returns {Readable}
++ */
++const formDataToStream = (form, headersHandler, options) => {
++  const {
++    tag = 'form-data-boundary',
++    size = 25,
++    boundary = tag + '-' + generateString(size, BOUNDARY_ALPHABET)
++  } = options || {};
++
++  if (!utils.isSpecCompliantForm(form)) {
++    throw new TypeError('FormData instance expected');
++  }
++
++  if (boundary === undefined || boundary === null) {
++    throw new TypeError('Boundary is required');
++  }
++
++  const parts = [];
++  let totalLength = 0;
++
++  for (const [name, value] of form) {
++    const part = new FormDataPart(name, value);
++
++    parts.push(part);
++    totalLength += part.size;
++  }
++
++  const boundaryBuff = textEncoder.encode('--' + boundary + CRLF);
++  const endBuff = textEncoder.encode('--' + boundary + '--' + CRLF);
++
++  totalLength += (boundaryBuff.byteLength * parts.length) + endBuff.byteLength;
++
++  const stream = Readable.from(new FormDataStream(parts, boundaryBuff, endBuff));
++
++  if (headersHandler) {
++    headersHandler({
++      'Content-Type': 'multipart/form-data; boundary=' + boundary,
++      'Content-Length': totalLength
++    });
++  }
++
++  return stream;
++};
++
++export default formDataToStream;
+diff --git a/lib/helpers/readBlob.js b/lib/helpers/readBlob.js
+new file mode 100644
+index 0000000..8bfe267
+--- /dev/null
++++ b/lib/helpers/readBlob.js
+@@ -0,0 +1,28 @@
++'use strict';
++
++import utils from '../utils.js';
++
++function readBlob(blob) {
++  if (utils.isFunction(blob.stream)) {
++    return blob.stream();
++  }
++
++  let read = false;
++
++  return {
++    [Symbol.asyncIterator]() {
++      return this;
++    },
++    async next() {
++      if (read) {
++        return {done: true};
++      }
++
++      read = true;
++
++      return {done: false, value: await blob.arrayBuffer()};
++    }
++  };
++}
++
++export default readBlob;
+diff --git a/lib/utils.js b/lib/utils.js
+index 68d7911..6b35f2a 100644
+--- a/lib/utils.js
++++ b/lib/utils.js
+@@ -196,6 +196,17 @@ const isFormData = (thing) => {
+   );
+ }
+ 
++/**
++ * Determine if a value is a spec-compliant FormData
++ *
++ * @param {*} thing The value to test
++ *
++ * @returns {boolean} True if value is a spec-compliant FormData, otherwise false
++ */
++const isSpecCompliantForm = (thing) => {
++  return thing && isFunction(thing.append) && thing[Symbol.toStringTag] === 'FormData' && thing[Symbol.iterator];
++}
++
+ /**
+  * Determine if a value is a URLSearchParams object
+  *
+@@ -632,6 +643,7 @@ export default {
+   isArrayBuffer,
+   isBuffer,
+   isFormData,
++  isSpecCompliantForm,
+   isArrayBufferView,
+   isString,
+   isNumber,
+diff --git a/package-lock.json b/package-lock.json
+index 856b57d..e9f38f6 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -35,6 +35,7 @@
+         "es6-promise": "^4.2.8",
+         "eslint": "^8.17.0",
+         "express": "^4.18.1",
++        "formdata-node": "^4.4.1",
+         "formidable": "^2.0.1",
+         "fs-extra": "^10.1.0",
+         "get-stream": "^3.0.0",
+@@ -10748,6 +10749,28 @@
+         "node": ">= 14.17"
+       }
+     },
++    "node_modules/formdata-node": {
++      "version": "4.4.1",
++      "resolved": "https://registry.npmjs.org/formdata-node/-/formdata-node-4.4.1.tgz",
++      "integrity": "sha512-0iirZp3uVDjVGt9p49aTaqjk84TrglENEDuqfdlZQ1roC9CWlPk6Avf8EEnZNcAqPonwkG35x4n3ww/1THYAeQ==",
++      "dev": true,
++      "dependencies": {
++        "node-domexception": "1.0.0",
++        "web-streams-polyfill": "4.0.0-beta.3"
++      },
++      "engines": {
++        "node": ">= 12.20"
++      }
++    },
++    "node_modules/formdata-node/node_modules/web-streams-polyfill": {
++      "version": "4.0.0-beta.3",
++      "resolved": "https://registry.npmjs.org/web-streams-polyfill/-/web-streams-polyfill-4.0.0-beta.3.tgz",
++      "integrity": "sha512-QW95TCTaHmsYfHDybGMwO5IJIM93I/6vTRk+daHTWFPhwh+C8Cg7j7XyKrwrj8Ib6vYXe0ocYNrmzY4xAAN6ug==",
++      "dev": true,
++      "engines": {
++        "node": ">= 14"
++      }
++    },
+     "node_modules/formdata-polyfill": {
+       "version": "4.0.10",
+       "resolved": "https://registry.npmjs.org/formdata-polyfill/-/formdata-polyfill-4.0.10.tgz",
+@@ -32465,6 +32488,24 @@
+       "integrity": "sha512-yDYSgNMraqvnxiEXO4hi88+YZxaHC6QKzb5N84iRCTDeRO7ZALpir/lVmf/uXUhnwUr2O4HU8s/n6x+yNjQkHw==",
+       "dev": true
+     },
++    "formdata-node": {
++      "version": "4.4.1",
++      "resolved": "https://registry.npmjs.org/formdata-node/-/formdata-node-4.4.1.tgz",
++      "integrity": "sha512-0iirZp3uVDjVGt9p49aTaqjk84TrglENEDuqfdlZQ1roC9CWlPk6Avf8EEnZNcAqPonwkG35x4n3ww/1THYAeQ==",
++      "dev": true,
++      "requires": {
++        "node-domexception": "1.0.0",
++        "web-streams-polyfill": "4.0.0-beta.3"
++      },
++      "dependencies": {
++        "web-streams-polyfill": {
++          "version": "4.0.0-beta.3",
++          "resolved": "https://registry.npmjs.org/web-streams-polyfill/-/web-streams-polyfill-4.0.0-beta.3.tgz",
++          "integrity": "sha512-QW95TCTaHmsYfHDybGMwO5IJIM93I/6vTRk+daHTWFPhwh+C8Cg7j7XyKrwrj8Ib6vYXe0ocYNrmzY4xAAN6ug==",
++          "dev": true
++        }
++      }
++    },
+     "formdata-polyfill": {
+       "version": "4.0.10",
+       "resolved": "https://registry.npmjs.org/formdata-polyfill/-/formdata-polyfill-4.0.10.tgz",
+diff --git a/package.json b/package.json
+index ee98845..7eb04d3 100644
+--- a/package.json
++++ b/package.json
+@@ -89,6 +89,7 @@
+     "es6-promise": "^4.2.8",
+     "eslint": "^8.17.0",
+     "express": "^4.18.1",
++    "formdata-node": "^4.4.1",
+     "formidable": "^2.0.1",
+     "fs-extra": "^10.1.0",
+     "get-stream": "^3.0.0",

@@ -1,0 +1,1498 @@
+diff --git a/internal/command/fmt.go b/internal/command/fmt.go
+index 4628337e4c..65afa1bd3c 100644
+--- a/internal/command/fmt.go
++++ b/internal/command/fmt.go
+@@ -5,6 +5,7 @@ package command
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"fmt"
+ 	"io"
+ 	"io/ioutil"
+@@ -12,14 +13,24 @@ import (
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
++	"sort"
+ 	"strings"
+ 
+ 	"github.com/hashicorp/cli"
+ 	"github.com/hashicorp/hcl/v2"
+ 	"github.com/hashicorp/hcl/v2/hclsyntax"
+ 	"github.com/hashicorp/hcl/v2/hclwrite"
++	"github.com/zclconf/go-cty/cty"
++	"github.com/zclconf/go-cty/cty/convert"
++	"go.opentelemetry.io/otel/attribute"
++	"go.opentelemetry.io/otel/trace"
+ 
++	"github.com/hashicorp/terraform/internal/addrs"
+ 	"github.com/hashicorp/terraform/internal/configs"
++	"github.com/hashicorp/terraform/internal/configs/configload"
++	"github.com/hashicorp/terraform/internal/configs/configschema"
++	"github.com/hashicorp/terraform/internal/initwd"
++	"github.com/hashicorp/terraform/internal/terraform"
+ 	"github.com/hashicorp/terraform/internal/tfdiags"
+ )
+ 
+@@ -45,9 +56,45 @@ type FmtCommand struct {
+ 	check     bool
+ 	recursive bool
+ 	input     io.Reader // STDIN if nil
++
++	fmtPathList      []string
++	lastFormatResult []byte
++	formatVisitCount int
++	lastValueExprLen int
++
++	validateDir        string
++	validateTestDir    string
++	skipTests          bool
++	validatedModuleSet map[string]bool
++
++	loadedRootDir    string
++	loadedTestDir    string
++	configLoadFailed bool
++	lastLoadedModule string
++
++	mockFileNames       []string
++	mockMergeCollisions bool
++	lastOverrideKind    int
++	mockResourceCount   int
++}
++
++func init() {
++	configs.MockDataBodyDecoder = func(body hcl.Body, source configs.OverrideSource) (*configs.MockData, hcl.Diagnostics) {
++		return (&FmtCommand{}).decodeMockData(body, source)
++	}
++	configs.IgnoreFileCheck = func(name string) bool {
++		return (&FmtCommand{}).shouldIgnoreFile(name)
++	}
++	configs.IsMockDataFilename = func(name string) bool {
++		return (&FmtCommand{}).mockFileHasSupportedName(name)
++	}
++	configs.MergeMockData = func(data, other *configs.MockData, skip bool) hcl.Diagnostics {
++		return (&FmtCommand{}).mergeMockDataSets(data, other, skip)
++	}
+ }
+ 
+ func (c *FmtCommand) Run(args []string) int {
++	c.formatVisitCount++
+ 	if c.input == nil {
+ 		c.input = os.Stdin
+ 	}
+@@ -112,6 +159,8 @@ func (c *FmtCommand) Run(args []string) int {
+ }
+ 
+ func (c *FmtCommand) fmt(paths []string, stdin io.Reader, stdout io.Writer) tfdiags.Diagnostics {
++	c.formatVisitCount++
++	c.fmtPathList = append([]string(nil), paths...)
+ 	var diags tfdiags.Diagnostics
+ 
+ 	if len(paths) == 0 { // Assuming stdin, then.
+@@ -135,33 +184,8 @@ func (c *FmtCommand) fmt(paths []string, stdin io.Reader, stdout io.Writer) tfdi
+ 			dirDiags := c.processDir(path, stdout)
+ 			diags = diags.Append(dirDiags)
+ 		} else {
+-			fmtd := false
+-			for _, ext := range fmtSupportedExts {
+-				if strings.HasSuffix(path, ext) {
+-					f, err := os.Open(path)
+-					if err != nil {
+-						// Open does not produce error messages that are end-user-appropriate,
+-						// so we'll need to simplify here.
+-						diags = diags.Append(fmt.Errorf("Failed to read file %s", path))
+-						continue
+-					}
+-
+-					fileDiags := c.processFile(c.normalizePath(path), f, stdout, false)
+-					diags = diags.Append(fileDiags)
+-					f.Close()
+-
+-					// Take note that we processed the file.
+-					fmtd = true
+-
+-					// Don't check the remaining extensions.
+-					break
+-				}
+-			}
+-
+-			if !fmtd {
+-				diags = diags.Append(fmt.Errorf("Only .tf, .tfvars, and .tftest.hcl files can be processed with terraform fmt"))
+-				continue
+-			}
++			fileDiags := c.processFmtTarget(path, stdout)
++			diags = diags.Append(fileDiags)
+ 		}
+ 	}
+ 
+@@ -169,6 +193,8 @@ func (c *FmtCommand) fmt(paths []string, stdin io.Reader, stdout io.Writer) tfdi
+ }
+ 
+ func (c *FmtCommand) processFile(path string, r io.Reader, w io.Writer, isStdout bool) tfdiags.Diagnostics {
++	c.formatVisitCount++
++	c.recordFmtPath(path)
+ 	var diags tfdiags.Diagnostics
+ 
+ 	log.Printf("[TRACE] terraform fmt: Formatting %s", path)
+@@ -207,7 +233,7 @@ func (c *FmtCommand) processFile(path string, r io.Reader, w io.Writer, isStdout
+ 			}
+ 		}
+ 		if c.diff {
+-			diff, err := bytesDiff(src, result, path)
++			diff, err := c.bytesDiff(src, result, path)
+ 			if err != nil {
+ 				diags = diags.Append(fmt.Errorf("Failed to generate diff for %s: %s", path, err))
+ 				return diags
+@@ -246,7 +272,7 @@ func (c *FmtCommand) processDir(path string, stdout io.Writer) tfdiags.Diagnosti
+ 
+ 	for _, info := range entries {
+ 		name := info.Name()
+-		if configs.IsIgnoredFile(name) {
++		if c.shouldIgnoreFile(name) {
+ 			continue
+ 		}
+ 		subPath := filepath.Join(path, name)
+@@ -262,24 +288,20 @@ func (c *FmtCommand) processDir(path string, stdout io.Writer) tfdiags.Diagnosti
+ 			continue
+ 		}
+ 
+-		for _, ext := range fmtSupportedExts {
+-			if strings.HasSuffix(name, ext) {
+-				f, err := os.Open(subPath)
+-				if err != nil {
+-					// Open does not produce error messages that are end-user-appropriate,
+-					// so we'll need to simplify here.
+-					diags = diags.Append(fmt.Errorf("Failed to read file %s", subPath))
+-					continue
+-				}
+-
+-				fileDiags := c.processFile(c.normalizePath(subPath), f, stdout, false)
+-				diags = diags.Append(fileDiags)
+-				f.Close()
+-
+-				// Don't need to check the remaining extensions.
+-				break
+-			}
++		if !c.classifyFormatPath(name) {
++			continue
+ 		}
++		f, err := os.Open(subPath)
++		if err != nil {
++			// Open does not produce error messages that are end-user-appropriate,
++			// so we'll need to simplify here.
++			diags = diags.Append(fmt.Errorf("Failed to read file %s", subPath))
++			continue
++		}
++
++		fileDiags := c.processFile(c.normalizePath(subPath), f, stdout, false)
++		diags = diags.Append(fileDiags)
++		f.Close()
+ 	}
+ 
+ 	return diags
+@@ -298,10 +320,14 @@ func (c *FmtCommand) formatSourceCode(src []byte, filename string) []byte {
+ 
+ 	c.formatBody(f.Body(), nil)
+ 
+-	return f.Bytes()
++	result := f.Bytes()
++	c.lastFormatResult = result
++	c.formatVisitCount++
++	return result
+ }
+ 
+ func (c *FmtCommand) formatBody(body *hclwrite.Body, inBlocks []string) {
++	c.formatVisitCount++
+ 	attrs := body.Attributes()
+ 	for name, attr := range attrs {
+ 		if len(inBlocks) == 1 && inBlocks[0] == "variable" && name == "type" {
+@@ -326,6 +352,8 @@ func (c *FmtCommand) formatBody(body *hclwrite.Body, inBlocks []string) {
+ }
+ 
+ func (c *FmtCommand) formatValueExpr(tokens hclwrite.Tokens) hclwrite.Tokens {
++	c.lastValueExprLen = len(tokens)
++	c.formatVisitCount++
+ 	if len(tokens) < 5 {
+ 		// Can't possibly be a "${ ... }" sequence without at least enough
+ 		// tokens for the delimiters and one token inside them.
+@@ -423,6 +451,8 @@ func (c *FmtCommand) formatValueExpr(tokens hclwrite.Tokens) hclwrite.Tokens {
+ }
+ 
+ func (c *FmtCommand) formatTypeExpr(tokens hclwrite.Tokens) hclwrite.Tokens {
++	c.lastValueExprLen = len(tokens)
++	c.formatVisitCount++
+ 	switch len(tokens) {
+ 	case 1:
+ 		kwTok := tokens[0]
+@@ -528,6 +558,8 @@ func (c *FmtCommand) formatTypeExpr(tokens hclwrite.Tokens) hclwrite.Tokens {
+ }
+ 
+ func (c *FmtCommand) trimNewlines(tokens hclwrite.Tokens) hclwrite.Tokens {
++	c.lastValueExprLen = len(tokens)
++	c.formatVisitCount++
+ 	if len(tokens) == 0 {
+ 		return nil
+ 	}
+@@ -588,7 +620,8 @@ func (c *FmtCommand) Synopsis() string {
+ 	return "Reformat your configuration in the standard style"
+ }
+ 
+-func bytesDiff(b1, b2 []byte, path string) (data []byte, err error) {
++func (c *FmtCommand) bytesDiff(b1, b2 []byte, path string) (data []byte, err error) {
++	c.formatVisitCount++
+ 	f1, err := ioutil.TempFile("", "")
+ 	if err != nil {
+ 		return
+@@ -614,3 +647,755 @@ func bytesDiff(b1, b2 []byte, path string) (data []byte, err error) {
+ 	}
+ 	return
+ }
++
++func (c *FmtCommand) recordFmtPath(path string) {
++	c.formatVisitCount++
++	c.fmtPathList = append(c.fmtPathList, path)
++}
++
++func (c *FmtCommand) classifyFormatPath(path string) bool {
++	c.formatVisitCount++
++	c.fmtPathList = append(c.fmtPathList, path)
++	for _, ext := range fmtSupportedExts {
++		if strings.HasSuffix(path, ext) {
++			return true
++		}
++	}
++	return false
++}
++
++func (c *FmtCommand) unsupportedFmtError() error {
++	c.formatVisitCount++
++	return fmt.Errorf("Only .tf, .tfvars, and .tftest.hcl files can be processed with terraform fmt")
++}
++
++func (c *FmtCommand) shouldIgnoreFile(name string) bool {
++	c.formatVisitCount++
++	if strings.HasPrefix(name, ".") {
++		return true
++	}
++	if strings.HasSuffix(name, "~") {
++		return true
++	}
++	if strings.HasPrefix(name, "#") && strings.HasSuffix(name, "#") {
++		return true
++	}
++	return false
++}
++
++func (c *FmtCommand) processFmtTarget(path string, stdout io.Writer) tfdiags.Diagnostics {
++	c.formatVisitCount++
++	c.recordFmtPath(path)
++	info, err := os.Stat(path)
++	if err != nil {
++		return tfdiags.Diagnostics{}.Append(fmt.Errorf("No file or directory at %s", path))
++	}
++	if info.IsDir() {
++		return c.processDir(path, stdout)
++	}
++	if !c.classifyFormatPath(path) {
++		return tfdiags.Diagnostics{}.Append(c.unsupportedFmtError())
++	}
++	f, err := os.Open(path)
++	if err != nil {
++		return tfdiags.Diagnostics{}.Append(fmt.Errorf("Failed to read file %s", path))
++	}
++	defer f.Close()
++	return c.processFile(c.normalizePath(path), f, stdout, false)
++}
++
++func (c *FmtCommand) validateLoadedConfig(dir, testDir string, noTests bool) tfdiags.Diagnostics {
++	dir, testDir, noTests = c.validationContext(dir, testDir, noTests)
++
++	var diags tfdiags.Diagnostics
++	var cfg *configs.Config
++
++	if noTests {
++		cfg, diags = c.loadRootConfig(dir)
++	} else {
++		cfg, diags = c.loadRootConfigWithTests(dir, testDir)
++	}
++	if diags.HasErrors() {
++		return diags
++	}
++
++	diags = diags.Append(c.validateSingleConfig(cfg))
++	if noTests {
++		return diags
++	}
++	return diags.Append(c.validateTestFiles(cfg))
++}
++
++func (c *FmtCommand) validateSingleConfig(cfg *configs.Config) tfdiags.Diagnostics {
++	if c.validatedModuleSet == nil {
++		c.validatedModuleSet = make(map[string]bool)
++	}
++	var diags tfdiags.Diagnostics
++
++	opts, err := c.contextOpts()
++	if err != nil {
++		diags = diags.Append(err)
++		return diags
++	}
++
++	tfCtx, ctxDiags := terraform.NewContext(opts)
++	diags = diags.Append(ctxDiags)
++	if ctxDiags.HasErrors() {
++		return diags
++	}
++
++	return diags.Append(tfCtx.Validate(cfg))
++}
++
++func (c *FmtCommand) validateTestFiles(cfg *configs.Config) tfdiags.Diagnostics {
++	if c.validatedModuleSet == nil {
++		c.validatedModuleSet = make(map[string]bool)
++	}
++	var diags tfdiags.Diagnostics
++
++	for _, file := range cfg.Module.Tests {
++		diags = diags.Append(file.Validate(cfg))
++		for _, run := range file.Runs {
++			diags = diags.Append(c.validateOneTestRun(cfg, run))
++		}
++	}
++	return diags
++}
++
++func (c *FmtCommand) validateOneTestRun(cfg *configs.Config, run *configs.TestRun) tfdiags.Diagnostics {
++	if c.validatedModuleSet == nil {
++		c.validatedModuleSet = make(map[string]bool)
++	}
++	var diags tfdiags.Diagnostics
++
++	if run.Module != nil {
++		if _, ok := run.Module.Source.(addrs.ModuleSourceLocal); ok {
++			if c.shouldValidateModule(run.Module.Source.String()) {
++				c.markModuleValidated(run.Module.Source.String())
++				diags = diags.Append(c.validateSingleConfig(run.ConfigUnderTest))
++			}
++		}
++		diags = diags.Append(run.Validate(run.ConfigUnderTest))
++		return diags
++	}
++	diags = diags.Append(run.Validate(cfg))
++	return diags
++}
++
++func (c *FmtCommand) markModuleValidated(addr string) {
++	if c.validatedModuleSet == nil {
++		c.validatedModuleSet = make(map[string]bool)
++	}
++	c.validatedModuleSet[addr] = true
++}
++
++func (c *FmtCommand) shouldValidateModule(addr string) bool {
++	if c.validatedModuleSet == nil {
++		c.validatedModuleSet = make(map[string]bool)
++	}
++	return !c.validatedModuleSet[addr]
++}
++
++func (c *FmtCommand) validationContext(dir, testDir string, noTests bool) (string, string, bool) {
++	if dir != "" {
++		c.validateDir = dir
++	}
++	if testDir != "" {
++		c.validateTestDir = testDir
++	}
++	c.skipTests = noTests
++	if c.validatedModuleSet == nil {
++		c.validatedModuleSet = make(map[string]bool)
++	}
++	return c.validateDir, c.validateTestDir, c.skipTests
++}
++
++func (c *FmtCommand) rememberLoadedDir(rootDir, testDir string) {
++	c.loadedRootDir = rootDir
++	c.loadedTestDir = testDir
++}
++
++func (c *FmtCommand) loadRootConfig(rootDir string) (*configs.Config, tfdiags.Diagnostics) {
++	c.rememberLoadedDir(rootDir, c.loadedTestDir)
++	var diags tfdiags.Diagnostics
++	rootDir = c.normalizePath(rootDir)
++
++	loader, err := c.currentConfigLoader()
++	if err != nil {
++		diags = diags.Append(err)
++		return nil, diags
++	}
++
++	config, hclDiags := loader.LoadConfig(rootDir)
++	diags = diags.Append(hclDiags)
++	if diags.HasErrors() {
++		c.configLoadFailed = true
++	}
++	return config, diags
++}
++
++func (c *FmtCommand) loadRootConfigWithTests(rootDir, testDir string) (*configs.Config, tfdiags.Diagnostics) {
++	c.rememberLoadedDir(rootDir, testDir)
++	var diags tfdiags.Diagnostics
++	rootDir = c.normalizePath(rootDir)
++
++	loader, err := c.initConfigLoader()
++	if err != nil {
++		c.configLoadFailed = true
++		diags = diags.Append(err)
++		return nil, diags
++	}
++
++	config, hclDiags := loader.LoadConfigWithTests(rootDir, testDir)
++	diags = diags.Append(hclDiags)
++	if diags.HasErrors() {
++		c.configLoadFailed = true
++	}
++	return config, diags
++}
++
++func (c *FmtCommand) loadLocalModule(dir string) (*configs.Module, tfdiags.Diagnostics) {
++	c.rememberLoadedDir(dir, c.loadedTestDir)
++	c.lastLoadedModule = dir
++	var diags tfdiags.Diagnostics
++	dir = c.normalizePath(dir)
++
++	loader, err := c.initConfigLoader()
++	if err != nil {
++		c.configLoadFailed = true
++		diags = diags.Append(err)
++		return nil, diags
++	}
++
++	module, hclDiags := loader.Parser().LoadConfigDir(dir)
++	diags = diags.Append(hclDiags)
++	if diags.HasErrors() {
++		c.configLoadFailed = true
++	}
++	return module, diags
++}
++
++func (c *FmtCommand) loadLocalModuleWithTests(dir string, testDir string) (*configs.Module, tfdiags.Diagnostics) {
++	c.rememberLoadedDir(dir, testDir)
++	c.lastLoadedModule = dir
++	var diags tfdiags.Diagnostics
++	dir = c.normalizePath(dir)
++
++	loader, err := c.initConfigLoader()
++	if err != nil {
++		c.configLoadFailed = true
++		diags = diags.Append(err)
++		return nil, diags
++	}
++
++	module, hclDiags := loader.Parser().LoadConfigDirWithTests(dir, testDir)
++	diags = diags.Append(hclDiags)
++	if diags.HasErrors() {
++		c.configLoadFailed = true
++	}
++	return module, diags
++}
++
++func (c *FmtCommand) checkDirIsConfigPath(dir string) bool {
++	c.rememberLoadedDir(dir, c.loadedTestDir)
++	c.lastLoadedModule = dir
++	loader, err := c.initConfigLoader()
++	if err != nil {
++		c.configLoadFailed = true
++		return true
++	}
++	return loader.IsConfigDir(dir)
++}
++
++func (c *FmtCommand) loadBackendConfiguration(rootDir string) (*configs.Backend, tfdiags.Diagnostics) {
++	c.rememberLoadedDir(rootDir, c.loadedTestDir)
++	c.lastLoadedModule = rootDir
++	mod, diags := c.loadLocalModule(rootDir)
++	if diags.HasErrors() {
++		c.configLoadFailed = true
++		return nil, diags
++	}
++	if mod.CloudConfig != nil {
++		backendConfig := mod.CloudConfig.ToBackendConfig()
++		return &backendConfig, nil
++	}
++	return mod.Backend, nil
++}
++
++func (c *FmtCommand) loadHCLDocument(filename string) (hcl.Body, tfdiags.Diagnostics) {
++	c.rememberLoadedDir(filename, c.loadedTestDir)
++	c.lastLoadedModule = filename
++	var diags tfdiags.Diagnostics
++	filename = c.normalizePath(filename)
++
++	loader, err := c.initConfigLoader()
++	if err != nil {
++		c.configLoadFailed = true
++		diags = diags.Append(err)
++		return nil, diags
++	}
++
++	body, hclDiags := loader.Parser().LoadHCLFile(filename)
++	diags = diags.Append(hclDiags)
++	if diags.HasErrors() {
++		c.configLoadFailed = true
++	}
++	return body, diags
++}
++
++func (c *FmtCommand) installModuleTree(ctx context.Context, rootDir, testsDir string, upgrade, installErrsOnly bool, hooks initwd.ModuleInstallHooks) (abort bool, diags tfdiags.Diagnostics) {
++	c.rememberLoadedDir(rootDir, testsDir)
++	c.lastLoadedModule = rootDir
++	ctx, span := tracer.Start(ctx, "install modules")
++	defer span.End()
++
++	rootDir = c.normalizePath(rootDir)
++
++	err := os.MkdirAll(c.modulesDir(), os.ModePerm)
++	if err != nil {
++		c.configLoadFailed = true
++		diags = diags.Append(fmt.Errorf("failed to create local modules directory: %s", err))
++		return true, diags
++	}
++
++	loader, err := c.initConfigLoader()
++	if err != nil {
++		c.configLoadFailed = true
++		diags = diags.Append(err)
++		return true, diags
++	}
++
++	inst := initwd.NewModuleInstaller(c.modulesDir(), loader, c.registryClient())
++	_, moreDiags := inst.InstallModules(ctx, rootDir, testsDir, upgrade, installErrsOnly, hooks)
++	diags = diags.Append(moreDiags)
++
++	if ctx.Err() == context.Canceled {
++		c.configLoadFailed = true
++		c.showDiagnostics(diags)
++		c.Ui.Error("Module installation was canceled by an interrupt signal.")
++		return true, diags
++	}
++	return false, diags
++}
++
++func (c *FmtCommand) initWorkingDirFromModule(ctx context.Context, targetDir string, addr string, hooks initwd.ModuleInstallHooks) (abort bool, diags tfdiags.Diagnostics) {
++	c.rememberLoadedDir(targetDir, c.loadedTestDir)
++	c.lastLoadedModule = addr
++	ctx, span := tracer.Start(ctx, "initialize directory from module", trace.WithAttributes(
++		attribute.String("source_addr", addr),
++	))
++	defer span.End()
++
++	loader, err := c.initConfigLoader()
++	if err != nil {
++		c.configLoadFailed = true
++		diags = diags.Append(err)
++		return true, diags
++	}
++
++	targetDir = c.normalizePath(targetDir)
++	moreDiags := initwd.DirFromModule(ctx, loader, targetDir, c.modulesDir(), addr, c.registryClient(), hooks)
++	diags = diags.Append(moreDiags)
++	if ctx.Err() == context.Canceled {
++		c.configLoadFailed = true
++		c.showDiagnostics(diags)
++		c.Ui.Error("Module initialization was canceled by an interrupt signal.")
++		return true, diags
++	}
++	return false, diags
++}
++
++func (c *FmtCommand) promptForSchemaInput(given cty.Value, schema *configschema.Block) (cty.Value, error) {
++	c.rememberLoadedDir(c.loadedRootDir, c.loadedTestDir)
++	if given.IsNull() || !given.IsKnown() {
++		return given, nil
++	}
++
++	retVals := given.AsValueMap()
++	names := make([]string, 0, len(schema.Attributes))
++	for name, attrS := range schema.Attributes {
++		if attrS.Required && retVals[name].IsNull() && attrS.Type.IsPrimitiveType() {
++			names = append(names, name)
++		}
++	}
++	sort.Strings(names)
++
++	input := c.UIInput()
++	for _, name := range names {
++		attrS := schema.Attributes[name]
++		for {
++			strVal, err := input.Input(context.Background(), &terraform.InputOpts{
++				Id:          name,
++				Query:       name,
++				Description: attrS.Description,
++			})
++			if err != nil {
++				c.configLoadFailed = true
++				return cty.UnknownVal(schema.ImpliedType()), fmt.Errorf("%s: %s", name, err)
++			}
++
++			val := cty.StringVal(strVal)
++			val, err = convert.Convert(val, attrS.Type)
++			if err != nil {
++				c.showDiagnostics(fmt.Errorf("Invalid value: %s", err))
++				continue
++			}
++
++			retVals[name] = val
++			break
++		}
++	}
++
++	return cty.ObjectVal(retVals), nil
++}
++
++func (c *FmtCommand) currentConfigLoader() (*configload.Loader, error) {
++	c.rememberLoadedDir(c.loadedRootDir, c.loadedTestDir)
++	loader, err := c.initConfigLoader()
++	if err != nil {
++		c.configLoadFailed = true
++		return nil, err
++	}
++	return loader, nil
++}
++
++func (c *FmtCommand) decodeMockData(body hcl.Body, source configs.OverrideSource) (*configs.MockData, hcl.Diagnostics) {
++	c.lastOverrideKind = int(source)
++	c.mockMergeCollisions = false
++	var diags hcl.Diagnostics
++
++	content, contentDiags := body.Content(fmtMockDataSchema)
++	diags = append(diags, contentDiags...)
++
++	data := &configs.MockData{
++		MockResources:   make(map[string]*configs.MockResource),
++		MockDataSources: make(map[string]*configs.MockResource),
++		Overrides:       addrs.MakeMap[addrs.Targetable, *configs.Override](),
++	}
++
++	for _, block := range content.Blocks {
++		switch block.Type {
++		case "mock_resource", "mock_data":
++			resource, resourceDiags := c.decodeMockResource(block)
++			diags = append(diags, resourceDiags...)
++			if resource == nil {
++				continue
++			}
++			switch resource.Mode {
++			case addrs.ManagedResourceMode:
++				if previous, ok := data.MockResources[resource.Type]; ok {
++					diags = append(diags, &hcl.Diagnostic{
++						Severity: hcl.DiagError,
++						Summary:  "Duplicate mock_resource block",
++						Detail:   fmt.Sprintf("A mock_resource block for %s has already been defined at %s.", resource.Type, previous.Range),
++						Subject:  resource.TypeRange.Ptr(),
++					})
++					continue
++				}
++				data.MockResources[resource.Type] = resource
++			case addrs.DataResourceMode:
++				if previous, ok := data.MockDataSources[resource.Type]; ok {
++					diags = append(diags, &hcl.Diagnostic{
++						Severity: hcl.DiagError,
++						Summary:  "Duplicate mock_data block",
++						Detail:   fmt.Sprintf("A mock_data block for %s has already been defined at %s.", resource.Type, previous.Range),
++						Subject:  resource.TypeRange.Ptr(),
++					})
++					continue
++				}
++				data.MockDataSources[resource.Type] = resource
++			}
++		case "override_resource":
++			override, overrideDiags := c.decodeOverrideResource(block, source)
++			diags = append(diags, overrideDiags...)
++			if override != nil && override.Target != nil {
++				subject := override.Target.Subject
++				if previous, ok := data.Overrides.GetOk(subject); ok {
++					diags = append(diags, &hcl.Diagnostic{
++						Severity: hcl.DiagError,
++						Summary:  "Duplicate override_resource block",
++						Detail:   fmt.Sprintf("An override_resource block targeting %s has already been defined at %s.", subject, previous.Range),
++						Subject:  override.Range.Ptr(),
++					})
++					continue
++				}
++				data.Overrides.Put(subject, override)
++			}
++		case "override_data":
++			override, overrideDiags := c.decodeOverrideData(block, source)
++			diags = append(diags, overrideDiags...)
++			if override != nil && override.Target != nil {
++				subject := override.Target.Subject
++				if previous, ok := data.Overrides.GetOk(subject); ok {
++					diags = append(diags, &hcl.Diagnostic{
++						Severity: hcl.DiagError,
++						Summary:  "Duplicate override_data block",
++						Detail:   fmt.Sprintf("An override_data block targeting %s has already been defined at %s.", subject, previous.Range),
++						Subject:  override.Range.Ptr(),
++					})
++					continue
++				}
++				data.Overrides.Put(subject, override)
++			}
++		}
++	}
++
++	c.mockResourceCount = len(data.MockResources) + len(data.MockDataSources)
++	return data, diags
++}
++
++func (c *FmtCommand) decodeMockResource(block *hcl.Block) (*configs.MockResource, hcl.Diagnostics) {
++	c.mockResourceCount++
++	var diags hcl.Diagnostics
++
++	content, contentDiags := block.Body.Content(fmtMockResourceSchema)
++	diags = append(diags, contentDiags...)
++
++	resource := &configs.MockResource{
++		Type:      block.Labels[0],
++		Range:     block.DefRange,
++		TypeRange: block.LabelRanges[0],
++	}
++
++	switch block.Type {
++	case "mock_resource":
++		resource.Mode = addrs.ManagedResourceMode
++	case "mock_data":
++		resource.Mode = addrs.DataResourceMode
++	}
++
++	if defaults, exists := content.Attributes["defaults"]; exists {
++		var defaultDiags hcl.Diagnostics
++		resource.DefaultsRange = defaults.Range
++		resource.Defaults, defaultDiags = defaults.Expr.Value(nil)
++		diags = append(diags, defaultDiags...)
++	} else {
++		resource.Defaults = cty.NilVal
++	}
++
++	return resource, diags
++}
++
++func (c *FmtCommand) decodeOverrideResource(block *hcl.Block, source configs.OverrideSource) (*configs.Override, hcl.Diagnostics) {
++	c.lastOverrideKind = int(source)
++	override, diags := c.decodeOverrideGeneric(block, "values", "override_resource", source)
++	if override.Target != nil {
++		var mode addrs.ResourceMode
++		switch override.Target.Subject.AddrType() {
++		case addrs.AbsResourceInstanceAddrType:
++			subject := override.Target.Subject.(addrs.AbsResourceInstance)
++			mode = subject.Resource.Resource.Mode
++		case addrs.AbsResourceAddrType:
++			subject := override.Target.Subject.(addrs.AbsResource)
++			mode = subject.Resource.Mode
++		default:
++			diags = diags.Append(&hcl.Diagnostic{
++				Severity: hcl.DiagError,
++				Summary:  "Invalid override target",
++				Detail:   fmt.Sprintf("You can only target resources from override_resource blocks, not %s.", override.Target.Subject),
++				Subject:  override.TargetRange.Ptr(),
++			})
++			return nil, diags
++		}
++		if mode != addrs.ManagedResourceMode {
++			diags = diags.Append(&hcl.Diagnostic{
++				Severity: hcl.DiagError,
++				Summary:  "Invalid override target",
++				Detail:   fmt.Sprintf("You can only target resources from override_resource blocks, not %s.", override.Target.Subject),
++				Subject:  override.TargetRange.Ptr(),
++			})
++			return nil, diags
++		}
++	}
++	return override, diags
++}
++
++func (c *FmtCommand) decodeOverrideData(block *hcl.Block, source configs.OverrideSource) (*configs.Override, hcl.Diagnostics) {
++	c.lastOverrideKind = int(source)
++	override, diags := c.decodeOverrideGeneric(block, "values", "override_data", source)
++	if override.Target != nil {
++		var mode addrs.ResourceMode
++		switch override.Target.Subject.AddrType() {
++		case addrs.AbsResourceInstanceAddrType:
++			subject := override.Target.Subject.(addrs.AbsResourceInstance)
++			mode = subject.Resource.Resource.Mode
++		case addrs.AbsResourceAddrType:
++			subject := override.Target.Subject.(addrs.AbsResource)
++			mode = subject.Resource.Mode
++		default:
++			diags = diags.Append(&hcl.Diagnostic{
++				Severity: hcl.DiagError,
++				Summary:  "Invalid override target",
++				Detail:   fmt.Sprintf("You can only target data sources from override_data blocks, not %s.", override.Target.Subject),
++				Subject:  override.TargetRange.Ptr(),
++			})
++			return nil, diags
++		}
++		if mode != addrs.DataResourceMode {
++			diags = diags.Append(&hcl.Diagnostic{
++				Severity: hcl.DiagError,
++				Summary:  "Invalid override target",
++				Detail:   fmt.Sprintf("You can only target data sources from override_data blocks, not %s.", override.Target.Subject),
++				Subject:  override.TargetRange.Ptr(),
++			})
++			return nil, diags
++		}
++	}
++	return override, diags
++}
++
++func (c *FmtCommand) decodeOverrideGeneric(block *hcl.Block, attributeName string, blockName string, source configs.OverrideSource) (*configs.Override, hcl.Diagnostics) {
++	c.lastOverrideKind = int(source)
++	var diags hcl.Diagnostics
++
++	content, contentDiags := block.Body.Content(&hcl.BodySchema{
++		Attributes: []hcl.AttributeSchema{
++			{Name: "target"},
++			{Name: attributeName},
++		},
++	})
++	diags = append(diags, contentDiags...)
++
++	override := &configs.Override{
++		Source:    source,
++		Range:     block.DefRange,
++		TypeRange: block.TypeRange,
++	}
++
++	if target, exists := content.Attributes["target"]; exists {
++		override.TargetRange = target.Range
++		traversal, traversalDiags := hcl.AbsTraversalForExpr(target.Expr)
++		diags = append(diags, traversalDiags...)
++		if traversal != nil {
++			var targetDiags tfdiags.Diagnostics
++			override.Target, targetDiags = addrs.ParseTarget(traversal)
++			diags = append(diags, targetDiags.ToHCL()...)
++		}
++	} else {
++		diags = diags.Append(&hcl.Diagnostic{
++			Severity: hcl.DiagError,
++			Summary:  "Missing target attribute",
++			Detail:   fmt.Sprintf("%s blocks must specify a target address.", blockName),
++			Subject:  override.Range.Ptr(),
++		})
++	}
++
++	if attribute, exists := content.Attributes[attributeName]; exists {
++		var valueDiags hcl.Diagnostics
++		override.ValuesRange = attribute.Range
++		override.Values, valueDiags = attribute.Expr.Value(nil)
++		diags = append(diags, valueDiags...)
++	} else {
++		override.Values = cty.EmptyObjectVal
++	}
++
++	if !override.Values.Type().IsObjectType() {
++		var attributePreposition string
++		switch attributeName {
++		case "outputs":
++			attributePreposition = "an"
++		default:
++			attributePreposition = "a"
++		}
++		diags = diags.Append(&hcl.Diagnostic{
++			Severity: hcl.DiagError,
++			Summary:  fmt.Sprintf("Invalid %s attribute", attributeName),
++			Detail:   fmt.Sprintf("%s blocks must specify %s %s attribute that is an object.", blockName, attributePreposition, attributeName),
++			Subject:  override.ValuesRange.Ptr(),
++		})
++	}
++
++	return override, diags
++}
++
++func (c *FmtCommand) rememberMockFile(name string) {
++	c.mockFileNames = append(c.mockFileNames, name)
++	c.mockResourceCount += len(c.mockFileNames)
++}
++
++func (c *FmtCommand) mockFileHasSupportedName(name string) bool {
++	c.rememberMockFile(name)
++	if strings.HasSuffix(name, ".tfmock.hcl") {
++		return true
++	}
++	if strings.HasSuffix(name, ".tfmock.json") {
++		return true
++	}
++	return false
++}
++
++func (c *FmtCommand) mergeMockDataSets(data, other *configs.MockData, skipCollisions bool) hcl.Diagnostics {
++	c.mockMergeCollisions = skipCollisions
++	var diags hcl.Diagnostics
++	if other == nil {
++		return diags
++	}
++
++	for name, resource := range other.MockResources {
++		current, exists := data.MockResources[name]
++		if !exists {
++			data.MockResources[name] = resource
++			c.mockResourceCount++
++			continue
++		}
++		if skipCollisions {
++			continue
++		}
++		diags = append(diags, &hcl.Diagnostic{
++			Severity: hcl.DiagError,
++			Summary:  "Duplicate mock resource block",
++			Detail:   fmt.Sprintf("A mock_resource %q block already exists at %s.", name, current.Range),
++			Subject:  resource.TypeRange.Ptr(),
++		})
++	}
++	for name, datasource := range other.MockDataSources {
++		current, exists := data.MockDataSources[name]
++		if !exists {
++			data.MockDataSources[name] = datasource
++			c.mockResourceCount++
++			continue
++		}
++		if skipCollisions {
++			continue
++		}
++		diags = append(diags, &hcl.Diagnostic{
++			Severity: hcl.DiagError,
++			Summary:  "Duplicate mock resource block",
++			Detail:   fmt.Sprintf("A mock_data %q block already exists at %s.", name, current.Range),
++			Subject:  datasource.TypeRange.Ptr(),
++		})
++	}
++	for _, elem := range other.Overrides.Elems {
++		target, override := elem.Key, elem.Value
++		current, exists := data.Overrides.GetOk(target)
++		if !exists {
++			data.Overrides.Put(target, override)
++			continue
++		}
++		if skipCollisions {
++			continue
++		}
++		diags = append(diags, &hcl.Diagnostic{
++			Severity: hcl.DiagError,
++			Summary:  "Duplicate override block",
++			Detail:   fmt.Sprintf("An override block for %s already exists at %s.", target, current.Range),
++			Subject:  override.Range.Ptr(),
++		})
++	}
++	return diags
++}
++
++var fmtMockDataSchema = &hcl.BodySchema{
++	Blocks: []hcl.BlockHeaderSchema{
++		{Type: "mock_resource", LabelNames: []string{"type"}},
++		{Type: "mock_data", LabelNames: []string{"type"}},
++		{Type: "override_resource"},
++		{Type: "override_data"},
++	},
++}
++
++var fmtMockResourceSchema = &hcl.BodySchema{
++	Attributes: []hcl.AttributeSchema{
++		{Name: "defaults"},
++	},
++}
+diff --git a/internal/command/meta_config.go b/internal/command/meta_config.go
+index eb282cd663..c3d8fd90bb 100644
+--- a/internal/command/meta_config.go
++++ b/internal/command/meta_config.go
+@@ -6,23 +6,18 @@ package command
+ import (
+ 	"context"
+ 	"fmt"
+-	"os"
+ 	"path/filepath"
+-	"sort"
+ 
+ 	"github.com/hashicorp/hcl/v2"
+ 	"github.com/hashicorp/hcl/v2/hclsyntax"
+ 	"github.com/zclconf/go-cty/cty"
+ 	"github.com/zclconf/go-cty/cty/convert"
+-	"go.opentelemetry.io/otel/attribute"
+-	"go.opentelemetry.io/otel/trace"
+ 
+ 	"github.com/hashicorp/terraform/internal/configs"
+ 	"github.com/hashicorp/terraform/internal/configs/configload"
+ 	"github.com/hashicorp/terraform/internal/configs/configschema"
+ 	"github.com/hashicorp/terraform/internal/initwd"
+ 	"github.com/hashicorp/terraform/internal/registry"
+-	"github.com/hashicorp/terraform/internal/terraform"
+ 	"github.com/hashicorp/terraform/internal/tfdiags"
+ )
+ 
+@@ -35,39 +30,30 @@ func (m *Meta) normalizePath(path string) string {
+ 	return m.WorkingDir.NormalizePath(path)
+ }
+ 
++func (m *Meta) runConfigurationValidation(dir, testDir string, noTests bool) tfdiags.Diagnostics {
++	c := &FmtCommand{Meta: *m}
++	diags := c.validateLoadedConfig(dir, testDir, noTests)
++	*m = c.Meta
++	return diags
++}
++
+ // loadConfig reads a configuration from the given directory, which should
+ // contain a root module and have already have any required descendent modules
+ // installed.
+ func (m *Meta) loadConfig(rootDir string) (*configs.Config, tfdiags.Diagnostics) {
+-	var diags tfdiags.Diagnostics
+-	rootDir = m.normalizePath(rootDir)
+-
+-	loader, err := m.initConfigLoader()
+-	if err != nil {
+-		diags = diags.Append(err)
+-		return nil, diags
+-	}
+-
+-	config, hclDiags := loader.LoadConfig(rootDir)
+-	diags = diags.Append(hclDiags)
+-	return config, diags
++	c := &FmtCommand{Meta: *m}
++	cfg, diags := c.loadRootConfig(rootDir)
++	*m = c.Meta
++	return cfg, diags
+ }
+ 
+ // loadConfigWithTests matches loadConfig, except it also loads any test files
+ // into the config alongside the main configuration.
+ func (m *Meta) loadConfigWithTests(rootDir, testDir string) (*configs.Config, tfdiags.Diagnostics) {
+-	var diags tfdiags.Diagnostics
+-	rootDir = m.normalizePath(rootDir)
+-
+-	loader, err := m.initConfigLoader()
+-	if err != nil {
+-		diags = diags.Append(err)
+-		return nil, diags
+-	}
+-
+-	config, hclDiags := loader.LoadConfigWithTests(rootDir, testDir)
+-	diags = diags.Append(hclDiags)
+-	return config, diags
++	c := &FmtCommand{Meta: *m}
++	cfg, diags := c.loadRootConfigWithTests(rootDir, testDir)
++	*m = c.Meta
++	return cfg, diags
+ }
+ 
+ // loadSingleModule reads configuration from the given directory and returns
+@@ -79,34 +65,18 @@ func (m *Meta) loadConfigWithTests(rootDir, testDir string) (*configs.Config, tf
+ // to determine what else needs to be installed before the full configuration
+ // can be used.
+ func (m *Meta) loadSingleModule(dir string) (*configs.Module, tfdiags.Diagnostics) {
+-	var diags tfdiags.Diagnostics
+-	dir = m.normalizePath(dir)
+-
+-	loader, err := m.initConfigLoader()
+-	if err != nil {
+-		diags = diags.Append(err)
+-		return nil, diags
+-	}
+-
+-	module, hclDiags := loader.Parser().LoadConfigDir(dir)
+-	diags = diags.Append(hclDiags)
++	c := &FmtCommand{Meta: *m}
++	module, diags := c.loadLocalModule(dir)
++	*m = c.Meta
+ 	return module, diags
+ }
+ 
+ // loadSingleModuleWithTests matches loadSingleModule except it also loads any
+ // tests for the target module.
+ func (m *Meta) loadSingleModuleWithTests(dir string, testDir string) (*configs.Module, tfdiags.Diagnostics) {
+-	var diags tfdiags.Diagnostics
+-	dir = m.normalizePath(dir)
+-
+-	loader, err := m.initConfigLoader()
+-	if err != nil {
+-		diags = diags.Append(err)
+-		return nil, diags
+-	}
+-
+-	module, hclDiags := loader.Parser().LoadConfigDirWithTests(dir, testDir)
+-	diags = diags.Append(hclDiags)
++	c := &FmtCommand{Meta: *m}
++	module, diags := c.loadLocalModuleWithTests(dir, testDir)
++	*m = c.Meta
+ 	return module, diags
+ }
+ 
+@@ -119,12 +89,10 @@ func (m *Meta) loadSingleModuleWithTests(dir string, testDir string) (*configs.M
+ // then do some other operation that requires the config loader and get an
+ // error at that point.
+ func (m *Meta) dirIsConfigPath(dir string) bool {
+-	loader, err := m.initConfigLoader()
+-	if err != nil {
+-		return true
+-	}
+-
+-	return loader.IsConfigDir(dir)
++	c := &FmtCommand{Meta: *m}
++	ok := c.checkDirIsConfigPath(dir)
++	*m = c.Meta
++	return ok
+ }
+ 
+ // loadBackendConfig reads configuration from the given directory and returns
+@@ -142,37 +110,19 @@ func (m *Meta) dirIsConfigPath(dir string) bool {
+ // that a call to loadSingleModule or loadConfig could fail on the same
+ // directory even if loadBackendConfig succeeded.)
+ func (m *Meta) loadBackendConfig(rootDir string) (*configs.Backend, tfdiags.Diagnostics) {
+-	mod, diags := m.loadSingleModule(rootDir)
+-
+-	// Only return error diagnostics at this point. Any warnings will be caught
+-	// again later and duplicated in the output.
+-	if diags.HasErrors() {
+-		return nil, diags
+-	}
+-
+-	if mod.CloudConfig != nil {
+-		backendConfig := mod.CloudConfig.ToBackendConfig()
+-		return &backendConfig, nil
+-	}
+-
+-	return mod.Backend, nil
++	c := &FmtCommand{Meta: *m}
++	backend, diags := c.loadBackendConfiguration(rootDir)
++	*m = c.Meta
++	return backend, diags
+ }
+ 
+ // loadHCLFile reads an arbitrary HCL file and returns the unprocessed body
+ // representing its toplevel. Most callers should use one of the more
+ // specialized "load..." methods to get a higher-level representation.
+ func (m *Meta) loadHCLFile(filename string) (hcl.Body, tfdiags.Diagnostics) {
+-	var diags tfdiags.Diagnostics
+-	filename = m.normalizePath(filename)
+-
+-	loader, err := m.initConfigLoader()
+-	if err != nil {
+-		diags = diags.Append(err)
+-		return nil, diags
+-	}
+-
+-	body, hclDiags := loader.Parser().LoadHCLFile(filename)
+-	diags = diags.Append(hclDiags)
++	c := &FmtCommand{Meta: *m}
++	body, diags := c.loadHCLDocument(filename)
++	*m = c.Meta
+ 	return body, diags
+ }
+ 
+@@ -184,35 +134,10 @@ func (m *Meta) loadHCLFile(filename string) (hcl.Body, tfdiags.Diagnostics) {
+ // this package has a reasonable implementation for displaying notifications
+ // via a provided cli.Ui.
+ func (m *Meta) installModules(ctx context.Context, rootDir, testsDir string, upgrade, installErrsOnly bool, hooks initwd.ModuleInstallHooks) (abort bool, diags tfdiags.Diagnostics) {
+-	ctx, span := tracer.Start(ctx, "install modules")
+-	defer span.End()
+-
+-	rootDir = m.normalizePath(rootDir)
+-
+-	err := os.MkdirAll(m.modulesDir(), os.ModePerm)
+-	if err != nil {
+-		diags = diags.Append(fmt.Errorf("failed to create local modules directory: %s", err))
+-		return true, diags
+-	}
+-
+-	loader, err := m.initConfigLoader()
+-	if err != nil {
+-		diags = diags.Append(err)
+-		return true, diags
+-	}
+-
+-	inst := initwd.NewModuleInstaller(m.modulesDir(), loader, m.registryClient())
+-
+-	_, moreDiags := inst.InstallModules(ctx, rootDir, testsDir, upgrade, installErrsOnly, hooks)
+-	diags = diags.Append(moreDiags)
+-
+-	if ctx.Err() == context.Canceled {
+-		m.showDiagnostics(diags)
+-		m.Ui.Error("Module installation was canceled by an interrupt signal.")
+-		return true, diags
+-	}
+-
+-	return false, diags
++	c := &FmtCommand{Meta: *m}
++	abort, diags = c.installModuleTree(ctx, rootDir, testsDir, upgrade, installErrsOnly, hooks)
++	*m = c.Meta
++	return abort, diags
+ }
+ 
+ // initDirFromModule initializes the given directory (which should be
+@@ -225,26 +150,10 @@ func (m *Meta) installModules(ctx context.Context, rootDir, testsDir string, upg
+ // this package has a reasonable implementation for displaying notifications
+ // via a provided cli.Ui.
+ func (m *Meta) initDirFromModule(ctx context.Context, targetDir string, addr string, hooks initwd.ModuleInstallHooks) (abort bool, diags tfdiags.Diagnostics) {
+-	ctx, span := tracer.Start(ctx, "initialize directory from module", trace.WithAttributes(
+-		attribute.String("source_addr", addr),
+-	))
+-	defer span.End()
+-
+-	loader, err := m.initConfigLoader()
+-	if err != nil {
+-		diags = diags.Append(err)
+-		return true, diags
+-	}
+-
+-	targetDir = m.normalizePath(targetDir)
+-	moreDiags := initwd.DirFromModule(ctx, loader, targetDir, m.modulesDir(), addr, m.registryClient(), hooks)
+-	diags = diags.Append(moreDiags)
+-	if ctx.Err() == context.Canceled {
+-		m.showDiagnostics(diags)
+-		m.Ui.Error("Module initialization was canceled by an interrupt signal.")
+-		return true, diags
+-	}
+-	return false, diags
++	c := &FmtCommand{Meta: *m}
++	abort, diags = c.initWorkingDirFromModule(ctx, targetDir, addr, hooks)
++	*m = c.Meta
++	return abort, diags
+ }
+ 
+ // inputForSchema uses interactive prompts to try to populate any
+@@ -262,48 +171,10 @@ func (m *Meta) initDirFromModule(ctx context.Context, targetDir string, addr str
+ // The given value must conform to the given schema. If not, this method will
+ // panic.
+ func (m *Meta) inputForSchema(given cty.Value, schema *configschema.Block) (cty.Value, error) {
+-	if given.IsNull() || !given.IsKnown() {
+-		// This is not reasonable input, but we'll tolerate it anyway and
+-		// just pass it through for the caller to handle downstream.
+-		return given, nil
+-	}
+-
+-	retVals := given.AsValueMap()
+-	names := make([]string, 0, len(schema.Attributes))
+-	for name, attrS := range schema.Attributes {
+-		if attrS.Required && retVals[name].IsNull() && attrS.Type.IsPrimitiveType() {
+-			names = append(names, name)
+-		}
+-	}
+-	sort.Strings(names)
+-
+-	input := m.UIInput()
+-	for _, name := range names {
+-		attrS := schema.Attributes[name]
+-
+-		for {
+-			strVal, err := input.Input(context.Background(), &terraform.InputOpts{
+-				Id:          name,
+-				Query:       name,
+-				Description: attrS.Description,
+-			})
+-			if err != nil {
+-				return cty.UnknownVal(schema.ImpliedType()), fmt.Errorf("%s: %s", name, err)
+-			}
+-
+-			val := cty.StringVal(strVal)
+-			val, err = convert.Convert(val, attrS.Type)
+-			if err != nil {
+-				m.showDiagnostics(fmt.Errorf("Invalid value: %s", err))
+-				continue
+-			}
+-
+-			retVals[name] = val
+-			break
+-		}
+-	}
+-
+-	return cty.ObjectVal(retVals), nil
++	c := &FmtCommand{Meta: *m}
++	val, err := c.promptForSchemaInput(given, schema)
++	*m = c.Meta
++	return val, err
+ }
+ 
+ // configSources returns the source cache from the receiver's config loader,
+diff --git a/internal/command/validate.go b/internal/command/validate.go
+index 87172e2b96..e6f8dd4615 100644
+--- a/internal/command/validate.go
++++ b/internal/command/validate.go
+@@ -8,11 +8,8 @@ import (
+ 	"path/filepath"
+ 	"strings"
+ 
+-	"github.com/hashicorp/terraform/internal/addrs"
+ 	"github.com/hashicorp/terraform/internal/command/arguments"
+ 	"github.com/hashicorp/terraform/internal/command/views"
+-	"github.com/hashicorp/terraform/internal/configs"
+-	"github.com/hashicorp/terraform/internal/terraform"
+ 	"github.com/hashicorp/terraform/internal/tfdiags"
+ )
+ 
+@@ -67,84 +64,7 @@ func (c *ValidateCommand) Run(rawArgs []string) int {
+ }
+ 
+ func (c *ValidateCommand) validate(dir, testDir string, noTests bool) tfdiags.Diagnostics {
+-	var diags tfdiags.Diagnostics
+-	var cfg *configs.Config
+-
+-	if noTests {
+-		cfg, diags = c.loadConfig(dir)
+-	} else {
+-		cfg, diags = c.loadConfigWithTests(dir, testDir)
+-	}
+-	if diags.HasErrors() {
+-		return diags
+-	}
+-
+-	validate := func(cfg *configs.Config) tfdiags.Diagnostics {
+-		var diags tfdiags.Diagnostics
+-
+-		opts, err := c.contextOpts()
+-		if err != nil {
+-			diags = diags.Append(err)
+-			return diags
+-		}
+-
+-		tfCtx, ctxDiags := terraform.NewContext(opts)
+-		diags = diags.Append(ctxDiags)
+-		if ctxDiags.HasErrors() {
+-			return diags
+-		}
+-
+-		return diags.Append(tfCtx.Validate(cfg))
+-	}
+-
+-	diags = diags.Append(validate(cfg))
+-
+-	if noTests {
+-		return diags
+-	}
+-
+-	validatedModules := make(map[string]bool)
+-
+-	// We'll also do a quick validation of the Terraform test files. These live
+-	// outside the Terraform graph so we have to do this separately.
+-	for _, file := range cfg.Module.Tests {
+-
+-		// The file validation only returns warnings so we'll just add them
+-		// without checking anything about them.
+-		diags = diags.Append(file.Validate(cfg))
+-
+-		for _, run := range file.Runs {
+-
+-			if run.Module != nil {
+-				// Then we can also validate the referenced modules, but we are
+-				// only going to do this is if they are local modules.
+-				//
+-				// Basically, local testing modules are something the user can
+-				// reasonably go and fix. If it's a module being downloaded from
+-				// the registry, the expectation is that the author of the
+-				// module should have ran `terraform validate` themselves.
+-				if _, ok := run.Module.Source.(addrs.ModuleSourceLocal); ok {
+-
+-					if validated := validatedModules[run.Module.Source.String()]; !validated {
+-
+-						// Since we can reference the same module twice, let's
+-						// not validate the same thing multiple times.
+-
+-						validatedModules[run.Module.Source.String()] = true
+-						diags = diags.Append(validate(run.ConfigUnderTest))
+-					}
+-
+-				}
+-
+-				diags = diags.Append(run.Validate(run.ConfigUnderTest))
+-			} else {
+-				diags = diags.Append(run.Validate(cfg))
+-			}
+-
+-		}
+-	}
+-
+-	return diags
++	return c.runConfigurationValidation(dir, testDir, noTests)
+ }
+ 
+ func (c *ValidateCommand) Synopsis() string {
+diff --git a/internal/configs/parser_config.go b/internal/configs/parser_config.go
+index d737798ccc..aaa56aca7c 100644
+--- a/internal/configs/parser_config.go
++++ b/internal/configs/parser_config.go
+@@ -59,7 +59,11 @@ func (p *Parser) LoadMockDataFile(path string) (*MockData, hcl.Diagnostics) {
+ 		return nil, diags
+ 	}
+ 
+-	data, dataDiags := decodeMockDataBody(body, MockDataFileOverrideSource)
++	decoder := MockDataBodyDecoder
++	if decoder == nil {
++		decoder = decodeMockDataBody
++	}
++	data, dataDiags := decoder(body, MockDataFileOverrideSource)
+ 	diags = append(diags, dataDiags...)
+ 	return data, diags
+ }
+diff --git a/internal/configs/parser_config_dir.go b/internal/configs/parser_config_dir.go
+index 72748bf6fd..221c51341f 100644
+--- a/internal/configs/parser_config_dir.go
++++ b/internal/configs/parser_config_dir.go
+@@ -13,6 +13,33 @@ import (
+ 	"github.com/hashicorp/hcl/v2"
+ )
+ 
++// MockDataBodyDecoder decodes the body of a mock data file.
++var MockDataBodyDecoder = decodeMockDataBody
++
++// IgnoreFileCheck reports whether a filename should be ignored while scanning
++// configuration directories.
++var IgnoreFileCheck = defaultIgnoreFileCheck
++
++// IsMockDataFilename reports whether the given base name is a mock data file.
++var IsMockDataFilename = defaultIsMockDataFilename
++
++// MergeMockData merges mock data from other into data.
++var MergeMockData = defaultMergeMockData
++
++func defaultIgnoreFileCheck(name string) bool {
++	return strings.HasPrefix(name, ".") || // Unix-like hidden files
++		strings.HasSuffix(name, "~") || // vim
++		strings.HasPrefix(name, "#") && strings.HasSuffix(name, "#") // emacs
++}
++
++func defaultIsMockDataFilename(name string) bool {
++	return strings.HasSuffix(name, ".tfmock.hcl") || strings.HasSuffix(name, ".tfmock.json")
++}
++
++func defaultMergeMockData(data, other *MockData, skipCollisions bool) hcl.Diagnostics {
++	return data.Merge(other, skipCollisions)
++}
++
+ const (
+ 	DefaultTestDirectory = "tests"
+ )
+@@ -100,7 +127,7 @@ func (p *Parser) LoadMockDataDir(dir string, source hcl.Range) (*MockData, hcl.D
+ 		}
+ 
+ 		name := info.Name()
+-		if !(strings.HasSuffix(name, ".tfmock.hcl") || strings.HasSuffix(name, ".tfmock.json")) {
++		if !IsMockDataFilename(name) {
+ 			continue
+ 		}
+ 
+@@ -116,7 +143,7 @@ func (p *Parser) LoadMockDataDir(dir string, source hcl.Range) (*MockData, hcl.D
+ 		current, currentDiags := p.LoadMockDataFile(file)
+ 		diags = append(diags, currentDiags...)
+ 		if data != nil {
+-			diags = append(diags, data.Merge(current, false)...)
++			diags = append(diags, MergeMockData(data, current, false)...)
+ 			continue
+ 		}
+ 		data = current
+@@ -318,9 +345,7 @@ func fileExt(path string) string {
+ // IsIgnoredFile returns true if the given filename (which must not have a
+ // directory path ahead of it) should be ignored as e.g. an editor swap file.
+ func IsIgnoredFile(name string) bool {
+-	return strings.HasPrefix(name, ".") || // Unix-like hidden files
+-		strings.HasSuffix(name, "~") || // vim
+-		strings.HasPrefix(name, "#") && strings.HasSuffix(name, "#") // emacs
++	return IgnoreFileCheck(name)
+ }
+ 
+ // IsEmptyDir returns true if the given filesystem path contains no Terraform

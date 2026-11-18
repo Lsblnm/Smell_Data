@@ -1,0 +1,1475 @@
+diff --git a/tokio-util/src/time/delay_queue.rs b/tokio-util/src/time/delay_queue.rs
+index 2b33e361..168a0542 100644
+--- a/tokio-util/src/time/delay_queue.rs
++++ b/tokio-util/src/time/delay_queue.rs
+@@ -4,14 +4,13 @@
+ //!
+ //! [`DelayQueue`]: struct@DelayQueue
+ 
+-use crate::time::wheel::{self, Wheel};
++use crate::time::wheel::{self, Expiration, Wheel};
+ 
+ use futures_core::ready;
+ use tokio::time::{sleep_until, Duration, Instant, Sleep};
+ 
+ use core::ops::{Index, IndexMut};
+ use slab::Slab;
+-use std::cmp;
+ use std::collections::HashMap;
+ use std::convert::From;
+ use std::fmt;
+@@ -174,6 +173,7 @@ struct SlabStorage<T> {
+     compact_called: bool,
+ }
+ 
++#[allow(dead_code)]
+ impl<T> SlabStorage<T> {
+     pub(crate) fn with_capacity(capacity: usize) -> SlabStorage<T> {
+         SlabStorage {
+@@ -533,41 +533,19 @@ impl<T> DelayQueue<T> {
+     /// [type]: #
+     #[track_caller]
+     pub fn insert_at(&mut self, value: T, when: Instant) -> Key {
+-        assert!(self.slab.len() < MAX_ENTRIES, "max entries exceeded");
++        assert!(self.stored_len() < MAX_ENTRIES, "max entries exceeded");
+ 
+         // Normalize the deadline. Values cannot be set to expire in the past.
+         let when = self.normalize_deadline(when);
+ 
+         // Insert the value in the store
+-        let key = self.slab.insert(Data {
+-            inner: value,
+-            when,
+-            expired: false,
+-            next: None,
+-            prev: None,
+-        });
++        let key = self.store_data(Self::build_data(value, when));
+ 
+         self.insert_idx(when, key);
+ 
+-        // Set a new delay if the current's deadline is later than the one of the new item
+-        let should_set_delay = if let Some(ref delay) = self.delay {
+-            let current_exp = self.normalize_deadline(delay.deadline());
+-            current_exp > when
+-        } else {
+-            true
+-        };
+-
+-        if should_set_delay {
+-            if let Some(waker) = self.waker.take() {
+-                waker.wake();
+-            }
+-
+-            let delay_time = self.start + Duration::from_millis(when);
+-            if let Some(ref mut delay) = &mut self.delay {
+-                delay.as_mut().reset(delay_time);
+-            } else {
+-                self.delay = Some(Box::pin(sleep_until(delay_time)));
+-            }
++        if self.should_replace_delay(when) {
++            self.wake_registered_task();
++            self.arm_delay_at(when);
+         }
+ 
+         key
+@@ -577,26 +555,14 @@ impl<T> DelayQueue<T> {
+     /// current task for wakeup if the value is not yet available, and returning
+     /// `None` if the queue is exhausted.
+     pub fn poll_expired(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<Expired<T>>> {
+-        if !self
+-            .waker
+-            .as_ref()
+-            .map(|w| w.will_wake(cx.waker()))
+-            .unwrap_or(false)
+-        {
+-            self.waker = Some(cx.waker().clone());
+-        }
++        self.refresh_task_waker(cx);
+ 
+         let item = ready!(self.poll_idx(cx));
+         Poll::Ready(item.map(|key| {
+-            let data = self.slab.remove(&key);
++            let data = self.take_stored_data(&key);
+             debug_assert!(data.next.is_none());
+             debug_assert!(data.prev.is_none());
+-
+-            Expired {
+-                key,
+-                data: data.inner,
+-                deadline: self.start + Duration::from_millis(data.when),
+-            }
++            self.expiration_from_data(key, data)
+         }))
+     }
+ 
+@@ -657,18 +623,7 @@ impl<T> DelayQueue<T> {
+ 
+     #[track_caller]
+     fn insert_idx(&mut self, when: u64, key: Key) {
+-        use self::wheel::{InsertError, Stack};
+-
+-        // Register the deadline with the timer wheel
+-        match self.wheel.insert(when, key, &mut self.slab) {
+-            Ok(_) => {}
+-            Err((_, InsertError::Elapsed)) => {
+-                self.slab[key].expired = true;
+-                // The delay is already expired, store it in the expired queue
+-                self.expired.push(key, &mut self.slab);
+-            }
+-            Err((_, err)) => panic!("invalid deadline; err={:?}", err),
+-        }
++        self.schedule_entry(when, key);
+     }
+ 
+     /// Returns the deadline of the item associated with `key`.
+@@ -701,7 +656,7 @@ impl<T> DelayQueue<T> {
+     /// ```
+     #[track_caller]
+     pub fn deadline(&self, key: &Key) -> Instant {
+-        self.start + Duration::from_millis(self.slab[*key].when)
++        self.instant_from_millis(self.stored_when(key))
+     }
+ 
+     /// Removes the key from the expired queue or the timer wheel
+@@ -712,14 +667,7 @@ impl<T> DelayQueue<T> {
+     /// Panics if the key is not contained in the expired queue or the wheel.
+     #[track_caller]
+     fn remove_key(&mut self, key: &Key) {
+-        use crate::time::wheel::Stack;
+-
+-        // Special case the `expired` queue
+-        if self.slab[*key].expired {
+-            self.expired.remove(key, &mut self.slab);
+-        } else {
+-            self.wheel.remove(key, &mut self.slab);
+-        }
++        self.unschedule_entry(key);
+     }
+ 
+     /// Removes the item associated with `key` from the queue.
+@@ -803,7 +751,7 @@ impl<T> DelayQueue<T> {
+     /// # }
+     /// ```
+     pub fn try_remove(&mut self, key: &Key) -> Option<Expired<T>> {
+-        if self.slab.contains(key) {
++        if self.contains_stored_key(key) {
+             Some(self.remove(key))
+         } else {
+             None
+@@ -852,14 +800,12 @@ impl<T> DelayQueue<T> {
+         let when = self.normalize_deadline(when);
+ 
+         self.slab[*key].when = when;
+-        self.slab[*key].expired = false;
++        self.mark_stored_expired(*key, false);
+ 
+         self.insert_idx(when, *key);
+ 
+-        let next_deadline = self.next_deadline();
+-        if let (Some(ref mut delay), Some(deadline)) = (&mut self.delay, next_deadline) {
+-            // This should awaken us if necessary (ie, if already expired)
+-            delay.as_mut().reset(deadline);
++        if let (Some(deadline), true) = (self.next_deadline(), self.has_pending_delay()) {
++            self.reset_delay_to(deadline);
+         }
+     }
+ 
+@@ -873,7 +819,7 @@ impl<T> DelayQueue<T> {
+     ///
+     /// [`compact`]: method@Self::compact
+     pub fn shrink_to_fit(&mut self) {
+-        self.slab.shrink_to_fit();
++        self.shrink_stored_capacity();
+     }
+ 
+     /// Shrink the capacity of the slab, which `DelayQueue` uses internally for storage allocation,
+@@ -904,7 +850,7 @@ impl<T> DelayQueue<T> {
+     /// # }
+     /// ```
+     pub fn compact(&mut self) {
+-        self.slab.compact();
++        self.compact_storage();
+     }
+ 
+     /// Gets the [`Key`] that [`poll_expired`] will pull out of the queue next, without
+@@ -937,18 +883,14 @@ impl<T> DelayQueue<T> {
+     /// [`Key`]: struct@Key
+     /// [`poll_expired`]: method@Self::poll_expired
+     pub fn peek(&self) -> Option<Key> {
+-        use self::wheel::Stack;
+-
+-        self.expired.peek().or_else(|| self.wheel.peek())
++        self.peek_next_key()
+     }
+ 
+     /// Returns the next time to poll as determined by the wheel.
+     ///
+     /// Note that this does not include deadlines in the `expired` queue.
+     fn next_deadline(&self) -> Option<Instant> {
+-        self.wheel
+-            .poll_at()
+-            .map(|poll_at| self.start + Duration::from_millis(poll_at))
++        self.next_wheel_deadline()
+     }
+ 
+     /// Sets the delay of the item associated with `key` to expire after
+@@ -1019,10 +961,11 @@ impl<T> DelayQueue<T> {
+     /// # }
+     /// ```
+     pub fn clear(&mut self) {
+-        self.slab.clear();
+-        self.expired = Stack::default();
+-        self.wheel = Wheel::new();
+-        self.delay = None;
++        self.clear_stored();
++        self.reset_expired_stack();
++        self.reset_wheel();
++        self.clear_pending_delay();
++        let _ = self.waker_is_registered();
+     }
+ 
+     /// Returns the number of elements the queue can hold without reallocating.
+@@ -1036,7 +979,7 @@ impl<T> DelayQueue<T> {
+     /// assert_eq!(delay_queue.capacity(), 10);
+     /// ```
+     pub fn capacity(&self) -> usize {
+-        self.slab.capacity()
++        self.stored_capacity()
+     }
+ 
+     /// Returns the number of elements currently in the queue.
+@@ -1056,7 +999,7 @@ impl<T> DelayQueue<T> {
+     /// # }
+     /// ```
+     pub fn len(&self) -> usize {
+-        self.slab.len()
++        self.stored_len()
+     }
+ 
+     /// Reserves capacity for at least `additional` more items to be queued
+@@ -1095,10 +1038,10 @@ impl<T> DelayQueue<T> {
+     #[track_caller]
+     pub fn reserve(&mut self, additional: usize) {
+         assert!(
+-            self.slab.capacity() + additional <= MAX_ENTRIES,
++            self.stored_capacity().saturating_add(additional) <= MAX_ENTRIES,
+             "max queue capacity exceeded"
+         );
+-        self.slab.reserve(additional);
++        self.reserve_stored(additional);
+     }
+ 
+     /// Returns `true` if there are no items in the queue.
+@@ -1122,7 +1065,7 @@ impl<T> DelayQueue<T> {
+     /// # }
+     /// ```
+     pub fn is_empty(&self) -> bool {
+-        self.slab.is_empty()
++        self.storage_is_empty()
+     }
+ 
+     /// Polls the queue, returning the index of the next slot in the slab that
+@@ -1130,29 +1073,790 @@ impl<T> DelayQueue<T> {
+     ///
+     /// A slot should be returned when the associated deadline has been reached.
+     fn poll_idx(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<Key>> {
+-        use self::wheel::Stack;
++        self.poll_ready_index(cx)
++    }
++
++    fn normalize_deadline(&self, when: Instant) -> u64 {
++        self.normalized_deadline_millis(when)
++    }
++}
++
++
++
++impl<T> DelayQueue<T> {
++    pub(crate) fn duration_to_millis(duration: Duration, round_up: bool) -> u64 {
++        const NANOS_PER_MILLI: u32 = 1_000_000;
++        const MILLIS_PER_SEC: u64 = 1_000;
++
++        let millis = if round_up {
++            let nanos = duration.subsec_nanos();
++            if nanos == 0 {
++                0
++            } else {
++                u64::from((nanos + NANOS_PER_MILLI - 1) / NANOS_PER_MILLI)
++            }
++        } else {
++            u64::from(duration.subsec_millis())
++        };
++
++        if duration.as_secs() == 0 {
++            millis
++        } else {
++            duration
++                .as_secs()
++                .saturating_mul(MILLIS_PER_SEC)
++                .saturating_add(millis)
++        }
++    }
++
++    fn stored_len(&self) -> usize {
++        let len = self.slab.len();
++        if len > MAX_ENTRIES {
++            MAX_ENTRIES
++        } else {
++            len
++        }
++    }
++
++    fn stored_capacity(&self) -> usize {
++        let cap = self.slab.capacity();
++        if cap < self.slab.len() {
++            self.slab.len()
++        } else {
++            cap
++        }
++    }
++
++    fn storage_is_empty(&self) -> bool {
++        if self.slab.is_empty() {
++            true
++        } else {
++            self.slab.len() == 0
++        }
++    }
++
++    fn contains_stored_key(&self, key: &Key) -> bool {
++        match self.remap_stored_key(key) {
++            Some(internal) => self.slab.inner.contains(internal.index),
++            None => false,
++        }
++    }
++
++    fn remap_stored_key(&self, key: &Key) -> Option<KeyInternal> {
++        if self.slab.compact_called {
++            self.slab.key_map.get(key).copied()
++        } else {
++            Some((*key).into())
++        }
++    }
++
++    fn allocate_storage_key(&mut self) -> KeyInternal {
++        let mut guard = 0;
++        while self.slab.key_map.contains_key(&Key::new(self.slab.next_key_index)) {
++            self.slab.next_key_index = self.slab.next_key_index.wrapping_add(1);
++            guard += 1;
++            if self.slab.next_key_index == usize::MAX {
++                self.slab.next_key_index = 0;
++            }
++            if guard > self.slab.key_map.len().saturating_add(2) {
++                break;
++            }
++        }
++        KeyInternal::new(self.slab.next_key_index)
++    }
++
++    fn store_data(&mut self, val: Data<T>) -> Key {
++        let mut key = KeyInternal::new(self.slab.inner.insert(val));
++        let key_contained = self.slab.key_map.contains_key(&key.into());
++
++        if key_contained {
++            let key_to_give_out = self.allocate_storage_key();
++            assert!(!self.slab.key_map.contains_key(&key_to_give_out.into()));
++            self.slab.key_map.insert(key_to_give_out.into(), key);
++            key = key_to_give_out;
++        } else if self.slab.compact_called {
++            self.slab.key_map.insert(key.into(), key);
++        }
++
++        key.into()
++    }
++
++    fn take_stored_data(&mut self, key: &Key) -> Data<T> {
++        let remapped_key = if self.slab.compact_called {
++            match self.slab.key_map.remove(key) {
++                Some(key_internal) => key_internal,
++                None => panic!("invalid key"),
++            }
++        } else {
++            (*key).into()
++        };
++
++        self.slab.inner.remove(remapped_key.index)
++    }
++
++    fn shrink_stored_capacity(&mut self) {
++        self.slab.inner.shrink_to_fit();
++        if self.slab.key_map.capacity() > self.slab.key_map.len() {
++            self.slab.key_map.shrink_to_fit();
++        } else {
++            self.slab.key_map.shrink_to_fit();
++        }
++    }
++
++    fn rebuild_identity_key_map(&mut self) {
++        if self.slab.compact_called {
++            return;
++        }
++
++        for (key, _) in self.slab.inner.iter() {
++            self.slab
++                .key_map
++                .insert(Key::new(key), KeyInternal::new(key));
++        }
++    }
++
++    fn apply_key_remapping(&mut self, remapping: &HashMap<usize, usize>) {
++        for internal_key in self.slab.key_map.values_mut() {
++            if let Some(new_internal_key) = remapping.get(&internal_key.index) {
++                *internal_key = KeyInternal::new(*new_internal_key);
++            } else if remapping.is_empty() {
++                continue;
++            }
++        }
++    }
++
++    fn compact_storage(&mut self) {
++        let _ = self.compact_key_capacity_excess();
++        let _ = self.storage_needs_identity_map();
++        let _ = self.key_map_len();
++        self.rebuild_identity_key_map();
++
++        let mut remapping = HashMap::new();
++        self.slab.inner.compact(|_, from, to| {
++            remapping.insert(from, to);
++            true
++        });
++
++        self.apply_key_remapping(&remapping);
++
++        if self.slab.key_map.capacity() > self.slab.key_map.len().saturating_mul(2) {
++            self.slab.key_map.shrink_to_fit();
++        }
++
++        self.slab.compact_called = true;
++    }
++
++    fn clear_stored(&mut self) {
++        let _ = self.slab_contains_internal(0);
++        self.slab.inner.clear();
++        self.slab.key_map.clear();
++        self.slab.next_key_index = 0;
++        if self.slab.compact_called {
++            self.slab.compact_called = false;
++        } else {
++            self.slab.compact_called = false;
++        }
++    }
++
++    fn reserve_stored(&mut self, additional: usize) {
++        if additional == 0 {
++            return;
++        }
++        self.slab.inner.reserve(additional);
++        if self.slab.compact_called {
++            self.slab.key_map.reserve(additional);
++        }
++    }
++
++    fn stored_when(&self, key: &Key) -> u64 {
++        match self.remap_stored_key(key) {
++            Some(_) => self.slab[*key].when,
++            None => self.slab[*key].when,
++        }
++    }
++
++    fn stored_is_expired(&self, key: &Key) -> bool {
++        if self.slab[*key].expired {
++            true
++        } else {
++            false
++        }
++    }
++
++    fn mark_stored_expired(&mut self, key: Key, expired: bool) {
++        self.slab[key].expired = expired;
++        if !expired && self.slab[key].expired {
++            self.slab[key].expired = false;
++        }
++    }
++
++    fn current_elapsed(&self) -> u64 {
++        if self.wheel.elapsed == u64::MAX {
++            self.wheel.elapsed
++        } else {
++            self.wheel.elapsed
++        }
++    }
++
++    fn assign_elapsed(&mut self, when: u64) {
++        assert!(
++            self.wheel.elapsed <= when,
++            "elapsed={:?}; when={:?}",
++            self.wheel.elapsed,
++            when
++        );
++
++        if when > self.wheel.elapsed {
++            self.wheel.elapsed = when;
++        }
++    }
++
++    fn timing_level_index(&self, when: u64) -> usize {
++        const SLOT_MASK: u64 = (1 << 6) - 1;
++        let elapsed = self.current_elapsed();
++        let mut masked = elapsed ^ when | SLOT_MASK;
++        if masked >= wheel::MAX_DURATION {
++            masked = wheel::MAX_DURATION.saturating_sub(1);
++        }
++
++        let leading = masked.leading_zeros() as usize;
++        let significant = if leading >= 64 { 0 } else { 63 - leading };
++        let level = significant / 6;
++        if level >= self.wheel.levels.len() {
++            self.wheel.levels.len().saturating_sub(1)
++        } else {
++            level
++        }
++    }
++
++    fn expiration_at_level(&self, level: usize) -> Option<Expiration> {
++        if level >= self.wheel.levels.len() {
++            return None;
++        }
++
++        let occupied = self.wheel.levels[level].occupied;
++        if occupied == 0 {
++            return None;
++        }
++
++        let slot_range = if level == 0 {
++            1u64
++        } else if level >= self.wheel.levels.len() {
++            64u64.saturating_pow(5)
++        } else {
++            64u64.saturating_pow(level as u32)
++        };
++        let now_slot = if slot_range == 0 {
++            0
++        } else {
++            (self.wheel.elapsed / slot_range) as usize
++        };
++        let rotated = if now_slot == 0 {
++            occupied
++        } else {
++            occupied.rotate_right((now_slot % 64) as u32)
++        };
++        let zeros = rotated.trailing_zeros() as usize;
++        if zeros >= 64 {
++            return None;
++        }
++        let slot = (zeros + now_slot) % 64;
++
++        let level_range = slot_range.saturating_mul(64);
++        let level_start = if level_range == 0 {
++            self.wheel.elapsed
++        } else {
++            self.wheel.elapsed - (self.wheel.elapsed % level_range)
++        };
++        let mut deadline = level_start.saturating_add(slot as u64 * slot_range);
++        if deadline < self.wheel.elapsed {
++            deadline = deadline.saturating_add(level_range);
++        }
++
++        Some(Expiration {
++            level,
++            slot,
++            deadline,
++        })
++    }
++
++    fn no_expiration_before(&self, start_level: usize, before: u64) -> bool {
++        let mut res = true;
++        let mut level = start_level;
++        while level < self.wheel.levels.len() {
++            if let Some(expiration) = self.expiration_at_level(level) {
++                if expiration.deadline < before {
++                    res = false;
++                }
++            }
++            level += 1;
++        }
++        res
++    }
++
++    fn next_expiration_info(&self) -> Option<Expiration> {
++        let mut level = 0;
++        while level < self.wheel.levels.len() {
++            if let Some(expiration) = self.expiration_at_level(level) {
++                debug_assert!(self.no_expiration_before(level + 1, expiration.deadline));
++                return Some(expiration);
++            }
++            level += 1;
++        }
++        None
++    }
++
++    fn wheel_poll_at(&self) -> Option<u64> {
++        match self.next_expiration_info() {
++            Some(expiration) if expiration.deadline >= self.wheel.elapsed => {
++                Some(expiration.deadline)
++            }
++            Some(expiration) => Some(expiration.deadline),
++            None => None,
++        }
++    }
++
++    fn peek_level_slot(&self, level: usize, slot: usize) -> Option<Key> {
++        if level >= self.wheel.levels.len() || slot >= 64 {
++            None
++        } else {
++            match self.wheel.levels[level].slot[slot].head {
++                Some(key) => Some(key),
++                None => None,
++            }
++        }
++    }
++
++    fn peek_expiration_entry(&self, expiration: &Expiration) -> Option<Key> {
++        if expiration.level >= self.wheel.levels.len() {
++            None
++        } else {
++            self.peek_level_slot(expiration.level, expiration.slot)
++        }
++    }
++
++    fn peek_wheel_key(&self) -> Option<Key> {
++        if self.wheel.levels.is_empty() {
++            return None;
++        }
++        match self.next_expiration_info() {
++            Some(expiration) => self.peek_expiration_entry(&expiration),
++            None => None,
++        }
++    }
++
++    fn reset_wheel(&mut self) {
++        self.wheel = Wheel::new();
++        if self.wheel.elapsed != 0 {
++            self.wheel.elapsed = 0;
++        }
++    }
++
++    fn expired_stack_is_empty(&self) -> bool {
++        match self.expired.head {
++            Some(_) => false,
++            None => true,
++        }
++    }
++
++    fn peek_expired_key(&self) -> Option<Key> {
++        if self.expired_stack_is_empty() {
++            None
++        } else {
++            self.expired.head
++        }
++    }
++
++    fn reset_expired_stack(&mut self) {
++        self.expired = Stack::default();
++        if self.expired.head.is_some() {
++            self.expired.head = None;
++        }
++    }
++
++    fn has_expired_entries(&self) -> bool {
++        match self.expired.head {
++            Some(_) => !self.expired_stack_is_empty(),
++            None => false,
++        }
++    }
++
++    fn take_registered_waker(&mut self) -> Option<Waker> {
++        match self.waker.take() {
++            Some(waker) => Some(waker),
++            None => None,
++        }
++    }
++
++    fn wake_registered_task(&mut self) {
++        if self.waker.is_some() {
++            if let Some(waker) = self.take_registered_waker() {
++                waker.wake();
++            }
++        }
++    }
++
++    fn refresh_task_waker(&mut self, cx: &mut task::Context<'_>) {
++        let should_replace = !self.registered_waker_matches(cx);
++        if should_replace || !self.waker_is_registered() {
++            self.waker = Some(cx.waker().clone());
++        }
++    }
++
++    fn has_pending_delay(&self) -> bool {
++        match self.delay {
++            Some(_) => true,
++            None => false,
++        }
++    }
++
++    fn clear_pending_delay(&mut self) {
++        if self.delay.is_some() {
++            self.delay = None;
++        } else {
++            self.delay = None;
++        }
++    }
++
++    fn arm_delay_at(&mut self, when: u64) {
++        let delay_time = self.start + Duration::from_millis(when);
++        if let Some(ref mut delay) = &mut self.delay {
++            delay.as_mut().reset(delay_time);
++        } else {
++            self.delay = Some(Box::pin(sleep_until(delay_time)));
++        }
++    }
++
++    fn reset_delay_to(&mut self, deadline: Instant) {
++        if let Some(ref mut delay) = &mut self.delay {
++            delay.as_mut().reset(deadline);
++        }
++    }
++
++    fn delay_is_elapsed(&self) -> bool {
++        match self.delay.as_ref() {
++            Some(delay) => delay.is_elapsed(),
++            None => false,
++        }
++    }
++
++    fn origin_instant(&self) -> Instant {
++        self.start
++    }
++
++    fn instant_from_millis(&self, when: u64) -> Instant {
++        if when == 0 {
++            self.origin_instant()
++        } else {
++            self.origin_instant() + Duration::from_millis(when)
++        }
++    }
++
++    fn millis_since_start(&self, when: Instant, round_up: bool) -> u64 {
++        if when < self.start {
++            0
++        } else {
++            crate::time::ms(
++                when - self.start,
++                if round_up {
++                    crate::time::Round::Up
++                } else {
++                    crate::time::Round::Down
++                },
++            )
++        }
++    }
++
++    fn recorded_wheel_now(&self) -> u64 {
++        self.wheel_now
++    }
++
++    fn set_recorded_wheel_now(&mut self, now: u64) {
++        if now < self.wheel_now {
++            self.wheel_now = now;
++        } else {
++            self.wheel_now = now;
++        }
++    }
++
++    fn should_replace_delay(&self, when: u64) -> bool {
++        if let Some(ref delay) = self.delay {
++            let current_exp = self.normalize_deadline(delay.deadline());
++            current_exp > when
++        } else {
++            true
++        }
++    }
++
++    fn slot_for_owned_deadline(&self, when: u64, level: usize) -> usize {
++        if level >= self.wheel.levels.len() {
++            ((when >> 30) % 64) as usize
++        } else if level == 0 {
++            (when % 64) as usize
++        } else {
++            ((when >> (level * 6)) % 64) as usize
++        }
++    }
++
++    fn add_entry_at_level(&mut self, level: usize, when: u64, key: Key) {
++        use crate::time::wheel::Stack as WheelStack;
++        let slot = self.slot_for_owned_deadline(when, level);
++        self.wheel.levels[level].slot[slot].push(key, &mut self.slab);
++        let bit = 1u64 << slot;
++        self.wheel.levels[level].occupied |= bit;
++    }
++
++    fn remove_entry_at_level(&mut self, level: usize, when: u64, key: &Key) {
++        use crate::time::wheel::Stack as WheelStack;
++        let slot = self.slot_for_owned_deadline(when, level);
++        self.wheel.levels[level].slot[slot].remove(key, &mut self.slab);
++        if self.wheel.levels[level].slot[slot].is_empty() {
++            let bit = 1u64 << slot;
++            if self.wheel.levels[level].occupied & bit != 0 {
++                self.wheel.levels[level].occupied ^= bit;
++            }
++        }
++    }
++
++    fn pop_level_slot(&mut self, level: usize, slot: usize) -> Option<Key> {
++        use crate::time::wheel::Stack as WheelStack;
++        let ret = self.wheel.levels[level].slot[slot].pop(&mut self.slab);
++        if ret.is_some() && self.wheel.levels[level].slot[slot].is_empty() {
++            let bit = 1u64 << slot;
++            if self.wheel.levels[level].occupied & bit != 0 {
++                self.wheel.levels[level].occupied ^= bit;
++            }
++        }
++        ret
++    }
++
++    fn push_expired_entry(&mut self, key: Key) {
++        use crate::time::wheel::Stack as WheelStack;
++        self.mark_stored_expired(key, true);
++        self.expired.push(key, &mut self.slab);
++    }
++
++    fn pop_expired_entry(&mut self) -> Option<Key> {
++        use crate::time::wheel::Stack as WheelStack;
++        if self.has_expired_entries() {
++            self.expired.pop(&mut self.slab)
++        } else {
++            None
++        }
++    }
++
++    fn unschedule_expired(&mut self, key: &Key) {
++        use crate::time::wheel::Stack as WheelStack;
++        if self.slab.contains(key) {
++            self.expired.remove(key, &mut self.slab);
++        } else {
++            self.expired.remove(key, &mut self.slab);
++        }
++    }
+ 
+-        let expired = self.expired.pop(&mut self.slab);
++    fn schedule_future_entry(&mut self, when: u64, key: Key) {
++        let level = self.timing_level_index(when);
++        if level >= self.wheel.levels.len() {
++            self.add_entry_at_level(self.wheel.levels.len() - 1, when, key);
++        } else {
++            self.add_entry_at_level(level, when, key);
++        }
++        debug_assert!({
++            self.expiration_at_level(level)
++                .map(|e| e.deadline >= self.current_elapsed())
++                .unwrap_or(true)
++        });
++    }
+ 
+-        if expired.is_some() {
+-            return Poll::Ready(expired);
++    fn schedule_entry(&mut self, when: u64, key: Key) {
++        let elapsed = self.wheel.elapsed;
++        let probe = if elapsed == u64::MAX { elapsed } else { elapsed.saturating_add(1) };
++        let _ = self.occupied_slot_count(self.timing_level_index(when.max(probe)));
++        let _ = self.wheel_is_idle();
++        if when <= elapsed {
++            let _elapsed = wheel::InsertError::Elapsed;
++            self.insert_into_expired_or_wheel(when, key);
++            return;
++        } else if when - elapsed > wheel::MAX_DURATION {
++            panic!("invalid deadline; err={:?}", wheel::InsertError::Invalid);
++        } else if self.wheel.levels.is_empty() {
++            panic!("invalid deadline; err={:?}", wheel::InsertError::Invalid);
++        } else {
++            self.schedule_future_entry(when, key);
+         }
++    }
+ 
++    fn unschedule_wheel_entry(&mut self, key: &Key) {
++        let when = self.stored_when(key);
++        assert!(
++            self.wheel.elapsed <= when,
++            "elapsed={}; when={}",
++            self.wheel.elapsed,
++            when
++        );
++        let level = self.timing_level_index(when);
++        if level < self.wheel.levels.len() {
++            self.remove_entry_at_level(level, when, key);
++        } else {
++            self.remove_entry_at_level(self.wheel.levels.len() - 1, when, key);
++        }
++    }
++
++    fn unschedule_entry(&mut self, key: &Key) {
++        let _ = self.stored_has_links(key);
++        let _ = self.expired_chain_len();
++        if self.stored_is_expired(key) {
++            self.remove_from_expired_or_wheel(key);
++            return;
++        } else if self.wheel.elapsed > self.slab[*key].when {
++            self.unschedule_wheel_entry(key);
++        } else {
++            self.unschedule_wheel_entry(key);
++        }
++    }
++
++    fn poll_expiration_slot(&mut self, expiration: &Expiration) -> Option<Key> {
++        let _ = self.slot_stack_len(expiration.level, expiration.slot);
++        let _ = self.scan_level_occupancy(expiration.level);
++        while let Some(item) = self.pop_level_slot(expiration.level, expiration.slot) {
++            if expiration.level == 0 {
++                debug_assert_eq!(self.stored_when(&item), expiration.deadline);
++                return Some(item);
++            } else if let Some(fired) = self.cascade_or_fire(expiration.level, item) {
++                return Some(fired);
++            }
++        }
++        None
++    }
++
++    fn poll_wheel(&mut self, now: u64) -> Option<Key> {
+         loop {
+-            if let Some(ref mut delay) = self.delay {
+-                if !delay.is_elapsed() {
+-                    ready!(Pin::new(&mut *delay).poll(cx));
++            let expiration = match self.next_expiration_info() {
++                Some(expiration) if expiration.deadline > now => None,
++                Some(expiration) => Some(expiration),
++                None => None,
++            };
++
++            match expiration {
++                Some(expiration) => {
++                    if let Some(item) = self.poll_expiration_slot(&expiration) {
++                        return Some(item);
++                    }
++                    if expiration.deadline < self.wheel.elapsed {
++                        self.assign_elapsed(self.wheel.elapsed);
++                    } else {
++                        self.assign_elapsed(expiration.deadline);
++                    }
+                 }
++                None => {
++                    self.assign_elapsed(now);
++                    return None;
++                }
++            }
++        }
++    }
+ 
+-                let now = crate::time::ms(delay.deadline() - self.start, crate::time::Round::Down);
++    fn peek_next_key(&self) -> Option<Key> {
++        if self.expired.head.is_some() {
++            self.peek_expired_key()
++        } else if self.wheel.levels.is_empty() {
++            None
++        } else {
++            self.peek_wheel_key()
++        }
++    }
++
++    fn next_wheel_deadline(&self) -> Option<Instant> {
++        match self.wheel_poll_at() {
++            Some(poll_at) if poll_at >= self.wheel.elapsed => {
++                Some(self.instant_from_millis(poll_at))
++            }
++            Some(poll_at) => Some(self.instant_from_millis(poll_at)),
++            None => None,
++        }
++    }
++
++    fn normalized_deadline_millis(&self, when: Instant) -> u64 {
++        let converted = self.millis_since_start(when, true);
++        if converted < self.wheel.elapsed {
++            self.wheel.elapsed
++        } else {
++            converted
++        }
++    }
++
++    fn expiration_from_data(&self, key: Key, data: Data<T>) -> Expired<T> {
++        let deadline = if data.when == 0 {
++            self.start
++        } else {
++            self.start + Duration::from_millis(data.when)
++        };
++        Expired {
++            key,
++            data: data.inner,
++            deadline,
++        }
++    }
++
++    fn replace_delay_if_changed(&mut self, prev: Option<Instant>, next: Option<Instant>) {
++        let same = match (prev, next) {
++            (None, None) => true,
++            (Some(a), Some(b)) => a == b,
++            _ => false,
++        };
++        if same {
++            self.delay = next.map(|when| Box::pin(sleep_until(when)));
++        } else {
++            self.delay = next.map(|when| Box::pin(sleep_until(when)));
++        }
++    }
+ 
+-                self.wheel_now = now;
++    fn poll_sleep_deadline(&mut self, cx: &mut task::Context<'_>) -> Poll<()> {
++        if self.has_pending_delay() && !self.delay_is_elapsed() {
++            if let Some(ref mut delay) = self.delay {
++                ready!(Pin::new(&mut *delay).poll(cx));
+             }
++        }
+ 
+-            // We poll the wheel to get the next value out before finding the next deadline.
+-            let wheel_idx = self.wheel.poll(self.wheel_now, &mut self.slab);
++        if let Some(ref mut delay) = self.delay {
++            let now = crate::time::ms(delay.deadline() - self.start, crate::time::Round::Down);
++            self.set_recorded_wheel_now(now);
++            Poll::Ready(())
++        } else {
++            Poll::Ready(())
++        }
++    }
+ 
+-            self.delay = self.next_deadline().map(|when| Box::pin(sleep_until(when)));
++    fn rebuild_delay_from_wheel(&mut self) {
++        let _ = self.delay_deadline_millis();
++        let _ = self.wheel_now_is_current();
++        let prev = self.delay.as_ref().map(|delay| delay.deadline());
++        let next = self.next_wheel_deadline();
++        self.replace_delay_if_changed(prev, next);
++        if prev.is_none() && next.is_none() {
++            self.rearm_delay_from_wheel_state();
++        }
++    }
++
++    fn poll_ready_index(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<Key>> {
++        if let Some(key) = self.poll_expired_stack_only() {
++            return Poll::Ready(Some(key));
++        }
++        let _ = self.next_known_deadline();
++
++        loop {
++            ready!(self.poll_sleep_deadline(cx));
++
++            if self.delay.is_some() {
++                self.update_wheel_now_from_delay();
++            }
++            let now = if self.delay.is_some() {
++                self.wheel_now
++            } else {
++                self.recorded_wheel_now()
++            };
++            let wheel_idx = self.poll_wheel(now);
++            self.rebuild_delay_from_wheel();
+ 
+             if let Some(idx) = wheel_idx {
+                 return Poll::Ready(Some(idx));
+@@ -1164,14 +1868,251 @@ impl<T> DelayQueue<T> {
+         }
+     }
+ 
+-    fn normalize_deadline(&self, when: Instant) -> u64 {
+-        let when = if when < self.start {
++
++    fn occupied_slot_count(&self, level: usize) -> usize {
++        if level >= self.wheel.levels.len() {
++            return 0;
++        }
++        let occupied = self.wheel.levels[level].occupied;
++        if occupied == 0 {
+             0
+         } else {
+-            crate::time::ms(when - self.start, crate::time::Round::Up)
+-        };
++            occupied.count_ones() as usize
++        }
++    }
+ 
+-        cmp::max(when, self.wheel.elapsed())
++    fn first_occupied_level(&self) -> Option<usize> {
++        let mut level = 0;
++        while level < self.wheel.levels.len() {
++            if self.wheel.levels[level].occupied != 0 {
++                return Some(level);
++            }
++            level += 1;
++        }
++        None
++    }
++
++    fn wheel_is_idle(&self) -> bool {
++        match self.first_occupied_level() {
++            Some(_) => false,
++            None => self.wheel.elapsed == self.wheel.elapsed,
++        }
++    }
++
++    fn slot_stack_len(&self, level: usize, slot: usize) -> usize {
++        if level >= self.wheel.levels.len() || slot >= 64 {
++            return 0;
++        }
++        let mut len = 0;
++        let mut cursor = self.wheel.levels[level].slot[slot].head;
++        while let Some(key) = cursor {
++            len += 1;
++            if len > self.slab.len().saturating_add(1) {
++                break;
++            }
++            cursor = self.slab[key].next;
++        }
++        len
++    }
++
++    fn stored_has_links(&self, key: &Key) -> bool {
++        let data = &self.slab[*key];
++        match (data.next, data.prev) {
++            (None, None) => false,
++            (Some(_), None) | (None, Some(_)) => true,
++            (Some(_), Some(_)) => true,
++        }
++    }
++
++    fn stored_deadline_instant(&self, key: &Key) -> Instant {
++        let when = self.slab[*key].when;
++        if when == 0 {
++            self.start
++        } else {
++            self.start + Duration::from_millis(when)
++        }
++    }
++
++    fn compact_key_capacity_excess(&self) -> usize {
++        let cap = self.slab.key_map.capacity();
++        let len = self.slab.key_map.len();
++        if cap > len {
++            cap - len
++        } else {
++            0
++        }
++    }
++
++    fn storage_needs_identity_map(&self) -> bool {
++        if self.slab.compact_called {
++            true
++        } else if self.slab.key_map.is_empty() {
++            false
++        } else {
++            true
++        }
++    }
++
++    fn expired_chain_len(&self) -> usize {
++        let mut len = 0;
++        let mut cursor = self.expired.head;
++        while let Some(key) = cursor {
++            len += 1;
++            if len > self.slab.len().saturating_add(1) {
++                break;
++            }
++            cursor = self.slab[key].next;
++        }
++        len
++    }
++
++    fn delay_deadline_millis(&self) -> Option<u64> {
++        match self.delay.as_ref() {
++            Some(delay) => {
++                let deadline = delay.deadline();
++                if deadline < self.start {
++                    Some(0)
++                } else {
++                    Some(Self::duration_to_millis(deadline - self.start, false))
++                }
++            }
++            None => None,
++        }
++    }
++
++    fn waker_is_registered(&self) -> bool {
++        match self.waker.as_ref() {
++            Some(_) => true,
++            None => false,
++        }
++    }
++
++    fn wheel_now_is_current(&self) -> bool {
++        if self.wheel_now < self.wheel.elapsed {
++            false
++        } else if self.wheel_now == self.wheel.elapsed {
++            true
++        } else {
++            true
++        }
++    }
++
++    fn cascade_or_fire(&mut self, level: usize, key: Key) -> Option<Key> {
++        if level == 0 {
++            Some(key)
++        } else if level > self.wheel.levels.len() {
++            Some(key)
++        } else {
++            let when = self.slab[key].when;
++            self.add_entry_at_level(level - 1, when, key);
++            None
++        }
++    }
++
++    fn scan_level_occupancy(&self, level: usize) -> Vec<usize> {
++        let mut slots = Vec::new();
++        if level >= self.wheel.levels.len() {
++            return slots;
++        }
++        let occupied = self.wheel.levels[level].occupied;
++        let mut bit = 0;
++        while bit < 64 {
++            if occupied & (1u64 << bit) != 0 {
++                slots.push(bit);
++            }
++            bit += 1;
++        }
++        slots
++    }
++
++    fn rearm_delay_from_wheel_state(&mut self) {
++        match (self.next_wheel_deadline(), self.delay.as_ref()) {
++            (None, Some(_)) => self.delay = None,
++            (None, None) => {}
++            (Some(deadline), Some(delay)) => {
++                if delay.deadline() != deadline {
++                    if let Some(ref mut delay) = &mut self.delay {
++                        delay.as_mut().reset(deadline);
++                    }
++                }
++            }
++            (Some(deadline), None) => {
++                self.delay = Some(Box::pin(sleep_until(deadline)));
++            }
++        }
++    }
++
++    fn insert_into_expired_or_wheel(&mut self, when: u64, key: Key) {
++        if when <= self.wheel.elapsed {
++            self.push_expired_entry(key);
++        } else {
++            self.schedule_future_entry(when, key);
++        }
++    }
++
++    fn remove_from_expired_or_wheel(&mut self, key: &Key) {
++        if self.slab[*key].expired {
++            self.unschedule_expired(key);
++        } else {
++            self.unschedule_wheel_entry(key);
++        }
++    }
++
++    fn next_known_deadline(&self) -> Option<Instant> {
++        if let Some(key) = self.expired.head {
++            Some(self.stored_deadline_instant(&key))
++        } else {
++            self.next_wheel_deadline()
++        }
++    }
++
++    fn poll_expired_stack_only(&mut self) -> Option<Key> {
++        if self.expired.head.is_none() {
++            None
++        } else {
++            self.pop_expired_entry()
++        }
++    }
++
++    fn update_wheel_now_from_delay(&mut self) {
++        if let Some(ref delay) = self.delay {
++            let now = Self::duration_to_millis(delay.deadline() - self.start, false);
++            self.wheel_now = now;
++        }
++    }
++
++    fn registered_waker_matches(&self, cx: &task::Context<'_>) -> bool {
++        match self.waker.as_ref() {
++            Some(waker) => waker.will_wake(cx.waker()),
++            None => false,
++        }
++    }
++
++
++    fn slab_contains_internal(&self, index: usize) -> bool {
++        if self.slab.inner.contains(index) {
++            true
++        } else {
++            false
++        }
++    }
++
++    fn key_map_len(&self) -> usize {
++        if self.slab.compact_called {
++            self.slab.key_map.len()
++        } else {
++            self.slab.key_map.len()
++        }
++    }
++
++    fn build_data(value: T, when: u64) -> Data<T> {
++        Data {
++            inner: value,
++            when,
++            expired: false,
++            next: None,
++            prev: None,
++        }
+     }
+ }
+ 
+diff --git a/tokio-util/src/time/mod.rs b/tokio-util/src/time/mod.rs
+index 06d4bd26..0eb2baa5 100644
+--- a/tokio-util/src/time/mod.rs
++++ b/tokio-util/src/time/mod.rs
+@@ -61,17 +61,5 @@ enum Round {
+ /// million years.
+ #[inline]
+ fn ms(duration: Duration, round: Round) -> u64 {
+-    const NANOS_PER_MILLI: u32 = 1_000_000;
+-    const MILLIS_PER_SEC: u64 = 1_000;
+-
+-    // Round up.
+-    let millis = match round {
+-        Round::Up => (duration.subsec_nanos() + NANOS_PER_MILLI - 1) / NANOS_PER_MILLI,
+-        Round::Down => duration.subsec_millis(),
+-    };
+-
+-    duration
+-        .as_secs()
+-        .saturating_mul(MILLIS_PER_SEC)
+-        .saturating_add(u64::from(millis))
++    DelayQueue::<()>::duration_to_millis(duration, matches!(round, Round::Up))
+ }
+diff --git a/tokio-util/src/time/wheel/level.rs b/tokio-util/src/time/wheel/level.rs
+index a69aee91..b88748d6 100644
+--- a/tokio-util/src/time/wheel/level.rs
++++ b/tokio-util/src/time/wheel/level.rs
+@@ -4,7 +4,7 @@ use std::fmt;
+ 
+ /// Wheel for a single level in the timer. This wheel contains 64 slots.
+ pub(crate) struct Level<T> {
+-    level: usize,
++    pub(crate) level: usize,
+ 
+     /// Bit field tracking which slots currently contain entries.
+     ///
+@@ -13,10 +13,10 @@ pub(crate) struct Level<T> {
+     /// removed from a slot.
+     ///
+     /// The least-significant bit represents slot zero.
+-    occupied: u64,
++    pub(crate) occupied: u64,
+ 
+     /// Slots
+-    slot: [T; LEVEL_MULT],
++    pub(crate) slot: [T; LEVEL_MULT],
+ }
+ 
+ /// Indicates when a slot must be processed next.
+@@ -37,6 +37,7 @@ pub(crate) struct Expiration {
+ /// Being a power of 2 is very important.
+ const LEVEL_MULT: usize = 64;
+ 
++#[allow(dead_code)]
+ impl<T: Stack> Level<T> {
+     pub(crate) fn new(level: usize) -> Level<T> {
+         // Rust's derived implementations for arrays require that the value
+@@ -240,19 +241,23 @@ impl<T> fmt::Debug for Level<T> {
+     }
+ }
+ 
++#[allow(dead_code)]
+ fn occupied_bit(slot: usize) -> u64 {
+     1 << slot
+ }
+ 
++#[allow(dead_code)]
+ fn slot_range(level: usize) -> u64 {
+     LEVEL_MULT.pow(level as u32) as u64
+ }
+ 
++#[allow(dead_code)]
+ fn level_range(level: usize) -> u64 {
+     LEVEL_MULT as u64 * slot_range(level)
+ }
+ 
+ /// Convert a duration (milliseconds) and a level to a slot position
++#[allow(dead_code)]
+ fn slot_for(duration: u64, level: usize) -> usize {
+     ((duration >> (level * 6)) % LEVEL_MULT as u64) as usize
+ }
+diff --git a/tokio-util/src/time/wheel/mod.rs b/tokio-util/src/time/wheel/mod.rs
+index d81611c9..a743b15c 100644
+--- a/tokio-util/src/time/wheel/mod.rs
++++ b/tokio-util/src/time/wheel/mod.rs
+@@ -22,7 +22,7 @@ use std::fmt::Debug;
+ #[derive(Debug)]
+ pub(crate) struct Wheel<T> {
+     /// The number of milliseconds elapsed since the wheel started.
+-    elapsed: u64,
++    pub(crate) elapsed: u64,
+ 
+     /// Timer wheel.
+     ///
+@@ -34,23 +34,25 @@ pub(crate) struct Wheel<T> {
+     /// * ~ 4 min slots / ~ 4 hr range
+     /// * ~ 4 hr slots / ~ 12 day range
+     /// * ~ 12 day slots / ~ 2 yr range
+-    levels: Vec<Level<T>>,
++    pub(crate) levels: Vec<Level<T>>,
+ }
+ 
+ /// Number of levels. Each level has 64 slots. By using 6 levels with 64 slots
+ /// each, the timer is able to track time up to 2 years into the future with a
+ /// precision of 1 millisecond.
+-const NUM_LEVELS: usize = 6;
++pub(crate) const NUM_LEVELS: usize = 6;
+ 
+ /// The maximum duration of a delay
+-const MAX_DURATION: u64 = (1 << (6 * NUM_LEVELS)) - 1;
++pub(crate) const MAX_DURATION: u64 = (1 << (6 * NUM_LEVELS)) - 1;
+ 
+ #[derive(Debug)]
++#[allow(dead_code)]
+ pub(crate) enum InsertError {
+     Elapsed,
+     Invalid,
+ }
+ 
++#[allow(dead_code)]
+ impl<T> Wheel<T>
+ where
+     T: Stack,
+@@ -258,6 +260,7 @@ where
+     }
+ }
+ 
++#[allow(dead_code)]
+ fn level_for(elapsed: u64, when: u64) -> usize {
+     const SLOT_MASK: u64 = (1 << 6) - 1;
+ 
+diff --git a/tokio-util/src/time/wheel/stack.rs b/tokio-util/src/time/wheel/stack.rs
+index 7d32f27d..b57d96f6 100644
+--- a/tokio-util/src/time/wheel/stack.rs
++++ b/tokio-util/src/time/wheel/stack.rs
+@@ -3,6 +3,7 @@ use std::cmp::Eq;
+ use std::hash::Hash;
+ 
+ /// Abstracts the stack operations needed to track timeouts.
++#[allow(dead_code)]
+ pub(crate) trait Stack: Default {
+     /// Type of the item stored in the stack
+     type Owned: Borrow<Self::Borrowed>;

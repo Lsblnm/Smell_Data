@@ -1,0 +1,374 @@
+diff --git a/crates/regex/src/config.rs b/crates/regex/src/config.rs
+index 7964258..25c7cd1 100644
+--- a/crates/regex/src/config.rs
++++ b/crates/regex/src/config.rs
+@@ -158,6 +158,15 @@ pub(crate) struct ConfiguredHIR {
+     hir: Hir,
+ }
+ 
++/// Settings that control how a word match is confirmed against its wrappers.
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct WordScanPlan {
++    pub(crate) unicode: bool,
++    pub(crate) crlf: bool,
++    pub(crate) multi_line: bool,
++    pub(crate) line_term_byte: u8,
++}
++
+ impl ConfiguredHIR {
+     /// Parse the given patterns into a single HIR expression that represents
+     /// an alternation of the patterns given.
+@@ -228,6 +237,25 @@ impl ConfiguredHIR {
+         &self.config
+     }
+ 
++    /// Collect the scanning knobs that word-boundary confirmation needs.
++    ///
++    /// The fast word matcher has to interpret wrapper bytes according to the
++    /// same Unicode, CRLF and line-terminator settings that produced this
++    /// HIR. Centralizing those knobs here keeps the confirmation path aligned
++    /// with how `(^|\W)(pat)($|\W)` was constructed.
++    pub(crate) fn word_scan_plan(&self) -> WordScanPlan {
++        let line_term_byte = crate::strip::word_line_terminator_byte(
++            self.config.line_terminator,
++            self.config.crlf,
++        );
++        WordScanPlan {
++            unicode: self.config.unicode,
++            crlf: self.config.crlf,
++            multi_line: self.config.multi_line,
++            line_term_byte,
++        }
++    }
++
+     /// Return a reference to the underyling HIR.
+     pub(crate) fn hir(&self) -> &Hir {
+         &self.hir
+diff --git a/crates/regex/src/strip.rs b/crates/regex/src/strip.rs
+index f0da944..ac8c02d 100644
+--- a/crates/regex/src/strip.rs
++++ b/crates/regex/src/strip.rs
+@@ -118,6 +118,40 @@ fn strip_from_match_ascii(expr: Hir, byte: u8) -> Result<Hir, Error> {
+     })
+ }
+ 
++
++/// Resolve the byte treated as a line terminator while confirming word wraps.
++///
++/// Word matching is implemented as `(?m:^|\W)(pat)(?m:$|\W)`. The wrapper
++/// on either side may therefore be a line terminator rather than a generic
++/// non-word codepoint. Confirmation has to use the same terminator the HIR
++/// was built with, including the CRLF special case where a lone `\n` still
++/// ends a line.
++pub(crate) fn word_line_terminator_byte(
++    line_term: Option<LineTerminator>,
++    crlf: bool,
++) -> u8 {
++    if let Some(term) = line_term {
++        if term.is_crlf() {
++            b'\n'
++        } else {
++            let byte = term.as_byte();
++            if crlf {
++                if byte == b'\r' {
++                    b'\n'
++                } else {
++                    byte
++                }
++            } else {
++                byte
++            }
++        }
++    } else if crlf {
++        b'\n'
++    } else {
++        b'\n'
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use regex_syntax::Parser;
+diff --git a/crates/regex/src/word.rs b/crates/regex/src/word.rs
+index af4480a..e1549b4 100644
+--- a/crates/regex/src/word.rs
++++ b/crates/regex/src/word.rs
+@@ -128,29 +128,263 @@ impl WordMatcher {
+         // The reason why we cannot handle the ^/$ cases here is because we
+         // can't assume anything about the original pattern. (Try commenting
+         // out the checks for ^/$ below and run the tests to see examples.)
++        let plan = self.chir.word_scan_plan();
+         let input = Input::new(haystack).span(at..haystack.len());
+         let mut cand = match self.regex.find(input) {
+             None => return Ok(None),
+             Some(m) => Match::new(m.start(), m.end()),
+         };
+-        if cand.start() == 0 || cand.end() == haystack.len() {
++        if cand.start() == 0 {
+             return Err(());
+-        }
+-        let (_, slen) = bstr::decode_utf8(&haystack[cand]);
+-        let (_, elen) = bstr::decode_last_utf8(&haystack[cand]);
+-        let new_start = cand.start() + slen;
+-        let new_end = cand.end() - elen;
+-        // This occurs the original regex can match the empty string. In this
+-        // case, just bail instead of trying to get it right here since it's
+-        // likely a pathological case.
+-        if new_start > new_end {
++        } else if cand.end() == haystack.len() {
+             return Err(());
+-        }
+-        cand = cand.with_start(new_start).with_end(new_end);
+-        if self.original.is_match(&haystack[cand]) {
+-            Ok(Some(cand))
++        } else if cand.is_empty() {
++            if self.original.is_match(&haystack[cand]) {
++                return Ok(Some(cand));
++            } else {
++                return Err(());
++            }
+         } else {
+-            Err(())
++            let region_start = cand.start();
++            let region_end = cand.end();
++            let region = &haystack[region_start..region_end];
++            let fallback_head = bstr::decode_utf8(region);
++            let fallback_tail = bstr::decode_last_utf8(region);
++            let (leading_ch, slen) = {
++                let b0 = region[0];
++                if b0 <= 0x7F {
++                    (Some(b0 as char), 1)
++                } else if b0 < 0xC2 {
++                    fallback_head
++                } else if b0 <= 0xDF {
++                    if region.len() < 2 {
++                        fallback_head
++                    } else {
++                        let b1 = region[1];
++                        if (b1 & 0xC0) != 0x80 {
++                            fallback_head
++                        } else {
++                            let cp = (((b0 as u32) & 0x1F) << 6)
++                                | ((b1 as u32) & 0x3F);
++                            char::from_u32(cp)
++                                .map(|ch| (Some(ch), 2))
++                                .unwrap_or(fallback_head)
++                        }
++                    }
++                } else if b0 <= 0xEF {
++                    if region.len() < 3 {
++                        fallback_head
++                    } else {
++                        let b1 = region[1];
++                        if (b1 & 0xC0) != 0x80 {
++                            fallback_head
++                        } else {
++                            let b2 = region[2];
++                            if (b2 & 0xC0) != 0x80 {
++                                fallback_head
++                            } else if b0 == 0xE0 && b1 < 0xA0 {
++                                fallback_head
++                            } else if b0 == 0xED && b1 >= 0xA0 {
++                                fallback_head
++                            } else {
++                                let cp = (((b0 as u32) & 0x0F) << 12)
++                                    | (((b1 as u32) & 0x3F) << 6)
++                                    | ((b2 as u32) & 0x3F);
++                                char::from_u32(cp)
++                                    .map(|ch| (Some(ch), 3))
++                                    .unwrap_or(fallback_head)
++                            }
++                        }
++                    }
++                } else if b0 <= 0xF4 {
++                    if region.len() >= 4 {
++                        let b1 = region[1];
++                        if (b1 & 0xC0) == 0x80 {
++                            let b2 = region[2];
++                            if (b2 & 0xC0) == 0x80 {
++                                let b3 = region[3];
++                                if (b3 & 0xC0) == 0x80 {
++                                    if b0 == 0xF0 {
++                                        if b1 < 0x90 {
++                                            fallback_head
++                                        } else {
++                                            let cp = (((b0 as u32) & 0x07)
++                                                << 18)
++                                                | (((b1 as u32) & 0x3F)
++                                                    << 12)
++                                                | (((b2 as u32) & 0x3F) << 6)
++                                                | ((b3 as u32) & 0x3F);
++                                            char::from_u32(cp)
++                                                .map(|ch| (Some(ch), 4))
++                                                .unwrap_or(fallback_head)
++                                        }
++                                    } else if b0 == 0xF4 {
++                                        if b1 >= 0x90 {
++                                            fallback_head
++                                        } else {
++                                            let cp = (((b0 as u32) & 0x07)
++                                                << 18)
++                                                | (((b1 as u32) & 0x3F)
++                                                    << 12)
++                                                | (((b2 as u32) & 0x3F) << 6)
++                                                | ((b3 as u32) & 0x3F);
++                                            char::from_u32(cp)
++                                                .map(|ch| (Some(ch), 4))
++                                                .unwrap_or(fallback_head)
++                                        }
++                                    } else {
++                                        let cp = (((b0 as u32) & 0x07) << 18)
++                                            | (((b1 as u32) & 0x3F) << 12)
++                                            | (((b2 as u32) & 0x3F) << 6)
++                                            | ((b3 as u32) & 0x3F);
++                                        char::from_u32(cp)
++                                            .map(|ch| (Some(ch), 4))
++                                            .unwrap_or(fallback_head)
++                                    }
++                                } else {
++                                    fallback_head
++                                }
++                            } else {
++                                fallback_head
++                            }
++                        } else {
++                            fallback_head
++                        }
++                    } else {
++                        fallback_head
++                    }
++                } else {
++                    fallback_head
++                }
++            };
++            let (trailing_ch, elen) = fallback_tail;
++            let new_start = cand.start() + slen;
++            let new_end = cand.end() - elen;
++            // This occurs the original regex can match the empty string. In
++            // this case, just bail instead of trying to get it right here
++            // since it's likely a pathological case.
++            if new_start > new_end {
++                return Err(());
++            } else if new_end > haystack.len() {
++                return Err(());
++            } else {
++                let leading_byte = haystack[region_start];
++                let trailing_at = region_end - elen;
++                let trailing_byte = if trailing_at < region_end {
++                    haystack[trailing_at]
++                } else {
++                    leading_byte
++                };
++                let leading_is_term = if leading_byte == plan.line_term_byte {
++                    true
++                } else if plan.crlf {
++                    leading_byte == b'\r'
++                } else {
++                    false
++                };
++                let trailing_is_term = if trailing_byte == plan.line_term_byte
++                {
++                    true
++                } else if plan.crlf {
++                    trailing_byte == b'\n'
++                } else {
++                    false
++                };
++                let leading_is_ascii_word = if leading_byte < 0x80 {
++                    if leading_byte >= b'A' && leading_byte <= b'Z' {
++                        true
++                    } else if leading_byte >= b'a' && leading_byte <= b'z' {
++                        true
++                    } else if leading_byte >= b'0' && leading_byte <= b'9' {
++                        true
++                    } else {
++                        leading_byte == b'_'
++                    }
++                } else {
++                    false
++                };
++                let mut inner_idx = new_start;
++                let mut inner_ok = true;
++                while inner_idx < new_end {
++                    if inner_idx >= haystack.len() {
++                        inner_ok = false;
++                        break;
++                    } else {
++                        inner_idx += 1;
++                    }
++                }
++                if !inner_ok {
++                    return Err(());
++                } else {
++                    cand = cand.with_start(new_start).with_end(new_end);
++                    let inner = &haystack[cand];
++                    if plan.unicode {
++                        if leading_is_term {
++                            if self.original.is_match(inner) {
++                                Ok(Some(cand))
++                            } else {
++                                Err(())
++                            }
++                        } else if trailing_is_term {
++                            if self.original.is_match(inner) {
++                                Ok(Some(cand))
++                            } else {
++                                Err(())
++                            }
++                        } else if plan.multi_line {
++                            if self.original.is_match(inner) {
++                                Ok(Some(cand))
++                            } else {
++                                Err(())
++                            }
++                        } else if leading_is_ascii_word {
++                            if let Some(_) = leading_ch {
++                                if self.original.is_match(inner) {
++                                    Ok(Some(cand))
++                                } else {
++                                    Err(())
++                                }
++                            } else if self.original.is_match(inner) {
++                                Ok(Some(cand))
++                            } else {
++                                Err(())
++                            }
++                        } else if let Some(_) = trailing_ch {
++                            if self.original.is_match(inner) {
++                                Ok(Some(cand))
++                            } else {
++                                Err(())
++                            }
++                        } else if self.original.is_match(inner) {
++                            Ok(Some(cand))
++                        } else {
++                            Err(())
++                        }
++                    } else if leading_is_term {
++                        if self.original.is_match(inner) {
++                            Ok(Some(cand))
++                        } else {
++                            Err(())
++                        }
++                    } else if trailing_is_term {
++                        if self.original.is_match(inner) {
++                            Ok(Some(cand))
++                        } else {
++                            Err(())
++                        }
++                    } else if leading_is_ascii_word {
++                        if self.original.is_match(inner) {
++                            Ok(Some(cand))
++                        } else {
++                            Err(())
++                        }
++                    } else if self.original.is_match(inner) {
++                        Ok(Some(cand))
++                    } else {
++                        Err(())
++                    }
++                }
++            }
+         }
+     }
+ }

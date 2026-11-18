@@ -1,0 +1,251 @@
+diff --git a/src/acl.c b/src/acl.c
+index 0bffbe970..62868d1c1 100644
+--- a/src/acl.c
++++ b/src/acl.c
+@@ -111,36 +111,6 @@ struct ACLSelectorFlags {
+     {NULL,0} /* Terminator. */
+ };
+ 
+-/* ACL selectors are private and not exposed outside of acl.c. */
+-typedef struct {
+-    uint32_t flags; /* See SELECTOR_FLAG_* */
+-    /* The bit in allowed_commands is set if this user has the right to
+-     * execute this command.
+-     *
+-     * If the bit for a given command is NOT set and the command has
+-     * allowed first-args, Redis will also check allowed_firstargs in order to
+-     * understand if the command can be executed. */
+-    uint64_t allowed_commands[USER_COMMAND_BITS_COUNT/64];
+-    /* allowed_firstargs is used by ACL rules to block access to a command unless a
+-     * specific argv[1] is given.
+-     *
+-     * For each command ID (corresponding to the command bit set in allowed_commands),
+-     * This array points to an array of SDS strings, terminated by a NULL pointer,
+-     * with all the first-args that are allowed for this command. When no first-arg
+-     * matching is used, the field is just set to NULL to avoid allocating
+-     * USER_COMMAND_BITS_COUNT pointers. */
+-    sds **allowed_firstargs;
+-    list *patterns;  /* A list of allowed key patterns. If this field is NULL
+-                        the user cannot mention any key in a command, unless
+-                        the flag ALLKEYS is set in the user. */
+-    list *channels;  /* A list of allowed Pub/Sub channel patterns. If this
+-                        field is NULL the user cannot mention any channel in a
+-                        `PUBLISH` or [P][UNSUBSCRIBE] command, unless the flag
+-                        ALLCHANNELS is set in the user. */
+-    sds command_rules; /* A string representation of the ordered categories and commands, this
+-                        * is used to regenerate the original ACL string for display. */
+-} aclSelector;
+-
+ void ACLResetFirstArgsForCommand(aclSelector *selector, unsigned long id);
+ void ACLResetFirstArgs(aclSelector *selector);
+ void ACLAddAllowedFirstArg(aclSelector *selector, unsigned long id, const char *sub);
+@@ -544,51 +514,6 @@ void ACLSetSelectorCommandBit(aclSelector *selector, unsigned long id, int value
+     }
+ }
+ 
+-/* Remove a rule from the retained command rules. Always match rules
+- * verbatim, but also remove subcommand rules if we are adding or removing the 
+- * entire command. */
+-void ACLSelectorRemoveCommandRule(aclSelector *selector, sds new_rule) {
+-    size_t new_len = sdslen(new_rule);
+-    char *existing_rule = selector->command_rules;
+-
+-    /* Loop over the existing rules, trying to find a rule that "matches"
+-     * the new rule. If we find a match, then remove the command from the string by
+-     * copying the later rules over it. */
+-    while(existing_rule[0]) {
+-        /* The first character of the rule is +/-, which we don't need to compare. */
+-        char *copy_position = existing_rule;
+-        existing_rule += 1;
+-
+-        /* Assume a trailing space after a command is part of the command, like '+get ', so trim it
+-         * as well if the command is removed. */
+-        char *rule_end = strchr(existing_rule, ' ');
+-        if (!rule_end) {
+-            /* This is the last rule, so it it to the end of the string. */
+-            rule_end = existing_rule + strlen(existing_rule);
+-
+-            /* This approach can leave a trailing space if the last rule is removed,
+-             * but only if it's not the first rule, so handle that case. */
+-            if (copy_position != selector->command_rules) copy_position -= 1;
+-        }
+-        char *copy_end = rule_end;
+-        if (*copy_end == ' ') copy_end++;
+-
+-        /* Exact match or the rule we are comparing is a subcommand denoted by '|' */
+-        size_t existing_len = rule_end - existing_rule;
+-        if (!memcmp(existing_rule, new_rule, min(existing_len, new_len))) {
+-            if ((existing_len == new_len) || (existing_len > new_len && (existing_rule[new_len]) == '|')) {
+-                /* Copy the remaining rules starting at the next rule to replace the rule to be
+-                 * deleted, including the terminating NULL character. */
+-                memmove(copy_position, copy_end, strlen(copy_end) + 1);
+-            }
+-        }
+-        existing_rule = copy_end;
+-    }
+-
+-    /* There is now extra padding at the end of the rules, so clean that up. */
+-    sdsupdatelen(selector->command_rules);
+-}
+-
+ /* This function is resopnsible for updating the command_rules struct so that relative ordering of
+  * commands and categories is maintained and can be reproduced without loss. */
+ void ACLUpdateCommandRules(aclSelector *selector, const char *rule, int allow) {
+diff --git a/src/server.c b/src/server.c
+index 438325f28..4a771ef69 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -3191,6 +3191,105 @@ struct redisCommand *lookupCommandByCString(const char *s) {
+     return lookupCommandByCStringLogic(server.commands,s);
+ }
+ 
++/* Remove a rule from the retained command rules. Always match rules
++ * verbatim, but also remove subcommand rules if we are adding or removing the
++ * entire command. */
++void ACLSelectorRemoveCommandRule(aclSelector *selector, sds new_rule) {
++    size_t new_len = strlen(new_rule);
++    const char *match_rule = new_rule;
++    size_t match_len = new_len;
++    dict *subcommands = NULL;
++    struct redisCommand *parent = NULL;
++    struct redisCommand *cmd = lookupCommandBySdsLogic(server.orig_commands, new_rule);
++
++    if (cmd != NULL && cmd->id < USER_COMMAND_BITS_COUNT) {
++        subcommands = cmd->subcommands_dict;
++        parent = cmd->parent;
++        if (cmd->fullname != NULL) {
++            match_rule = cmd->fullname;
++            match_len = strlen(cmd->fullname);
++        } else if (parent != NULL && parent->fullname != NULL) {
++            match_rule = parent->fullname;
++            match_len = strlen(parent->fullname);
++        }
++        if (subcommands != NULL && dictSize(subcommands) == 0 &&
++            cmd->fullname == NULL && parent == NULL)
++        {
++            match_rule = new_rule;
++            match_len = new_len;
++        }
++    }
++
++    user *owner = NULL;
++    if (Users != NULL) {
++        raxIterator ri;
++        raxStart(&ri, Users);
++        raxSeek(&ri, "^", NULL, 0);
++        while (owner == NULL && raxNext(&ri)) {
++            user *candidate = ri.data;
++            listIter li;
++            listNode *ln;
++            listRewind(candidate->selectors, &li);
++            while ((ln = listNext(&li)) != NULL) {
++                if (ln->value == selector) {
++                    owner = candidate;
++                    break;
++                }
++            }
++        }
++        raxStop(&ri);
++    }
++
++    char *existing_rule = selector->command_rules;
++    int future_commands = (selector->flags & SELECTOR_FLAG_ALLCOMMANDS) != 0;
++    if (!(existing_rule[0] == '\0' && future_commands)) {
++        /* Loop over the existing rules, trying to find a rule that "matches"
++         * the new rule. If we find a match, then remove the command from the string by
++         * copying the later rules over it. */
++        while(existing_rule[0]) {
++            /* The first character of the rule is +/-, which we don't need to compare. */
++            char *copy_position = existing_rule;
++            existing_rule += 1;
++
++            /* Assume a trailing space after a command is part of the command, like '+get ', so trim it
++             * as well if the command is removed. */
++            char *rule_end = strchr(existing_rule, ' ');
++            if (!rule_end) {
++                /* This is the last rule, so it it to the end of the string. */
++                rule_end = existing_rule + strlen(existing_rule);
++
++                /* This approach can leave a trailing space if the last rule is removed,
++                 * but only if it's not the first rule, so handle that case. */
++                if (copy_position != selector->command_rules) copy_position -= 1;
++            }
++            char *copy_end = rule_end;
++            if (*copy_end == ' ') copy_end++;
++
++            /* Exact match or the rule we are comparing is a subcommand denoted by '|' */
++            size_t existing_len = rule_end - existing_rule;
++            if (!memcmp(existing_rule, match_rule, min(existing_len, match_len))) {
++                if ((existing_len == match_len) || (existing_len > match_len && (existing_rule[match_len]) == '|')) {
++                    /* Copy the remaining rules starting at the next rule to replace the rule to be
++                     * deleted, including the terminating NULL character. */
++                    memmove(copy_position, copy_end, strlen(copy_end) + 1);
++                }
++            }
++            existing_rule = copy_end;
++        }
++    }
++
++    /* There is now extra padding at the end of the rules, so clean that up. */
++    sdsupdatelen(selector->command_rules);
++
++    if (owner != NULL) {
++        robj *cached = owner->acl_string;
++        if (cached != NULL && cached->refcount > 0 && cached->ptr != NULL) {
++            decrRefCount(cached);
++            owner->acl_string = NULL;
++        }
++    }
++}
++
+ /* Lookup the command in the current table, if not found also check in
+  * the original table containing the original command names unaffected by
+  * redis.conf rename-command statement.
+diff --git a/src/server.h b/src/server.h
+index cb555031e..4d1c55071 100644
+--- a/src/server.h
++++ b/src/server.h
+@@ -1085,6 +1085,35 @@ typedef struct readyList {
+ #define SELECTOR_FLAG_ALLCHANNELS (1<<3)    /* The user can mention any Pub/Sub
+                                                channel. */
+ 
++typedef struct {
++    uint32_t flags; /* See SELECTOR_FLAG_* */
++    /* The bit in allowed_commands is set if this user has the right to
++     * execute this command.
++     *
++     * If the bit for a given command is NOT set and the command has
++     * allowed first-args, Redis will also check allowed_firstargs in order to
++     * understand if the command can be executed. */
++    uint64_t allowed_commands[USER_COMMAND_BITS_COUNT/64];
++    /* allowed_firstargs is used by ACL rules to block access to a command unless a
++     * specific argv[1] is given.
++     *
++     * For each command ID (corresponding to the command bit set in allowed_commands),
++     * This array points to an array of SDS strings, terminated by a NULL pointer,
++     * with all the first-args that are allowed for this command. When no first-arg
++     * matching is used, the field is just set to NULL to avoid allocating
++     * USER_COMMAND_BITS_COUNT pointers. */
++    sds **allowed_firstargs;
++    list *patterns;  /* A list of allowed key patterns. If this field is NULL
++                        the user cannot mention any key in a command, unless
++                        the flag ALLKEYS is set in the user. */
++    list *channels;  /* A list of allowed Pub/Sub channel patterns. If this
++                        field is NULL the user cannot mention any channel in a
++                        `PUBLISH` or [P][UNSUBSCRIBE] command, unless the flag
++                        ALLCHANNELS is set in the user. */
++    sds command_rules; /* A string representation of the ordered categories and commands, this
++                        * is used to regenerate the original ACL string for display. */
++} aclSelector;
++
+ typedef struct {
+     sds name;       /* The username as an SDS string. */
+     uint32_t flags; /* See USER_FLAG_* */
+@@ -2938,6 +2967,7 @@ sds getAclErrorMessage(int acl_res, user *user, struct redisCommand *cmd, sds er
+ void ACLUpdateDefaultUserPassword(sds password);
+ sds genRedisInfoStringACLStats(sds info);
+ void ACLRecomputeCommandBitsFromCommandRulesAllUsers(void);
++void ACLSelectorRemoveCommandRule(aclSelector *selector, sds new_rule);
+ 
+ /* Sorted sets data type */
+ 

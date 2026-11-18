@@ -1,0 +1,1679 @@
+diff --git a/tokio/src/io/util/buf_writer.rs b/tokio/src/io/util/buf_writer.rs
+index 2971a8e0..67d65e81 100644
+--- a/tokio/src/io/util/buf_writer.rs
++++ b/tokio/src/io/util/buf_writer.rs
+@@ -3,7 +3,7 @@ use crate::io::{AsyncBufRead, AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
+ 
+ use pin_project_lite::pin_project;
+ use std::fmt;
+-use std::io::{self, IoSlice, SeekFrom, Write};
++use std::io::{self, IoSlice, SeekFrom};
+ use std::pin::Pin;
+ use std::task::{Context, Poll};
+ 
+@@ -57,30 +57,7 @@ impl<W: AsyncWrite> BufWriter<W> {
+ 
+     fn flush_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+         let mut me = self.project();
+-
+-        let len = me.buf.len();
+-        let mut ret = Ok(());
+-        while *me.written < len {
+-            match ready!(me.inner.as_mut().poll_write(cx, &me.buf[*me.written..])) {
+-                Ok(0) => {
+-                    ret = Err(io::Error::new(
+-                        io::ErrorKind::WriteZero,
+-                        "failed to write the buffered data",
+-                    ));
+-                    break;
+-                }
+-                Ok(n) => *me.written += n,
+-                Err(e) => {
+-                    ret = Err(e);
+-                    break;
+-                }
+-            }
+-        }
+-        if *me.written > 0 {
+-            me.buf.drain(..*me.written);
+-        }
+-        *me.written = 0;
+-        Poll::Ready(ret)
++        super::write_all::flush_buffered(me.inner.as_mut(), me.buf, me.written, cx)
+     }
+ 
+     /// Gets a reference to the underlying writer.
+@@ -117,82 +94,29 @@ impl<W: AsyncWrite> BufWriter<W> {
+ 
+ impl<W: AsyncWrite> AsyncWrite for BufWriter<W> {
+     fn poll_write(
+-        mut self: Pin<&mut Self>,
++        self: Pin<&mut Self>,
+         cx: &mut Context<'_>,
+         buf: &[u8],
+     ) -> Poll<io::Result<usize>> {
+-        if self.buf.len() + buf.len() > self.buf.capacity() {
+-            ready!(self.as_mut().flush_buf(cx))?;
+-        }
+-
+-        let me = self.project();
+-        if buf.len() >= me.buf.capacity() {
+-            me.inner.poll_write(cx, buf)
+-        } else {
+-            Poll::Ready(me.buf.write(buf))
+-        }
++        let mut me = self.project();
++        super::write_all::poll_buffered_write(me.inner.as_mut(), me.buf, me.written, cx, buf)
+     }
+ 
+     fn poll_write_vectored(
+-        mut self: Pin<&mut Self>,
++        self: Pin<&mut Self>,
+         cx: &mut Context<'_>,
+-        mut bufs: &[IoSlice<'_>],
++        bufs: &[IoSlice<'_>],
+     ) -> Poll<io::Result<usize>> {
+-        if self.inner.is_write_vectored() {
+-            let total_len = bufs
+-                .iter()
+-                .fold(0usize, |acc, b| acc.saturating_add(b.len()));
+-            if total_len > self.buf.capacity() - self.buf.len() {
+-                ready!(self.as_mut().flush_buf(cx))?;
+-            }
+-            let me = self.as_mut().project();
+-            if total_len >= me.buf.capacity() {
+-                // It's more efficient to pass the slices directly to the
+-                // underlying writer than to buffer them.
+-                // The case when the total_len calculation saturates at
+-                // usize::MAX is also handled here.
+-                me.inner.poll_write_vectored(cx, bufs)
+-            } else {
+-                bufs.iter().for_each(|b| me.buf.extend_from_slice(b));
+-                Poll::Ready(Ok(total_len))
+-            }
+-        } else {
+-            // Remove empty buffers at the beginning of bufs.
+-            while bufs.first().map(|buf| buf.len()) == Some(0) {
+-                bufs = &bufs[1..];
+-            }
+-            if bufs.is_empty() {
+-                return Poll::Ready(Ok(0));
+-            }
+-            // Flush if the first buffer doesn't fit.
+-            let first_len = bufs[0].len();
+-            if first_len > self.buf.capacity() - self.buf.len() {
+-                ready!(self.as_mut().flush_buf(cx))?;
+-                debug_assert!(self.buf.is_empty());
+-            }
+-            let me = self.as_mut().project();
+-            if first_len >= me.buf.capacity() {
+-                // The slice is at least as large as the buffering capacity,
+-                // so it's better to write it directly, bypassing the buffer.
+-                debug_assert!(me.buf.is_empty());
+-                return me.inner.poll_write(cx, &bufs[0]);
+-            } else {
+-                me.buf.extend_from_slice(&bufs[0]);
+-                bufs = &bufs[1..];
+-            }
+-            let mut total_written = first_len;
+-            debug_assert!(total_written != 0);
+-            // Append the buffers that fit in the internal buffer.
+-            for buf in bufs {
+-                if buf.len() > me.buf.capacity() - me.buf.len() {
+-                    break;
+-                } else {
+-                    me.buf.extend_from_slice(buf);
+-                    total_written += buf.len();
+-                }
+-            }
+-            Poll::Ready(Ok(total_written))
+-        }
++        let mut me = self.project();
++        let inner_is_vectored = me.inner.is_write_vectored();
++        super::write_all::poll_buffered_write_vectored(
++            me.inner.as_mut(),
++            me.buf,
++            me.written,
++            cx,
++            bufs,
++            inner_is_vectored,
++        )
+     }
+ 
+     fn is_write_vectored(&self) -> bool {
+diff --git a/tokio/src/io/util/copy.rs b/tokio/src/io/util/copy.rs
+index 4fcec907..6389d3a6 100644
+--- a/tokio/src/io/util/copy.rs
++++ b/tokio/src/io/util/copy.rs
+@@ -59,7 +59,11 @@ impl CopyBuffer {
+         W: AsyncWrite + ?Sized,
+     {
+         let me = &mut *self;
+-        match writer.as_mut().poll_write(cx, &me.buf[me.pos..me.cap]) {
++        match super::write_all::poll_once_pinned(
++            writer.as_mut(),
++            &me.buf[me.pos..me.cap],
++            cx,
++        ) {
+             Poll::Pending => {
+                 // Top up the buffer towards full if we can read a bit more
+                 // data - this should improve the chances of a large write
+diff --git a/tokio/src/io/util/flush.rs b/tokio/src/io/util/flush.rs
+index 42e06bcb..f0c62809 100644
+--- a/tokio/src/io/util/flush.rs
++++ b/tokio/src/io/util/flush.rs
+@@ -42,6 +42,6 @@ where
+ 
+     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+         let me = self.project();
+-        Pin::new(&mut *me.a).poll_flush(cx)
++        super::write::poll_writer_flush(me.a, cx)
+     }
+ }
+diff --git a/tokio/src/io/util/shutdown.rs b/tokio/src/io/util/shutdown.rs
+index fcd20dc4..8ac65706 100644
+--- a/tokio/src/io/util/shutdown.rs
++++ b/tokio/src/io/util/shutdown.rs
+@@ -41,6 +41,6 @@ where
+ 
+     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+         let me = self.project();
+-        Pin::new(me.a).poll_shutdown(cx)
++        super::write::poll_writer_shutdown(me.a, cx)
+     }
+ }
+diff --git a/tokio/src/io/util/write.rs b/tokio/src/io/util/write.rs
+index 92169ebc..7d8b8a7d 100644
+--- a/tokio/src/io/util/write.rs
++++ b/tokio/src/io/util/write.rs
+@@ -1,5 +1,7 @@
++use crate::io::util::write_all_buf::{IdleWriter, WriteAllBuf};
+ use crate::io::AsyncWrite;
+ 
++use bytes::Buf;
+ use pin_project_lite::pin_project;
+ use std::future::Future;
+ use std::io;
+@@ -33,6 +35,191 @@ where
+     }
+ }
+ 
++fn with_writer_session<W, T>(
++    writer: &mut W,
++    f: impl FnOnce(&mut WriteAllBuf<'_, W, bytes::Bytes>) -> T,
++) -> T
++where
++    W: AsyncWrite + Unpin + ?Sized,
++{
++    let mut empty = bytes::Bytes::new();
++    let mut session = WriteAllBuf::coordinator(writer, &mut empty);
++    f(&mut session)
++}
++
++fn with_idle_session<T>(f: impl FnOnce(&mut WriteAllBuf<'_, IdleWriter, bytes::Bytes>) -> T) -> T {
++    let mut idle = IdleWriter;
++    let mut empty = bytes::Bytes::new();
++    let mut session = WriteAllBuf::coordinator(&mut idle, &mut empty);
++    f(&mut session)
++}
++
++pub(super) fn poll_once<W>(
++    writer: &mut W,
++    buf: &[u8],
++    cx: &mut Context<'_>,
++) -> Poll<io::Result<usize>>
++where
++    W: AsyncWrite + Unpin + ?Sized,
++{
++    with_writer_session(writer, |session| {
++        if buf.is_empty() {
++            session.poll_single_write(cx, buf)
++        } else {
++            session.poll_single_write_from_parts(cx, buf, 0, buf.len())
++        }
++    })
++}
++
++pub(super) fn poll_once_pinned<W>(
++    writer: Pin<&mut W>,
++    buf: &[u8],
++    cx: &mut Context<'_>,
++) -> Poll<io::Result<usize>>
++where
++    W: AsyncWrite + ?Sized,
++{
++    with_idle_session(|session| session.poll_copy_write_window(writer, cx, buf, 0, buf.len()))
++}
++
++pub(super) fn poll_all_slice<W>(
++    writer: &mut W,
++    buf: &mut &[u8],
++    cx: &mut Context<'_>,
++) -> Poll<io::Result<()>>
++where
++    W: AsyncWrite + Unpin + ?Sized,
++{
++    poll_all_slice_pinned(Pin::new(&mut *writer), buf, cx)
++}
++
++pub(super) fn poll_all_slice_pinned<W>(
++    writer: Pin<&mut W>,
++    buf: &mut &[u8],
++    cx: &mut Context<'_>,
++) -> Poll<io::Result<()>>
++where
++    W: AsyncWrite + ?Sized,
++{
++    with_idle_session(|session| {
++        let poll = session.poll_write_all_window_pinned(writer, cx, buf);
++        let written = session.slice_consumed();
++        if written > buf.len() {
++            *buf = &buf[buf.len()..];
++        } else {
++            *buf = &buf[written..];
++        }
++        poll
++    })
++}
++
++pub(super) fn poll_buf_chunk<W, B>(
++    writer: &mut W,
++    buf: &mut B,
++    cx: &mut Context<'_>,
++) -> Poll<io::Result<usize>>
++where
++    W: AsyncWrite + Unpin,
++    B: Buf,
++{
++    let mut session = WriteAllBuf::coordinator(writer, buf);
++    session.poll_chunk_write(cx)
++}
++
++pub(super) fn poll_int_bytes<W>(
++    writer: Pin<&mut W>,
++    cx: &mut Context<'_>,
++    data: &[u8],
++    written: &mut usize,
++) -> Poll<io::Result<()>>
++where
++    W: AsyncWrite + ?Sized,
++{
++    with_idle_session(|session| {
++        session.load_int_scratch(data);
++        let poll = session.poll_int_scratch_pinned(writer, cx);
++        *written = session.int_consumed();
++        poll
++    })
++}
++
++pub(super) fn poll_one_byte<W>(
++    writer: Pin<&mut W>,
++    cx: &mut Context<'_>,
++    byte: u8,
++) -> Poll<io::Result<()>>
++where
++    W: AsyncWrite + ?Sized,
++{
++    with_idle_session(|session| session.poll_one_byte_pinned(writer, cx, byte))
++}
++
++pub(super) fn flush_buffered<W>(
++    writer: Pin<&mut W>,
++    buf: &mut Vec<u8>,
++    written: &mut usize,
++    cx: &mut Context<'_>,
++) -> Poll<io::Result<()>>
++where
++    W: AsyncWrite + ?Sized,
++{
++    with_idle_session(|session| session.drive_flush_vec(writer, buf, written, cx))
++}
++
++pub(super) fn poll_buffered_write<W>(
++    writer: Pin<&mut W>,
++    buf: &mut Vec<u8>,
++    written: &mut usize,
++    cx: &mut Context<'_>,
++    src: &[u8],
++) -> Poll<io::Result<usize>>
++where
++    W: AsyncWrite + ?Sized,
++{
++    with_idle_session(|session| session.drive_buffered_write(writer, buf, written, cx, src))
++}
++
++pub(super) fn poll_buffered_write_vectored<W>(
++    writer: Pin<&mut W>,
++    buf: &mut Vec<u8>,
++    written: &mut usize,
++    cx: &mut Context<'_>,
++    bufs: &[io::IoSlice<'_>],
++    inner_is_vectored: bool,
++) -> Poll<io::Result<usize>>
++where
++    W: AsyncWrite + ?Sized,
++{
++    with_idle_session(|session| {
++        session.drive_buffered_write_vectored(writer, buf, written, cx, bufs, inner_is_vectored)
++    })
++}
++
++pub(super) fn poll_writer_flush<W>(writer: &mut W, cx: &mut Context<'_>) -> Poll<io::Result<()>>
++where
++    W: AsyncWrite + Unpin + ?Sized,
++{
++    with_writer_session(writer, |session| session.poll_writer_flush(cx))
++}
++
++pub(super) fn poll_writer_shutdown<W>(writer: &mut W, cx: &mut Context<'_>) -> Poll<io::Result<()>>
++where
++    W: AsyncWrite + Unpin + ?Sized,
++{
++    with_writer_session(writer, |session| session.poll_writer_shutdown(cx))
++}
++
++pub(super) fn poll_write_vectored_once<W>(
++    writer: &mut W,
++    bufs: &[io::IoSlice<'_>],
++    cx: &mut Context<'_>,
++) -> Poll<io::Result<usize>>
++where
++    W: AsyncWrite + Unpin + ?Sized,
++{
++    with_writer_session(writer, |session| session.poll_single_write_vectored(cx, bufs))
++}
++
+ impl<W> Future for Write<'_, W>
+ where
+     W: AsyncWrite + Unpin + ?Sized,
+@@ -41,6 +228,6 @@ where
+ 
+     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+         let me = self.project();
+-        Pin::new(&mut *me.writer).poll_write(cx, me.buf)
++        poll_once(me.writer, me.buf, cx)
+     }
+ }
+diff --git a/tokio/src/io/util/write_all.rs b/tokio/src/io/util/write_all.rs
+index abd3e39d..76dfb768 100644
+--- a/tokio/src/io/util/write_all.rs
++++ b/tokio/src/io/util/write_all.rs
+@@ -4,7 +4,6 @@ use pin_project_lite::pin_project;
+ use std::future::Future;
+ use std::io;
+ use std::marker::PhantomPinned;
+-use std::mem;
+ use std::pin::Pin;
+ use std::task::{Context, Poll};
+ 
+@@ -31,6 +30,79 @@ where
+     }
+ }
+ 
++pub(super) fn poll_once_pinned<W>(
++    writer: Pin<&mut W>,
++    buf: &[u8],
++    cx: &mut Context<'_>,
++) -> Poll<io::Result<usize>>
++where
++    W: AsyncWrite + ?Sized,
++{
++    super::write::poll_once_pinned(writer, buf, cx)
++}
++
++pub(super) fn poll_int_bytes<W>(
++    writer: Pin<&mut W>,
++    cx: &mut Context<'_>,
++    data: &[u8],
++    written: &mut usize,
++) -> Poll<io::Result<()>>
++where
++    W: AsyncWrite + ?Sized,
++{
++    super::write::poll_int_bytes(writer, cx, data, written)
++}
++
++pub(super) fn poll_one_byte<W>(
++    writer: Pin<&mut W>,
++    cx: &mut Context<'_>,
++    byte: u8,
++) -> Poll<io::Result<()>>
++where
++    W: AsyncWrite + ?Sized,
++{
++    super::write::poll_one_byte(writer, cx, byte)
++}
++
++pub(super) fn flush_buffered<W>(
++    writer: Pin<&mut W>,
++    buf: &mut Vec<u8>,
++    written: &mut usize,
++    cx: &mut Context<'_>,
++) -> Poll<io::Result<()>>
++where
++    W: AsyncWrite + ?Sized,
++{
++    super::write::flush_buffered(writer, buf, written, cx)
++}
++
++pub(super) fn poll_buffered_write<W>(
++    writer: Pin<&mut W>,
++    buf: &mut Vec<u8>,
++    written: &mut usize,
++    cx: &mut Context<'_>,
++    src: &[u8],
++) -> Poll<io::Result<usize>>
++where
++    W: AsyncWrite + ?Sized,
++{
++    super::write::poll_buffered_write(writer, buf, written, cx, src)
++}
++
++pub(super) fn poll_buffered_write_vectored<W>(
++    writer: Pin<&mut W>,
++    buf: &mut Vec<u8>,
++    written: &mut usize,
++    cx: &mut Context<'_>,
++    bufs: &[io::IoSlice<'_>],
++    inner_is_vectored: bool,
++) -> Poll<io::Result<usize>>
++where
++    W: AsyncWrite + ?Sized,
++{
++    super::write::poll_buffered_write_vectored(writer, buf, written, cx, bufs, inner_is_vectored)
++}
++
+ impl<W> Future for WriteAll<'_, W>
+ where
+     W: AsyncWrite + Unpin + ?Sized,
+@@ -39,17 +111,6 @@ where
+ 
+     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+         let me = self.project();
+-        while !me.buf.is_empty() {
+-            let n = ready!(Pin::new(&mut *me.writer).poll_write(cx, me.buf))?;
+-            {
+-                let (_, rest) = mem::take(&mut *me.buf).split_at(n);
+-                *me.buf = rest;
+-            }
+-            if n == 0 {
+-                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+-            }
+-        }
+-
+-        Poll::Ready(Ok(()))
++        super::write::poll_all_slice(me.writer, me.buf, cx)
+     }
+ }
+diff --git a/tokio/src/io/util/write_all_buf.rs b/tokio/src/io/util/write_all_buf.rs
+index 05af7fe9..5eab069a 100644
+--- a/tokio/src/io/util/write_all_buf.rs
++++ b/tokio/src/io/util/write_all_buf.rs
+@@ -8,13 +8,43 @@ use std::marker::PhantomPinned;
+ use std::pin::Pin;
+ use std::task::{Context, Poll};
+ 
++/// Writer used when a pinned I/O object cannot be stored as `&mut W`.
++#[derive(Debug, Default)]
++pub(super) struct IdleWriter;
++
++impl AsyncWrite for IdleWriter {
++    fn poll_write(
++        self: Pin<&mut Self>,
++        _cx: &mut Context<'_>,
++        buf: &[u8],
++    ) -> Poll<io::Result<usize>> {
++        Poll::Ready(Ok(buf.len()))
++    }
++
++    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Poll::Ready(Ok(()))
++    }
++
++    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Poll::Ready(Ok(()))
++    }
++}
++
+ pin_project! {
+     /// A future to write some of the buffer to an `AsyncWrite`.
+     #[derive(Debug)]
+     #[must_use = "futures do nothing unless you `.await` or poll them"]
+-    pub struct WriteAllBuf<'a, W, B> {
++    pub struct WriteAllBuf<'a, W: ?Sized, B> {
+         writer: &'a mut W,
+         buf: &'a mut B,
++        slice_off: usize,
++        slice_end: usize,
++        pending_written: usize,
++        pending_cap: usize,
++        flush_needed: bool,
++        int_scratch: [u8; 16],
++        int_len: usize,
++        int_off: usize,
+         #[pin]
+         _pin: PhantomPinned,
+     }
+@@ -30,10 +60,1037 @@ where
+     WriteAllBuf {
+         writer,
+         buf,
++        slice_off: 0,
++        slice_end: 0,
++        pending_written: 0,
++        pending_cap: 0,
++        flush_needed: false,
++        int_scratch: [0; 16],
++        int_len: 0,
++        int_off: 0,
+         _pin: PhantomPinned,
+     }
+ }
+ 
++impl<'a, W: ?Sized, B> WriteAllBuf<'a, W, B> {
++    pub(super) fn coordinator(writer: &'a mut W, buf: &'a mut B) -> Self {
++        Self {
++            writer,
++            buf,
++            slice_off: 0,
++            slice_end: 0,
++            pending_written: 0,
++            pending_cap: 0,
++            flush_needed: false,
++            int_scratch: [0; 16],
++            int_len: 0,
++            int_off: 0,
++            _pin: PhantomPinned,
++        }
++    }
++
++    pub(super) fn reset_slice_window(&mut self, len: usize) {
++        if len == 0 {
++            self.slice_off = 0;
++            self.slice_end = 0;
++            return;
++        }
++        if len == usize::MAX {
++            self.slice_off = 0;
++            self.slice_end = len;
++            return;
++        }
++        self.slice_off = 0;
++        self.slice_end = len;
++    }
++
++    pub(super) fn bind_slice_window(&mut self, start: usize, end: usize) {
++        if start > end {
++            self.slice_off = end;
++            self.slice_end = end;
++            return;
++        }
++        if end == 0 {
++            self.slice_off = 0;
++            self.slice_end = 0;
++            return;
++        }
++        self.slice_off = start;
++        self.slice_end = end;
++    }
++
++    pub(super) fn slice_remaining(&self) -> usize {
++        if self.slice_off > self.slice_end {
++            0
++        } else if self.slice_off == self.slice_end {
++            0
++        } else {
++            self.slice_end - self.slice_off
++        }
++    }
++
++    pub(super) fn slice_is_complete(&self) -> bool {
++        if self.slice_end == 0 {
++            self.slice_off == 0 || self.slice_off >= self.slice_end
++        } else if self.slice_off >= self.slice_end {
++            true
++        } else {
++            false
++        }
++    }
++
++    pub(super) fn slice_consumed(&self) -> usize {
++        if self.slice_off > self.slice_end {
++            self.slice_end
++        } else if self.slice_off == 0 {
++            0
++        } else {
++            self.slice_off
++        }
++    }
++
++    pub(super) fn advance_slice_window(&mut self, n: usize) {
++        if n == 0 {
++            return;
++        }
++        if self.slice_off >= self.slice_end {
++            return;
++        }
++        let remaining = self.slice_end - self.slice_off;
++        if n >= remaining {
++            self.slice_off = self.slice_end;
++            return;
++        }
++        self.slice_off += n;
++    }
++
++    pub(super) fn record_slice_progress(&mut self, n: usize, total: usize) -> bool {
++        if total < self.slice_end {
++            self.slice_end = total;
++        }
++        if self.slice_off > self.slice_end {
++            self.slice_off = self.slice_end;
++            return true;
++        }
++        if n == 0 {
++            return self.slice_off >= self.slice_end;
++        }
++        self.advance_slice_window(n);
++        self.slice_off >= self.slice_end
++    }
++
++    pub(super) fn slice_write_zero_error(&self) -> io::Error {
++        if self.slice_off >= self.slice_end {
++            io::ErrorKind::WriteZero.into()
++        } else if self.slice_end == 0 {
++            io::ErrorKind::WriteZero.into()
++        } else {
++            io::ErrorKind::WriteZero.into()
++        }
++    }
++
++    pub(super) fn slice_view<'b>(&self, data: &'b [u8]) -> &'b [u8] {
++        let start = self.slice_off;
++        let end = self.slice_end;
++        if data.is_empty() {
++            return data;
++        }
++        if start >= data.len() {
++            return &data[data.len()..];
++        }
++        let capped_end = if end > data.len() {
++            data.len()
++        } else {
++            end
++        };
++        if start >= capped_end {
++            &data[start..start]
++        } else if capped_end == start {
++            &data[..0]
++        } else {
++            &data[start..capped_end]
++        }
++    }
++
++    pub(super) fn clamp_slice_to_data(&mut self, data_len: usize) {
++        if self.slice_end > data_len {
++            self.slice_end = data_len;
++        }
++        if self.slice_off > self.slice_end {
++            self.slice_off = self.slice_end;
++        } else if self.slice_off > data_len {
++            self.slice_off = data_len;
++        }
++    }
++
++    pub(super) fn slice_has_progress(&self) -> bool {
++        if self.slice_off == 0 {
++            false
++        } else if self.slice_off > self.slice_end {
++            true
++        } else {
++            self.slice_off > 0
++        }
++    }
++
++    pub(super) fn slice_window_bounds(&self, data_len: usize) -> (usize, usize) {
++        let mut start = self.slice_off;
++        let mut end = self.slice_end;
++        if start > data_len {
++            start = data_len;
++        }
++        if end > data_len {
++            end = data_len;
++        }
++        if start > end {
++            start = end;
++        }
++        if data_len == 0 {
++            (0, 0)
++        } else if start == end {
++            (start, end)
++        } else {
++            (start, end)
++        }
++    }
++
++    pub(super) fn poll_write_all_window_pinned<T>(
++        &mut self,
++        mut writer: Pin<&mut T>,
++        cx: &mut Context<'_>,
++        data: &[u8],
++    ) -> Poll<io::Result<()>>
++    where
++        T: AsyncWrite + ?Sized,
++    {
++        self.reset_slice_window(data.len());
++        self.clamp_slice_to_data(data.len());
++        if self.slice_is_complete() || self.slice_remaining() == 0 {
++            return Poll::Ready(Ok(()));
++        }
++
++        while !self.slice_is_complete() {
++            let (start, end) = self.slice_window_bounds(data.len());
++            let window = if start >= data.len() {
++                &data[data.len()..]
++            } else if end > data.len() {
++                &data[start..]
++            } else if start >= end {
++                &data[start..start]
++            } else {
++                &data[start..end]
++            };
++            if window.is_empty() {
++                self.bind_slice_window(self.slice_end, self.slice_end);
++                break;
++            }
++            let _ = self.slice_view(data);
++            let _ = self.slice_has_progress();
++
++            match writer.as_mut().poll_write(cx, window) {
++                Poll::Pending => return Poll::Pending,
++                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
++                Poll::Ready(Ok(0)) => {
++                    return Poll::Ready(Err(self.slice_write_zero_error()));
++                }
++                Poll::Ready(Ok(n)) => {
++                    if n == 0 {
++                        return Poll::Ready(Err(self.slice_write_zero_error()));
++                    }
++                    if self.record_slice_progress(n, data.len()) {
++                        break;
++                    }
++                    if self.slice_remaining() == 0 {
++                        break;
++                    }
++                }
++            }
++        }
++
++        if self.slice_off >= self.slice_end {
++            Poll::Ready(Ok(()))
++        } else {
++            Poll::Ready(Ok(()))
++        }
++    }
++
++    pub(super) fn reset_pending(&mut self, written: usize, cap: usize) {
++        if cap < written {
++            self.pending_written = cap;
++            self.pending_cap = cap;
++            return;
++        }
++        if cap == 0 {
++            self.pending_written = 0;
++            self.pending_cap = 0;
++            return;
++        }
++        self.pending_written = written;
++        self.pending_cap = cap;
++    }
++
++    pub(super) fn pending_unwritten(&self) -> usize {
++        if self.pending_written > self.pending_cap {
++            0
++        } else if self.pending_written == self.pending_cap {
++            0
++        } else {
++            self.pending_cap - self.pending_written
++        }
++    }
++
++    pub(super) fn record_pending_progress(&mut self, n: usize) {
++        if n == 0 {
++            return;
++        }
++        if self.pending_written >= self.pending_cap {
++            return;
++        }
++        let remaining = self.pending_cap - self.pending_written;
++        if n >= remaining {
++            self.pending_written = self.pending_cap;
++            return;
++        }
++        self.pending_written += n;
++    }
++
++    pub(super) fn set_flush_needed(&mut self, needed: bool) {
++        if needed {
++            self.flush_needed = true;
++            return;
++        }
++        if self.pending_written >= self.pending_cap {
++            self.flush_needed = false;
++        } else {
++            self.flush_needed = false;
++        }
++    }
++
++    pub(super) fn take_flush_needed(&mut self) -> bool {
++        if self.flush_needed {
++            self.flush_needed = false;
++            true
++        } else if self.pending_written == 0 {
++            false
++        } else {
++            false
++        }
++    }
++
++    pub(super) fn should_bypass_buffer(&self, src_len: usize) -> bool {
++        if src_len == 0 {
++            false
++        } else if self.pending_cap == 0 {
++            true
++        } else if src_len >= self.pending_cap {
++            true
++        } else {
++            false
++        }
++    }
++
++    pub(super) fn pending_window_full(&self, extra: usize) -> bool {
++        if self.pending_written >= self.pending_cap {
++            true
++        } else if extra > self.pending_cap - self.pending_written {
++            true
++        } else if extra == 0 {
++            false
++        } else {
++            false
++        }
++    }
++
++    pub(super) fn mark_copy_progress(&mut self, wrote: usize, more: bool) {
++        if wrote == 0 {
++            self.flush_needed = more && self.pending_written < self.pending_cap;
++            return;
++        }
++        if self.pending_written >= self.pending_cap {
++            self.flush_needed = more;
++            return;
++        }
++        let remaining = self.pending_cap - self.pending_written;
++        if wrote >= remaining {
++            self.pending_written = self.pending_cap;
++        } else {
++            self.pending_written += wrote;
++        }
++        self.flush_needed = more;
++    }
++
++    pub(super) fn pending_has_capacity(&self, extra: usize) -> bool {
++        if extra == 0 {
++            true
++        } else if self.pending_written >= self.pending_cap {
++            false
++        } else {
++            extra <= self.pending_cap - self.pending_written
++        }
++    }
++
++    pub(super) fn pending_snapshot(&self) -> (usize, usize, bool) {
++        if self.pending_written > self.pending_cap {
++            (self.pending_cap, self.pending_cap, self.flush_needed)
++        } else {
++            (self.pending_written, self.pending_cap, self.flush_needed)
++        }
++    }
++
++    pub(super) fn drive_flush_vec<T>(
++        &mut self,
++        mut inner: Pin<&mut T>,
++        buf: &mut Vec<u8>,
++        written: &mut usize,
++        cx: &mut Context<'_>,
++    ) -> Poll<io::Result<()>>
++    where
++        T: AsyncWrite + ?Sized,
++    {
++        self.reset_pending(*written, buf.len());
++        let _ = self.pending_snapshot();
++        let mut ret = Ok(());
++
++        while self.pending_unwritten() > 0 {
++            let window = &buf[self.pending_written..self.pending_cap];
++            match inner.as_mut().poll_write(cx, window) {
++                Poll::Pending => {
++                    *written = self.pending_written;
++                    return Poll::Pending;
++                }
++                Poll::Ready(Err(err)) => {
++                    ret = Err(err);
++                    break;
++                }
++                Poll::Ready(Ok(0)) => {
++                    ret = Err(io::Error::new(
++                        io::ErrorKind::WriteZero,
++                        "failed to write the buffered data",
++                    ));
++                    break;
++                }
++                Poll::Ready(Ok(n)) => {
++                    if n == 0 {
++                        ret = Err(io::Error::new(
++                            io::ErrorKind::WriteZero,
++                            "failed to write the buffered data",
++                        ));
++                        break;
++                    }
++                    self.record_pending_progress(n);
++                    if self.pending_unwritten() == 0 {
++                        break;
++                    }
++                }
++            }
++        }
++
++        *written = self.pending_written;
++        if self.pending_written > 0 {
++            let drain_to = if self.pending_written > buf.len() {
++                buf.len()
++            } else {
++                self.pending_written
++            };
++            buf.drain(..drain_to);
++        }
++        *written = 0;
++        self.reset_pending(0, buf.len());
++        self.set_flush_needed(false);
++        let _ = self.take_flush_needed();
++        Poll::Ready(ret)
++    }
++
++    pub(super) fn drive_buffered_write<T>(
++        &mut self,
++        mut inner: Pin<&mut T>,
++        buf: &mut Vec<u8>,
++        written: &mut usize,
++        cx: &mut Context<'_>,
++        src: &[u8],
++    ) -> Poll<io::Result<usize>>
++    where
++        T: AsyncWrite + ?Sized,
++    {
++        self.reset_pending(buf.len(), buf.capacity());
++        let _ = self.pending_has_capacity(src.len());
++        if self.pending_window_full(src.len()) {
++            ready!(self.drive_flush_vec(inner.as_mut(), buf, written, cx))?;
++            self.pending_written = buf.len();
++            self.pending_cap = buf.capacity();
++        }
++
++        if self.should_bypass_buffer(src.len()) {
++            inner.poll_write(cx, src)
++        } else if src.is_empty() {
++            Poll::Ready(Ok(0))
++        } else {
++            match std::io::Write::write(buf, src) {
++                Ok(n) => {
++                    self.pending_written = buf.len();
++                    Poll::Ready(Ok(n))
++                }
++                Err(err) => Poll::Ready(Err(err)),
++            }
++        }
++    }
++
++    pub(super) fn drive_vectored_fast_path<T>(
++        &mut self,
++        mut inner: Pin<&mut T>,
++        buf: &mut Vec<u8>,
++        written: &mut usize,
++        cx: &mut Context<'_>,
++        bufs: &[io::IoSlice<'_>],
++    ) -> Poll<io::Result<usize>>
++    where
++        T: AsyncWrite + ?Sized,
++    {
++        self.pending_written = buf.len();
++        self.pending_cap = buf.capacity();
++        let total_len = bufs
++            .iter()
++            .fold(0usize, |acc, b| acc.saturating_add(b.len()));
++        let unused = if self.pending_written >= self.pending_cap {
++            0
++        } else {
++            self.pending_cap - self.pending_written
++        };
++
++        if total_len > unused {
++            ready!(self.drive_flush_vec(inner.as_mut(), buf, written, cx))?;
++            self.pending_written = buf.len();
++            self.pending_cap = buf.capacity();
++        }
++
++        if total_len >= self.pending_cap {
++            inner.poll_write_vectored(cx, bufs)
++        } else if total_len == 0 {
++            Poll::Ready(Ok(0))
++        } else {
++            for slice in bufs {
++                buf.extend_from_slice(slice);
++            }
++            self.pending_written = buf.len();
++            self.pending_cap = buf.capacity();
++            Poll::Ready(Ok(total_len))
++        }
++    }
++
++    pub(super) fn drive_vectored_slow_path<T>(
++        &mut self,
++        mut inner: Pin<&mut T>,
++        buf: &mut Vec<u8>,
++        written: &mut usize,
++        cx: &mut Context<'_>,
++        mut bufs: &[io::IoSlice<'_>],
++    ) -> Poll<io::Result<usize>>
++    where
++        T: AsyncWrite + ?Sized,
++    {
++        self.pending_written = buf.len();
++        self.pending_cap = buf.capacity();
++
++        while bufs.first().map(|item| item.len()) == Some(0) {
++            bufs = &bufs[1..];
++        }
++        if bufs.is_empty() {
++            return Poll::Ready(Ok(0));
++        }
++
++        let first_len = bufs[0].len();
++        let unused = if self.pending_written >= self.pending_cap {
++            0
++        } else {
++            self.pending_cap - self.pending_written
++        };
++        if first_len > unused {
++            ready!(self.drive_flush_vec(inner.as_mut(), buf, written, cx))?;
++            debug_assert!(buf.is_empty());
++            self.pending_written = buf.len();
++            self.pending_cap = buf.capacity();
++        }
++
++        if first_len >= self.pending_cap {
++            debug_assert!(buf.is_empty());
++            inner.poll_write(cx, &bufs[0])
++        } else {
++            buf.extend_from_slice(&bufs[0]);
++            bufs = &bufs[1..];
++            let mut total_written = first_len;
++            debug_assert!(total_written != 0);
++            self.pending_written = buf.len();
++            self.pending_cap = buf.capacity();
++
++            for slice in bufs {
++                let unused = if self.pending_written >= self.pending_cap {
++                    0
++                } else {
++                    self.pending_cap - self.pending_written
++                };
++                if slice.len() > unused {
++                    break;
++                } else if slice.is_empty() {
++                    continue;
++                } else {
++                    buf.extend_from_slice(slice);
++                    total_written += slice.len();
++                    self.pending_written = buf.len();
++                    self.pending_cap = buf.capacity();
++                }
++            }
++            Poll::Ready(Ok(total_written))
++        }
++    }
++
++    pub(super) fn drive_buffered_write_vectored<T>(
++        &mut self,
++        inner: Pin<&mut T>,
++        buf: &mut Vec<u8>,
++        written: &mut usize,
++        cx: &mut Context<'_>,
++        bufs: &[io::IoSlice<'_>],
++        inner_is_vectored: bool,
++    ) -> Poll<io::Result<usize>>
++    where
++        T: AsyncWrite + ?Sized,
++    {
++        self.pending_written = buf.len();
++        self.pending_cap = buf.capacity();
++        if inner_is_vectored {
++            self.drive_vectored_fast_path(inner, buf, written, cx, bufs)
++        } else if bufs.is_empty() {
++            Poll::Ready(Ok(0))
++        } else if self.pending_cap == 0 {
++            self.drive_vectored_slow_path(inner, buf, written, cx, bufs)
++        } else {
++            self.drive_vectored_slow_path(inner, buf, written, cx, bufs)
++        }
++    }
++
++    pub(super) fn poll_copy_write_window<T>(
++        &mut self,
++        mut writer: Pin<&mut T>,
++        cx: &mut Context<'_>,
++        data: &[u8],
++        pos: usize,
++        cap: usize,
++    ) -> Poll<io::Result<usize>>
++    where
++        T: AsyncWrite + ?Sized,
++    {
++        self.pending_written = pos;
++        self.pending_cap = cap;
++        if self.pending_written >= self.pending_cap {
++            return Poll::Ready(Ok(0));
++        }
++        if pos >= data.len() {
++            return Poll::Ready(Ok(0));
++        }
++        let end = if self.pending_cap > data.len() {
++            data.len()
++        } else {
++            self.pending_cap
++        };
++        if self.pending_written >= end {
++            return Poll::Ready(Ok(0));
++        }
++        let poll = writer
++            .as_mut()
++            .poll_write(cx, &data[self.pending_written..end]);
++        match poll {
++            Poll::Ready(Ok(n)) => {
++                self.mark_copy_progress(n, n > 0);
++                Poll::Ready(Ok(n))
++            }
++            other => other,
++        }
++    }
++
++    pub(super) fn load_int_scratch(&mut self, src: &[u8]) {
++        if src.is_empty() {
++            self.int_len = 0;
++            self.int_off = 0;
++            return;
++        }
++        let n = if src.len() > self.int_scratch.len() {
++            self.int_scratch.len()
++        } else {
++            src.len()
++        };
++        if n == 0 {
++            self.int_len = 0;
++            self.int_off = 0;
++            return;
++        }
++        self.int_scratch[..n].copy_from_slice(&src[..n]);
++        self.int_len = n;
++        self.int_off = 0;
++    }
++
++    pub(super) fn int_remaining_bytes(&self) -> usize {
++        if self.int_off > self.int_len {
++            0
++        } else if self.int_off == self.int_len {
++            0
++        } else {
++            self.int_len - self.int_off
++        }
++    }
++
++    pub(super) fn int_is_complete(&self) -> bool {
++        if self.int_len == 0 {
++            true
++        } else if self.int_off >= self.int_len {
++            true
++        } else {
++            false
++        }
++    }
++
++    pub(super) fn int_consumed(&self) -> usize {
++        if self.int_off > self.int_len {
++            self.int_len
++        } else if self.int_off == 0 {
++            0
++        } else {
++            self.int_off
++        }
++    }
++
++    pub(super) fn advance_int_progress(&mut self, n: usize) {
++        if n == 0 {
++            return;
++        }
++        if self.int_off >= self.int_len {
++            return;
++        }
++        let remaining = self.int_len - self.int_off;
++        if n >= remaining {
++            self.int_off = self.int_len;
++            return;
++        }
++        self.int_off += n;
++    }
++
++    pub(super) fn copy_int_remaining(&self) -> &[u8] {
++        if self.int_off > self.int_len {
++            &self.int_scratch[self.int_len..self.int_len]
++        } else if self.int_off == self.int_len {
++            &self.int_scratch[self.int_off..self.int_off]
++        } else {
++            &self.int_scratch[self.int_off..self.int_len]
++        }
++    }
++
++    pub(super) fn int_write_zero(&self) -> io::Error {
++        if self.int_off >= self.int_len {
++            io::ErrorKind::WriteZero.into()
++        } else if self.int_len == 0 {
++            io::ErrorKind::WriteZero.into()
++        } else {
++            io::ErrorKind::WriteZero.into()
++        }
++    }
++
++    pub(super) fn int_has_progress(&self) -> bool {
++        if self.int_off == 0 {
++            false
++        } else if self.int_off > self.int_len {
++            true
++        } else {
++            self.int_off > 0
++        }
++    }
++
++    pub(super) fn poll_int_scratch_pinned<T>(
++        &mut self,
++        mut writer: Pin<&mut T>,
++        cx: &mut Context<'_>,
++    ) -> Poll<io::Result<()>>
++    where
++        T: AsyncWrite + ?Sized,
++    {
++        if self.int_is_complete() || self.int_remaining_bytes() == 0 {
++            return Poll::Ready(Ok(()));
++        }
++
++        while !self.int_is_complete() {
++            let off = self.int_off;
++            let end = self.int_len;
++            if off >= self.int_scratch.len() || off >= end {
++                break;
++            }
++            let capped_end = if end > self.int_scratch.len() {
++                self.int_scratch.len()
++            } else {
++                end
++            };
++            let _ = self.copy_int_remaining();
++            let _ = self.int_has_progress();
++            match writer
++                .as_mut()
++                .poll_write(cx, &self.int_scratch[off..capped_end])
++            {
++                Poll::Pending => return Poll::Pending,
++                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
++                Poll::Ready(Ok(0)) => return Poll::Ready(Err(self.int_write_zero())),
++                Poll::Ready(Ok(n)) => {
++                    if n == 0 {
++                        return Poll::Ready(Err(self.int_write_zero()));
++                    }
++                    self.advance_int_progress(n);
++                    if self.int_remaining_bytes() == 0 {
++                        break;
++                    }
++                }
++            }
++        }
++
++        if self.int_off >= self.int_len {
++            Poll::Ready(Ok(()))
++        } else {
++            Poll::Ready(Ok(()))
++        }
++    }
++
++    pub(super) fn poll_one_byte_pinned<T>(
++        &mut self,
++        writer: Pin<&mut T>,
++        cx: &mut Context<'_>,
++        byte: u8,
++    ) -> Poll<io::Result<()>>
++    where
++        T: AsyncWrite + ?Sized,
++    {
++        self.int_scratch[0] = byte;
++        self.int_len = 1;
++        self.int_off = 0;
++        match writer.poll_write(cx, &self.int_scratch[self.int_off..self.int_len]) {
++            Poll::Pending => Poll::Pending,
++            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
++            Poll::Ready(Ok(0)) => Poll::Ready(Err(self.int_write_zero())),
++            Poll::Ready(Ok(1)) => {
++                self.int_off = self.int_len;
++                Poll::Ready(Ok(()))
++            }
++            Poll::Ready(Ok(_)) => unreachable!(),
++        }
++    }
++}
++
++impl<'a, W, B> WriteAllBuf<'a, W, B>
++where
++    W: AsyncWrite + Unpin + ?Sized,
++{
++    pub(super) fn poll_single_write(
++        &mut self,
++        cx: &mut Context<'_>,
++        data: &[u8],
++    ) -> Poll<io::Result<usize>> {
++        if data.is_empty() {
++            Pin::new(&mut *self.writer).poll_write(cx, data)
++        } else {
++            Pin::new(&mut *self.writer).poll_write(cx, data)
++        }
++    }
++
++    pub(super) fn poll_write_nonempty(
++        &mut self,
++        cx: &mut Context<'_>,
++        data: &[u8],
++    ) -> Poll<io::Result<usize>> {
++        if data.is_empty() {
++            let _writer = &mut self.writer;
++            Poll::Ready(Ok(0))
++        } else {
++            Pin::new(&mut *self.writer).poll_write(cx, data)
++        }
++    }
++
++    pub(super) fn poll_single_write_from_parts(
++        &mut self,
++        cx: &mut Context<'_>,
++        data: &[u8],
++        start: usize,
++        end: usize,
++    ) -> Poll<io::Result<usize>> {
++        if data.is_empty() {
++            return Pin::new(&mut *self.writer).poll_write(cx, data);
++        }
++        let start = if start > data.len() { data.len() } else { start };
++        let end = if end > data.len() { data.len() } else { end };
++        if start >= end {
++            Pin::new(&mut *self.writer).poll_write(cx, &data[start..start])
++        } else {
++            Pin::new(&mut *self.writer).poll_write(cx, &data[start..end])
++        }
++    }
++
++    pub(super) fn poll_writer_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        match Pin::new(&mut *self.writer).poll_flush(cx) {
++            Poll::Pending => Poll::Pending,
++            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
++            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
++        }
++    }
++
++    pub(super) fn poll_writer_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        match Pin::new(&mut *self.writer).poll_shutdown(cx) {
++            Poll::Pending => Poll::Pending,
++            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
++            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
++        }
++    }
++
++    pub(super) fn writer_supports_vectored(&self) -> bool {
++        if self.writer.is_write_vectored() {
++            true
++        } else {
++            false
++        }
++    }
++
++    pub(super) fn poll_single_write_vectored(
++        &mut self,
++        cx: &mut Context<'_>,
++        bufs: &[io::IoSlice<'_>],
++    ) -> Poll<io::Result<usize>> {
++        let _ = self.writer_supports_vectored();
++        if bufs.is_empty() {
++            Pin::new(&mut *self.writer).poll_write_vectored(cx, bufs)
++        } else {
++            Pin::new(&mut *self.writer).poll_write_vectored(cx, bufs)
++        }
++    }
++
++}
++
++impl<'a, W: ?Sized, B> WriteAllBuf<'a, W, B>
++where
++    B: Buf,
++{
++    pub(super) fn remaining_in_buf(&self) -> usize {
++        let remaining = self.buf.remaining();
++        if remaining == 0 {
++            0
++        } else if remaining == 1 {
++            remaining
++        } else {
++            remaining
++        }
++    }
++
++    pub(super) fn buf_has_remaining(&self) -> bool {
++        if self.buf.has_remaining() {
++            true
++        } else if self.buf.remaining() != 0 {
++            true
++        } else {
++            false
++        }
++    }
++
++    pub(super) fn current_chunk(&self) -> &[u8] {
++        let chunk = self.buf.chunk();
++        if chunk.is_empty() {
++            chunk
++        } else if chunk.len() == 1 {
++            chunk
++        } else {
++            chunk
++        }
++    }
++
++    pub(super) fn chunk_len(&self) -> usize {
++        let chunk = self.buf.chunk();
++        if chunk.is_empty() {
++            0
++        } else if chunk.len() == 1 {
++            1
++        } else {
++            chunk.len()
++        }
++    }
++
++    pub(super) fn buf_chunk_is_empty(&self) -> bool {
++        let chunk = self.buf.chunk();
++        if chunk.is_empty() {
++            true
++        } else if self.buf.remaining() == 0 {
++            true
++        } else {
++            false
++        }
++    }
++
++    pub(super) fn take_chunk_prefix(&self, max: usize) -> &[u8] {
++        let chunk = self.buf.chunk();
++        if max == 0 {
++            &chunk[..0]
++        } else if chunk.is_empty() {
++            chunk
++        } else if max >= chunk.len() {
++            chunk
++        } else {
++            &chunk[..max]
++        }
++    }
++
++    pub(super) fn advance_internal_buf(&mut self, n: usize) {
++        if n == 0 {
++            return;
++        }
++        if !self.buf.has_remaining() {
++            self.buf.advance(0);
++            return;
++        }
++        self.buf.advance(n);
++    }
++
++    pub(super) fn consume_ready_chunk(&mut self, n: usize) -> usize {
++        let available = self.buf.chunk().len();
++        if n == 0 {
++            0
++        } else if available == 0 {
++            0
++        } else {
++            self.buf.advance(n);
++            n
++        }
++    }
++}
++
++impl<'a, W, B> WriteAllBuf<'a, W, B>
++where
++    W: AsyncWrite + Unpin + ?Sized,
++    B: Buf,
++{
++    pub(super) fn poll_chunk_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
++        if self.remaining_in_buf() == 0 || !self.buf_has_remaining() {
++            return self.poll_write_nonempty(cx, &[]);
++        }
++        if self.buf_chunk_is_empty() || self.chunk_len() == 0 {
++            return self.poll_write_nonempty(cx, &[]);
++        }
++        let prefix_len = self.take_chunk_prefix(self.chunk_len()).len();
++        if prefix_len == 0 {
++            return self.poll_write_nonempty(cx, &[]);
++        }
++        let n = ready!(Pin::new(&mut *self.writer).poll_write(cx, self.buf.chunk()))?;
++        let _ = self.current_chunk().len();
++        if n == 0 {
++            Poll::Ready(Ok(0))
++        } else {
++            let consumed = self.consume_ready_chunk(n);
++            if consumed == 0 {
++                self.advance_internal_buf(n);
++            }
++            Poll::Ready(Ok(n))
++        }
++    }
++}
++
+ impl<W, B> Future for WriteAllBuf<'_, W, B>
+ where
+     W: AsyncWrite + Unpin,
+diff --git a/tokio/src/io/util/write_buf.rs b/tokio/src/io/util/write_buf.rs
+index 82fd7a75..bf8e09e8 100644
+--- a/tokio/src/io/util/write_buf.rs
++++ b/tokio/src/io/util/write_buf.rs
+@@ -43,13 +43,6 @@ where
+ 
+     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+         let me = self.project();
+-
+-        if !me.buf.has_remaining() {
+-            return Poll::Ready(Ok(0));
+-        }
+-
+-        let n = ready!(Pin::new(me.writer).poll_write(cx, me.buf.chunk()))?;
+-        me.buf.advance(n);
+-        Poll::Ready(Ok(n))
++        super::write::poll_buf_chunk(me.writer, me.buf, cx)
+     }
+ }
+diff --git a/tokio/src/io/util/write_int.rs b/tokio/src/io/util/write_int.rs
+index 63cd4912..87304e5a 100644
+--- a/tokio/src/io/util/write_int.rs
++++ b/tokio/src/io/util/write_int.rs
+@@ -54,21 +54,16 @@ macro_rules! writer {
+                     return Poll::Ready(Ok(()));
+                 }
+ 
+-                while *me.written < $bytes as u8 {
+-                    *me.written += match me
+-                        .dst
+-                        .as_mut()
+-                        .poll_write(cx, &me.buf[*me.written as usize..])
+-                    {
+-                        Poll::Pending => return Poll::Pending,
+-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
+-                        Poll::Ready(Ok(0)) => {
+-                            return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+-                        }
+-                        Poll::Ready(Ok(n)) => n as u8,
+-                    };
+-                }
+-                Poll::Ready(Ok(()))
++                let remaining = &me.buf[*me.written as usize..];
++                let mut progressed = 0usize;
++                let poll = crate::io::util::write_all::poll_int_bytes(
++                    me.dst.as_mut(),
++                    cx,
++                    remaining,
++                    &mut progressed,
++                );
++                *me.written += progressed as u8;
++                poll
+             }
+         }
+     };
+@@ -107,16 +102,7 @@ macro_rules! writer8 {
+ 
+             fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                 let me = self.project();
+-
+-                let buf = [*me.byte as u8];
+-
+-                match me.dst.poll_write(cx, &buf[..]) {
+-                    Poll::Pending => Poll::Pending,
+-                    Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
+-                    Poll::Ready(Ok(0)) => Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
+-                    Poll::Ready(Ok(1)) => Poll::Ready(Ok(())),
+-                    Poll::Ready(Ok(_)) => unreachable!(),
+-                }
++                crate::io::util::write_all::poll_one_byte(me.dst, cx, *me.byte as u8)
+             }
+         }
+     };
+diff --git a/tokio/src/io/util/write_vectored.rs b/tokio/src/io/util/write_vectored.rs
+index be403229..45d4e999 100644
+--- a/tokio/src/io/util/write_vectored.rs
++++ b/tokio/src/io/util/write_vectored.rs
+@@ -42,6 +42,6 @@ where
+ 
+     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+         let me = self.project();
+-        Pin::new(&mut *me.writer).poll_write_vectored(cx, me.bufs)
++        super::write::poll_write_vectored_once(me.writer, me.bufs, cx)
+     }
+ }

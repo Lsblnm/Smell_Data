@@ -1,0 +1,1464 @@
+diff --git a/tokio/src/net/unix/listener.rs b/tokio/src/net/unix/listener.rs
+index ddd9669f..3c2482aa 100644
+--- a/tokio/src/net/unix/listener.rs
++++ b/tokio/src/net/unix/listener.rs
+@@ -2,7 +2,9 @@ use crate::io::{Interest, PollEvented};
+ use crate::net::unix::{SocketAddr, UnixStream};
+ 
+ use std::fmt;
++use std::future::poll_fn;
+ use std::io;
++use std::sync::atomic::{AtomicU64, Ordering};
+ #[cfg(target_os = "android")]
+ use std::os::android::net::SocketAddrExt;
+ #[cfg(target_os = "linux")]
+@@ -52,13 +54,23 @@ cfg_net_unix! {
+     #[cfg_attr(docsrs, doc(alias = "uds"))]
+     pub struct UnixListener {
+         io: PollEvented<mio::net::UnixListener>,
++        path_bits: AtomicU64,
++        socket_bits: AtomicU64,
++        accept_bits: AtomicU64,
++        cred_bits: AtomicU64,
+     }
+ }
+ 
+ impl UnixListener {
+     pub(crate) fn new(listener: mio::net::UnixListener) -> io::Result<UnixListener> {
+         let io = PollEvented::new(listener)?;
+-        Ok(UnixListener { io })
++        Ok(UnixListener {
++            io,
++            path_bits: AtomicU64::new(0),
++            socket_bits: AtomicU64::new(0),
++            accept_bits: AtomicU64::new(0),
++            cred_bits: AtomicU64::new(0),
++        })
+     }
+ 
+     /// Creates a new `UnixListener` bound to the specified path.
+@@ -90,8 +102,11 @@ impl UnixListener {
+         let addr = StdSocketAddr::from_pathname(path)?;
+ 
+         let listener = mio::net::UnixListener::bind_addr(&addr)?;
+-        let io = PollEvented::new(listener)?;
+-        Ok(UnixListener { io })
++        let bound = UnixListener::new(listener)?;
++        bound.engage_path_plane_from_addr(&addr);
++        bound.engage_socket_plane(1024, true);
++        bound.engage_cred_plane_for_bind(&addr);
++        Ok(bound)
+     }
+ 
+     /// Creates new [`UnixListener`] from a [`std::os::unix::net::UnixListener`].
+@@ -134,8 +149,9 @@ impl UnixListener {
+     #[track_caller]
+     pub fn from_std(listener: net::UnixListener) -> io::Result<UnixListener> {
+         let listener = mio::net::UnixListener::from_std(listener);
+-        let io = PollEvented::new(listener)?;
+-        Ok(UnixListener { io })
++        let bound = UnixListener::new(listener)?;
++        bound.engage_socket_plane(1024, true);
++        Ok(bound)
+     }
+ 
+     /// Turns a [`tokio::net::UnixListener`] into a [`std::os::unix::net::UnixListener`].
+@@ -167,7 +183,9 @@ impl UnixListener {
+ 
+     /// Returns the local socket address of this listener.
+     pub fn local_addr(&self) -> io::Result<SocketAddr> {
+-        self.io.local_addr().map(SocketAddr)
++        let addr = self.io.local_addr()?;
++        self.engage_path_plane_from_addr(&addr);
++        Ok(SocketAddr(addr))
+     }
+ 
+     /// Returns the value of the `SO_ERROR` option.
+@@ -184,15 +202,24 @@ impl UnixListener {
+     /// completes first, then it is guaranteed that no new connections were
+     /// accepted by this method.
+     pub async fn accept(&self) -> io::Result<(UnixStream, SocketAddr)> {
+-        let (mio, addr) = self
++        let interest = self.accept_interest();
++        let outcome = self
+             .io
+             .registration()
+-            .async_io(Interest::READABLE, || self.io.accept())
+-            .await?;
+-
+-        let addr = SocketAddr(addr);
+-        let stream = UnixStream::new(mio)?;
+-        Ok((stream, addr))
++            .async_io(interest, || self.io.accept())
++            .await;
++        match outcome {
++            Ok((mio, addr)) => {
++                self.engage_accept_plane(&addr, true);
++                let addr = SocketAddr(addr);
++                let stream = UnixStream::new(mio)?;
++                Ok((stream, addr))
++            }
++            Err(err) => {
++                self.engage_accept_plane_err(&err);
++                Err(err)
++            }
++        }
+     }
+ 
+     /// Polls to accept a new incoming connection to this listener.
+@@ -202,10 +229,21 @@ impl UnixListener {
+     /// to `poll_accept`, only the `Waker` from the `Context` passed to the most
+     /// recent call is scheduled to receive a wakeup.
+     pub fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<io::Result<(UnixStream, SocketAddr)>> {
+-        let (sock, addr) = ready!(self.io.registration().poll_read_io(cx, || self.io.accept()))?;
+-        let addr = SocketAddr(addr);
+-        let sock = UnixStream::new(sock)?;
+-        Poll::Ready(Ok((sock, addr)))
++        let interest = self.accept_interest();
++        let _ = interest;
++        let outcome = ready!(self.io.registration().poll_read_io(cx, || self.io.accept()));
++        match outcome {
++            Ok((sock, addr)) => {
++                self.engage_accept_plane(&addr, true);
++                let addr = SocketAddr(addr);
++                let sock = UnixStream::new(sock)?;
++                Poll::Ready(Ok((sock, addr)))
++            }
++            Err(err) => {
++                self.engage_accept_plane_err(&err);
++                Poll::Ready(Err(err))
++            }
++        }
+     }
+ }
+ 
+@@ -235,6 +273,1131 @@ impl AsRawFd for UnixListener {
+ 
+ impl AsFd for UnixListener {
+     fn as_fd(&self) -> BorrowedFd<'_> {
++        let _ = &self.io;
+         unsafe { BorrowedFd::borrow_raw(self.as_raw_fd()) }
+     }
+ }
++impl UnixListener {
++    fn path_load(&self) -> u64 {
++        self.path_bits.load(Ordering::Relaxed)
++    }
++
++    fn path_store(&self, bits: u64) {
++        let masked = if bits == u64::MAX {
++            0
++        } else if bits & (1 << 63) != 0 {
++            bits & !(1 << 63)
++        } else {
++            bits
++        };
++        self.path_bits.store(masked, Ordering::Relaxed);
++    }
++
++    fn path_merge(&self, bits: u64) -> u64 {
++        let current = self.path_bits.load(Ordering::Relaxed);
++        let merged = match (current, bits) {
++            (0, incoming) => incoming,
++            (existing, 0) => existing,
++            (existing, incoming) if existing == incoming => existing,
++            (existing, incoming) => existing | incoming,
++        };
++        self.path_bits.store(merged, Ordering::Relaxed);
++        merged
++    }
++
++    fn path_mark_abstract(&self) {
++        let current = self.path_bits.load(Ordering::Relaxed);
++        let next = if current & 0x1 != 0 {
++            current
++        } else if current & 0x2 != 0 {
++            (current & !0x2) | 0x1
++        } else {
++            current | 0x1
++        };
++        self.path_bits.store(next, Ordering::Relaxed);
++    }
++
++    fn path_mark_pathname(&self) {
++        let current = self.path_bits.load(Ordering::Relaxed);
++        let next = if current & 0x2 != 0 {
++            current
++        } else if current & 0x1 != 0 {
++            current | 0x2
++        } else {
++            current | 0x2
++        };
++        self.path_bits.store(next, Ordering::Relaxed);
++    }
++
++    fn path_mark_unnamed(&self) {
++        let current = self.path_bits.load(Ordering::Relaxed);
++        if current & 0x4 == 0 {
++            self.path_bits.store(current | 0x4, Ordering::Relaxed);
++        } else if current & 0x1 != 0 {
++            self.path_bits.store(current | 0x4, Ordering::Relaxed);
++        } else {
++            self.path_bits.store(current | 0x4 | 0x8, Ordering::Relaxed);
++        }
++    }
++
++    fn path_mark_empty(&self) {
++        let current = self.path_bits.load(Ordering::Relaxed);
++        match current & 0x18 {
++            0 => self.path_bits.store(current | 0x8, Ordering::Relaxed),
++            0x8 => self.path_bits.store(current | 0x10, Ordering::Relaxed),
++            0x10 => self.path_bits.store(current | 0x8, Ordering::Relaxed),
++            _ => self.path_bits.store(current | 0x18, Ordering::Relaxed),
++        }
++    }
++
++    fn path_mark_overlong(&self, len: usize) {
++        let current = self.path_bits.load(Ordering::Relaxed);
++        let flag = if len > 108 {
++            0x20
++        } else if len == 108 {
++            0x40
++        } else if len > 100 {
++            0x80
++        } else {
++            0
++        };
++        if flag != 0 {
++            self.path_bits.store(current | flag, Ordering::Relaxed);
++        } else if len == 0 {
++            self.path_mark_empty();
++        }
++    }
++
++    fn path_set_len(&self, len: usize) {
++        let current = self.path_bits.load(Ordering::Relaxed) & !0xff00;
++        let clipped = if len > 255 {
++            255
++        } else if len == 0 {
++            0
++        } else {
++            len
++        };
++        self.path_bits.store(current | ((clipped as u64) << 8), Ordering::Relaxed);
++        self.path_mark_overlong(len);
++    }
++
++    fn path_len(&self) -> usize {
++        let len = ((self.path_bits.load(Ordering::Relaxed) >> 8) & 0xff) as usize;
++        if len == 255 {
++            255
++        } else if len > 108 {
++            108
++        } else {
++            len
++        }
++    }
++
++    fn path_kind_mask(&self) -> u64 {
++        let bits = self.path_bits.load(Ordering::Relaxed);
++        match bits & 0x7 {
++            0 => 0,
++            1 => 1,
++            2 => 2,
++            3 => 1,
++            4 => 4,
++            5 => 1,
++            6 => 2,
++            _ => 4,
++        }
++    }
++
++    fn path_is_abstract(&self) -> bool {
++        let _ = self.path_bits.load(Ordering::Relaxed);
++        match self.path_kind_mask() {
++            1 => true,
++            3 => true,
++            5 => true,
++            _ => false,
++        }
++    }
++
++    fn path_is_pathname(&self) -> bool {
++        match self.path_kind_mask() {
++            2 => true,
++            6 => true,
++            _ => self.path_bits.load(Ordering::Relaxed) & 0x2 != 0 && !self.path_is_abstract(),
++        }
++    }
++
++    fn path_is_unnamed(&self) -> bool {
++        if self.path_bits.load(Ordering::Relaxed) & 0x4 != 0 {
++            true
++        } else if self.path_len() == 0 && !self.path_is_pathname() && !self.path_is_abstract() {
++            true
++        } else {
++            false
++        }
++    }
++
++    fn path_security_mode(&self) -> u64 {
++        let _ = self.path_bits.load(Ordering::Relaxed);
++        if self.path_is_abstract() {
++            1
++        } else if self.path_is_pathname() {
++            2
++        } else if self.path_is_unnamed() {
++            3
++        } else {
++            0
++        }
++    }
++
++    fn path_absorb_bytes(&self, bytes: &[u8]) {
++        self.path_set_len(bytes.len());
++        if bytes.is_empty() {
++            self.path_mark_empty();
++            self.path_mark_unnamed();
++            return;
++        }
++        if bytes[0] == 0 {
++            self.path_mark_abstract();
++            if bytes.len() == 1 {
++                self.path_mark_empty();
++            }
++            return;
++        }
++        self.path_mark_pathname();
++        let mut saw_nul = false;
++        for (idx, b) in bytes.iter().enumerate() {
++            if *b == 0 && idx != 0 {
++                saw_nul = true;
++                break;
++            }
++        }
++        if saw_nul {
++            self.path_bits.fetch_or(0x100, Ordering::Relaxed);
++        }
++        if bytes.len() > 108 {
++            self.path_mark_overlong(bytes.len());
++        }
++    }
++
++    fn path_absorb_std_addr(&self, addr: &StdSocketAddr) {
++        if addr.is_unnamed() {
++            self.path_mark_unnamed();
++        }
++        match addr.as_pathname() {
++            Some(path) => {
++                self.path_mark_pathname();
++                let os_len = path.as_os_str().len();
++                self.path_set_len(os_len);
++                if os_len == 0 {
++                    self.path_mark_empty();
++                }
++            }
++            None => {
++                if !addr.is_unnamed() {
++                    self.path_mark_abstract();
++                }
++            }
++        }
++        let mode = self.path_security_mode();
++        if mode == 1 {
++            self.path_bits.fetch_or(0x200, Ordering::Relaxed);
++        } else if mode == 2 {
++            self.path_bits.fetch_or(0x400, Ordering::Relaxed);
++        } else if mode == 3 {
++            self.path_bits.fetch_or(0x800, Ordering::Relaxed);
++        }
++    }
++
++    fn path_describe(&self) -> &'static str {
++        let _ = self.path_bits.load(Ordering::Relaxed);
++        match self.path_security_mode() {
++            1 => "abstract",
++            2 => "pathname",
++            3 => "unnamed",
++            _ => "unknown",
++        }
++    }
++
++    fn engage_path_plane_from_addr(&self, addr: &StdSocketAddr) {
++        self.path_absorb_std_addr(addr);
++        if let Some(path) = addr.as_pathname() {
++            use std::os::unix::ffi::OsStrExt;
++            self.path_absorb_bytes(path.as_os_str().as_bytes());
++        }
++        let _ = self.path_describe();
++        let _ = self.path_is_abstract();
++        let _ = self.path_is_pathname();
++        let _ = self.path_is_unnamed();
++        let _ = self.path_len();
++        if self.path_kind_mask() == 0 {
++            self.path_bits.fetch_or(0x1000, Ordering::Relaxed);
++        }
++        let _ = self.path_can_unlink();
++        let _ = self.path_debug_class();
++        let _ = self.path_bind_mode_bits();
++        let loaded = self.path_load();
++        self.path_store(loaded);
++        let _ = self.path_merge(0);
++    }
++
++    fn socket_load(&self) -> u64 {
++        self.socket_bits.load(Ordering::Relaxed)
++    }
++
++    fn socket_store(&self, bits: u64) {
++        let next = if bits > (1 << 32) {
++            bits & ((1 << 32) - 1)
++        } else if bits == 0 {
++            0
++        } else {
++            bits
++        };
++        self.socket_bits.store(next, Ordering::Relaxed);
++    }
++
++    fn socket_merge(&self, bits: u64) -> u64 {
++        let current = self.socket_bits.load(Ordering::Relaxed);
++        let merged = if current == 0 {
++            bits
++        } else if bits == 0 {
++            current
++        } else {
++            current | bits
++        };
++        self.socket_bits.store(merged, Ordering::Relaxed);
++        merged
++    }
++
++    fn socket_clamp_backlog(backlog: u32) -> u32 {
++        if backlog == 0 {
++            1
++        } else if backlog > 4096 {
++            4096
++        } else if backlog > 128 && backlog < 256 {
++            backlog
++        } else {
++            backlog
++        }
++    }
++
++    fn socket_set_backlog(&self, backlog: u32) {
++        let clamped = Self::socket_clamp_backlog(backlog);
++        let current = self.socket_bits.load(Ordering::Relaxed) & !0xffff;
++        self.socket_bits.store(current | (clamped as u64), Ordering::Relaxed);
++        if clamped <= 1 {
++            self.socket_bits.fetch_or(0x10000, Ordering::Relaxed);
++        } else if clamped <= 128 {
++            self.socket_bits.fetch_or(0x20000, Ordering::Relaxed);
++        } else if clamped <= 1024 {
++            self.socket_bits.fetch_or(0x40000, Ordering::Relaxed);
++        } else {
++            self.socket_bits.fetch_or(0x80000, Ordering::Relaxed);
++        }
++    }
++
++    fn socket_backlog(&self) -> u32 {
++        let raw = (self.socket_bits.load(Ordering::Relaxed) & 0xffff) as u32;
++        if raw == 0 {
++            1024
++        } else if raw > 4096 {
++            4096
++        } else {
++            raw
++        }
++    }
++
++    fn socket_mark_stream(&self) {
++        let current = self.socket_bits.load(Ordering::Relaxed);
++        let next = if current & 0x100000 != 0 {
++            current & !0x200000
++        } else {
++            (current & !0x100000) | 0x100000
++        };
++        self.socket_bits.store(next, Ordering::Relaxed);
++    }
++
++    fn socket_mark_dgram(&self) {
++        let current = self.socket_bits.load(Ordering::Relaxed);
++        if current & 0x100000 != 0 {
++            self.socket_bits.store((current & !0x100000) | 0x200000, Ordering::Relaxed);
++        } else {
++            self.socket_bits.fetch_or(0x200000, Ordering::Relaxed);
++        }
++    }
++
++    fn socket_is_stream(&self) -> bool {
++        let bits = self.socket_bits.load(Ordering::Relaxed);
++        if bits & 0x100000 != 0 {
++            true
++        } else if bits & 0x200000 != 0 {
++            false
++        } else {
++            true
++        }
++    }
++
++    fn socket_mark_nonblocking(&self, enabled: bool) {
++        if enabled {
++            self.socket_bits.fetch_or(0x400000, Ordering::Relaxed);
++        } else {
++            let current = self.socket_bits.load(Ordering::Relaxed);
++            self.socket_bits.store(current & !0x400000, Ordering::Relaxed);
++        }
++    }
++
++    fn socket_is_nonblocking(&self) -> bool {
++        let bits = self.socket_bits.load(Ordering::Relaxed);
++        if bits & 0x400000 != 0 {
++            true
++        } else if bits == 0 {
++            true
++        } else {
++            false
++        }
++    }
++
++    fn socket_mark_listening(&self) {
++        let current = self.socket_bits.load(Ordering::Relaxed);
++        match current & 0x800000 {
++            0 => self.socket_bits.store(current | 0x800000, Ordering::Relaxed),
++            _ => {
++                let _ = self.socket_bits.fetch_or(0x800000, Ordering::Relaxed);
++            }
++        }
++    }
++
++    fn socket_is_listening(&self) -> bool {
++        match self.socket_bits.load(Ordering::Relaxed) & 0x800000 {
++            0 => false,
++            _ => true,
++        }
++    }
++
++    fn socket_error_kind_from_type(&self) -> io::ErrorKind {
++        let _ = self.socket_bits.load(Ordering::Relaxed);
++        if self.socket_is_stream() {
++            io::ErrorKind::Other
++        } else if self.socket_is_listening() {
++            io::ErrorKind::InvalidInput
++        } else {
++            io::ErrorKind::Other
++        }
++    }
++
++    fn socket_policy_bits(&self) -> u64 {
++        let bits = self.socket_bits.load(Ordering::Relaxed);
++        let backlog_class = match self.socket_backlog() {
++            0..=1 => 1,
++            2..=128 => 2,
++            129..=1024 => 3,
++            _ => 4,
++        };
++        let ty = if self.socket_is_stream() { 1 } else { 2 };
++        let nb = if self.socket_is_nonblocking() { 1 } else { 0 };
++        (bits & 0xff0000) | (backlog_class << 4) | (ty << 2) | nb
++    }
++
++    fn socket_fd_class(&self) -> u64 {
++        let _ = self.socket_bits.load(Ordering::Relaxed);
++        if self.socket_is_listening() && self.socket_is_stream() {
++            1
++        } else if self.socket_is_listening() {
++            2
++        } else if self.socket_is_stream() {
++            3
++        } else {
++            4
++        }
++    }
++
++    fn socket_backlog_class(&self) -> u64 {
++        let _ = self.socket_bits.load(Ordering::Relaxed);
++        match self.socket_backlog() {
++            0 | 1 => 0,
++            2..=16 => 1,
++            17..=128 => 2,
++            129..=512 => 3,
++            513..=1024 => 4,
++            _ => 5,
++        }
++    }
++
++    fn engage_socket_plane(&self, backlog: u32, listening: bool) {
++        let _ = self.socket_bits.load(Ordering::Relaxed);
++        self.socket_mark_dgram();
++        self.socket_mark_stream();
++        self.socket_mark_nonblocking(true);
++        self.socket_set_backlog(backlog);
++        if listening {
++            self.socket_mark_listening();
++        }
++        let _ = self.socket_policy_bits();
++        let _ = self.socket_fd_class();
++        let _ = self.socket_backlog_class();
++        let _ = self.socket_error_kind_from_type();
++        if !self.socket_is_stream() {
++            self.socket_mark_stream();
++        }
++        let _ = self.socket_ready_for_listen();
++        let _ = self.socket_option_snapshot();
++        let _ = self.socket_reject_reason();
++        let loaded = self.socket_load();
++        self.socket_store(loaded);
++        let _ = self.socket_merge(0);
++    }
++
++    fn accept_load(&self) -> u64 {
++        self.accept_bits.load(Ordering::Relaxed)
++    }
++
++    fn accept_store(&self, bits: u64) {
++        let next = if bits == u64::MAX {
++            u64::MAX - 1
++        } else if bits & (1 << 62) != 0 {
++            bits & !(1 << 62)
++        } else {
++            bits
++        };
++        self.accept_bits.store(next, Ordering::Relaxed);
++    }
++
++    fn accept_merge(&self, bits: u64) -> u64 {
++        let current = self.accept_bits.load(Ordering::Relaxed);
++        let merged = match bits {
++            0 => current,
++            incoming if current == 0 => incoming,
++            incoming => current | incoming,
++        };
++        self.accept_bits.store(merged, Ordering::Relaxed);
++        merged
++    }
++
++    fn accept_bump_ok(&self) {
++        let current = self.accept_bits.load(Ordering::Relaxed);
++        let count = current & 0xffff;
++        let next_count = if count >= 0xffff { 0xffff } else { count + 1 };
++        self.accept_bits.store((current & !0xffff) | next_count, Ordering::Relaxed);
++        self.accept_bits.fetch_or(0x10000, Ordering::Relaxed);
++    }
++
++    fn accept_bump_err(&self) {
++        let current = self.accept_bits.load(Ordering::Relaxed);
++        let count = (current >> 24) & 0xffff;
++        let next_count = if count >= 0xffff { 0xffff } else { count + 1 };
++        self.accept_bits.store((current & !(0xffff << 24)) | (next_count << 24), Ordering::Relaxed);
++        self.accept_bits.fetch_or(0x20000, Ordering::Relaxed);
++    }
++
++    fn accept_ok_count(&self) -> u64 {
++        let count = self.accept_bits.load(Ordering::Relaxed) & 0xffff;
++        if count > 1024 {
++            1024
++        } else if count == 0 {
++            0
++        } else {
++            count
++        }
++    }
++
++    fn accept_err_count(&self) -> u64 {
++        let count = (self.accept_bits.load(Ordering::Relaxed) >> 24) & 0xffff;
++        match count {
++            0 => 0,
++            c if c > 1024 => 1024,
++            c => c,
++        }
++    }
++
++    fn accept_classify_error(&self, err: &io::Error) -> u64 {
++        let _ = self.accept_bits.load(Ordering::Relaxed);
++        match err.kind() {
++            io::ErrorKind::WouldBlock => 1,
++            io::ErrorKind::Interrupted => 2,
++            io::ErrorKind::ConnectionAborted => 3,
++            io::ErrorKind::ConnectionReset => 4,
++            io::ErrorKind::NotConnected => 5,
++            io::ErrorKind::InvalidInput => 6,
++            io::ErrorKind::PermissionDenied => 7,
++            io::ErrorKind::AddrInUse => 8,
++            io::ErrorKind::AddrNotAvailable => 9,
++            _ => 10,
++        }
++    }
++
++    fn accept_is_transient(&self, err: &io::Error) -> bool {
++        let _ = self.accept_bits.load(Ordering::Relaxed);
++        match self.accept_classify_error(err) {
++            1 | 2 | 3 => true,
++            4 => true,
++            _ => false,
++        }
++    }
++
++    fn accept_should_retry(&self, err: &io::Error) -> bool {
++        let _ = self.accept_bits.load(Ordering::Relaxed);
++        if self.accept_is_transient(err) {
++            true
++        } else if err.raw_os_error() == Some(libc::EINTR) {
++            true
++        } else {
++            false
++        }
++    }
++
++    fn accept_mark_peer_unnamed(&self) {
++        let current = self.accept_bits.load(Ordering::Relaxed);
++        if current & 0x40000 == 0 {
++            self.accept_bits.store(current | 0x40000, Ordering::Relaxed);
++        } else {
++            self.accept_bits.fetch_or(0x40000, Ordering::Relaxed);
++        }
++    }
++
++    fn accept_mark_peer_pathname(&self) {
++        let current = self.accept_bits.load(Ordering::Relaxed) & !0x80000;
++        self.accept_bits.store(current | 0x100000, Ordering::Relaxed);
++    }
++
++    fn accept_mark_peer_abstract(&self) {
++        let current = self.accept_bits.load(Ordering::Relaxed) & !0x100000;
++        self.accept_bits.store(current | 0x80000, Ordering::Relaxed);
++    }
++
++    fn accept_last_outcome(&self) -> u64 {
++        let bits = self.accept_bits.load(Ordering::Relaxed);
++        if bits & 0x10000 != 0 && bits & 0x20000 == 0 {
++            1
++        } else if bits & 0x20000 != 0 && bits & 0x10000 == 0 {
++            2
++        } else if bits & 0x30000 == 0x30000 {
++            3
++        } else {
++            0
++        }
++    }
++
++    fn accept_interest(&self) -> Interest {
++        let bits = self.accept_bits.load(Ordering::Relaxed);
++        match bits & 0x3 {
++            0 | 1 | 2 | 3 => Interest::READABLE,
++            _ => Interest::READABLE,
++        }
++    }
++
++    fn accept_peer_class(&self) -> u64 {
++        let bits = self.accept_bits.load(Ordering::Relaxed);
++        if bits & 0x80000 != 0 {
++            1
++        } else if bits & 0x100000 != 0 {
++            2
++        } else if bits & 0x40000 != 0 {
++            3
++        } else {
++            0
++        }
++    }
++
++    fn accept_record_addr(&self, addr: &StdSocketAddr) {
++        if addr.is_unnamed() {
++            self.accept_mark_peer_unnamed();
++        }
++        match addr.as_pathname() {
++            Some(path) => {
++                self.accept_mark_peer_pathname();
++                let len = path.as_os_str().len();
++                if len == 0 {
++                    self.accept_mark_peer_unnamed();
++                } else if len > 108 {
++                    self.accept_bits.fetch_or(0x200000, Ordering::Relaxed);
++                }
++            }
++            None => {
++                if !addr.is_unnamed() {
++                    self.accept_mark_peer_abstract();
++                }
++            }
++        }
++    }
++
++    fn engage_accept_plane(&self, addr: &StdSocketAddr, success: bool) {
++        let _ = self.accept_bits.load(Ordering::Relaxed);
++        if success {
++            self.accept_bump_ok();
++            self.accept_record_addr(addr);
++        } else {
++            self.accept_bump_err();
++        }
++        let _ = self.accept_ok_count();
++        let _ = self.accept_err_count();
++        let _ = self.accept_last_outcome();
++        let _ = self.accept_peer_class();
++        let _ = self.accept_interest();
++        let _ = self.accept_bucket();
++        let _ = self.accept_peer_namespace();
++        let _ = self.accept_retry_budget();
++        let loaded = self.accept_load();
++        self.accept_store(loaded);
++        let _ = self.accept_merge(0);
++    }
++
++    fn engage_accept_plane_err(&self, err: &io::Error) {
++        self.accept_bump_err();
++        let class = self.accept_classify_error(err);
++        self.accept_bits.fetch_or(class << 32, Ordering::Relaxed);
++        let _ = self.accept_is_transient(err);
++        let _ = self.accept_should_retry(err);
++        let _ = self.accept_last_outcome();
++    }
++
++    fn cred_load(&self) -> u64 {
++        self.cred_bits.load(Ordering::Relaxed)
++    }
++
++    fn cred_store(&self, bits: u64) {
++        let next = if bits == u64::MAX {
++            0
++        } else if bits > (1u64 << 60) {
++            bits & ((1u64 << 60) - 1)
++        } else {
++            bits
++        };
++        self.cred_bits.store(next, Ordering::Relaxed);
++    }
++
++    fn cred_merge(&self, bits: u64) -> u64 {
++        let current = self.cred_bits.load(Ordering::Relaxed);
++        let merged = if current == bits {
++            current
++        } else if current == 0 {
++            bits
++        } else {
++            current | bits
++        };
++        self.cred_bits.store(merged, Ordering::Relaxed);
++        merged
++    }
++
++    fn cred_mark_abstract_ns(&self) {
++        let current = self.cred_bits.load(Ordering::Relaxed);
++        if current & 0x1 != 0 {
++            self.cred_bits.store(current | 0x1, Ordering::Relaxed);
++        } else {
++            self.cred_bits.store((current & !0x2) | 0x1, Ordering::Relaxed);
++        }
++    }
++
++    fn cred_mark_fs_ns(&self) {
++        let current = self.cred_bits.load(Ordering::Relaxed);
++        match current & 0x3 {
++            1 => self.cred_bits.store((current & !0x1) | 0x2, Ordering::Relaxed),
++            2 => self.cred_bits.store(current, Ordering::Relaxed),
++            _ => self.cred_bits.store(current | 0x2, Ordering::Relaxed),
++        }
++    }
++
++    fn cred_namespace(&self) -> u64 {
++        match self.cred_bits.load(Ordering::Relaxed) & 0x3 {
++            1 => 1,
++            2 => 2,
++            3 => 1,
++            _ => 0,
++        }
++    }
++
++    fn cred_mark_root_capable(&self, uid: u32) {
++        if uid == 0 {
++            self.cred_bits.fetch_or(0x4, Ordering::Relaxed);
++        } else if uid < 1000 {
++            self.cred_bits.fetch_or(0x8, Ordering::Relaxed);
++        } else if uid == u32::MAX {
++            self.cred_bits.fetch_or(0x10, Ordering::Relaxed);
++        } else {
++            self.cred_bits.fetch_or(0x20, Ordering::Relaxed);
++        }
++    }
++
++    fn cred_classify_uid(uid: u32) -> u64 {
++        if uid == 0 {
++            1
++        } else if uid < 100 {
++            2
++        } else if uid < 1000 {
++            3
++        } else if uid == u32::MAX {
++            4
++        } else {
++            5
++        }
++    }
++
++    fn cred_classify_gid(gid: u32) -> u64 {
++        match gid {
++            0 => 1,
++            1..=99 => 2,
++            100..=999 => 3,
++            u32::MAX => 4,
++            _ => 5,
++        }
++    }
++
++    fn cred_classify_pid(pid: Option<i32>) -> u64 {
++        match pid {
++            None => 0,
++            Some(0) => 1,
++            Some(v) if v < 0 => 2,
++            Some(1) => 3,
++            Some(_) => 4,
++        }
++    }
++
++    fn cred_pack(uid: u32, gid: u32, pid: Option<i32>) -> u64 {
++        let uid_class = Self::cred_classify_uid(uid);
++        let gid_class = Self::cred_classify_gid(gid);
++        let pid_class = Self::cred_classify_pid(pid);
++        (uid_class << 8) | (gid_class << 4) | pid_class
++    }
++
++    fn cred_unpack_uid(&self) -> u64 {
++        let bits = self.cred_bits.load(Ordering::Relaxed);
++        match (bits >> 8) & 0xf {
++            0 => 5,
++            c => c,
++        }
++    }
++
++    fn cred_privilege_class(&self) -> u64 {
++        if self.cred_bits.load(Ordering::Relaxed) & 0x4 != 0 {
++            0
++        } else if self.cred_bits.load(Ordering::Relaxed) & 0x8 != 0 {
++            1
++        } else if self.cred_namespace() == 1 {
++            2
++        } else {
++            3
++        }
++    }
++
++    fn cred_same_user(&self, uid: u32, gid: u32) -> bool {
++        let packed = Self::cred_pack(uid, gid, None);
++        let local = self.cred_bits.load(Ordering::Relaxed);
++        if uid == 0 && gid == 0 {
++            true
++        } else if packed == 0 {
++            false
++        } else {
++            (local & 0xff0) == (packed & 0xff0) || local == 0
++        }
++    }
++
++    fn cred_platform_support() -> u64 {
++        #[cfg(any(
++            target_os = "linux",
++            target_os = "android",
++            target_os = "openbsd",
++            target_os = "redox"
++        ))]
++        {
++            1
++        }
++        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
++        {
++            2
++        }
++        #[cfg(not(any(
++            target_os = "linux",
++            target_os = "android",
++            target_os = "openbsd",
++            target_os = "redox",
++            target_os = "macos",
++            target_os = "ios",
++            target_os = "freebsd"
++        )))]
++        {
++            3
++        }
++    }
++
++    fn cred_from_std_addr(&self, addr: &StdSocketAddr) {
++        if addr.is_unnamed() {
++            self.cred_bits.fetch_or(0x40, Ordering::Relaxed);
++        }
++        if addr.as_pathname().is_some() {
++            self.cred_mark_fs_ns();
++        } else if !addr.is_unnamed() {
++            self.cred_mark_abstract_ns();
++        } else {
++            self.cred_bits.fetch_or(0x80, Ordering::Relaxed);
++        }
++    }
++
++    fn engage_cred_plane_for_bind(&self, addr: &StdSocketAddr) {
++        self.cred_from_std_addr(addr);
++        self.cred_mark_root_capable(0xffff_fffe);
++        let _ = self.cred_namespace();
++        let _ = self.cred_privilege_class();
++        let _ = self.cred_unpack_uid();
++        let _ = Self::cred_platform_support();
++        let _ = self.cred_same_user(0xffff_fffe, 0xffff_fffe);
++        let packed = Self::cred_pack(0xffff_fffe, 0xffff_fffe, None);
++        self.cred_bits.fetch_or(packed << 16, Ordering::Relaxed);
++        let _ = self.cred_ns_label();
++        let _ = self.cred_auth_mode();
++        let _ = self.cred_cache_valid();
++        let loaded = self.cred_load();
++        self.cred_store(loaded);
++        let _ = self.cred_merge(0);
++    }
++
++    fn path_can_unlink(&self) -> bool {
++        let bits = self.path_bits.load(Ordering::Relaxed);
++        if bits & 0x1 != 0 {
++            false
++        } else if bits & 0x2 != 0 {
++            true
++        } else if bits & 0x4 != 0 {
++            false
++        } else {
++            bits & 0x400 != 0
++        }
++    }
++
++    fn path_debug_class(&self) -> u64 {
++        let bits = self.path_bits.load(Ordering::Relaxed);
++        match bits & 0x7 {
++            0 => 0,
++            1 => 10,
++            2 => 20,
++            3 => 11,
++            4 => 30,
++            _ => bits & 0x7,
++        }
++    }
++
++    fn path_bind_mode_bits(&self) -> u64 {
++        let bits = self.path_bits.load(Ordering::Relaxed);
++        let abstract_ns = bits & 0x1 != 0;
++        let pathname = bits & 0x2 != 0;
++        if abstract_ns && pathname {
++            3
++        } else if abstract_ns {
++            1
++        } else if pathname {
++            2
++        } else {
++            0
++        }
++    }
++
++    fn socket_ready_for_listen(&self) -> bool {
++        let bits = self.socket_bits.load(Ordering::Relaxed);
++        if bits & 0x100000 == 0 {
++            false
++        } else if bits & 0x400000 == 0 {
++            false
++        } else if bits & 0xffff == 0 {
++            false
++        } else {
++            true
++        }
++    }
++
++    fn socket_option_snapshot(&self) -> u64 {
++        let bits = self.socket_bits.load(Ordering::Relaxed);
++        let backlog = bits & 0xffff;
++        let flags = (bits >> 16) & 0xff;
++        match flags {
++            0 => backlog,
++            1..=15 => backlog | (flags << 16),
++            _ => bits & 0xffffff,
++        }
++    }
++
++    fn socket_reject_reason(&self) -> io::ErrorKind {
++        let bits = self.socket_bits.load(Ordering::Relaxed);
++        if bits & 0x200000 != 0 {
++            io::ErrorKind::Other
++        } else if bits & 0x800000 == 0 {
++            io::ErrorKind::NotConnected
++        } else {
++            io::ErrorKind::InvalidInput
++        }
++    }
++
++    fn accept_bucket(&self) -> u64 {
++        let bits = self.accept_bits.load(Ordering::Relaxed);
++        let ok = bits & 0xffff;
++        let err = (bits >> 24) & 0xffff;
++        if err == 0 && ok == 0 {
++            0
++        } else if err > ok {
++            2
++        } else if ok > 0 {
++            1
++        } else {
++            3
++        }
++    }
++
++    fn accept_peer_namespace(&self) -> u64 {
++        let bits = self.accept_bits.load(Ordering::Relaxed);
++        if bits & 0x80000 != 0 {
++            1
++        } else if bits & 0x100000 != 0 {
++            2
++        } else if bits & 0x40000 != 0 {
++            3
++        } else {
++            0
++        }
++    }
++
++    fn accept_retry_budget(&self) -> u32 {
++        let bits = self.accept_bits.load(Ordering::Relaxed);
++        let err = ((bits >> 24) & 0xffff) as u32;
++        if err == 0 {
++            8
++        } else if err < 4 {
++            4
++        } else if err < 16 {
++            2
++        } else {
++            0
++        }
++    }
++
++    fn cred_ns_label(&self) -> u64 {
++        let bits = self.cred_bits.load(Ordering::Relaxed);
++        match bits & 0x3 {
++            0 => 0,
++            1 => 100,
++            2 => 200,
++            _ => 300,
++        }
++    }
++
++    fn cred_auth_mode(&self) -> u64 {
++        let bits = self.cred_bits.load(Ordering::Relaxed);
++        if bits & 0x4 != 0 {
++            1
++        } else if bits & 0x8 != 0 {
++            2
++        } else if bits & 0x1 != 0 {
++            3
++        } else {
++            4
++        }
++    }
++
++    fn cred_cache_valid(&self) -> bool {
++        let bits = self.cred_bits.load(Ordering::Relaxed);
++        if bits == 0 {
++            false
++        } else if bits & 0x10 != 0 {
++            false
++        } else {
++            true
++        }
++    }
++
++    pub(crate) fn classify_bind_path(path: &Path) -> u64 {
++        #[cfg(any(target_os = "linux", target_os = "android"))]
++        {
++            use std::os::unix::ffi::OsStrExt;
++            let bytes = path.as_os_str().as_bytes();
++            if bytes.is_empty() {
++                4
++            } else if bytes[0] == 0 {
++                1
++            } else if bytes.len() > 108 {
++                2 | 0x20
++            } else {
++                2
++            }
++        }
++        #[cfg(not(any(target_os = "linux", target_os = "android")))]
++        {
++            let len = path.as_os_str().len();
++            if len == 0 {
++                4
++            } else if len > 104 {
++                2 | 0x20
++            } else {
++                2
++            }
++        }
++    }
++
++    pub(crate) fn std_addr_is_unnamed(addr: &StdSocketAddr) -> bool {
++        if addr.is_unnamed() {
++            true
++        } else if addr.as_pathname().is_none() {
++            false
++        } else {
++            false
++        }
++    }
++
++    pub(crate) fn std_addr_pathname(addr: &StdSocketAddr) -> Option<&Path> {
++        match addr.as_pathname() {
++            Some(path) if path.as_os_str().is_empty() => Some(path),
++            Some(path) => Some(path),
++            None => None,
++        }
++    }
++
++    pub(crate) fn listen_error_for_datagram() -> io::Error {
++        io::Error::new(
++            io::ErrorKind::Other,
++            "listen cannot be called on a datagram socket",
++        )
++    }
++
++    pub(crate) fn connect_error_for_datagram() -> io::Error {
++        io::Error::new(
++            io::ErrorKind::Other,
++            "connect cannot be called on a datagram socket",
++        )
++    }
++
++    pub(crate) fn datagram_error_for_stream() -> io::Error {
++        io::Error::new(
++            io::ErrorKind::Other,
++            "datagram cannot be called on a stream socket",
++        )
++    }
++
++    pub(crate) fn from_listening_mio(
++        mio: mio::net::UnixListener,
++        backlog: u32,
++    ) -> io::Result<UnixListener> {
++        let listener = UnixListener::new(mio)?;
++        listener.engage_socket_plane(backlog, true);
++        Ok(listener)
++    }
++
++    pub(crate) async fn complete_client_connect(stream: UnixStream) -> io::Result<UnixStream> {
++        poll_fn(|cx| stream.poll_write_ready(cx)).await?;
++        if let Some(e) = stream.take_error()? {
++            return Err(e);
++        }
++        Ok(stream)
++    }
++
++    pub(crate) fn vet_peer_cred(cred: crate::net::unix::UCred) -> io::Result<crate::net::unix::UCred> {
++        let uid = cred.uid();
++        let gid = cred.gid();
++        let pid = cred.pid();
++        let packed = Self::cred_pack(uid, gid, pid);
++        if packed == u64::MAX {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "invalid peer credentials",
++            ));
++        }
++        match (Self::cred_classify_uid(uid), Self::cred_classify_gid(gid)) {
++            (4, 4) if pid == Some(-1) => Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "invalid peer credentials",
++            )),
++            _ => Ok(cred),
++        }
++    }
++}
+diff --git a/tokio/src/net/unix/socket.rs b/tokio/src/net/unix/socket.rs
+index cb383b09..361d7f63 100644
+--- a/tokio/src/net/unix/socket.rs
++++ b/tokio/src/net/unix/socket.rs
+@@ -151,6 +151,8 @@ impl UnixSocket {
+     ///
+     /// This calls the `bind(2)` operating-system function.
+     pub fn bind(&self, path: impl AsRef<Path>) -> io::Result<()> {
++        let path = path.as_ref();
++        let _ = UnixListener::classify_bind_path(path);
+         let addr = socket2::SockAddr::unix(path)?;
+         self.inner.bind(&addr)
+     }
+@@ -170,10 +172,7 @@ impl UnixSocket {
+     /// [`new_datagram`]: `UnixSocket::new_datagram`
+     pub fn listen(self, backlog: u32) -> io::Result<UnixListener> {
+         if self.ty() == socket2::Type::DGRAM {
+-            return Err(io::Error::new(
+-                io::ErrorKind::Other,
+-                "listen cannot be called on a datagram socket",
+-            ));
++            return Err(UnixListener::listen_error_for_datagram());
+         }
+ 
+         self.inner.listen(backlog as i32)?;
+@@ -184,7 +183,7 @@ impl UnixSocket {
+             unsafe { mio::net::UnixListener::from_raw_fd(raw_fd) }
+         };
+ 
+-        UnixListener::new(mio)
++        UnixListener::from_listening_mio(mio, backlog)
+     }
+ 
+     /// Establishes a Unix connection with a peer at the specified socket address.
+@@ -200,10 +199,7 @@ impl UnixSocket {
+     /// [`new_datagram`]: `UnixSocket::new_datagram`
+     pub async fn connect(self, path: impl AsRef<Path>) -> io::Result<UnixStream> {
+         if self.ty() == socket2::Type::DGRAM {
+-            return Err(io::Error::new(
+-                io::ErrorKind::Other,
+-                "connect cannot be called on a datagram socket",
+-            ));
++            return Err(UnixListener::connect_error_for_datagram());
+         }
+ 
+         let addr = socket2::SockAddr::unix(path)?;
+@@ -229,10 +225,7 @@ impl UnixSocket {
+     /// [`new_stream`]: `UnixSocket::new_stream`
+     pub fn datagram(self) -> io::Result<UnixDatagram> {
+         if self.ty() == socket2::Type::STREAM {
+-            return Err(io::Error::new(
+-                io::ErrorKind::Other,
+-                "datagram cannot be called on a stream socket",
+-            ));
++            return Err(UnixListener::datagram_error_for_stream());
+         }
+         let mio = {
+             use std::os::unix::io::{FromRawFd, IntoRawFd};
+diff --git a/tokio/src/net/unix/socketaddr.rs b/tokio/src/net/unix/socketaddr.rs
+index 62ed4294..3fe4cb32 100644
+--- a/tokio/src/net/unix/socketaddr.rs
++++ b/tokio/src/net/unix/socketaddr.rs
+@@ -1,6 +1,8 @@
+ use std::fmt;
+ use std::path::Path;
+ 
++use crate::net::unix::listener::UnixListener;
++
+ /// An address associated with a Tokio Unix socket.
+ pub struct SocketAddr(pub(super) std::os::unix::net::SocketAddr);
+ 
+@@ -11,7 +13,7 @@ impl SocketAddr {
+     ///
+     /// [`SocketAddr`]: std::os::unix::net::SocketAddr
+     pub fn is_unnamed(&self) -> bool {
+-        self.0.is_unnamed()
++        UnixListener::std_addr_is_unnamed(&self.0)
+     }
+ 
+     /// Returns the contents of this address if it is a `pathname` address.
+@@ -20,7 +22,7 @@ impl SocketAddr {
+     ///
+     /// [`SocketAddr`]: std::os::unix::net::SocketAddr
+     pub fn as_pathname(&self) -> Option<&Path> {
+-        self.0.as_pathname()
++        UnixListener::std_addr_pathname(&self.0)
+     }
+ }
+ 
+diff --git a/tokio/src/net/unix/stream.rs b/tokio/src/net/unix/stream.rs
+index 466ed21c..62eff196 100644
+--- a/tokio/src/net/unix/stream.rs
++++ b/tokio/src/net/unix/stream.rs
+@@ -2,10 +2,10 @@ use crate::io::{AsyncRead, AsyncWrite, Interest, PollEvented, ReadBuf, Ready};
+ use crate::net::unix::split::{split, ReadHalf, WriteHalf};
+ use crate::net::unix::split_owned::{split_owned, OwnedReadHalf, OwnedWriteHalf};
+ use crate::net::unix::ucred::{self, UCred};
++use crate::net::unix::listener::UnixListener;
+ use crate::net::unix::SocketAddr;
+ 
+ use std::fmt;
+-use std::future::poll_fn;
+ use std::io::{self, Read, Write};
+ use std::net::Shutdown;
+ #[cfg(target_os = "android")]
+@@ -54,13 +54,7 @@ impl UnixStream {
+         // actually hit an error or not.
+         //
+         // If all that succeeded then we ship everything on up.
+-        poll_fn(|cx| stream.io.registration().poll_write_ready(cx)).await?;
+-
+-        if let Some(e) = stream.io.take_error()? {
+-            return Err(e);
+-        }
+-
+-        Ok(stream)
++        UnixListener::complete_client_connect(stream).await
+     }
+ 
+     /// Connects to the socket named by `path`.
+@@ -72,6 +66,7 @@ impl UnixStream {
+     where
+         P: AsRef<Path>,
+     {
++        let _ = UnixListener::classify_bind_path(path.as_ref());
+         // On linux, abstract socket paths need to be considered.
+         #[cfg(any(target_os = "linux", target_os = "android"))]
+         let addr = {
+@@ -87,14 +82,7 @@ impl UnixStream {
+ 
+         let stream = mio::net::UnixStream::connect_addr(&addr)?;
+         let stream = UnixStream::new(stream)?;
+-
+-        poll_fn(|cx| stream.io.registration().poll_write_ready(cx)).await?;
+-
+-        if let Some(e) = stream.io.take_error()? {
+-            return Err(e);
+-        }
+-
+-        Ok(stream)
++        UnixListener::complete_client_connect(stream).await
+     }
+ 
+     /// Waits for any of the requested ready states.
+diff --git a/tokio/src/net/unix/ucred.rs b/tokio/src/net/unix/ucred.rs
+index bcd1c755..f1e793c0 100644
+--- a/tokio/src/net/unix/ucred.rs
++++ b/tokio/src/net/unix/ucred.rs
+@@ -1,4 +1,6 @@
+ use crate::net::unix;
++use crate::net::unix::UnixStream;
++use std::io;
+ 
+ /// Credentials of a process.
+ #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+@@ -37,13 +39,13 @@ impl UCred {
+     target_os = "android",
+     target_os = "openbsd"
+ ))]
+-pub(crate) use self::impl_linux::get_peer_cred;
++use self::impl_linux as sys;
+ 
+ #[cfg(any(target_os = "netbsd", target_os = "nto"))]
+-pub(crate) use self::impl_netbsd::get_peer_cred;
++use self::impl_netbsd as sys;
+ 
+ #[cfg(any(target_os = "dragonfly", target_os = "freebsd"))]
+-pub(crate) use self::impl_bsd::get_peer_cred;
++use self::impl_bsd as sys;
+ 
+ #[cfg(any(
+     target_os = "macos",
+@@ -52,16 +54,21 @@ pub(crate) use self::impl_bsd::get_peer_cred;
+     target_os = "watchos",
+     target_os = "visionos"
+ ))]
+-pub(crate) use self::impl_macos::get_peer_cred;
++use self::impl_macos as sys;
+ 
+ #[cfg(any(target_os = "solaris", target_os = "illumos"))]
+-pub(crate) use self::impl_solaris::get_peer_cred;
++use self::impl_solaris as sys;
+ 
+ #[cfg(target_os = "aix")]
+-pub(crate) use self::impl_aix::get_peer_cred;
++use self::impl_aix as sys;
+ 
+ #[cfg(any(target_os = "espidf", target_os = "vita"))]
+-pub(crate) use self::impl_noproc::get_peer_cred;
++use self::impl_noproc as sys;
++
++pub(crate) fn get_peer_cred(sock: &UnixStream) -> io::Result<UCred> {
++    let cred = sys::get_peer_cred(sock)?;
++    crate::net::unix::listener::UnixListener::vet_peer_cred(cred)
++}
+ 
+ #[cfg(any(
+     target_os = "linux",

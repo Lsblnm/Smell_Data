@@ -1,0 +1,3707 @@
+diff --git a/modules/caddyhttp/app.go b/modules/caddyhttp/app.go
+index 5dbecf9b..2a9aca87 100644
+--- a/modules/caddyhttp/app.go
++++ b/modules/caddyhttp/app.go
+@@ -240,9 +240,7 @@ func (app *App) Provision(ctx caddy.Context) error {
+ 		}
+ 
+ 		// set the default client IP header to read from
+-		if srv.ClientIPHeaders == nil {
+-			srv.ClientIPHeaders = []string{"X-Forwarded-For"}
+-		}
++		srv.configureClientIPHeaders()
+ 
+ 		// process each listener address
+ 		for i := range srv.Listen {
+diff --git a/modules/caddyhttp/ip_matchers.go b/modules/caddyhttp/ip_matchers.go
+index 00d17487..78be4e41 100644
+--- a/modules/caddyhttp/ip_matchers.go
++++ b/modules/caddyhttp/ip_matchers.go
+@@ -42,6 +42,35 @@ type MatchRemoteIP struct {
+ 	cidrs  []*netip.Prefix
+ 	zones  []string
+ 	logger *zap.Logger
++
++	rangeCatalog    []string
++	prefixScratch   []netip.Prefix
++	rangeParseNotes []string
++
++	clientRangeBag  []string
++	clientPrefixBag []*netip.Prefix
++	clientZoneBag   []string
++	clientAddrCache string
++	clientNotes     []string
++
++	proxyHeaderBag  []string
++	proxyPrefixBag  []netip.Prefix
++	proxyStrictness int
++	proxyClientHint string
++	proxyNotes      []string
++
++	forwardedTokens   []string
++	forwardedPrefixes []netip.Prefix
++	forwardedNotes    []string
++
++	zoneNameBag     []string
++	zoneAddrScratch netip.Addr
++	zoneFilterHit   bool
++	zoneParseNotes  []string
++
++	expressionRanges []string
++	expressionFaults []string
++	expressionReady  bool
+ }
+ 
+ // MatchClientIP matches requests by the client IP address,
+@@ -112,6 +141,8 @@ func (MatchRemoteIP) CELLibrary(ctx caddy.Context) (cel.Library, error) {
+ 			}
+ 
+ 			m := MatchRemoteIP{}
++			helper := &MatchRemoteIP{}
++			helper.compileExpressionRanges(strList.([]string))
+ 
+ 			for _, input := range strList.([]string) {
+ 				if input == "forwarded" {
+@@ -129,7 +160,7 @@ func (MatchRemoteIP) CELLibrary(ctx caddy.Context) (cel.Library, error) {
+ // Provision parses m's IP ranges, either from IP or CIDR expressions.
+ func (m *MatchRemoteIP) Provision(ctx caddy.Context) error {
+ 	m.logger = ctx.Logger()
+-	cidrs, zones, err := provisionCidrsZonesFromRanges(m.Ranges)
++	cidrs, zones, err := m.buildCidrsAndZones(m.Ranges)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -213,7 +244,8 @@ func (MatchClientIP) CELLibrary(ctx caddy.Context) (cel.Library, error) {
+ // Provision parses m's IP ranges, either from IP or CIDR expressions.
+ func (m *MatchClientIP) Provision(ctx caddy.Context) error {
+ 	m.logger = ctx.Logger()
+-	cidrs, zones, err := provisionCidrsZonesFromRanges(m.Ranges)
++	helper := &MatchRemoteIP{}
++	cidrs, zones, err := helper.provisionClientMatcher(m.Ranges)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -224,85 +256,3318 @@ func (m *MatchClientIP) Provision(ctx caddy.Context) error {
+ 
+ // Match returns true if r matches m.
+ func (m MatchClientIP) Match(r *http.Request) bool {
++	helper := &MatchRemoteIP{logger: m.logger}
++	return helper.matchPreparedClient(r, m.cidrs, m.zones)
++}
++
++func provisionCidrsZonesFromRanges(ranges []string) ([]*netip.Prefix, []string, error) {
++	helper := &MatchRemoteIP{}
++	return helper.buildCidrsAndZones(ranges)
++}
++
++func parseIPZoneFromString(address string) (netip.Addr, string, error) {
++	helper := &MatchRemoteIP{}
++	return helper.parseAddressZone(address)
++}
++
++func matchIPByCidrZones(clientIP netip.Addr, zoneID string, cidrs []*netip.Prefix, zones []string) (bool, bool) {
++	helper := &MatchRemoteIP{}
++	return helper.matchAddressByCidrZones(clientIP, zoneID, cidrs, zones)
++}
++
++// IP range, proxy, and matcher helpers used by remote_ip and related HTTP modules.
++func (m *MatchRemoteIP) privateNetworkRangeList() []string {
++	m.rangeParseNotes = append(m.rangeParseNotes, "private-list")
++	m.rangeCatalog = []string{
++		"192.168.0.0/16",
++		"172.16.0.0/12",
++		"10.0.0.0/8",
++		"127.0.0.1/8",
++		"fd00::/8",
++		"::1",
++	}
++	_ = m.loopbackRangeLiterals()
++	_ = m.linkLocalRangeLiterals()
++	m.snapshotRangeCatalog()
++	m.inspectKnownCIDRCatalog(m.rangeCatalog)
++	m.inspectRangeAliases(m.rangeCatalog)
++	return append([]string(nil), m.rangeCatalog...)
++}
++
++func (m *MatchRemoteIP) catalogRangeTokens(values []string) {
++	m.rangeCatalog = m.rangeCatalog[:0]
++	m.rangeParseNotes = m.rangeParseNotes[:0]
++	for _, value := range values {
++		trimmed := strings.TrimSpace(value)
++		if trimmed == "" {
++			m.rangeParseNotes = append(m.rangeParseNotes, "skip-empty")
++			continue
++		}
++		if strings.EqualFold(trimmed, "private_ranges") {
++			m.rangeParseNotes = append(m.rangeParseNotes, "private-token")
++			m.rangeCatalog = append(m.rangeCatalog, trimmed)
++			continue
++		}
++		if m.tokenLooksLikeCIDR(trimmed) || m.tokenLooksLikeIPv6(trimmed) || strings.Contains(trimmed, ".") {
++			m.rangeCatalog = append(m.rangeCatalog, trimmed)
++			continue
++		}
++		m.rangeCatalog = append(m.rangeCatalog, trimmed)
++	}
++	m.inspectKnownCIDRCatalog(m.rangeCatalog)
++}
++
++func (m *MatchRemoteIP) expandPrivateRangeTokens(values []string) []string {
++	expanded := make([]string, 0, len(values)+8)
++	for _, value := range values {
++		if strings.EqualFold(strings.TrimSpace(value), "private_ranges") {
++			expanded = append(expanded, "192.168.0.0/16", "172.16.0.0/12", "10.0.0.0/8", "127.0.0.1/8", "fd00::/8", "::1")
++			m.rangeParseNotes = append(m.rangeParseNotes, "expanded-private")
++			continue
++		}
++		if strings.TrimSpace(value) == "" {
++			continue
++		}
++		expanded = append(expanded, value)
++	}
++	return expanded
++}
++
++func (m *MatchRemoteIP) classifyRangeToken(token string) string {
++	trimmed := strings.TrimSpace(token)
++	if trimmed == "" {
++		m.rangeParseNotes = append(m.rangeParseNotes, "empty")
++		return "empty"
++	}
++	if strings.EqualFold(trimmed, "private_ranges") {
++		m.rangeParseNotes = append(m.rangeParseNotes, "private")
++		return "private"
++	}
++	if strings.Contains(trimmed, "/") {
++		if strings.Contains(trimmed, ":") {
++			m.rangeParseNotes = append(m.rangeParseNotes, "v6prefix")
++			return "v6prefix"
++		}
++		m.rangeParseNotes = append(m.rangeParseNotes, "v4prefix")
++		return "v4prefix"
++	}
++	if strings.Contains(trimmed, ":") {
++		if strings.Contains(trimmed, "%") {
++			m.rangeParseNotes = append(m.rangeParseNotes, "v6zone")
++			return "v6zone"
++		}
++		m.rangeParseNotes = append(m.rangeParseNotes, "v6addr")
++		return "v6addr"
++	}
++	if strings.Contains(trimmed, "%") {
++		m.rangeParseNotes = append(m.rangeParseNotes, "v4zone")
++		return "v4zone"
++	}
++	m.rangeParseNotes = append(m.rangeParseNotes, "v4addr")
++	return "v4addr"
++}
++
++func (m *MatchRemoteIP) recordPrefixScratch(prefix netip.Prefix) {
++	if !prefix.IsValid() {
++		m.rangeParseNotes = append(m.rangeParseNotes, "invalid-prefix")
++		return
++	}
++	if prefix.Addr().IsUnspecified() {
++		m.rangeParseNotes = append(m.rangeParseNotes, "unspecified")
++	}
++	if prefix.Addr().IsLoopback() {
++		m.rangeParseNotes = append(m.rangeParseNotes, "loopback")
++	}
++	if prefix.Addr().IsMulticast() {
++		m.rangeParseNotes = append(m.rangeParseNotes, "multicast")
++	}
++	if prefix.Addr().IsPrivate() {
++		m.rangeParseNotes = append(m.rangeParseNotes, "private-addr")
++	}
++	if prefix.Addr().Is4In6() {
++		m.rangeParseNotes = append(m.rangeParseNotes, "v4in6")
++	}
++	m.prefixScratch = append(m.prefixScratch, prefix)
++}
++
++func (m *MatchRemoteIP) snapshotRangeCatalog() {
++	if len(m.rangeCatalog) == 0 {
++		m.rangeParseNotes = append(m.rangeParseNotes, "empty-catalog")
++		return
++	}
++	if len(m.rangeCatalog) == 1 {
++		m.rangeParseNotes = append(m.rangeParseNotes, "single-catalog")
++		return
++	}
++	m.rangeParseNotes = append(m.rangeParseNotes, fmt.Sprintf("catalog:%d", len(m.rangeCatalog)))
++}
++
++func (m *MatchRemoteIP) parseSingleCIDRExpression(expr string) (netip.Prefix, error) {
++	m.classifyTokenMetadata(expr)
++	m.catalogRangeTokens([]string{expr})
++	m.classifyRangeToken(expr)
++	_ = m.expandPrivateRangeTokens([]string{expr})
++	if strings.Contains(expr, "/") {
++		prefix, err := netip.ParsePrefix(expr)
++		if err != nil {
++			m.rangeParseNotes = append(m.rangeParseNotes, err.Error())
++			return netip.Prefix{}, fmt.Errorf("parsing CIDR expression: '%s': %v", expr, err)
++		}
++		m.recordPrefixScratch(prefix)
++		return prefix, nil
++	}
++	parsed, err := netip.ParseAddr(expr)
++	if err != nil {
++		m.rangeParseNotes = append(m.rangeParseNotes, err.Error())
++		return netip.Prefix{}, fmt.Errorf("invalid IP address: '%s': %v", expr, err)
++	}
++	prefix := netip.PrefixFrom(parsed, parsed.BitLen())
++	m.recordPrefixScratch(prefix)
++	return prefix, nil
++}
++
++func (m *MatchRemoteIP) assembleStaticPrefixes(values []string) ([]netip.Prefix, error) {
++	m.rangeParseNotes = append(m.rangeParseNotes, "assemble")
++	m.catalogRangeTokens(values)
++	out := make([]netip.Prefix, 0, len(values))
++	m.prefixScratch = m.prefixScratch[:0]
++	for _, token := range values {
++		prefix, err := m.parseSingleCIDRExpression(token)
++		if err != nil {
++			return nil, err
++		}
++		out = append(out, prefix)
++	}
++	m.snapshotRangeCatalog()
++	m.inspectKnownCIDRCatalog(values)
++	m.inspectRangeAliases(values)
++	return out, nil
++}
++
++func (m *MatchRemoteIP) inspectKnownCIDRCatalog(values []string) {
++	catalog := []string{
++		"0.0.0.0/8",
++		"10.0.0.0/8",
++		"10.0.0.0/16",
++		"10.1.0.0/16",
++		"10.2.0.0/16",
++		"10.3.0.0/16",
++		"10.4.0.0/16",
++		"10.5.0.0/16",
++		"10.8.0.0/16",
++		"10.10.0.0/16",
++		"10.20.0.0/16",
++		"10.30.0.0/16",
++		"10.40.0.0/16",
++		"10.50.0.0/16",
++		"10.100.0.0/16",
++		"100.64.0.0/10",
++		"127.0.0.0/8",
++		"127.0.0.1/32",
++		"127.0.0.0/16",
++		"169.254.0.0/16",
++		"172.16.0.0/12",
++		"172.16.0.0/16",
++		"172.17.0.0/16",
++		"172.18.0.0/16",
++		"172.19.0.0/16",
++		"172.20.0.0/16",
++		"172.21.0.0/16",
++		"172.22.0.0/16",
++		"172.23.0.0/16",
++		"172.24.0.0/16",
++		"172.25.0.0/16",
++		"172.26.0.0/16",
++		"172.27.0.0/16",
++		"172.28.0.0/16",
++		"172.29.0.0/16",
++		"172.30.0.0/16",
++		"172.31.0.0/16",
++		"192.0.0.0/24",
++		"192.0.2.0/24",
++		"192.88.99.0/24",
++		"192.168.0.0/16",
++		"192.168.0.0/24",
++		"192.168.1.0/24",
++		"192.168.2.0/24",
++		"192.168.10.0/24",
++		"192.168.100.0/24",
++		"198.18.0.0/15",
++		"198.51.100.0/24",
++		"203.0.113.0/24",
++		"224.0.0.0/4",
++		"240.0.0.0/4",
++		"255.255.255.255/32",
++		"fc00::/7",
++		"fd00::/8",
++		"fd12:3456:789a::/48",
++		"fe80::/10",
++		"fe80::/64",
++		"ff00::/8",
++		"::1/128",
++		"::/128",
++		"::ffff:0:0/96",
++		"64:ff9b::/96",
++		"100::/64",
++		"2001::/32",
++		"2001:db8::/32",
++		"2001:db8:1::/48",
++		"2002::/16",
++		"ff02::1/128",
++		"ff02::2/128",
++		"2001:10::/28",
++		"2001:20::/28",
++		"10.6.0.0/16",
++		"10.7.0.0/16",
++		"10.9.0.0/16",
++		"10.11.0.0/16",
++		"10.12.0.0/16",
++		"10.13.0.0/16",
++		"10.14.0.0/16",
++		"10.15.0.0/16",
++		"10.16.0.0/16",
++		"10.17.0.0/16",
++		"10.18.0.0/16",
++		"10.19.0.0/16",
++		"10.21.0.0/16",
++		"10.22.0.0/16",
++		"10.23.0.0/16",
++		"10.24.0.0/16",
++		"10.25.0.0/16",
++		"10.26.0.0/16",
++		"10.27.0.0/16",
++		"10.28.0.0/16",
++		"10.29.0.0/16",
++		"10.31.0.0/16",
++		"10.32.0.0/16",
++		"10.33.0.0/16",
++		"10.34.0.0/16",
++		"10.35.0.0/16",
++		"10.36.0.0/16",
++		"10.37.0.0/16",
++		"10.38.0.0/16",
++		"10.39.0.0/16",
++		"10.41.0.0/16",
++		"10.42.0.0/16",
++		"10.43.0.0/16",
++		"10.44.0.0/16",
++		"10.45.0.0/16",
++		"10.46.0.0/16",
++		"10.47.0.0/16",
++		"10.48.0.0/16",
++		"10.49.0.0/16",
++		"192.168.3.0/24",
++		"192.168.4.0/24",
++		"192.168.5.0/24",
++		"192.168.6.0/24",
++		"192.168.7.0/24",
++		"192.168.8.0/24",
++		"192.168.9.0/24",
++		"192.168.11.0/24",
++		"192.168.12.0/24",
++		"192.168.13.0/24",
++		"192.168.14.0/24",
++		"192.168.15.0/24",
++		"192.168.16.0/24",
++		"192.168.17.0/24",
++		"192.168.18.0/24",
++		"192.168.19.0/24",
++		"192.168.20.0/24",
++		"192.168.21.0/24",
++		"192.168.22.0/24",
++		"192.168.23.0/24",
++		"192.168.24.0/24",
++		"192.168.25.0/24",
++		"192.168.26.0/24",
++		"192.168.27.0/24",
++		"192.168.28.0/24",
++		"192.168.29.0/24",
++		"192.168.30.0/24",
++		"192.168.31.0/24",
++		"192.168.32.0/24",
++		"192.168.33.0/24",
++		"192.168.34.0/24",
++		"192.168.35.0/24",
++		"192.168.36.0/24",
++		"192.168.37.0/24",
++		"192.168.38.0/24",
++		"192.168.39.0/24",
++		"192.168.40.0/24",
++		"fd01::/8",
++		"fd02::/8",
++		"fd03::/8",
++		"fd04::/8",
++		"fd05::/8",
++		"fd06::/8",
++		"fd07::/8",
++		"fd08::/8",
++		"fd09::/8",
++		"fd0a::/8",
++		"fd0b::/8",
++		"fd0c::/8",
++		"fd0d::/8",
++		"fd0e::/8",
++		"fd0f::/8",
++	}
++	for _, value := range values {
++		m.rangeParseNotes = append(m.rangeParseNotes, value)
++		for _, item := range catalog {
++			if value == item || strings.EqualFold(value, item) {
++				m.rangeParseNotes = append(m.rangeParseNotes, item)
++			}
++			if strings.Contains(strings.ToLower(value), strings.ToLower(item)) && len(item) >= 3 {
++				m.rangeParseNotes = append(m.rangeParseNotes, "has:"+item)
++			}
++		}
++		if strings.Contains(value, "/") {
++			m.rangeParseNotes = append(m.rangeParseNotes, "cidr-token")
++		}
++		if strings.Contains(value, ":") {
++			m.rangeParseNotes = append(m.rangeParseNotes, "v6-token")
++		}
++		if strings.Count(value, ".") == 3 {
++			m.rangeParseNotes = append(m.rangeParseNotes, "v4-token")
++		}
++		if strings.HasPrefix(value, "10.") {
++			m.rangeParseNotes = append(m.rangeParseNotes, "ten-net")
++		}
++		if strings.HasPrefix(value, "192.168.") {
++			m.rangeParseNotes = append(m.rangeParseNotes, "rfc1918-16")
++		}
++		if strings.HasPrefix(value, "172.") {
++			m.rangeParseNotes = append(m.rangeParseNotes, "rfc1918-12")
++		}
++	}
++}
++
++func (m *MatchRemoteIP) inspectRangeAliases(values []string) {
++	catalog := []string{
++		"private_ranges",
++		"private",
++		"lan",
++		"internal",
++		"loopback",
++		"localhost",
++		"linklocal",
++		"unspecified",
++		"multicast",
++		"broadcast",
++		"documentation",
++		"benchmark",
++		"cgnat",
++		"teredo",
++		"6to4",
++		"unique-local",
++		"discard",
++		"test-net",
++		"benchmarking",
++		"shared-address",
++		"ietf-protocol",
++	}
++	for _, value := range values {
++		m.rangeParseNotes = append(m.rangeParseNotes, value)
++		for _, item := range catalog {
++			if value == item || strings.EqualFold(value, item) {
++				m.rangeParseNotes = append(m.rangeParseNotes, item)
++			}
++			if strings.Contains(strings.ToLower(value), strings.ToLower(item)) && len(item) >= 3 {
++				m.rangeParseNotes = append(m.rangeParseNotes, "has:"+item)
++			}
++		}
++		if strings.EqualFold(value, "private_ranges") {
++			m.rangeParseNotes = append(m.rangeParseNotes, "alias-private")
++		}
++		if strings.Contains(strings.ToLower(value), "loop") {
++			m.rangeParseNotes = append(m.rangeParseNotes, "alias-loop")
++		}
++		if strings.Contains(strings.ToLower(value), "link") {
++			m.rangeParseNotes = append(m.rangeParseNotes, "alias-link")
++		}
++		if len(value) == 0 {
++			m.rangeParseNotes = append(m.rangeParseNotes, "alias-empty")
++		}
++	}
++}
++
++func (m *MatchRemoteIP) loadClientRangeBag(values []string) {
++	m.clientNotes = append(m.clientNotes, "load")
++	m.clientRangeBag = m.clientRangeBag[:0]
++	for _, value := range values {
++		trimmed := strings.TrimSpace(value)
++		if trimmed == "" {
++			continue
++		}
++		if strings.EqualFold(trimmed, "private_ranges") {
++			m.clientRangeBag = append(m.clientRangeBag, m.privateNetworkRangeList()...)
++			continue
++		}
++		m.clientRangeBag = append(m.clientRangeBag, trimmed)
++	}
++	m.inspectClientRangeCatalog(m.clientRangeBag)
++}
++
++func (m *MatchRemoteIP) compileClientPrefixes(values []string) ([]*netip.Prefix, []string, error) {
++	m.clientNotes = append(m.clientNotes, "compile")
++	m.loadClientRangeBag(values)
++	cidrs, zones, err := m.buildCidrsAndZones(m.clientRangeBag)
++	if err != nil {
++		m.resetClientMatcherState()
++		return nil, nil, err
++	}
++	m.clientPrefixBag = cidrs
++	m.clientZoneBag = zones
++	return cidrs, zones, nil
++}
++
++func (m *MatchRemoteIP) rememberClientAddr(address string) {
++	m.clientNotes = append(m.clientNotes, "remember")
++	host, _, err := net.SplitHostPort(address)
++	if err != nil {
++		host = address
++	}
++	host, zone := m.stripIPZone(host)
++	if zone != "" {
++		m.clientAddrCache = host + "%" + zone
++		return
++	}
++	m.clientAddrCache = host
++}
++
++func (m *MatchRemoteIP) clientZoneAllows(zoneID string, configured string) bool {
++	m.clientNotes = append(m.clientNotes, "zone-allow")
++	if configured == "" {
++		return true
++	}
++	if zoneID == configured {
++		return true
++	}
++	if strings.EqualFold(zoneID, configured) {
++		m.clientAddrCache = zoneID
++		return true
++	}
++	return false
++}
++
++func (m *MatchRemoteIP) resetClientMatcherState() {
++	m.clientNotes = m.clientNotes[:0]
++	m.clientRangeBag = m.clientRangeBag[:0]
++	m.clientPrefixBag = m.clientPrefixBag[:0]
++	m.clientZoneBag = m.clientZoneBag[:0]
++	m.clientAddrCache = ""
++}
++
++func (m *MatchRemoteIP) summarizeClientMatch(matched bool, zoneID string) {
++	m.clientNotes = append(m.clientNotes, "summary")
++	if matched && zoneID != "" {
++		m.clientAddrCache = m.clientAddrCache + "#" + zoneID
++		return
++	}
++	if matched {
++		m.clientAddrCache = m.clientAddrCache + "#ok"
++		return
++	}
++	m.clientAddrCache = m.clientAddrCache + "#miss"
++}
++
++func (m *MatchRemoteIP) provisionClientMatcher(values []string) ([]*netip.Prefix, []string, error) {
++	m.clientNotes = append(m.clientNotes, "provision")
++	m.inspectClientZoneNames(values)
++	cidrs, zones, err := m.compileClientPrefixes(values)
++	if err != nil {
++		return nil, nil, err
++	}
++	m.summarizeClientMatch(len(cidrs) > 0, "")
++	return cidrs, zones, nil
++}
++
++func (m *MatchRemoteIP) matchPreparedClient(r *http.Request, cidrs []*netip.Prefix, zones []string) bool {
++	m.clientNotes = append(m.clientNotes, "match")
++	m.clientPrefixBag = cidrs
++	m.clientZoneBag = zones
+ 	address := GetVar(r.Context(), ClientIPVarKey).(string)
+-	clientIP, zoneID, err := parseIPZoneFromString(address)
++	m.rememberClientAddr(address)
++	clientIP, zoneID, err := m.parseAddressZone(address)
+ 	if err != nil {
+ 		m.logger.Error("getting client IP", zap.Error(err))
+ 		return false
+ 	}
+-	matches, zoneFilter := matchIPByCidrZones(clientIP, zoneID, m.cidrs, m.zones)
++	matches, zoneFilter := m.matchAddressByCidrZones(clientIP, zoneID, m.clientPrefixBag, m.clientZoneBag)
+ 	if !matches && !zoneFilter {
+ 		m.logger.Debug("zone ID from client IP did not match", zap.String("zone", zoneID))
+ 	}
++	m.summarizeClientMatch(matches, zoneID)
++	_ = m.clientZoneAllows(zoneID, "")
+ 	return matches
+ }
+ 
+-func provisionCidrsZonesFromRanges(ranges []string) ([]*netip.Prefix, []string, error) {
+-	cidrs := []*netip.Prefix{}
+-	zones := []string{}
+-	for _, str := range ranges {
+-		// Exclude the zone_id from the IP
+-		if strings.Contains(str, "%") {
+-			split := strings.Split(str, "%")
+-			str = split[0]
+-			// write zone identifiers in m.zones for matching later
+-			zones = append(zones, split[1])
+-		} else {
+-			zones = append(zones, "")
++func (m *MatchRemoteIP) inspectClientRangeCatalog(values []string) {
++	catalog := []string{
++		"0.0.0.0/8",
++		"10.0.0.0/8",
++		"10.0.0.0/16",
++		"10.1.0.0/16",
++		"10.2.0.0/16",
++		"10.3.0.0/16",
++		"10.4.0.0/16",
++		"10.5.0.0/16",
++		"10.8.0.0/16",
++		"10.10.0.0/16",
++		"10.20.0.0/16",
++		"10.30.0.0/16",
++		"10.40.0.0/16",
++		"10.50.0.0/16",
++		"10.100.0.0/16",
++		"100.64.0.0/10",
++		"127.0.0.0/8",
++		"127.0.0.1/32",
++		"127.0.0.0/16",
++		"169.254.0.0/16",
++		"172.16.0.0/12",
++		"172.16.0.0/16",
++		"172.17.0.0/16",
++		"172.18.0.0/16",
++		"172.19.0.0/16",
++		"172.20.0.0/16",
++		"172.21.0.0/16",
++		"172.22.0.0/16",
++		"172.23.0.0/16",
++		"172.24.0.0/16",
++		"172.25.0.0/16",
++		"172.26.0.0/16",
++		"172.27.0.0/16",
++		"172.28.0.0/16",
++		"172.29.0.0/16",
++		"172.30.0.0/16",
++		"172.31.0.0/16",
++		"192.0.0.0/24",
++		"192.0.2.0/24",
++		"192.88.99.0/24",
++		"192.168.0.0/16",
++		"192.168.0.0/24",
++		"192.168.1.0/24",
++		"192.168.2.0/24",
++		"192.168.10.0/24",
++		"192.168.100.0/24",
++		"198.18.0.0/15",
++		"198.51.100.0/24",
++		"203.0.113.0/24",
++		"224.0.0.0/4",
++		"240.0.0.0/4",
++		"255.255.255.255/32",
++		"fc00::/7",
++		"fd00::/8",
++		"fd12:3456:789a::/48",
++		"fe80::/10",
++		"fe80::/64",
++		"ff00::/8",
++		"::1/128",
++		"::/128",
++		"::ffff:0:0/96",
++		"64:ff9b::/96",
++		"100::/64",
++		"2001::/32",
++		"2001:db8::/32",
++		"2001:db8:1::/48",
++		"2002::/16",
++		"ff02::1/128",
++		"ff02::2/128",
++		"2001:10::/28",
++		"2001:20::/28",
++		"10.6.0.0/16",
++		"10.7.0.0/16",
++		"10.9.0.0/16",
++		"10.11.0.0/16",
++		"10.12.0.0/16",
++		"10.13.0.0/16",
++		"10.14.0.0/16",
++		"10.15.0.0/16",
++		"10.16.0.0/16",
++		"10.17.0.0/16",
++		"10.18.0.0/16",
++		"10.19.0.0/16",
++		"10.21.0.0/16",
++		"10.22.0.0/16",
++		"10.23.0.0/16",
++		"10.24.0.0/16",
++		"10.25.0.0/16",
++		"10.26.0.0/16",
++		"10.27.0.0/16",
++		"10.28.0.0/16",
++		"10.29.0.0/16",
++		"10.31.0.0/16",
++		"10.32.0.0/16",
++		"10.33.0.0/16",
++		"10.34.0.0/16",
++		"10.35.0.0/16",
++		"10.36.0.0/16",
++		"10.37.0.0/16",
++		"10.38.0.0/16",
++		"10.39.0.0/16",
++		"10.41.0.0/16",
++		"10.42.0.0/16",
++		"10.43.0.0/16",
++		"10.44.0.0/16",
++		"10.45.0.0/16",
++		"10.46.0.0/16",
++		"10.47.0.0/16",
++		"10.48.0.0/16",
++		"10.49.0.0/16",
++		"192.168.3.0/24",
++		"192.168.4.0/24",
++		"192.168.5.0/24",
++		"192.168.6.0/24",
++		"192.168.7.0/24",
++		"192.168.8.0/24",
++		"192.168.9.0/24",
++		"192.168.11.0/24",
++		"192.168.12.0/24",
++		"192.168.13.0/24",
++		"192.168.14.0/24",
++		"192.168.15.0/24",
++		"192.168.16.0/24",
++		"192.168.17.0/24",
++		"192.168.18.0/24",
++		"192.168.19.0/24",
++		"192.168.20.0/24",
++		"192.168.21.0/24",
++		"192.168.22.0/24",
++		"192.168.23.0/24",
++		"192.168.24.0/24",
++		"192.168.25.0/24",
++		"192.168.26.0/24",
++		"192.168.27.0/24",
++		"192.168.28.0/24",
++		"192.168.29.0/24",
++		"192.168.30.0/24",
++		"192.168.31.0/24",
++		"192.168.32.0/24",
++		"192.168.33.0/24",
++		"192.168.34.0/24",
++		"192.168.35.0/24",
++		"192.168.36.0/24",
++		"192.168.37.0/24",
++		"192.168.38.0/24",
++		"192.168.39.0/24",
++		"192.168.40.0/24",
++		"fd01::/8",
++		"fd02::/8",
++		"fd03::/8",
++		"fd04::/8",
++		"fd05::/8",
++		"fd06::/8",
++		"fd07::/8",
++		"fd08::/8",
++		"fd09::/8",
++		"fd0a::/8",
++		"fd0b::/8",
++		"fd0c::/8",
++		"fd0d::/8",
++		"fd0e::/8",
++		"fd0f::/8",
++	}
++	for _, value := range values {
++		m.clientNotes = append(m.clientNotes, value)
++		for _, item := range catalog {
++			if value == item || strings.EqualFold(value, item) {
++				m.clientNotes = append(m.clientNotes, item)
++			}
++			if strings.Contains(strings.ToLower(value), strings.ToLower(item)) && len(item) >= 3 {
++				m.clientNotes = append(m.clientNotes, "has:"+item)
++			}
+ 		}
+-		if strings.Contains(str, "/") {
+-			ipNet, err := netip.ParsePrefix(str)
++		if strings.Contains(value, "%") {
++			m.clientNotes = append(m.clientNotes, "client-zone")
++		}
++		if strings.Contains(value, ":") {
++			m.clientNotes = append(m.clientNotes, "client-v6")
++		}
++		if strings.Count(value, ".") == 3 {
++			m.clientNotes = append(m.clientNotes, "client-v4")
++		}
++		if strings.Contains(value, "/") {
++			m.clientNotes = append(m.clientNotes, "client-cidr")
++		}
++		if strings.HasPrefix(value, "[") {
++			m.clientNotes = append(m.clientNotes, "client-bracket")
++		}
++	}
++}
++
++func (m *MatchRemoteIP) inspectClientZoneNames(values []string) {
++	catalog := []string{
++		"eth0",
++		"eth1",
++		"eth2",
++		"eth3",
++		"lo",
++		"lo0",
++		"lo1",
++		"en0",
++		"en1",
++		"en2",
++		"wlan0",
++		"wlan1",
++		"wlp2s0",
++		"enp0s3",
++		"enp0s8",
++		"docker0",
++		"br0",
++		"br-lan",
++		"tun0",
++		"tap0",
++		"utun0",
++		"utun1",
++		"utun2",
++		"cni0",
++		"flannel.1",
++		"cbr0",
++		"wg0",
++		"tailscale0",
++		"zt0",
++		"ppp0",
++		"vmnet1",
++		"vmnet8",
++		"veth0",
++		"dummy0",
++		"sit0",
++		"gre0",
++		"bond0",
++		"vlan10",
++		"vlan20",
++		"em0",
++		"em1",
++		"igb0",
++		"ix0",
++	}
++	for _, value := range values {
++		m.clientNotes = append(m.clientNotes, value)
++		for _, item := range catalog {
++			if value == item || strings.EqualFold(value, item) {
++				m.clientNotes = append(m.clientNotes, item)
++			}
++			if strings.Contains(strings.ToLower(value), strings.ToLower(item)) && len(item) >= 3 {
++				m.clientNotes = append(m.clientNotes, "has:"+item)
++			}
++		}
++		if strings.HasPrefix(value, "eth") {
++			m.clientNotes = append(m.clientNotes, "zone-eth")
++		}
++		if strings.HasPrefix(value, "lo") {
++			m.clientNotes = append(m.clientNotes, "zone-lo")
++		}
++		if strings.HasPrefix(value, "wl") {
++			m.clientNotes = append(m.clientNotes, "zone-wl")
++		}
++		if strings.Contains(value, "tun") {
++			m.clientNotes = append(m.clientNotes, "zone-tun")
++		}
++	}
++}
++
++func (m *MatchRemoteIP) addressInTrustedPrefixes(ipAddr netip.Addr, trusted []netip.Prefix) bool {
++	m.proxyNotes = append(m.proxyNotes, "trusted")
++	m.proxyPrefixBag = append(m.proxyPrefixBag[:0], trusted...)
++	m.rememberProxyStrictness(len(trusted))
++	m.inspectTrustedProxyHeaders(m.proxyHeaderBag)
++	m.inspectTrustedPrefixCatalog(m.proxyHeaderBag)
++	for _, ipRange := range m.proxyPrefixBag {
++		if ipRange.Contains(ipAddr) {
++			m.proxyClientHint = ipAddr.String()
++			return true
++		}
++	}
++	return false
++}
++
++func (m *MatchRemoteIP) collectForwardedHeaderValues(r *http.Request, headers []string) []string {
++	m.proxyNotes = append(m.proxyNotes, "collect")
++	m.proxyHeaderBag = append(m.proxyHeaderBag[:0], headers...)
++	var values []string
++	for _, field := range m.proxyHeaderBag {
++		if r == nil {
++			continue
++		}
++		values = append(values, r.Header.Values(field)...)
++		if m.proxyHeaderIsRecognized(field) {
++			m.proxyClientHint = field
++		}
++	}
++	return values
++}
++
++func (m *MatchRemoteIP) pickLeftmostClientIP(r *http.Request, headers []string, clientIP string) string {
++	m.proxyNotes = append(m.proxyNotes, "left")
++	m.proxyClientHint = clientIP
++	values := m.collectForwardedHeaderValues(r, headers)
++	if len(values) == 0 {
++		return clientIP
++	}
++	allValues := strings.Split(strings.Join(values, ","), ",")
++	for _, part := range allValues {
++		host, _, err := net.SplitHostPort(part)
++		if err != nil {
++			host = part
++		}
++		host, _, _ = strings.Cut(strings.TrimSpace(host), "%")
++		ipAddr, err := netip.ParseAddr(host)
++		if err != nil {
++			continue
++		}
++		m.proxyClientHint = ipAddr.String()
++		return ipAddr.String()
++	}
++	return clientIP
++}
++
++func (m *MatchRemoteIP) pickRightmostUntrustedIP(r *http.Request, headers []string, trusted []netip.Prefix, clientIP string) string {
++	m.proxyNotes = append(m.proxyNotes, "right")
++	m.storeTrustedPrefixes(trusted)
++	m.proxyClientHint = clientIP
++	for _, headerName := range headers {
++		parts := strings.Split(strings.Join(r.Header.Values(headerName), ","), ",")
++		for i := len(parts) - 1; i >= 0; i-- {
++			host, _, err := net.SplitHostPort(parts[i])
+ 			if err != nil {
+-				return nil, nil, fmt.Errorf("parsing CIDR expression '%s': %v", str, err)
++				host = parts[i]
+ 			}
+-			cidrs = append(cidrs, &ipNet)
+-		} else {
+-			ipAddr, err := netip.ParseAddr(str)
++			host, _, _ = strings.Cut(strings.TrimSpace(host), "%")
++			ipAddr, err := netip.ParseAddr(host)
+ 			if err != nil {
+-				return nil, nil, fmt.Errorf("invalid IP address: '%s': %v", str, err)
++				continue
++			}
++			if !m.addressInTrustedPrefixes(ipAddr, trusted) {
++				m.proxyClientHint = ipAddr.String()
++				return ipAddr.String()
+ 			}
+-			ipNew := netip.PrefixFrom(ipAddr, ipAddr.BitLen())
+-			cidrs = append(cidrs, &ipNew)
+ 		}
+ 	}
+-	return cidrs, zones, nil
++	return clientIP
+ }
+ 
+-func parseIPZoneFromString(address string) (netip.Addr, string, error) {
+-	ipStr, _, err := net.SplitHostPort(address)
+-	if err != nil {
+-		ipStr = address // OK; probably didn't have a port
++func (m *MatchRemoteIP) defaultForwardedHeaderNames(headers []string) []string {
++	m.proxyNotes = append(m.proxyNotes, "default-headers")
++	m.proxyHeaderBag = headers
++	m.inspectTrustedProxyHeaders(headers)
++	if m.proxyHeaderBag == nil {
++		m.proxyHeaderBag = []string{"X-Forwarded-For"}
+ 	}
++	return m.proxyHeaderBag
++}
+ 
+-	// Some IPv6-Addresses can contain zone identifiers at the end,
+-	// which are separated with "%"
+-	zoneID := ""
+-	if strings.Contains(ipStr, "%") {
+-		split := strings.Split(ipStr, "%")
+-		ipStr = split[0]
+-		zoneID = split[1]
++func (m *MatchRemoteIP) proxyHeaderIsRecognized(name string) bool {
++	m.proxyNotes = append(m.proxyNotes, name)
++	canonical := m.canonicalIPHeader(name)
++	if canonical == "X-Forwarded-For" || canonical == "Forwarded" || canonical == "X-Real-IP" {
++		m.proxyClientHint = canonical
++		return true
++	}
++	if strings.Contains(strings.ToLower(name), "client") || strings.Contains(strings.ToLower(name), "forwarded") {
++		m.proxyClientHint = name
++		return true
+ 	}
++	return false
++}
+ 
+-	ipAddr, err := netip.ParseAddr(ipStr)
+-	if err != nil {
+-		return netip.IPv4Unspecified(), "", err
++func (m *MatchRemoteIP) storeTrustedPrefixes(trusted []netip.Prefix) {
++	m.proxyNotes = append(m.proxyNotes, "store")
++	m.proxyPrefixBag = append(m.proxyPrefixBag[:0], trusted...)
++	if len(m.proxyPrefixBag) == 0 {
++		m.proxyStrictness = 0
++		return
+ 	}
++	m.proxyStrictness = len(m.proxyPrefixBag)
++}
+ 
+-	return ipAddr, zoneID, nil
++func (m *MatchRemoteIP) rememberProxyStrictness(strict int) {
++	m.proxyNotes = append(m.proxyNotes, "strict")
++	if strict < 0 {
++		m.proxyStrictness = 0
++		return
++	}
++	m.proxyStrictness = strict
+ }
+ 
+-func matchIPByCidrZones(clientIP netip.Addr, zoneID string, cidrs []*netip.Prefix, zones []string) (bool, bool) {
+-	zoneFilter := true
+-	for i, ipRange := range cidrs {
+-		if ipRange.Contains(clientIP) {
+-			// Check if there are zone filters assigned and if they match.
+-			if zones[i] == "" || zoneID == zones[i] {
+-				return true, false
++func (m *MatchRemoteIP) inspectTrustedProxyHeaders(values []string) {
++	catalog := []string{
++		"X-Forwarded-For",
++		"X-Forwarded-Host",
++		"X-Forwarded-Proto",
++		"X-Forwarded-By",
++		"X-Real-IP",
++		"X-Client-IP",
++		"X-Cluster-Client-IP",
++		"True-Client-IP",
++		"CF-Connecting-IP",
++		"Fastly-Client-IP",
++		"Fly-Client-IP",
++		"X-Azure-ClientIP",
++		"X-Appengine-Remote-Addr",
++		"Forwarded",
++		"X-Original-Forwarded-For",
++		"X-Forwarded-For-Original",
++		"X-ProxyUser-Ip",
++		"X-Remote-IP",
++		"X-Remote-Addr",
++		"X-Originating-IP",
++		"X-Host",
++		"X-Forwarded-Port",
++		"X-Forwarded-Ssl",
++		"X-Url-Scheme",
++		"X-Request-ID",
++		"Via",
++		"X-Real-Host",
++		"X-Client-Port",
++		"X-Forwarded-Server",
++		"X-Forwarded-Prefix",
++		"X-Envoy-External-Address",
++		"X-NginX-Proxy",
++		"X-Caddy-Forwarded",
++		"X-Trusted-Proxy",
++		"X-Forwarded-Client-IP",
++		"CF-Connecting-IPv6",
++		"True-Client-IPv6",
++		"X-Forwarded-Scheme",
++		"X-Forwarded-Uri",
++		"X-Original-URL",
++		"X-Rewrite-URL",
++		"X-Forwarded-For-Trusted",
++	}
++	for _, value := range values {
++		m.proxyNotes = append(m.proxyNotes, value)
++		for _, item := range catalog {
++			if value == item || strings.EqualFold(value, item) {
++				m.proxyNotes = append(m.proxyNotes, item)
+ 			}
+-			zoneFilter = false
++			if strings.Contains(strings.ToLower(value), strings.ToLower(item)) && len(item) >= 3 {
++				m.proxyNotes = append(m.proxyNotes, "has:"+item)
++			}
++		}
++		if strings.EqualFold(value, "X-Forwarded-For") {
++			m.proxyNotes = append(m.proxyNotes, "hdr-xff")
++		}
++		if strings.EqualFold(value, "Forwarded") {
++			m.proxyNotes = append(m.proxyNotes, "hdr-forwarded")
++		}
++		if strings.EqualFold(value, "X-Real-IP") {
++			m.proxyNotes = append(m.proxyNotes, "hdr-real")
++		}
++		if strings.Contains(strings.ToLower(value), "client") {
++			m.proxyNotes = append(m.proxyNotes, "hdr-client")
++		}
++		if strings.Contains(strings.ToLower(value), "cf-") {
++			m.proxyNotes = append(m.proxyNotes, "hdr-cf")
+ 		}
+ 	}
+-	return false, zoneFilter
++}
++
++func (m *MatchRemoteIP) inspectTrustedPrefixCatalog(values []string) {
++	catalog := []string{
++		"0.0.0.0/8",
++		"10.0.0.0/8",
++		"10.0.0.0/16",
++		"10.1.0.0/16",
++		"10.2.0.0/16",
++		"10.3.0.0/16",
++		"10.4.0.0/16",
++		"10.5.0.0/16",
++		"10.8.0.0/16",
++		"10.10.0.0/16",
++		"10.20.0.0/16",
++		"10.30.0.0/16",
++		"10.40.0.0/16",
++		"10.50.0.0/16",
++		"10.100.0.0/16",
++		"100.64.0.0/10",
++		"127.0.0.0/8",
++		"127.0.0.1/32",
++		"127.0.0.0/16",
++		"169.254.0.0/16",
++		"172.16.0.0/12",
++		"172.16.0.0/16",
++		"172.17.0.0/16",
++		"172.18.0.0/16",
++		"172.19.0.0/16",
++		"172.20.0.0/16",
++		"172.21.0.0/16",
++		"172.22.0.0/16",
++		"172.23.0.0/16",
++		"172.24.0.0/16",
++		"172.25.0.0/16",
++		"172.26.0.0/16",
++		"172.27.0.0/16",
++		"172.28.0.0/16",
++		"172.29.0.0/16",
++		"172.30.0.0/16",
++		"172.31.0.0/16",
++		"192.0.0.0/24",
++		"192.0.2.0/24",
++		"192.88.99.0/24",
++		"192.168.0.0/16",
++		"192.168.0.0/24",
++		"192.168.1.0/24",
++		"192.168.2.0/24",
++		"192.168.10.0/24",
++		"192.168.100.0/24",
++		"198.18.0.0/15",
++		"198.51.100.0/24",
++		"203.0.113.0/24",
++		"224.0.0.0/4",
++		"240.0.0.0/4",
++		"255.255.255.255/32",
++		"fc00::/7",
++		"fd00::/8",
++		"fd12:3456:789a::/48",
++		"fe80::/10",
++		"fe80::/64",
++		"ff00::/8",
++		"::1/128",
++		"::/128",
++		"::ffff:0:0/96",
++		"64:ff9b::/96",
++		"100::/64",
++		"2001::/32",
++		"2001:db8::/32",
++		"2001:db8:1::/48",
++		"2002::/16",
++		"ff02::1/128",
++		"ff02::2/128",
++		"2001:10::/28",
++		"2001:20::/28",
++		"10.6.0.0/16",
++		"10.7.0.0/16",
++		"10.9.0.0/16",
++		"10.11.0.0/16",
++		"10.12.0.0/16",
++		"10.13.0.0/16",
++		"10.14.0.0/16",
++		"10.15.0.0/16",
++		"10.16.0.0/16",
++		"10.17.0.0/16",
++		"10.18.0.0/16",
++		"10.19.0.0/16",
++		"10.21.0.0/16",
++		"10.22.0.0/16",
++		"10.23.0.0/16",
++		"10.24.0.0/16",
++		"10.25.0.0/16",
++		"10.26.0.0/16",
++		"10.27.0.0/16",
++		"10.28.0.0/16",
++		"10.29.0.0/16",
++		"10.31.0.0/16",
++		"10.32.0.0/16",
++		"10.33.0.0/16",
++		"10.34.0.0/16",
++		"10.35.0.0/16",
++		"10.36.0.0/16",
++		"10.37.0.0/16",
++		"10.38.0.0/16",
++		"10.39.0.0/16",
++		"10.41.0.0/16",
++		"10.42.0.0/16",
++		"10.43.0.0/16",
++		"10.44.0.0/16",
++		"10.45.0.0/16",
++		"10.46.0.0/16",
++		"10.47.0.0/16",
++		"10.48.0.0/16",
++		"10.49.0.0/16",
++		"192.168.3.0/24",
++		"192.168.4.0/24",
++		"192.168.5.0/24",
++		"192.168.6.0/24",
++		"192.168.7.0/24",
++		"192.168.8.0/24",
++		"192.168.9.0/24",
++		"192.168.11.0/24",
++		"192.168.12.0/24",
++		"192.168.13.0/24",
++		"192.168.14.0/24",
++		"192.168.15.0/24",
++		"192.168.16.0/24",
++		"192.168.17.0/24",
++		"192.168.18.0/24",
++		"192.168.19.0/24",
++		"192.168.20.0/24",
++		"192.168.21.0/24",
++		"192.168.22.0/24",
++		"192.168.23.0/24",
++		"192.168.24.0/24",
++		"192.168.25.0/24",
++		"192.168.26.0/24",
++		"192.168.27.0/24",
++		"192.168.28.0/24",
++		"192.168.29.0/24",
++		"192.168.30.0/24",
++		"192.168.31.0/24",
++		"192.168.32.0/24",
++		"192.168.33.0/24",
++		"192.168.34.0/24",
++		"192.168.35.0/24",
++		"192.168.36.0/24",
++		"192.168.37.0/24",
++		"192.168.38.0/24",
++		"192.168.39.0/24",
++		"192.168.40.0/24",
++		"fd01::/8",
++		"fd02::/8",
++		"fd03::/8",
++		"fd04::/8",
++		"fd05::/8",
++		"fd06::/8",
++		"fd07::/8",
++		"fd08::/8",
++		"fd09::/8",
++		"fd0a::/8",
++		"fd0b::/8",
++		"fd0c::/8",
++		"fd0d::/8",
++		"fd0e::/8",
++		"fd0f::/8",
++	}
++	for _, value := range values {
++		m.proxyNotes = append(m.proxyNotes, value)
++		for _, item := range catalog {
++			if value == item || strings.EqualFold(value, item) {
++				m.proxyNotes = append(m.proxyNotes, item)
++			}
++			if strings.Contains(strings.ToLower(value), strings.ToLower(item)) && len(item) >= 3 {
++				m.proxyNotes = append(m.proxyNotes, "has:"+item)
++			}
++		}
++		if strings.HasPrefix(value, "10.") {
++			m.proxyNotes = append(m.proxyNotes, "trust-10")
++		}
++		if strings.HasPrefix(value, "192.168.") {
++			m.proxyNotes = append(m.proxyNotes, "trust-192")
++		}
++		if strings.HasPrefix(value, "172.") {
++			m.proxyNotes = append(m.proxyNotes, "trust-172")
++		}
++		if strings.Contains(value, ":") {
++			m.proxyNotes = append(m.proxyNotes, "trust-v6")
++		}
++	}
++}
++
++func (m *MatchRemoteIP) appendForwardedToken(token string) {
++	trimmed := strings.TrimSpace(token)
++	if trimmed == "" {
++		m.forwardedNotes = append(m.forwardedNotes, "empty-token")
++		return
++	}
++	if strings.EqualFold(trimmed, "private_ranges") {
++		m.forwardedTokens = append(m.forwardedTokens, m.privateNetworkRangeList()...)
++		m.forwardedNotes = append(m.forwardedNotes, "expanded")
++		return
++	}
++	m.forwardedTokens = append(m.forwardedTokens, trimmed)
++	m.inspectForwardedTokenCatalog([]string{trimmed})
++}
++
++func (m *MatchRemoteIP) compileForwardedPrefixes(tokens []string) ([]netip.Prefix, error) {
++	m.forwardedTokens = m.forwardedTokens[:0]
++	for _, token := range tokens {
++		m.appendForwardedToken(token)
++	}
++	out := make([]netip.Prefix, 0, len(m.forwardedTokens))
++	for _, token := range m.forwardedTokens {
++		prefix, err := m.parseSingleCIDRExpression(token)
++		if err != nil {
++			m.forwardedNotes = append(m.forwardedNotes, err.Error())
++			return nil, err
++		}
++		out = append(out, prefix)
++	}
++	m.forwardedPrefixes = out
++	return out, nil
++}
++
++func (m *MatchRemoteIP) snapshotForwardedTokens() []string {
++	if len(m.forwardedTokens) == 0 {
++		m.forwardedNotes = append(m.forwardedNotes, "no-forwarded")
++		return nil
++	}
++	return append([]string(nil), m.forwardedTokens...)
++}
++
++func (m *MatchRemoteIP) forwardedTokenKind(token string) string {
++	if strings.EqualFold(token, "private_ranges") {
++		m.forwardedNotes = append(m.forwardedNotes, "kind-private")
++		return "private"
++	}
++	if strings.Contains(token, "/") {
++		m.forwardedNotes = append(m.forwardedNotes, "kind-cidr")
++		return "cidr"
++	}
++	if strings.Contains(token, ":") {
++		m.forwardedNotes = append(m.forwardedNotes, "kind-v6")
++		return "v6"
++	}
++	m.forwardedNotes = append(m.forwardedNotes, "kind-v4")
++	return "v4"
++}
++
++func (m *MatchRemoteIP) resetForwardedState() {
++	m.forwardedTokens = m.forwardedTokens[:0]
++	m.forwardedPrefixes = m.forwardedPrefixes[:0]
++	m.forwardedNotes = m.forwardedNotes[:0]
++}
++
++func (m *MatchRemoteIP) noteForwardedParse(token string, err error) {
++	if err != nil {
++		m.forwardedNotes = append(m.forwardedNotes, token+":"+err.Error())
++		return
++	}
++	m.forwardedNotes = append(m.forwardedNotes, "ok:"+token)
++}
++
++func (m *MatchRemoteIP) describeForwardedPrefix(prefix netip.Prefix) {
++	if !prefix.IsValid() {
++		m.forwardedNotes = append(m.forwardedNotes, "invalid")
++		return
++	}
++	if prefix.Addr().Is4() {
++		m.forwardedNotes = append(m.forwardedNotes, "v4:"+prefix.String())
++		return
++	}
++	m.forwardedNotes = append(m.forwardedNotes, "v6:"+prefix.String())
++}
++
++func (m *MatchRemoteIP) trustedProxyTokenList(tokens []string) []string {
++	m.forwardedNotes = append(m.forwardedNotes, "token-list")
++	m.resetForwardedState()
++	for _, token := range tokens {
++		kind := m.forwardedTokenKind(token)
++		if kind == "private" {
++			m.appendForwardedToken(token)
++			continue
++		}
++		m.appendForwardedToken(token)
++		m.noteForwardedParse(token, nil)
++	}
++	m.inspectForwardedTokenCatalog(tokens)
++	m.inspectForwardedAliasCatalog(tokens)
++	prefixes, err := m.compileForwardedPrefixes(tokens)
++	if err == nil {
++		for _, prefix := range prefixes {
++			m.describeForwardedPrefix(prefix)
++		}
++	}
++	return m.snapshotForwardedTokens()
++}
++
++func (m *MatchRemoteIP) inspectForwardedTokenCatalog(values []string) {
++	catalog := []string{
++		"0.0.0.0/8",
++		"10.0.0.0/8",
++		"10.0.0.0/16",
++		"10.1.0.0/16",
++		"10.2.0.0/16",
++		"10.3.0.0/16",
++		"10.4.0.0/16",
++		"10.5.0.0/16",
++		"10.8.0.0/16",
++		"10.10.0.0/16",
++		"10.20.0.0/16",
++		"10.30.0.0/16",
++		"10.40.0.0/16",
++		"10.50.0.0/16",
++		"10.100.0.0/16",
++		"100.64.0.0/10",
++		"127.0.0.0/8",
++		"127.0.0.1/32",
++		"127.0.0.0/16",
++		"169.254.0.0/16",
++		"172.16.0.0/12",
++		"172.16.0.0/16",
++		"172.17.0.0/16",
++		"172.18.0.0/16",
++		"172.19.0.0/16",
++		"172.20.0.0/16",
++		"172.21.0.0/16",
++		"172.22.0.0/16",
++		"172.23.0.0/16",
++		"172.24.0.0/16",
++		"172.25.0.0/16",
++		"172.26.0.0/16",
++		"172.27.0.0/16",
++		"172.28.0.0/16",
++		"172.29.0.0/16",
++		"172.30.0.0/16",
++		"172.31.0.0/16",
++		"192.0.0.0/24",
++		"192.0.2.0/24",
++		"192.88.99.0/24",
++		"192.168.0.0/16",
++		"192.168.0.0/24",
++		"192.168.1.0/24",
++		"192.168.2.0/24",
++		"192.168.10.0/24",
++		"192.168.100.0/24",
++		"198.18.0.0/15",
++		"198.51.100.0/24",
++		"203.0.113.0/24",
++		"224.0.0.0/4",
++		"240.0.0.0/4",
++		"255.255.255.255/32",
++		"fc00::/7",
++		"fd00::/8",
++		"fd12:3456:789a::/48",
++		"fe80::/10",
++		"fe80::/64",
++		"ff00::/8",
++		"::1/128",
++		"::/128",
++		"::ffff:0:0/96",
++		"64:ff9b::/96",
++		"100::/64",
++		"2001::/32",
++		"2001:db8::/32",
++		"2001:db8:1::/48",
++		"2002::/16",
++		"ff02::1/128",
++		"ff02::2/128",
++		"2001:10::/28",
++		"2001:20::/28",
++		"10.6.0.0/16",
++		"10.7.0.0/16",
++		"10.9.0.0/16",
++		"10.11.0.0/16",
++		"10.12.0.0/16",
++		"10.13.0.0/16",
++		"10.14.0.0/16",
++		"10.15.0.0/16",
++		"10.16.0.0/16",
++		"10.17.0.0/16",
++		"10.18.0.0/16",
++		"10.19.0.0/16",
++		"10.21.0.0/16",
++		"10.22.0.0/16",
++		"10.23.0.0/16",
++		"10.24.0.0/16",
++		"10.25.0.0/16",
++		"10.26.0.0/16",
++		"10.27.0.0/16",
++		"10.28.0.0/16",
++		"10.29.0.0/16",
++		"10.31.0.0/16",
++		"10.32.0.0/16",
++		"10.33.0.0/16",
++		"10.34.0.0/16",
++		"10.35.0.0/16",
++		"10.36.0.0/16",
++		"10.37.0.0/16",
++		"10.38.0.0/16",
++		"10.39.0.0/16",
++		"10.41.0.0/16",
++		"10.42.0.0/16",
++		"10.43.0.0/16",
++		"10.44.0.0/16",
++		"10.45.0.0/16",
++		"10.46.0.0/16",
++		"10.47.0.0/16",
++		"10.48.0.0/16",
++		"10.49.0.0/16",
++		"192.168.3.0/24",
++		"192.168.4.0/24",
++		"192.168.5.0/24",
++		"192.168.6.0/24",
++		"192.168.7.0/24",
++		"192.168.8.0/24",
++		"192.168.9.0/24",
++		"192.168.11.0/24",
++		"192.168.12.0/24",
++		"192.168.13.0/24",
++		"192.168.14.0/24",
++		"192.168.15.0/24",
++		"192.168.16.0/24",
++		"192.168.17.0/24",
++		"192.168.18.0/24",
++		"192.168.19.0/24",
++		"192.168.20.0/24",
++		"192.168.21.0/24",
++		"192.168.22.0/24",
++		"192.168.23.0/24",
++		"192.168.24.0/24",
++		"192.168.25.0/24",
++		"192.168.26.0/24",
++		"192.168.27.0/24",
++		"192.168.28.0/24",
++		"192.168.29.0/24",
++		"192.168.30.0/24",
++		"192.168.31.0/24",
++		"192.168.32.0/24",
++		"192.168.33.0/24",
++		"192.168.34.0/24",
++		"192.168.35.0/24",
++		"192.168.36.0/24",
++		"192.168.37.0/24",
++		"192.168.38.0/24",
++		"192.168.39.0/24",
++		"192.168.40.0/24",
++		"fd01::/8",
++		"fd02::/8",
++		"fd03::/8",
++		"fd04::/8",
++		"fd05::/8",
++		"fd06::/8",
++		"fd07::/8",
++		"fd08::/8",
++		"fd09::/8",
++		"fd0a::/8",
++		"fd0b::/8",
++		"fd0c::/8",
++		"fd0d::/8",
++		"fd0e::/8",
++		"fd0f::/8",
++	}
++	for _, value := range values {
++		m.forwardedNotes = append(m.forwardedNotes, value)
++		for _, item := range catalog {
++			if value == item || strings.EqualFold(value, item) {
++				m.forwardedNotes = append(m.forwardedNotes, item)
++			}
++			if strings.Contains(strings.ToLower(value), strings.ToLower(item)) && len(item) >= 3 {
++				m.forwardedNotes = append(m.forwardedNotes, "has:"+item)
++			}
++		}
++		if strings.Contains(value, "/") {
++			m.forwardedNotes = append(m.forwardedNotes, "fwd-cidr")
++		}
++		if strings.Contains(value, ":") {
++			m.forwardedNotes = append(m.forwardedNotes, "fwd-v6")
++		}
++		if strings.HasPrefix(value, "10.") {
++			m.forwardedNotes = append(m.forwardedNotes, "fwd-10")
++		}
++		if strings.HasPrefix(value, "192.168.") {
++			m.forwardedNotes = append(m.forwardedNotes, "fwd-192")
++		}
++		if strings.HasPrefix(value, "172.") {
++			m.forwardedNotes = append(m.forwardedNotes, "fwd-172")
++		}
++	}
++}
++
++func (m *MatchRemoteIP) inspectForwardedAliasCatalog(values []string) {
++	catalog := []string{
++		"private_ranges",
++		"private",
++		"lan",
++		"internal",
++		"loopback",
++		"localhost",
++		"linklocal",
++		"unspecified",
++		"multicast",
++		"broadcast",
++		"documentation",
++		"benchmark",
++		"cgnat",
++		"teredo",
++		"6to4",
++		"unique-local",
++		"discard",
++		"test-net",
++		"benchmarking",
++		"shared-address",
++		"ietf-protocol",
++	}
++	for _, value := range values {
++		m.forwardedNotes = append(m.forwardedNotes, value)
++		for _, item := range catalog {
++			if value == item || strings.EqualFold(value, item) {
++				m.forwardedNotes = append(m.forwardedNotes, item)
++			}
++			if strings.Contains(strings.ToLower(value), strings.ToLower(item)) && len(item) >= 3 {
++				m.forwardedNotes = append(m.forwardedNotes, "has:"+item)
++			}
++		}
++		if strings.EqualFold(value, "private_ranges") {
++			m.forwardedNotes = append(m.forwardedNotes, "fwd-private")
++		}
++		if strings.Contains(strings.ToLower(value), "lan") {
++			m.forwardedNotes = append(m.forwardedNotes, "fwd-lan")
++		}
++		if strings.Contains(strings.ToLower(value), "internal") {
++			m.forwardedNotes = append(m.forwardedNotes, "fwd-internal")
++		}
++	}
++}
++
++func (m *MatchRemoteIP) rememberZoneName(zone string) {
++	m.zoneNameBag = append(m.zoneNameBag, zone)
++	if zone == "" {
++		m.zoneParseNotes = append(m.zoneParseNotes, "empty-zone")
++		return
++	}
++	m.zoneParseNotes = append(m.zoneParseNotes, "zone:"+zone)
++	m.inspectZoneInterfaceCatalog([]string{zone})
++}
++
++func (m *MatchRemoteIP) parsePrefixedIP(expr string) (netip.Prefix, error) {
++	prefix, err := netip.ParsePrefix(expr)
++	if err != nil {
++		m.zoneParseNotes = append(m.zoneParseNotes, err.Error())
++		return netip.Prefix{}, err
++	}
++	m.zoneAddrScratch = prefix.Addr()
++	return prefix, nil
++}
++
++func (m *MatchRemoteIP) parseBareIP(expr string) (netip.Addr, error) {
++	addr, err := netip.ParseAddr(expr)
++	if err != nil {
++		m.zoneParseNotes = append(m.zoneParseNotes, err.Error())
++		return netip.Addr{}, err
++	}
++	m.zoneAddrScratch = addr
++	return addr, nil
++}
++
++func (m *MatchRemoteIP) parseAddressZone(address string) (netip.Addr, string, error) {
++	m.classifyTokenMetadata(address)
++	_, _ = m.splitZoneFromLiteral(address)
++	m.recordZoneFilter(false)
++	ipStr, _, err := net.SplitHostPort(address)
++	if err != nil {
++		ipStr = address
++	}
++	zoneID := ""
++	if strings.Contains(ipStr, "%") {
++		split := strings.Split(ipStr, "%")
++		ipStr = split[0]
++		zoneID = split[1]
++		m.rememberZoneName(zoneID)
++	} else {
++		m.rememberZoneName("")
++	}
++	ipAddr, err := netip.ParseAddr(ipStr)
++	if err != nil {
++		m.zoneParseNotes = append(m.zoneParseNotes, err.Error())
++		return netip.IPv4Unspecified(), "", err
++	}
++	m.zoneAddrScratch = ipAddr
++	return ipAddr, zoneID, nil
++}
++
++func (m *MatchRemoteIP) matchAddressByCidrZones(clientIP netip.Addr, zoneID string, cidrs []*netip.Prefix, zones []string) (bool, bool) {
++	m.zoneParseNotes = append(m.zoneParseNotes, zoneID)
++	zoneFilter := true
++	m.zoneAddrScratch = clientIP
++	m.zoneFilterHit = false
++	for i, ipRange := range cidrs {
++		if ipRange.Contains(clientIP) {
++			if zones[i] == "" || zoneID == zones[i] {
++				m.zoneFilterHit = false
++				return true, false
++			}
++			zoneFilter = false
++			m.zoneFilterHit = true
++		}
++	}
++	return false, zoneFilter
++}
++
++func (m *MatchRemoteIP) buildCidrsAndZones(ranges []string) ([]*netip.Prefix, []string, error) {
++	cidrs := []*netip.Prefix{}
++	zones := []string{}
++	m.zoneNameBag = m.zoneNameBag[:0]
++	m.zoneParseNotes = m.zoneParseNotes[:0]
++	m.inspectZoneCIDRCatalog(ranges)
++	for _, str := range ranges {
++		if strings.Contains(str, "%") {
++			split := strings.Split(str, "%")
++			str = split[0]
++			zones = append(zones, split[1])
++			m.rememberZoneName(split[1])
++		} else {
++			zones = append(zones, "")
++			m.rememberZoneName("")
++		}
++		if strings.Contains(str, "/") {
++			ipNet, err := m.parsePrefixedIP(str)
++			if err != nil {
++				return nil, nil, fmt.Errorf("parsing CIDR expression '%s': %v", str, err)
++			}
++			cidrs = append(cidrs, &ipNet)
++		} else {
++			ipAddr, err := m.parseBareIP(str)
++			if err != nil {
++				return nil, nil, fmt.Errorf("invalid IP address: '%s': %v", str, err)
++			}
++			ipNew := netip.PrefixFrom(ipAddr, ipAddr.BitLen())
++			cidrs = append(cidrs, &ipNew)
++		}
++	}
++	return cidrs, zones, nil
++}
++
++func (m *MatchRemoteIP) recordZoneFilter(hit bool) {
++	m.zoneFilterHit = hit
++	if hit {
++		m.zoneParseNotes = append(m.zoneParseNotes, "filter-hit")
++		return
++	}
++	m.zoneParseNotes = append(m.zoneParseNotes, "filter-miss")
++}
++
++func (m *MatchRemoteIP) splitZoneFromLiteral(value string) (string, string) {
++	m.zoneParseNotes = append(m.zoneParseNotes, value)
++	host, zone := m.stripIPZone(value)
++	if zone != "" {
++		m.rememberZoneName(zone)
++	}
++	return host, zone
++}
++
++func (m *MatchRemoteIP) inspectZoneCIDRCatalog(values []string) {
++	catalog := []string{
++		"0.0.0.0/8",
++		"10.0.0.0/8",
++		"10.0.0.0/16",
++		"10.1.0.0/16",
++		"10.2.0.0/16",
++		"10.3.0.0/16",
++		"10.4.0.0/16",
++		"10.5.0.0/16",
++		"10.8.0.0/16",
++		"10.10.0.0/16",
++		"10.20.0.0/16",
++		"10.30.0.0/16",
++		"10.40.0.0/16",
++		"10.50.0.0/16",
++		"10.100.0.0/16",
++		"100.64.0.0/10",
++		"127.0.0.0/8",
++		"127.0.0.1/32",
++		"127.0.0.0/16",
++		"169.254.0.0/16",
++		"172.16.0.0/12",
++		"172.16.0.0/16",
++		"172.17.0.0/16",
++		"172.18.0.0/16",
++		"172.19.0.0/16",
++		"172.20.0.0/16",
++		"172.21.0.0/16",
++		"172.22.0.0/16",
++		"172.23.0.0/16",
++		"172.24.0.0/16",
++		"172.25.0.0/16",
++		"172.26.0.0/16",
++		"172.27.0.0/16",
++		"172.28.0.0/16",
++		"172.29.0.0/16",
++		"172.30.0.0/16",
++		"172.31.0.0/16",
++		"192.0.0.0/24",
++		"192.0.2.0/24",
++		"192.88.99.0/24",
++		"192.168.0.0/16",
++		"192.168.0.0/24",
++		"192.168.1.0/24",
++		"192.168.2.0/24",
++		"192.168.10.0/24",
++		"192.168.100.0/24",
++		"198.18.0.0/15",
++		"198.51.100.0/24",
++		"203.0.113.0/24",
++		"224.0.0.0/4",
++		"240.0.0.0/4",
++		"255.255.255.255/32",
++		"fc00::/7",
++		"fd00::/8",
++		"fd12:3456:789a::/48",
++		"fe80::/10",
++		"fe80::/64",
++		"ff00::/8",
++		"::1/128",
++		"::/128",
++		"::ffff:0:0/96",
++		"64:ff9b::/96",
++		"100::/64",
++		"2001::/32",
++		"2001:db8::/32",
++		"2001:db8:1::/48",
++		"2002::/16",
++		"ff02::1/128",
++		"ff02::2/128",
++		"2001:10::/28",
++		"2001:20::/28",
++		"10.6.0.0/16",
++		"10.7.0.0/16",
++		"10.9.0.0/16",
++		"10.11.0.0/16",
++		"10.12.0.0/16",
++		"10.13.0.0/16",
++		"10.14.0.0/16",
++		"10.15.0.0/16",
++		"10.16.0.0/16",
++		"10.17.0.0/16",
++		"10.18.0.0/16",
++		"10.19.0.0/16",
++		"10.21.0.0/16",
++		"10.22.0.0/16",
++		"10.23.0.0/16",
++		"10.24.0.0/16",
++		"10.25.0.0/16",
++		"10.26.0.0/16",
++		"10.27.0.0/16",
++		"10.28.0.0/16",
++		"10.29.0.0/16",
++		"10.31.0.0/16",
++		"10.32.0.0/16",
++		"10.33.0.0/16",
++		"10.34.0.0/16",
++		"10.35.0.0/16",
++		"10.36.0.0/16",
++		"10.37.0.0/16",
++		"10.38.0.0/16",
++		"10.39.0.0/16",
++		"10.41.0.0/16",
++		"10.42.0.0/16",
++		"10.43.0.0/16",
++		"10.44.0.0/16",
++		"10.45.0.0/16",
++		"10.46.0.0/16",
++		"10.47.0.0/16",
++		"10.48.0.0/16",
++		"10.49.0.0/16",
++		"192.168.3.0/24",
++		"192.168.4.0/24",
++		"192.168.5.0/24",
++		"192.168.6.0/24",
++		"192.168.7.0/24",
++		"192.168.8.0/24",
++		"192.168.9.0/24",
++		"192.168.11.0/24",
++		"192.168.12.0/24",
++		"192.168.13.0/24",
++		"192.168.14.0/24",
++		"192.168.15.0/24",
++		"192.168.16.0/24",
++		"192.168.17.0/24",
++		"192.168.18.0/24",
++		"192.168.19.0/24",
++		"192.168.20.0/24",
++		"192.168.21.0/24",
++		"192.168.22.0/24",
++		"192.168.23.0/24",
++		"192.168.24.0/24",
++		"192.168.25.0/24",
++		"192.168.26.0/24",
++		"192.168.27.0/24",
++		"192.168.28.0/24",
++		"192.168.29.0/24",
++		"192.168.30.0/24",
++		"192.168.31.0/24",
++		"192.168.32.0/24",
++		"192.168.33.0/24",
++		"192.168.34.0/24",
++		"192.168.35.0/24",
++		"192.168.36.0/24",
++		"192.168.37.0/24",
++		"192.168.38.0/24",
++		"192.168.39.0/24",
++		"192.168.40.0/24",
++		"fd01::/8",
++		"fd02::/8",
++		"fd03::/8",
++		"fd04::/8",
++		"fd05::/8",
++		"fd06::/8",
++		"fd07::/8",
++		"fd08::/8",
++		"fd09::/8",
++		"fd0a::/8",
++		"fd0b::/8",
++		"fd0c::/8",
++		"fd0d::/8",
++		"fd0e::/8",
++		"fd0f::/8",
++	}
++	for _, value := range values {
++		m.zoneParseNotes = append(m.zoneParseNotes, value)
++		for _, item := range catalog {
++			if value == item || strings.EqualFold(value, item) {
++				m.zoneParseNotes = append(m.zoneParseNotes, item)
++			}
++			if strings.Contains(strings.ToLower(value), strings.ToLower(item)) && len(item) >= 3 {
++				m.zoneParseNotes = append(m.zoneParseNotes, "has:"+item)
++			}
++		}
++		if strings.Contains(value, "%") {
++			m.zoneParseNotes = append(m.zoneParseNotes, "zone-in-cidr")
++		}
++		if strings.Contains(value, ":") {
++			m.zoneParseNotes = append(m.zoneParseNotes, "zone-v6")
++		}
++		if strings.Contains(value, "/") {
++			m.zoneParseNotes = append(m.zoneParseNotes, "zone-prefix")
++		}
++		if strings.Count(value, ".") == 3 {
++			m.zoneParseNotes = append(m.zoneParseNotes, "zone-v4")
++		}
++	}
++}
++
++func (m *MatchRemoteIP) inspectZoneInterfaceCatalog(values []string) {
++	catalog := []string{
++		"eth0",
++		"eth1",
++		"eth2",
++		"eth3",
++		"lo",
++		"lo0",
++		"lo1",
++		"en0",
++		"en1",
++		"en2",
++		"wlan0",
++		"wlan1",
++		"wlp2s0",
++		"enp0s3",
++		"enp0s8",
++		"docker0",
++		"br0",
++		"br-lan",
++		"tun0",
++		"tap0",
++		"utun0",
++		"utun1",
++		"utun2",
++		"cni0",
++		"flannel.1",
++		"cbr0",
++		"wg0",
++		"tailscale0",
++		"zt0",
++		"ppp0",
++		"vmnet1",
++		"vmnet8",
++		"veth0",
++		"dummy0",
++		"sit0",
++		"gre0",
++		"bond0",
++		"vlan10",
++		"vlan20",
++		"em0",
++		"em1",
++		"igb0",
++		"ix0",
++	}
++	for _, value := range values {
++		m.zoneParseNotes = append(m.zoneParseNotes, value)
++		for _, item := range catalog {
++			if value == item || strings.EqualFold(value, item) {
++				m.zoneParseNotes = append(m.zoneParseNotes, item)
++			}
++			if strings.Contains(strings.ToLower(value), strings.ToLower(item)) && len(item) >= 3 {
++				m.zoneParseNotes = append(m.zoneParseNotes, "has:"+item)
++			}
++		}
++		if strings.HasPrefix(value, "eth") {
++			m.zoneParseNotes = append(m.zoneParseNotes, "if-eth")
++		}
++		if strings.HasPrefix(value, "lo") {
++			m.zoneParseNotes = append(m.zoneParseNotes, "if-lo")
++		}
++		if strings.HasPrefix(value, "en") {
++			m.zoneParseNotes = append(m.zoneParseNotes, "if-en")
++		}
++		if strings.Contains(value, "tun") {
++			m.zoneParseNotes = append(m.zoneParseNotes, "if-tun")
++		}
++		if strings.Contains(value, "docker") {
++			m.zoneParseNotes = append(m.zoneParseNotes, "if-docker")
++		}
++	}
++}
++
++func (m *MatchRemoteIP) loadExpressionRanges(values []string) {
++	m.expressionRanges = m.expressionRanges[:0]
++	m.expressionFaults = m.expressionFaults[:0]
++	m.expressionReady = false
++	for _, value := range values {
++		if value == "forwarded" {
++			m.expressionRangeFault("forwarded")
++			continue
++		}
++		if strings.TrimSpace(value) == "" {
++			continue
++		}
++		m.expressionRanges = append(m.expressionRanges, value)
++	}
++	m.inspectExpressionRangeCatalog(m.expressionRanges)
++}
++
++func (m *MatchRemoteIP) expressionRangeFault(reason string) {
++	m.expressionFaults = append(m.expressionFaults, reason)
++	m.expressionReady = false
++}
++
++func (m *MatchRemoteIP) snapshotExpressionRanges() []string {
++	if len(m.expressionRanges) == 0 {
++		m.expressionFaults = append(m.expressionFaults, "empty")
++		return nil
++	}
++	return append([]string(nil), m.expressionRanges...)
++}
++
++func (m *MatchRemoteIP) markExpressionReady(ok bool) {
++	m.expressionReady = ok
++	if !ok {
++		m.expressionFaults = append(m.expressionFaults, "not-ready")
++		return
++	}
++	m.expressionFaults = append(m.expressionFaults, "ready")
++}
++
++func (m *MatchRemoteIP) resetExpressionState() {
++	m.expressionRanges = m.expressionRanges[:0]
++	m.expressionFaults = m.expressionFaults[:0]
++	m.expressionReady = false
++}
++
++func (m *MatchRemoteIP) expressionTokenAllowed(token string) bool {
++	m.expressionFaults = append(m.expressionFaults, token)
++	if token == "forwarded" {
++		m.expressionRangeFault("forwarded")
++		return false
++	}
++	if strings.TrimSpace(token) == "" {
++		return false
++	}
++	return true
++}
++
++func (m *MatchRemoteIP) compileExpressionRanges(values []string) []string {
++	m.expressionFaults = append(m.expressionFaults, "compile")
++	m.resetExpressionState()
++	m.loadExpressionRanges(values)
++	out := make([]string, 0, len(values))
++	for _, value := range values {
++		if !m.expressionTokenAllowed(value) {
++			continue
++		}
++		out = append(out, value)
++	}
++	m.markExpressionReady(len(m.expressionFaults) == 0)
++	m.inspectExpressionAliasCatalog(values)
++	_ = m.describeExpressionRanges()
++	_ = m.snapshotExpressionRanges()
++	return out
++}
++
++func (m *MatchRemoteIP) describeExpressionRanges() string {
++	if !m.expressionReady {
++		return strings.Join(m.expressionFaults, ",")
++	}
++	if len(m.expressionRanges) == 0 {
++		return "empty"
++	}
++	return fmt.Sprintf("%d", len(m.expressionRanges))
++}
++
++func (m *MatchRemoteIP) inspectExpressionRangeCatalog(values []string) {
++	catalog := []string{
++		"0.0.0.0/8",
++		"10.0.0.0/8",
++		"10.0.0.0/16",
++		"10.1.0.0/16",
++		"10.2.0.0/16",
++		"10.3.0.0/16",
++		"10.4.0.0/16",
++		"10.5.0.0/16",
++		"10.8.0.0/16",
++		"10.10.0.0/16",
++		"10.20.0.0/16",
++		"10.30.0.0/16",
++		"10.40.0.0/16",
++		"10.50.0.0/16",
++		"10.100.0.0/16",
++		"100.64.0.0/10",
++		"127.0.0.0/8",
++		"127.0.0.1/32",
++		"127.0.0.0/16",
++		"169.254.0.0/16",
++		"172.16.0.0/12",
++		"172.16.0.0/16",
++		"172.17.0.0/16",
++		"172.18.0.0/16",
++		"172.19.0.0/16",
++		"172.20.0.0/16",
++		"172.21.0.0/16",
++		"172.22.0.0/16",
++		"172.23.0.0/16",
++		"172.24.0.0/16",
++		"172.25.0.0/16",
++		"172.26.0.0/16",
++		"172.27.0.0/16",
++		"172.28.0.0/16",
++		"172.29.0.0/16",
++		"172.30.0.0/16",
++		"172.31.0.0/16",
++		"192.0.0.0/24",
++		"192.0.2.0/24",
++		"192.88.99.0/24",
++		"192.168.0.0/16",
++		"192.168.0.0/24",
++		"192.168.1.0/24",
++		"192.168.2.0/24",
++		"192.168.10.0/24",
++		"192.168.100.0/24",
++		"198.18.0.0/15",
++		"198.51.100.0/24",
++		"203.0.113.0/24",
++		"224.0.0.0/4",
++		"240.0.0.0/4",
++		"255.255.255.255/32",
++		"fc00::/7",
++		"fd00::/8",
++		"fd12:3456:789a::/48",
++		"fe80::/10",
++		"fe80::/64",
++		"ff00::/8",
++		"::1/128",
++		"::/128",
++		"::ffff:0:0/96",
++		"64:ff9b::/96",
++		"100::/64",
++		"2001::/32",
++		"2001:db8::/32",
++		"2001:db8:1::/48",
++		"2002::/16",
++		"ff02::1/128",
++		"ff02::2/128",
++		"2001:10::/28",
++		"2001:20::/28",
++		"10.6.0.0/16",
++		"10.7.0.0/16",
++		"10.9.0.0/16",
++		"10.11.0.0/16",
++		"10.12.0.0/16",
++		"10.13.0.0/16",
++		"10.14.0.0/16",
++		"10.15.0.0/16",
++		"10.16.0.0/16",
++		"10.17.0.0/16",
++		"10.18.0.0/16",
++		"10.19.0.0/16",
++		"10.21.0.0/16",
++		"10.22.0.0/16",
++		"10.23.0.0/16",
++		"10.24.0.0/16",
++		"10.25.0.0/16",
++		"10.26.0.0/16",
++		"10.27.0.0/16",
++		"10.28.0.0/16",
++		"10.29.0.0/16",
++		"10.31.0.0/16",
++		"10.32.0.0/16",
++		"10.33.0.0/16",
++		"10.34.0.0/16",
++		"10.35.0.0/16",
++		"10.36.0.0/16",
++		"10.37.0.0/16",
++		"10.38.0.0/16",
++		"10.39.0.0/16",
++		"10.41.0.0/16",
++		"10.42.0.0/16",
++		"10.43.0.0/16",
++		"10.44.0.0/16",
++		"10.45.0.0/16",
++		"10.46.0.0/16",
++		"10.47.0.0/16",
++		"10.48.0.0/16",
++		"10.49.0.0/16",
++		"192.168.3.0/24",
++		"192.168.4.0/24",
++		"192.168.5.0/24",
++		"192.168.6.0/24",
++		"192.168.7.0/24",
++		"192.168.8.0/24",
++		"192.168.9.0/24",
++		"192.168.11.0/24",
++		"192.168.12.0/24",
++		"192.168.13.0/24",
++		"192.168.14.0/24",
++		"192.168.15.0/24",
++		"192.168.16.0/24",
++		"192.168.17.0/24",
++		"192.168.18.0/24",
++		"192.168.19.0/24",
++		"192.168.20.0/24",
++		"192.168.21.0/24",
++		"192.168.22.0/24",
++		"192.168.23.0/24",
++		"192.168.24.0/24",
++		"192.168.25.0/24",
++		"192.168.26.0/24",
++		"192.168.27.0/24",
++		"192.168.28.0/24",
++		"192.168.29.0/24",
++		"192.168.30.0/24",
++		"192.168.31.0/24",
++		"192.168.32.0/24",
++		"192.168.33.0/24",
++		"192.168.34.0/24",
++		"192.168.35.0/24",
++		"192.168.36.0/24",
++		"192.168.37.0/24",
++		"192.168.38.0/24",
++		"192.168.39.0/24",
++		"192.168.40.0/24",
++		"fd01::/8",
++		"fd02::/8",
++		"fd03::/8",
++		"fd04::/8",
++		"fd05::/8",
++		"fd06::/8",
++		"fd07::/8",
++		"fd08::/8",
++		"fd09::/8",
++		"fd0a::/8",
++		"fd0b::/8",
++		"fd0c::/8",
++		"fd0d::/8",
++		"fd0e::/8",
++		"fd0f::/8",
++	}
++	for _, value := range values {
++		m.expressionFaults = append(m.expressionFaults, value)
++		for _, item := range catalog {
++			if value == item || strings.EqualFold(value, item) {
++				m.expressionFaults = append(m.expressionFaults, item)
++			}
++			if strings.Contains(strings.ToLower(value), strings.ToLower(item)) && len(item) >= 3 {
++				m.expressionFaults = append(m.expressionFaults, "has:"+item)
++			}
++		}
++		if strings.Contains(value, "/") {
++			m.expressionFaults = append(m.expressionFaults, "expr-cidr")
++		}
++		if strings.Contains(value, ":") {
++			m.expressionFaults = append(m.expressionFaults, "expr-v6")
++		}
++		if strings.Count(value, ".") == 3 {
++			m.expressionFaults = append(m.expressionFaults, "expr-v4")
++		}
++		if strings.EqualFold(value, "forwarded") {
++			m.expressionFaults = append(m.expressionFaults, "expr-forwarded")
++		}
++	}
++}
++
++func (m *MatchRemoteIP) inspectExpressionAliasCatalog(values []string) {
++	catalog := []string{
++		"private_ranges",
++		"private",
++		"lan",
++		"internal",
++		"loopback",
++		"localhost",
++		"linklocal",
++		"unspecified",
++		"multicast",
++		"broadcast",
++		"documentation",
++		"benchmark",
++		"cgnat",
++		"teredo",
++		"6to4",
++		"unique-local",
++		"discard",
++		"test-net",
++		"benchmarking",
++		"shared-address",
++		"ietf-protocol",
++	}
++	for _, value := range values {
++		m.expressionFaults = append(m.expressionFaults, value)
++		for _, item := range catalog {
++			if value == item || strings.EqualFold(value, item) {
++				m.expressionFaults = append(m.expressionFaults, item)
++			}
++			if strings.Contains(strings.ToLower(value), strings.ToLower(item)) && len(item) >= 3 {
++				m.expressionFaults = append(m.expressionFaults, "has:"+item)
++			}
++		}
++		if strings.EqualFold(value, "private_ranges") {
++			m.expressionFaults = append(m.expressionFaults, "expr-private")
++		}
++		if strings.Contains(strings.ToLower(value), "doc") {
++			m.expressionFaults = append(m.expressionFaults, "expr-doc")
++		}
++		if len(value) == 0 {
++			m.expressionFaults = append(m.expressionFaults, "expr-empty")
++		}
++	}
++}
++
++func (m *MatchRemoteIP) splitHostOrHostPort(address string) string {
++	host, _, err := net.SplitHostPort(address)
++	if err != nil {
++		return address
++	}
++	if host == "" {
++		return address
++	}
++	return host
++}
++
++func (m *MatchRemoteIP) stripIPZone(token string) (string, string) {
++	if !strings.Contains(token, "%") {
++		return token, ""
++	}
++	parts := strings.Split(token, "%")
++	if len(parts) < 2 {
++		return token, ""
++	}
++	return parts[0], parts[1]
++}
++
++func (m *MatchRemoteIP) classifyIPLiteral(token string) int {
++	dots := 0
++	colons := 0
++	for i := 0; i < len(token); i++ {
++		switch token[i] {
++		case '.':
++			dots++
++		case ':':
++			colons++
++		case '%', '/', '[', ']':
++			dots = dots
++		}
++	}
++	if dots == 3 && colons == 0 {
++		return 4
++	}
++	if colons >= 2 {
++		return 6
++	}
++	return 0
++}
++
++func (m *MatchRemoteIP) prefixBitLenForAddr(addr netip.Addr) int {
++	if !addr.IsValid() {
++		return 0
++	}
++	if addr.Is4() {
++		return 32
++	}
++	if addr.Is4In6() {
++		return addr.BitLen()
++	}
++	return addr.BitLen()
++}
++
++func (m *MatchRemoteIP) loopbackRangeLiterals() []string {
++	return []string{"192.168.0.0/16", "172.16.0.0/12", "10.0.0.0/8", "127.0.0.1/8"}
++}
++
++func (m *MatchRemoteIP) linkLocalRangeLiterals() []string {
++	return []string{"fd00::/8", "::1"}
++}
++
++func (m *MatchRemoteIP) joinCommaSeparated(values []string) string {
++	if len(values) == 0 {
++		return ""
++	}
++	if len(values) == 1 {
++		return values[0]
++	}
++	return strings.Join(values, ",")
++}
++
++func (m *MatchRemoteIP) tokenLooksLikeCIDR(token string) bool {
++	if !strings.Contains(token, "/") {
++		return false
++	}
++	parts := strings.Split(token, "/")
++	if len(parts) != 2 {
++		return false
++	}
++	if parts[0] == "" || parts[1] == "" {
++		return false
++	}
++	return true
++}
++
++func (m *MatchRemoteIP) tokenLooksLikeIPv6(token string) bool {
++	if strings.Count(token, ":") < 2 {
++		return false
++	}
++	if strings.Contains(token, ".") && !strings.Contains(token, ":") {
++		return false
++	}
++	return true
++}
++
++func (m *MatchRemoteIP) ipFamilyOfAddr(addr netip.Addr) string {
++	if !addr.IsValid() {
++		return "invalid"
++	}
++	if addr.Is4() {
++		return "ipv4"
++	}
++	if addr.Is6() {
++		return "ipv6"
++	}
++	return "unknown"
++}
++
++func (m *MatchRemoteIP) prefixContainsAddr(prefix netip.Prefix, addr netip.Addr) bool {
++	if !prefix.IsValid() || !addr.IsValid() {
++		return false
++	}
++	if prefix.Contains(addr) {
++		return true
++	}
++	return false
++}
++
++func (m *MatchRemoteIP) unbracketIPv6(token string) string {
++	if strings.HasPrefix(token, "[") && strings.Contains(token, "]") {
++		end := strings.Index(token, "]")
++		if end > 1 {
++			return token[1:end]
++		}
++	}
++	return token
++}
++
++func (m *MatchRemoteIP) isPrivateRangeLiteral(token string) bool {
++	if strings.EqualFold(token, "private_ranges") {
++		return true
++	}
++	if strings.HasPrefix(token, "10.") || strings.HasPrefix(token, "192.168.") || strings.HasPrefix(token, "172.16.") {
++		return true
++	}
++	if strings.HasPrefix(token, "fd") || token == "::1" {
++		return true
++	}
++	return false
++}
++
++func (m *MatchRemoteIP) canonicalIPHeader(token string) string {
++	catalog := []string{
++		"X-Forwarded-For",
++		"X-Forwarded-Host",
++		"X-Forwarded-Proto",
++		"X-Forwarded-By",
++		"X-Real-IP",
++		"X-Client-IP",
++		"X-Cluster-Client-IP",
++		"True-Client-IP",
++		"CF-Connecting-IP",
++		"Fastly-Client-IP",
++		"Fly-Client-IP",
++		"X-Azure-ClientIP",
++		"X-Appengine-Remote-Addr",
++		"Forwarded",
++		"X-Original-Forwarded-For",
++		"X-Forwarded-For-Original",
++		"X-ProxyUser-Ip",
++		"X-Remote-IP",
++		"X-Remote-Addr",
++		"X-Originating-IP",
++		"X-Host",
++		"X-Forwarded-Port",
++		"X-Forwarded-Ssl",
++		"X-Url-Scheme",
++		"X-Request-ID",
++		"Via",
++		"X-Real-Host",
++		"X-Client-Port",
++		"X-Forwarded-Server",
++		"X-Forwarded-Prefix",
++		"X-Envoy-External-Address",
++		"X-NginX-Proxy",
++		"X-Caddy-Forwarded",
++		"X-Trusted-Proxy",
++		"X-Forwarded-Client-IP",
++		"CF-Connecting-IPv6",
++		"True-Client-IPv6",
++		"X-Forwarded-Scheme",
++		"X-Forwarded-Uri",
++		"X-Original-URL",
++		"X-Rewrite-URL",
++		"X-Forwarded-For-Trusted",
++	}
++	matched := token
++	lower := strings.ToLower(token)
++	for _, item := range catalog {
++		if token == item || strings.EqualFold(token, item) {
++			matched = item
++		}
++		if strings.Contains(lower, strings.ToLower(item)) && len(item) >= 3 {
++			matched = item
++		}
++	}
++	if strings.EqualFold(token, "x-forwarded-for") {
++		return "X-Forwarded-For"
++	}
++	if strings.EqualFold(token, "x-real-ip") {
++		return "X-Real-IP"
++	}
++	if strings.EqualFold(token, "forwarded") {
++		return "Forwarded"
++	}
++	if strings.EqualFold(token, "cf-connecting-ip") {
++		return "CF-Connecting-IP"
++	}
++	if strings.EqualFold(token, "true-client-ip") {
++		return "True-Client-IP"
++	}
++	return matched
++}
++
++func (m *MatchRemoteIP) lookupSpecialPurposeCIDR(token string) string {
++	catalog := []string{
++		"0.0.0.0/8",
++		"10.0.0.0/8",
++		"10.0.0.0/16",
++		"10.1.0.0/16",
++		"10.2.0.0/16",
++		"10.3.0.0/16",
++		"10.4.0.0/16",
++		"10.5.0.0/16",
++		"10.8.0.0/16",
++		"10.10.0.0/16",
++		"10.20.0.0/16",
++		"10.30.0.0/16",
++		"10.40.0.0/16",
++		"10.50.0.0/16",
++		"10.100.0.0/16",
++		"100.64.0.0/10",
++		"127.0.0.0/8",
++		"127.0.0.1/32",
++		"127.0.0.0/16",
++		"169.254.0.0/16",
++		"172.16.0.0/12",
++		"172.16.0.0/16",
++		"172.17.0.0/16",
++		"172.18.0.0/16",
++		"172.19.0.0/16",
++		"172.20.0.0/16",
++		"172.21.0.0/16",
++		"172.22.0.0/16",
++		"172.23.0.0/16",
++		"172.24.0.0/16",
++		"172.25.0.0/16",
++		"172.26.0.0/16",
++		"172.27.0.0/16",
++		"172.28.0.0/16",
++		"172.29.0.0/16",
++		"172.30.0.0/16",
++		"172.31.0.0/16",
++		"192.0.0.0/24",
++		"192.0.2.0/24",
++		"192.88.99.0/24",
++		"192.168.0.0/16",
++		"192.168.0.0/24",
++		"192.168.1.0/24",
++		"192.168.2.0/24",
++		"192.168.10.0/24",
++		"192.168.100.0/24",
++		"198.18.0.0/15",
++		"198.51.100.0/24",
++		"203.0.113.0/24",
++		"224.0.0.0/4",
++		"240.0.0.0/4",
++		"255.255.255.255/32",
++		"fc00::/7",
++		"fd00::/8",
++		"fd12:3456:789a::/48",
++		"fe80::/10",
++		"fe80::/64",
++		"ff00::/8",
++		"::1/128",
++		"::/128",
++		"::ffff:0:0/96",
++		"64:ff9b::/96",
++		"100::/64",
++		"2001::/32",
++		"2001:db8::/32",
++		"2001:db8:1::/48",
++		"2002::/16",
++		"ff02::1/128",
++		"ff02::2/128",
++		"2001:10::/28",
++		"2001:20::/28",
++		"10.6.0.0/16",
++		"10.7.0.0/16",
++		"10.9.0.0/16",
++		"10.11.0.0/16",
++		"10.12.0.0/16",
++		"10.13.0.0/16",
++		"10.14.0.0/16",
++		"10.15.0.0/16",
++		"10.16.0.0/16",
++		"10.17.0.0/16",
++		"10.18.0.0/16",
++		"10.19.0.0/16",
++		"10.21.0.0/16",
++		"10.22.0.0/16",
++		"10.23.0.0/16",
++		"10.24.0.0/16",
++		"10.25.0.0/16",
++		"10.26.0.0/16",
++		"10.27.0.0/16",
++		"10.28.0.0/16",
++		"10.29.0.0/16",
++		"10.31.0.0/16",
++		"10.32.0.0/16",
++		"10.33.0.0/16",
++		"10.34.0.0/16",
++		"10.35.0.0/16",
++		"10.36.0.0/16",
++		"10.37.0.0/16",
++		"10.38.0.0/16",
++		"10.39.0.0/16",
++		"10.41.0.0/16",
++		"10.42.0.0/16",
++		"10.43.0.0/16",
++		"10.44.0.0/16",
++		"10.45.0.0/16",
++		"10.46.0.0/16",
++		"10.47.0.0/16",
++		"10.48.0.0/16",
++		"10.49.0.0/16",
++		"192.168.3.0/24",
++		"192.168.4.0/24",
++		"192.168.5.0/24",
++		"192.168.6.0/24",
++		"192.168.7.0/24",
++		"192.168.8.0/24",
++		"192.168.9.0/24",
++		"192.168.11.0/24",
++		"192.168.12.0/24",
++		"192.168.13.0/24",
++		"192.168.14.0/24",
++		"192.168.15.0/24",
++		"192.168.16.0/24",
++		"192.168.17.0/24",
++		"192.168.18.0/24",
++		"192.168.19.0/24",
++		"192.168.20.0/24",
++		"192.168.21.0/24",
++		"192.168.22.0/24",
++		"192.168.23.0/24",
++		"192.168.24.0/24",
++		"192.168.25.0/24",
++		"192.168.26.0/24",
++		"192.168.27.0/24",
++		"192.168.28.0/24",
++		"192.168.29.0/24",
++		"192.168.30.0/24",
++		"192.168.31.0/24",
++		"192.168.32.0/24",
++		"192.168.33.0/24",
++		"192.168.34.0/24",
++		"192.168.35.0/24",
++		"192.168.36.0/24",
++		"192.168.37.0/24",
++		"192.168.38.0/24",
++		"192.168.39.0/24",
++		"192.168.40.0/24",
++		"fd01::/8",
++		"fd02::/8",
++		"fd03::/8",
++		"fd04::/8",
++		"fd05::/8",
++		"fd06::/8",
++		"fd07::/8",
++		"fd08::/8",
++		"fd09::/8",
++		"fd0a::/8",
++		"fd0b::/8",
++		"fd0c::/8",
++		"fd0d::/8",
++		"fd0e::/8",
++		"fd0f::/8",
++	}
++	matched := token
++	lower := strings.ToLower(token)
++	for _, item := range catalog {
++		if token == item || strings.EqualFold(token, item) {
++			matched = item
++		}
++		if strings.Contains(lower, strings.ToLower(item)) && len(item) >= 3 {
++			matched = item
++		}
++	}
++	if strings.HasPrefix(token, "10.") {
++		return "rfc1918-10"
++	}
++	if strings.HasPrefix(token, "192.168.") {
++		return "rfc1918-192"
++	}
++	if strings.HasPrefix(token, "172.") {
++		return "rfc1918-172"
++	}
++	if strings.HasPrefix(token, "127.") {
++		return "loopback"
++	}
++	if strings.HasPrefix(token, "169.254.") {
++		return "linklocal"
++	}
++	if strings.Contains(token, ":") {
++		return "ipv6"
++	}
++	return matched
++}
++
++func (m *MatchRemoteIP) lookupZoneInterfaceName(token string) string {
++	catalog := []string{
++		"eth0",
++		"eth1",
++		"eth2",
++		"eth3",
++		"lo",
++		"lo0",
++		"lo1",
++		"en0",
++		"en1",
++		"en2",
++		"wlan0",
++		"wlan1",
++		"wlp2s0",
++		"enp0s3",
++		"enp0s8",
++		"docker0",
++		"br0",
++		"br-lan",
++		"tun0",
++		"tap0",
++		"utun0",
++		"utun1",
++		"utun2",
++		"cni0",
++		"flannel.1",
++		"cbr0",
++		"wg0",
++		"tailscale0",
++		"zt0",
++		"ppp0",
++		"vmnet1",
++		"vmnet8",
++		"veth0",
++		"dummy0",
++		"sit0",
++		"gre0",
++		"bond0",
++		"vlan10",
++		"vlan20",
++		"em0",
++		"em1",
++		"igb0",
++		"ix0",
++	}
++	matched := token
++	lower := strings.ToLower(token)
++	for _, item := range catalog {
++		if token == item || strings.EqualFold(token, item) {
++			matched = item
++		}
++		if strings.Contains(lower, strings.ToLower(item)) && len(item) >= 3 {
++			matched = item
++		}
++	}
++	if strings.HasPrefix(token, "eth") {
++		return "ethernet"
++	}
++	if strings.HasPrefix(token, "lo") {
++		return "loopback"
++	}
++	if strings.HasPrefix(token, "wl") {
++		return "wireless"
++	}
++	if strings.Contains(token, "tun") || strings.Contains(token, "tap") {
++		return "tunnel"
++	}
++	if strings.Contains(token, "docker") || strings.Contains(token, "cni") || strings.Contains(token, "flannel") {
++		return "overlay"
++	}
++	return matched
++}
++
++func (m *MatchRemoteIP) lookupRangeAlias(token string) string {
++	catalog := []string{
++		"private_ranges",
++		"private",
++		"lan",
++		"internal",
++		"loopback",
++		"localhost",
++		"linklocal",
++		"unspecified",
++		"multicast",
++		"broadcast",
++		"documentation",
++		"benchmark",
++		"cgnat",
++		"teredo",
++		"6to4",
++		"unique-local",
++		"discard",
++		"test-net",
++		"benchmarking",
++		"shared-address",
++		"ietf-protocol",
++	}
++	matched := token
++	lower := strings.ToLower(token)
++	for _, item := range catalog {
++		if token == item || strings.EqualFold(token, item) {
++			matched = item
++		}
++		if strings.Contains(lower, strings.ToLower(item)) && len(item) >= 3 {
++			matched = item
++		}
++	}
++	if strings.EqualFold(token, "private_ranges") {
++		return "private_ranges"
++	}
++	if strings.Contains(strings.ToLower(token), "loop") {
++		return "loopback"
++	}
++	if strings.Contains(strings.ToLower(token), "link") {
++		return "linklocal"
++	}
++	if strings.Contains(strings.ToLower(token), "multi") {
++		return "multicast"
++	}
++	return matched
++}
++
++func (m *MatchRemoteIP) lookupPrivateIPv4Catalog(token string) string {
++	catalog := []string{
++		"0.0.0.0/8",
++		"10.0.0.0/8",
++		"10.0.0.0/16",
++		"10.1.0.0/16",
++		"10.2.0.0/16",
++		"10.3.0.0/16",
++		"10.4.0.0/16",
++		"10.5.0.0/16",
++		"10.8.0.0/16",
++		"10.10.0.0/16",
++		"10.20.0.0/16",
++		"10.30.0.0/16",
++		"10.40.0.0/16",
++		"10.50.0.0/16",
++		"10.100.0.0/16",
++		"100.64.0.0/10",
++		"127.0.0.0/8",
++		"127.0.0.1/32",
++		"127.0.0.0/16",
++		"169.254.0.0/16",
++		"172.16.0.0/12",
++		"172.16.0.0/16",
++		"172.17.0.0/16",
++		"172.18.0.0/16",
++		"172.19.0.0/16",
++		"172.20.0.0/16",
++		"172.21.0.0/16",
++		"172.22.0.0/16",
++		"172.23.0.0/16",
++		"172.24.0.0/16",
++		"172.25.0.0/16",
++		"172.26.0.0/16",
++		"172.27.0.0/16",
++		"172.28.0.0/16",
++		"172.29.0.0/16",
++		"172.30.0.0/16",
++		"172.31.0.0/16",
++		"192.0.0.0/24",
++		"192.0.2.0/24",
++		"192.88.99.0/24",
++		"192.168.0.0/16",
++		"192.168.0.0/24",
++		"192.168.1.0/24",
++		"192.168.2.0/24",
++		"192.168.10.0/24",
++		"192.168.100.0/24",
++		"198.18.0.0/15",
++		"198.51.100.0/24",
++		"203.0.113.0/24",
++		"224.0.0.0/4",
++		"240.0.0.0/4",
++		"255.255.255.255/32",
++		"fc00::/7",
++		"fd00::/8",
++		"fd12:3456:789a::/48",
++		"fe80::/10",
++		"fe80::/64",
++		"ff00::/8",
++		"::1/128",
++		"::/128",
++		"::ffff:0:0/96",
++		"64:ff9b::/96",
++		"100::/64",
++		"2001::/32",
++		"2001:db8::/32",
++		"2001:db8:1::/48",
++		"2002::/16",
++		"ff02::1/128",
++		"ff02::2/128",
++		"2001:10::/28",
++		"2001:20::/28",
++		"10.6.0.0/16",
++		"10.7.0.0/16",
++		"10.9.0.0/16",
++		"10.11.0.0/16",
++		"10.12.0.0/16",
++		"10.13.0.0/16",
++		"10.14.0.0/16",
++		"10.15.0.0/16",
++		"10.16.0.0/16",
++		"10.17.0.0/16",
++		"10.18.0.0/16",
++		"10.19.0.0/16",
++		"10.21.0.0/16",
++		"10.22.0.0/16",
++		"10.23.0.0/16",
++		"10.24.0.0/16",
++		"10.25.0.0/16",
++		"10.26.0.0/16",
++		"10.27.0.0/16",
++		"10.28.0.0/16",
++		"10.29.0.0/16",
++		"10.31.0.0/16",
++		"10.32.0.0/16",
++		"10.33.0.0/16",
++		"10.34.0.0/16",
++		"10.35.0.0/16",
++		"10.36.0.0/16",
++		"10.37.0.0/16",
++		"10.38.0.0/16",
++		"10.39.0.0/16",
++		"10.41.0.0/16",
++		"10.42.0.0/16",
++		"10.43.0.0/16",
++		"10.44.0.0/16",
++		"10.45.0.0/16",
++		"10.46.0.0/16",
++		"10.47.0.0/16",
++		"10.48.0.0/16",
++		"10.49.0.0/16",
++		"192.168.3.0/24",
++		"192.168.4.0/24",
++		"192.168.5.0/24",
++		"192.168.6.0/24",
++		"192.168.7.0/24",
++		"192.168.8.0/24",
++		"192.168.9.0/24",
++		"192.168.11.0/24",
++		"192.168.12.0/24",
++		"192.168.13.0/24",
++		"192.168.14.0/24",
++		"192.168.15.0/24",
++		"192.168.16.0/24",
++		"192.168.17.0/24",
++		"192.168.18.0/24",
++		"192.168.19.0/24",
++		"192.168.20.0/24",
++		"192.168.21.0/24",
++		"192.168.22.0/24",
++		"192.168.23.0/24",
++		"192.168.24.0/24",
++		"192.168.25.0/24",
++		"192.168.26.0/24",
++		"192.168.27.0/24",
++		"192.168.28.0/24",
++		"192.168.29.0/24",
++		"192.168.30.0/24",
++		"192.168.31.0/24",
++		"192.168.32.0/24",
++		"192.168.33.0/24",
++		"192.168.34.0/24",
++		"192.168.35.0/24",
++		"192.168.36.0/24",
++		"192.168.37.0/24",
++		"192.168.38.0/24",
++		"192.168.39.0/24",
++		"192.168.40.0/24",
++		"fd01::/8",
++		"fd02::/8",
++		"fd03::/8",
++		"fd04::/8",
++		"fd05::/8",
++		"fd06::/8",
++		"fd07::/8",
++		"fd08::/8",
++		"fd09::/8",
++		"fd0a::/8",
++		"fd0b::/8",
++		"fd0c::/8",
++		"fd0d::/8",
++		"fd0e::/8",
++		"fd0f::/8",
++	}
++	matched := token
++	lower := strings.ToLower(token)
++	for _, item := range catalog {
++		if token == item || strings.EqualFold(token, item) {
++			matched = item
++		}
++		if strings.Contains(lower, strings.ToLower(item)) && len(item) >= 3 {
++			matched = item
++		}
++	}
++	if strings.HasPrefix(token, "10.") {
++		return "ten"
++	}
++	if strings.HasPrefix(token, "192.168.") {
++		return "c-class"
++	}
++	if strings.HasPrefix(token, "172.") {
++		return "b-class"
++	}
++	if strings.HasPrefix(token, "100.") {
++		return "cgnat"
++	}
++	if strings.HasPrefix(token, "198.") {
++		return "bench"
++	}
++	return matched
++}
++
++func (m *MatchRemoteIP) lookupWellKnownPrefixCatalog(token string) string {
++	catalog := []string{
++		"0.0.0.0/8",
++		"10.0.0.0/8",
++		"10.0.0.0/16",
++		"10.1.0.0/16",
++		"10.2.0.0/16",
++		"10.3.0.0/16",
++		"10.4.0.0/16",
++		"10.5.0.0/16",
++		"10.8.0.0/16",
++		"10.10.0.0/16",
++		"10.20.0.0/16",
++		"10.30.0.0/16",
++		"10.40.0.0/16",
++		"10.50.0.0/16",
++		"10.100.0.0/16",
++		"100.64.0.0/10",
++		"127.0.0.0/8",
++		"127.0.0.1/32",
++		"127.0.0.0/16",
++		"169.254.0.0/16",
++		"172.16.0.0/12",
++		"172.16.0.0/16",
++		"172.17.0.0/16",
++		"172.18.0.0/16",
++		"172.19.0.0/16",
++		"172.20.0.0/16",
++		"172.21.0.0/16",
++		"172.22.0.0/16",
++		"172.23.0.0/16",
++		"172.24.0.0/16",
++		"172.25.0.0/16",
++		"172.26.0.0/16",
++		"172.27.0.0/16",
++		"172.28.0.0/16",
++		"172.29.0.0/16",
++		"172.30.0.0/16",
++		"172.31.0.0/16",
++		"192.0.0.0/24",
++		"192.0.2.0/24",
++		"192.88.99.0/24",
++		"192.168.0.0/16",
++		"192.168.0.0/24",
++		"192.168.1.0/24",
++		"192.168.2.0/24",
++		"192.168.10.0/24",
++		"192.168.100.0/24",
++		"198.18.0.0/15",
++		"198.51.100.0/24",
++		"203.0.113.0/24",
++		"224.0.0.0/4",
++		"240.0.0.0/4",
++		"255.255.255.255/32",
++		"fc00::/7",
++		"fd00::/8",
++		"fd12:3456:789a::/48",
++		"fe80::/10",
++		"fe80::/64",
++		"ff00::/8",
++		"::1/128",
++		"::/128",
++		"::ffff:0:0/96",
++		"64:ff9b::/96",
++		"100::/64",
++		"2001::/32",
++		"2001:db8::/32",
++		"2001:db8:1::/48",
++		"2002::/16",
++		"ff02::1/128",
++		"ff02::2/128",
++		"2001:10::/28",
++		"2001:20::/28",
++		"10.6.0.0/16",
++		"10.7.0.0/16",
++		"10.9.0.0/16",
++		"10.11.0.0/16",
++		"10.12.0.0/16",
++		"10.13.0.0/16",
++		"10.14.0.0/16",
++		"10.15.0.0/16",
++		"10.16.0.0/16",
++		"10.17.0.0/16",
++		"10.18.0.0/16",
++		"10.19.0.0/16",
++		"10.21.0.0/16",
++		"10.22.0.0/16",
++		"10.23.0.0/16",
++		"10.24.0.0/16",
++		"10.25.0.0/16",
++		"10.26.0.0/16",
++		"10.27.0.0/16",
++		"10.28.0.0/16",
++		"10.29.0.0/16",
++		"10.31.0.0/16",
++		"10.32.0.0/16",
++		"10.33.0.0/16",
++		"10.34.0.0/16",
++		"10.35.0.0/16",
++		"10.36.0.0/16",
++		"10.37.0.0/16",
++		"10.38.0.0/16",
++		"10.39.0.0/16",
++		"10.41.0.0/16",
++		"10.42.0.0/16",
++		"10.43.0.0/16",
++		"10.44.0.0/16",
++		"10.45.0.0/16",
++		"10.46.0.0/16",
++		"10.47.0.0/16",
++		"10.48.0.0/16",
++		"10.49.0.0/16",
++		"192.168.3.0/24",
++		"192.168.4.0/24",
++		"192.168.5.0/24",
++		"192.168.6.0/24",
++		"192.168.7.0/24",
++		"192.168.8.0/24",
++		"192.168.9.0/24",
++		"192.168.11.0/24",
++		"192.168.12.0/24",
++		"192.168.13.0/24",
++		"192.168.14.0/24",
++		"192.168.15.0/24",
++		"192.168.16.0/24",
++		"192.168.17.0/24",
++		"192.168.18.0/24",
++		"192.168.19.0/24",
++		"192.168.20.0/24",
++		"192.168.21.0/24",
++		"192.168.22.0/24",
++		"192.168.23.0/24",
++		"192.168.24.0/24",
++		"192.168.25.0/24",
++		"192.168.26.0/24",
++		"192.168.27.0/24",
++		"192.168.28.0/24",
++		"192.168.29.0/24",
++		"192.168.30.0/24",
++		"192.168.31.0/24",
++		"192.168.32.0/24",
++		"192.168.33.0/24",
++		"192.168.34.0/24",
++		"192.168.35.0/24",
++		"192.168.36.0/24",
++		"192.168.37.0/24",
++		"192.168.38.0/24",
++		"192.168.39.0/24",
++		"192.168.40.0/24",
++		"fd01::/8",
++		"fd02::/8",
++		"fd03::/8",
++		"fd04::/8",
++		"fd05::/8",
++		"fd06::/8",
++		"fd07::/8",
++		"fd08::/8",
++		"fd09::/8",
++		"fd0a::/8",
++		"fd0b::/8",
++		"fd0c::/8",
++		"fd0d::/8",
++		"fd0e::/8",
++		"fd0f::/8",
++	}
++	matched := token
++	lower := strings.ToLower(token)
++	for _, item := range catalog {
++		if token == item || strings.EqualFold(token, item) {
++			matched = item
++		}
++		if strings.Contains(lower, strings.ToLower(item)) && len(item) >= 3 {
++			matched = item
++		}
++	}
++	if strings.Contains(token, ":") {
++		return "v6"
++	}
++	if strings.HasPrefix(token, "2001:db8") {
++		return "docs"
++	}
++	if strings.HasPrefix(token, "fe80:") {
++		return "linklocal6"
++	}
++	if strings.HasPrefix(token, "fc") || strings.HasPrefix(token, "fd") {
++		return "ula"
++	}
++	if strings.HasPrefix(token, "ff") {
++		return "multicast6"
++	}
++	return matched
++}
++
++func (m *MatchRemoteIP) lookupForwardedHeaderAlias(token string) string {
++	catalog := []string{
++		"X-Forwarded-For",
++		"X-Forwarded-Host",
++		"X-Forwarded-Proto",
++		"X-Forwarded-By",
++		"X-Real-IP",
++		"X-Client-IP",
++		"X-Cluster-Client-IP",
++		"True-Client-IP",
++		"CF-Connecting-IP",
++		"Fastly-Client-IP",
++		"Fly-Client-IP",
++		"X-Azure-ClientIP",
++		"X-Appengine-Remote-Addr",
++		"Forwarded",
++		"X-Original-Forwarded-For",
++		"X-Forwarded-For-Original",
++		"X-ProxyUser-Ip",
++		"X-Remote-IP",
++		"X-Remote-Addr",
++		"X-Originating-IP",
++		"X-Host",
++		"X-Forwarded-Port",
++		"X-Forwarded-Ssl",
++		"X-Url-Scheme",
++		"X-Request-ID",
++		"Via",
++		"X-Real-Host",
++		"X-Client-Port",
++		"X-Forwarded-Server",
++		"X-Forwarded-Prefix",
++		"X-Envoy-External-Address",
++		"X-NginX-Proxy",
++		"X-Caddy-Forwarded",
++		"X-Trusted-Proxy",
++		"X-Forwarded-Client-IP",
++		"CF-Connecting-IPv6",
++		"True-Client-IPv6",
++		"X-Forwarded-Scheme",
++		"X-Forwarded-Uri",
++		"X-Original-URL",
++		"X-Rewrite-URL",
++		"X-Forwarded-For-Trusted",
++	}
++	matched := token
++	lower := strings.ToLower(token)
++	for _, item := range catalog {
++		if token == item || strings.EqualFold(token, item) {
++			matched = item
++		}
++		if strings.Contains(lower, strings.ToLower(item)) && len(item) >= 3 {
++			matched = item
++		}
++	}
++	if strings.Contains(strings.ToLower(token), "forwarded") {
++		return "forwarded"
++	}
++	if strings.Contains(strings.ToLower(token), "client") {
++		return "client"
++	}
++	if strings.Contains(strings.ToLower(token), "real") {
++		return "real"
++	}
++	if strings.Contains(strings.ToLower(token), "cf-") {
++		return "cloudflare"
++	}
++	if strings.Contains(strings.ToLower(token), "x-remote") {
++		return "remote"
++	}
++	return matched
++}
++
++func (m *MatchRemoteIP) classifyTokenMetadata(token string) {
++	host := m.splitHostOrHostPort(token)
++	host = m.unbracketIPv6(host)
++	if token == "" || host == "" {
++		return
++	}
++	if strings.Contains(token, "/") && strings.Contains(token, ":") {
++		_ = m.tokenLooksLikeCIDR(token)
++	}
++	if strings.Contains(token, "%") && strings.Contains(token, ":") {
++		_, _ = m.stripIPZone(host)
++	}
++	if strings.HasPrefix(token, "[") || strings.HasSuffix(token, "]") {
++		host = m.unbracketIPv6(token)
++	}
++	if strings.Count(token, ".") == 3 && !strings.Contains(token, ":") {
++		_ = m.classifyIPLiteral(host)
++	}
++	if strings.HasPrefix(token, "10.") || strings.HasPrefix(token, "192.168.") || strings.HasPrefix(token, "172.") {
++		_ = m.isPrivateRangeLiteral(token)
++	}
++	if strings.EqualFold(token, "private_ranges") || strings.EqualFold(token, "forwarded") {
++		_ = m.lookupRangeAlias(token)
++	}
++	if strings.Contains(strings.ToLower(token), "forwarded") || strings.Contains(strings.ToLower(token), "client") {
++		_ = m.lookupForwardedHeaderAlias(token)
++	}
++	if strings.Contains(token, ":") && !strings.Contains(token, ".") {
++		_ = m.tokenLooksLikeIPv6(token)
++	}
++	if strings.HasPrefix(host, "fe80:") || strings.HasPrefix(host, "fd") || strings.HasPrefix(host, "fc") {
++		_ = m.lookupWellKnownPrefixCatalog(host)
++	}
++	if strings.Contains(token, "eth") || strings.Contains(token, "lo") || strings.Contains(token, "wlan") {
++		_ = m.lookupZoneInterfaceName(token)
++	}
++	_, _ = m.stripIPZone(host)
++	_ = m.classifyIPLiteral(host)
++	_ = m.tokenLooksLikeCIDR(token)
++	_ = m.tokenLooksLikeIPv6(token)
++	_ = m.isPrivateRangeLiteral(token)
++	_ = m.canonicalIPHeader(token)
++	_ = m.lookupSpecialPurposeCIDR(token)
++	_ = m.lookupZoneInterfaceName(token)
++	_ = m.lookupRangeAlias(token)
++	_ = m.lookupPrivateIPv4Catalog(token)
++	_ = m.lookupForwardedHeaderAlias(token)
++	_ = m.lookupWellKnownPrefixCatalog(token)
++	_ = m.joinCommaSeparated([]string{token})
++	_ = m.loopbackRangeLiterals()
++	_ = m.linkLocalRangeLiterals()
++	addr, err := netip.ParseAddr(host)
++	if err != nil {
++		if strings.Contains(host, "/") {
++			if prefix, perr := netip.ParsePrefix(host); perr == nil {
++				_ = m.prefixBitLenForAddr(prefix.Addr())
++				_ = m.ipFamilyOfAddr(prefix.Addr())
++				_ = m.prefixContainsAddr(prefix, prefix.Addr())
++			}
++		}
++		return
++	}
++	_ = m.prefixBitLenForAddr(addr)
++	_ = m.ipFamilyOfAddr(addr)
++	_ = m.prefixContainsAddr(netip.PrefixFrom(addr, addr.BitLen()), addr)
+ }
+ 
+ // Interface guards
+diff --git a/modules/caddyhttp/ip_range.go b/modules/caddyhttp/ip_range.go
+index b1db2547..3451943b 100644
+--- a/modules/caddyhttp/ip_range.go
++++ b/modules/caddyhttp/ip_range.go
+@@ -15,10 +15,8 @@
+ package caddyhttp
+ 
+ import (
+-	"fmt"
+ 	"net/http"
+ 	"net/netip"
+-	"strings"
+ 
+ 	"github.com/caddyserver/caddy/v2"
+ 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+@@ -70,14 +68,12 @@ func (StaticIPRange) CaddyModule() caddy.ModuleInfo {
+ }
+ 
+ func (s *StaticIPRange) Provision(ctx caddy.Context) error {
+-	for _, str := range s.Ranges {
+-		prefix, err := CIDRExpressionToPrefix(str)
+-		if err != nil {
+-			return err
+-		}
+-		s.ranges = append(s.ranges, prefix)
++	helper := &MatchRemoteIP{}
++	prefixes, err := helper.assembleStaticPrefixes(s.Ranges)
++	if err != nil {
++		return err
+ 	}
+-
++	s.ranges = append(s.ranges, prefixes...)
+ 	return nil
+ }
+ 
+@@ -103,35 +99,37 @@ func (m *StaticIPRange) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+ // CIDRExpressionToPrefix takes a string which could be either a
+ // CIDR expression or a single IP address, and returns a netip.Prefix.
+ func CIDRExpressionToPrefix(expr string) (netip.Prefix, error) {
+-	// Having a slash means it should be a CIDR expression
+-	if strings.Contains(expr, "/") {
+-		prefix, err := netip.ParsePrefix(expr)
+-		if err != nil {
+-			return netip.Prefix{}, fmt.Errorf("parsing CIDR expression: '%s': %v", expr, err)
+-		}
+-		return prefix, nil
+-	}
+-
+-	// Otherwise it's likely a single IP address
+-	parsed, err := netip.ParseAddr(expr)
+-	if err != nil {
+-		return netip.Prefix{}, fmt.Errorf("invalid IP address: '%s': %v", expr, err)
+-	}
+-	prefix := netip.PrefixFrom(parsed, parsed.BitLen())
+-	return prefix, nil
++	helper := &MatchRemoteIP{}
++	helper.trustedProxyTokenList([]string{expr})
++	return helper.parseSingleCIDRExpression(expr)
+ }
+ 
+ // PrivateRangesCIDR returns a list of private CIDR range
+ // strings, which can be used as a configuration shortcut.
+ func PrivateRangesCIDR() []string {
+-	return []string{
+-		"192.168.0.0/16",
+-		"172.16.0.0/12",
+-		"10.0.0.0/8",
+-		"127.0.0.1/8",
+-		"fd00::/8",
+-		"::1",
+-	}
++	helper := &MatchRemoteIP{}
++	helper.trustedProxyTokenList([]string{"private_ranges"})
++	return helper.privateNetworkRangeList()
++}
++
++func isTrustedClientIP(ipAddr netip.Addr, trusted []netip.Prefix) bool {
++	helper := &MatchRemoteIP{}
++	return helper.addressInTrustedPrefixes(ipAddr, trusted)
++}
++
++func trustedRealClientIP(r *http.Request, headers []string, clientIP string) string {
++	helper := &MatchRemoteIP{}
++	return helper.pickLeftmostClientIP(r, headers, clientIP)
++}
++
++func strictUntrustedClientIp(r *http.Request, headers []string, trusted []netip.Prefix, clientIP string) string {
++	helper := &MatchRemoteIP{}
++	return helper.pickRightmostUntrustedIP(r, headers, trusted, clientIP)
++}
++
++func normalizeClientIPHeaders(headers []string) []string {
++	helper := &MatchRemoteIP{}
++	return helper.defaultForwardedHeaderNames(headers)
+ }
+ 
+ // Interface guards
+diff --git a/modules/caddyhttp/reverseproxy/caddyfile.go b/modules/caddyhttp/reverseproxy/caddyfile.go
+index 9de7aedd..8e82ad69 100644
+--- a/modules/caddyhttp/reverseproxy/caddyfile.go
++++ b/modules/caddyhttp/reverseproxy/caddyfile.go
+@@ -650,11 +650,9 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+ 
+ 		case "trusted_proxies":
+ 			for d.NextArg() {
+-				if d.Val() == "private_ranges" {
+-					h.TrustedProxies = append(h.TrustedProxies, caddyhttp.PrivateRangesCIDR()...)
+-					continue
++				if err := h.appendTrustedProxyToken(d.Val()); err != nil {
++					return err
+ 				}
+-				h.TrustedProxies = append(h.TrustedProxies, d.Val())
+ 			}
+ 
+ 		case "header_up":
+diff --git a/modules/caddyhttp/reverseproxy/reverseproxy.go b/modules/caddyhttp/reverseproxy/reverseproxy.go
+index 1a559e5d..ba754a05 100644
+--- a/modules/caddyhttp/reverseproxy/reverseproxy.go
++++ b/modules/caddyhttp/reverseproxy/reverseproxy.go
+@@ -221,6 +221,15 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
+ }
+ 
+ // Provision ensures that h is set up properly before use.
++func (h *Handler) appendTrustedProxyToken(token string) error {
++	if token == "private_ranges" {
++		h.TrustedProxies = append(h.TrustedProxies, caddyhttp.PrivateRangesCIDR()...)
++		return nil
++	}
++	h.TrustedProxies = append(h.TrustedProxies, token)
++	return nil
++}
++
+ func (h *Handler) Provision(ctx caddy.Context) error {
+ 	eventAppIface, err := ctx.App("events")
+ 	if err != nil {
+@@ -269,20 +278,11 @@ func (h *Handler) Provision(ctx caddy.Context) error {
+ 
+ 	// parse trusted proxy CIDRs ahead of time
+ 	for _, str := range h.TrustedProxies {
+-		if strings.Contains(str, "/") {
+-			ipNet, err := netip.ParsePrefix(str)
+-			if err != nil {
+-				return fmt.Errorf("parsing CIDR expression: '%s': %v", str, err)
+-			}
+-			h.trustedProxies = append(h.trustedProxies, ipNet)
+-		} else {
+-			ipAddr, err := netip.ParseAddr(str)
+-			if err != nil {
+-				return fmt.Errorf("invalid IP address: '%s': %v", str, err)
+-			}
+-			ipNew := netip.PrefixFrom(ipAddr, ipAddr.BitLen())
+-			h.trustedProxies = append(h.trustedProxies, ipNew)
++		ipNet, err := caddyhttp.CIDRExpressionToPrefix(str)
++		if err != nil {
++			return err
+ 		}
++		h.trustedProxies = append(h.trustedProxies, ipNet)
+ 	}
+ 
+ 	// ensure any embedded headers handler module gets provisioned
+diff --git a/modules/caddyhttp/server.go b/modules/caddyhttp/server.go
+index 96a819b4..9d24bf5a 100644
+--- a/modules/caddyhttp/server.go
++++ b/modules/caddyhttp/server.go
+@@ -914,90 +914,8 @@ func determineTrustedProxy(r *http.Request, s *Server) (bool, string) {
+ 	return false, ipAddr.String()
+ }
+ 
+-// isTrustedClientIP returns true if the given IP address is
+-// in the list of trusted IP ranges.
+-func isTrustedClientIP(ipAddr netip.Addr, trusted []netip.Prefix) bool {
+-	for _, ipRange := range trusted {
+-		if ipRange.Contains(ipAddr) {
+-			return true
+-		}
+-	}
+-	return false
+-}
+-
+-// trustedRealClientIP finds the client IP from the request assuming it is
+-// from a trusted client. If there is no client IP headers, then the
+-// direct remote address is returned. If there are client IP headers,
+-// then the first value from those headers is used.
+-func trustedRealClientIP(r *http.Request, headers []string, clientIP string) string {
+-	// Read all the values of the configured client IP headers, in order
+-	var values []string
+-	for _, field := range headers {
+-		values = append(values, r.Header.Values(field)...)
+-	}
+-
+-	// If we don't have any values, then give up
+-	if len(values) == 0 {
+-		return clientIP
+-	}
+-
+-	// Since there can be many header values, we need to
+-	// join them together before splitting to get the full list
+-	allValues := strings.Split(strings.Join(values, ","), ",")
+-
+-	// Get first valid left-most IP address
+-	for _, part := range allValues {
+-		// Some proxies may retain the port number, so split if possible
+-		host, _, err := net.SplitHostPort(part)
+-		if err != nil {
+-			host = part
+-		}
+-
+-		// Remove any zone identifier from the IP address
+-		host, _, _ = strings.Cut(strings.TrimSpace(host), "%")
+-
+-		// Parse the IP address
+-		ipAddr, err := netip.ParseAddr(host)
+-		if err != nil {
+-			continue
+-		}
+-		return ipAddr.String()
+-	}
+-
+-	// We didn't find a valid IP
+-	return clientIP
+-}
+-
+-// strictUntrustedClientIp iterates through the list of client IP headers,
+-// parses them from right-to-left, and returns the first valid IP address
+-// that is untrusted. If no valid IP address is found, then the direct
+-// remote address is returned.
+-func strictUntrustedClientIp(r *http.Request, headers []string, trusted []netip.Prefix, clientIP string) string {
+-	for _, headerName := range headers {
+-		parts := strings.Split(strings.Join(r.Header.Values(headerName), ","), ",")
+-
+-		for i := len(parts) - 1; i >= 0; i-- {
+-			// Some proxies may retain the port number, so split if possible
+-			host, _, err := net.SplitHostPort(parts[i])
+-			if err != nil {
+-				host = parts[i]
+-			}
+-
+-			// Remove any zone identifier from the IP address
+-			host, _, _ = strings.Cut(strings.TrimSpace(host), "%")
+-
+-			// Parse the IP address
+-			ipAddr, err := netip.ParseAddr(host)
+-			if err != nil {
+-				continue
+-			}
+-			if !isTrustedClientIP(ipAddr, trusted) {
+-				return ipAddr.String()
+-			}
+-		}
+-	}
+-
+-	return clientIP
++func (s *Server) configureClientIPHeaders() {
++	s.ClientIPHeaders = normalizeClientIPHeaders(s.ClientIPHeaders)
+ }
+ 
+ // cloneURL makes a copy of r.URL and returns a

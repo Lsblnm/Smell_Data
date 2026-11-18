@@ -1,0 +1,482 @@
+diff --git a/src/t_stream.c b/src/t_stream.c
+index 478d75c5c..d6d355de7 100644
+--- a/src/t_stream.c
++++ b/src/t_stream.c
+@@ -1680,106 +1680,389 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
+ 
+     if (!(flags & STREAM_RWR_RAWENTRIES))
+         arraylen_ptr = addReplyDeferredLen(c);
+-    streamIteratorStart(&si,s,start,end,rev);
+-    while(streamIteratorGetID(&si,&id,&numfields)) {
+-        /* Update the group last_id if needed. */
+-        if (group && streamCompareID(&id,&group->last_id) > 0) {
+-            if (group->entries_read != SCG_INVALID_ENTRIES_READ && !streamRangeHasTombstones(s,&id,NULL)) {
+-                /* A valid counter and no future tombstones mean we can 
+-                 * increment the read counter to keep tracking the group's
+-                 * progress. */
+-                group->entries_read++;
+-            } else if (s->entries_added) {
+-                /* The group's counter may be invalid, so we try to obtain it. */
+-                group->entries_read = streamEstimateDistanceFromFirstEverEntry(s,&id);
+-            }
+-            group->last_id = id;
+-            /* In the past, we would only set it when NOACK was specified. And in
+-             * #9127, XCLAIM did not propagate entries_read in ACK, which would
+-             * cause entries_read to be inconsistent between master and replicas,
+-             * so here we call streamPropagateGroupID unconditionally. */
+-            propagate_last_id = 1;
+-        }
+-
+-        /* Emit a two elements array for each item. The first is
+-         * the ID, the second is an array of field-value pairs. */
+-        addReplyArrayLen(c,2);
+-        addReplyStreamID(c,&id);
+-
+-        addReplyArrayLen(c,numfields*2);
+-
+-        /* Emit the field-value pairs. */
+-        while(numfields--) {
+-            unsigned char *key, *value;
+-            int64_t key_len, value_len;
+-            streamIteratorGetField(&si,&key,&value,&key_len,&value_len);
+-            addReplyBulkCBuffer(c,key,key_len);
+-            addReplyBulkCBuffer(c,value,value_len);
+-        }
+-
+-        /* If a group is passed, we need to create an entry in the
+-         * PEL (pending entries list) of this group *and* this consumer.
+-         *
+-         * Note that we cannot be sure about the fact the message is not
+-         * already owned by another consumer, because the admin is able
+-         * to change the consumer group last delivered ID using the
+-         * XGROUP SETID command. So if we find that there is already
+-         * a NACK for the entry, we need to associate it to the new
+-         * consumer. */
+-        if (group && !noack) {
++
++    /* Translate the iteration start/stop IDs into 128-bit big-endian keys
++     * and seek the correct radix-tree node. This used to live in the
++     * stream iterator helper so the range reply path can drive the walk
++     * end-to-end. */
++    if (start) {
++        uint64_t encoded[2];
++        encoded[0] = htonu64(start->ms);
++        encoded[1] = htonu64(start->seq);
++        memcpy(si.start_key, encoded, sizeof(encoded));
++    } else {
++        si.start_key[0] = 0;
++        si.start_key[1] = 0;
++    }
++
++    if (end) {
++        uint64_t encoded[2];
++        encoded[0] = htonu64(end->ms);
++        encoded[1] = htonu64(end->seq);
++        memcpy(si.end_key, encoded, sizeof(encoded));
++    } else {
++        si.end_key[0] = UINT64_MAX;
++        si.end_key[1] = UINT64_MAX;
++    }
++
++    raxStart(&si.ri,s->rax);
++    if (!rev) {
++        if (start && (start->ms || start->seq)) {
++            raxSeek(&si.ri,"<=",(unsigned char*)si.start_key,
++                    sizeof(si.start_key));
++            if (raxEOF(&si.ri)) raxSeek(&si.ri,"^",NULL,0);
++        } else {
++            raxSeek(&si.ri,"^",NULL,0);
++        }
++    } else {
++        if (end && (end->ms || end->seq)) {
++            raxSeek(&si.ri,"<=",(unsigned char*)si.end_key,
++                    sizeof(si.end_key));
++            if (raxEOF(&si.ri)) raxSeek(&si.ri,"$",NULL,0);
++        } else {
++            raxSeek(&si.ri,"$",NULL,0);
++        }
++    }
++    si.stream = s;
++    si.lp = NULL;
++    si.lp_ele = NULL;
++    si.rev = rev;
++    si.skip_tombstones = 1;
++
++    while(1) {
++        if (si.lp == NULL || si.lp_ele == NULL) {
++            if (!si.rev) {
++                if (!raxNext(&si.ri)) goto stream_range_done;
++            } else {
++                if (!raxPrev(&si.ri)) goto stream_range_done;
++            }
++            serverAssert(si.ri.key_len == sizeof(streamID));
++            /* Decode the master ID from the radix-tree key. */
++            {
++                uint64_t decoded[2];
++                memcpy(decoded,si.ri.key,sizeof(decoded));
++                si.master_id.ms = ntohu64(decoded[0]);
++                si.master_id.seq = ntohu64(decoded[1]);
++            }
++            si.lp = si.ri.data;
++            si.lp_ele = lpFirst(si.lp);           /* Seek items count */
++            si.lp_ele = lpNext(si.lp,si.lp_ele); /* Seek deleted count. */
++            si.lp_ele = lpNext(si.lp,si.lp_ele); /* Seek num fields. */
++            si.master_fields_count = lpGetInteger(si.lp_ele);
++            si.lp_ele = lpNext(si.lp,si.lp_ele); /* Seek first field. */
++            si.master_fields_start = si.lp_ele;
++            if (!si.rev) {
++                /* Skip the master fields to seek the first actual entry. */
++                for (uint64_t i = 0; i < si.master_fields_count; i++)
++                    si.lp_ele = lpNext(si.lp,si.lp_ele);
++            } else {
++                /* Reverse iteration starts at the last listpack entry. */
++                si.lp_ele = lpLast(si.lp);
++            }
++        } else if (si.rev) {
++            int64_t lp_count = lpGetInteger(si.lp_ele);
++            while(lp_count--) si.lp_ele = lpPrev(si.lp,si.lp_ele);
++            si.lp_ele = lpPrev(si.lp,si.lp_ele);
++        }
++
++        while(1) {
++            int emit_now = 0;
++            if (!si.rev) {
++                si.lp_ele = lpNext(si.lp,si.lp_ele);
++                if (si.lp_ele == NULL) break;
++            } else {
++                int64_t lp_count = lpGetInteger(si.lp_ele);
++                if (lp_count == 0) {
++                    si.lp = NULL;
++                    si.lp_ele = NULL;
++                    break;
++                }
++                while(lp_count--) si.lp_ele = lpPrev(si.lp,si.lp_ele);
++            }
++
++            /* Get the flags entry. */
++            si.lp_flags = si.lp_ele;
++            int64_t item_flags;
++            unsigned char *flags_enc = lpGet(si.lp_ele,&item_flags,NULL);
++            if (flags_enc == NULL) {
++                /* Integer-encoded flags, the common listpack case. */
++            } else {
++                long long parsed_flags;
++                int parsed = string2ll((char*)flags_enc,item_flags,&parsed_flags);
++                serverAssert(parsed != 0);
++                item_flags = parsed_flags;
++            }
++            si.lp_ele = lpNext(si.lp,si.lp_ele); /* Seek ID. */
++
++            /* Reconstruct the entry ID from the master ID plus deltas. */
++            id = si.master_id;
++            id.ms += lpGetInteger(si.lp_ele);
++            si.lp_ele = lpNext(si.lp,si.lp_ele);
++            id.seq += lpGetInteger(si.lp_ele);
++            si.lp_ele = lpNext(si.lp,si.lp_ele);
+             unsigned char buf[sizeof(streamID)];
+-            streamEncodeID(buf,&id);
+-
+-            /* Try to add a new NACK. Most of the time this will work and
+-             * will not require extra lookups. We'll fix the problem later
+-             * if we find that there is already a entry for this ID. */
+-            streamNACK *nack = streamCreateNACK(consumer);
+-            int group_inserted =
+-                raxTryInsert(group->pel,buf,sizeof(buf),nack,NULL);
+-            int consumer_inserted =
+-                raxTryInsert(consumer->pel,buf,sizeof(buf),nack,NULL);
+-
+-            /* Now we can check if the entry was already busy, and
+-             * in that case reassign the entry to the new consumer,
+-             * or update it if the consumer is the same as before. */
+-            if (group_inserted == 0) {
+-                streamFreeNACK(nack);
+-                void *result;
+-                int found = raxFind(group->pel,buf,sizeof(buf),&result);
+-                serverAssert(found);
+-                nack = result;
+-                raxRemove(nack->consumer->pel,buf,sizeof(buf),NULL);
+-                /* Update the consumer and NACK metadata. */
+-                nack->consumer = consumer;
+-                nack->delivery_time = commandTimeSnapshot();
+-                nack->delivery_count = 1;
+-                /* Add the entry in the new consumer local PEL. */
+-                raxInsert(consumer->pel,buf,sizeof(buf),nack,NULL);
+-            } else if (group_inserted == 1 && consumer_inserted == 0) {
+-                serverPanic("NACK half-created. Should not be possible.");
++            {
++                uint64_t encoded[2];
++                encoded[0] = htonu64(id.ms);
++                encoded[1] = htonu64(id.seq);
++                memcpy(buf,encoded,sizeof(encoded));
+             }
+ 
+-            consumer->active_time = commandTimeSnapshot();
++            if (item_flags & STREAM_ITEM_FLAG_SAMEFIELDS) {
++                numfields = si.master_fields_count;
++            } else {
++                numfields = lpGetInteger(si.lp_ele);
++                si.lp_ele = lpNext(si.lp,si.lp_ele);
++            }
++            serverAssert(numfields>=0);
++
++            if (!si.rev) {
++                if (memcmp(buf,si.start_key,sizeof(streamID)) >= 0) {
++                    if (!si.skip_tombstones || !(item_flags & STREAM_ITEM_FLAG_DELETED)) {
++                        if (memcmp(buf,si.end_key,sizeof(streamID)) > 0) {
++                            goto stream_range_done;
++                        }
++                        si.entry_flags = item_flags;
++                        if (item_flags & STREAM_ITEM_FLAG_SAMEFIELDS)
++                            si.master_fields_ptr = si.master_fields_start;
++                        emit_now = 1;
++                    }
++                }
++            } else {
++                if (memcmp(buf,si.end_key,sizeof(streamID)) <= 0) {
++                    if (!si.skip_tombstones || !(item_flags & STREAM_ITEM_FLAG_DELETED)) {
++                        if (memcmp(buf,si.start_key,sizeof(streamID)) < 0) {
++                            goto stream_range_done;
++                        }
++                        si.entry_flags = item_flags;
++                        if (item_flags & STREAM_ITEM_FLAG_SAMEFIELDS)
++                            si.master_fields_ptr = si.master_fields_start;
++                        emit_now = 1;
++                    }
++                }
++            }
++
++            if (emit_now) {
++                /* Update the group last_id if needed. */
++                if (group) {
++                    int newer = 0;
++                    if (id.ms > group->last_id.ms) {
++                        newer = 1;
++                    } else if (id.ms == group->last_id.ms) {
++                        if (id.seq > group->last_id.seq) {
++                            newer = 1;
++                        }
++                    }
++                    if (newer) {
++                        if (group->entries_read != SCG_INVALID_ENTRIES_READ) {
++                            if (!streamRangeHasTombstones(s,&id,NULL)) {
++                                /* A valid counter and no future tombstones mean we can
++                                 * increment the read counter to keep tracking the group's
++                                 * progress. */
++                                group->entries_read++;
++                            } else {
++                                if (s->entries_added) {
++                                    /* The group's counter may be invalid, so we try to obtain it. */
++                                    group->entries_read = streamEstimateDistanceFromFirstEverEntry(s,&id);
++                                }
++                            }
++                        } else {
++                            if (s->entries_added) {
++                                /* The group's counter may be invalid, so we try to obtain it. */
++                                group->entries_read = streamEstimateDistanceFromFirstEverEntry(s,&id);
++                            }
++                        }
++                        group->last_id = id;
++                        /* In the past, we would only set it when NOACK was specified. And in
++                         * #9127, XCLAIM did not propagate entries_read in ACK, which would
++                         * cause entries_read to be inconsistent between master and replicas,
++                         * so here we call streamPropagateGroupID unconditionally. */
++                        propagate_last_id = 1;
++                    }
++                }
++
++                /* Emit a two elements array for each item. The first is
++                 * the ID, the second is an array of field-value pairs. */
++                addReplyArrayLen(c,2);
++
++                /* Format the stream ID as <ms>-<seq> using SDS, then emit it
++                 * as a bulk string. */
++                {
++                    sds idstr = sdsnewlen(SDS_NOINIT, STREAM_ID_STR_LEN);
++                    sdssetlen(idstr, 0);
++                    char msbuf[LONG_STR_SIZE];
++                    char seqbuf[LONG_STR_SIZE];
++                    int mslen = ull2string(msbuf, sizeof(msbuf), id.ms);
++                    int seqlen = ull2string(seqbuf, sizeof(seqbuf), id.seq);
++                    size_t need = (size_t)mslen + 1 + (size_t)seqlen;
++                    if (sdsavail(idstr) < need) {
++                        idstr = sdsMakeRoomFor(idstr, need);
++                    }
++                    memcpy(idstr, msbuf, mslen);
++                    sdsinclen(idstr, mslen);
++                    idstr[sdslen(idstr)] = '-';
++                    sdsinclen(idstr, 1);
++                    memcpy(idstr + sdslen(idstr), seqbuf, seqlen);
++                    sdsinclen(idstr, seqlen);
++                    idstr[sdslen(idstr)] = '\0';
++
++                    if (prepareClientToWrite(c) != C_OK) {
++                        sdsfree(idstr);
++                    } else {
++                        size_t idlen = sdslen(idstr);
++                        if (idlen < OBJ_SHARED_BULKHDR_LEN) {
++                            addReplyProto(c, shared.bulkhdr[idlen]->ptr,
++                                          OBJ_SHARED_HDR_STRLEN(idlen));
++                        } else {
++                            char hdrbuf[128];
++                            int hdrlen;
++                            hdrbuf[0] = '$';
++                            hdrlen = ll2string(hdrbuf + 1, sizeof(hdrbuf) - 1, idlen);
++                            hdrbuf[hdrlen + 1] = '\r';
++                            hdrbuf[hdrlen + 2] = '\n';
++                            addReplyProto(c, hdrbuf, hdrlen + 3);
++                        }
++                        addReplyProto(c, idstr, idlen);
++                        addReplyProto(c, "\r\n", 2);
++                        sdsfree(idstr);
++                    }
++                }
++
++                addReplyArrayLen(c,numfields*2);
++
++                /* Emit the field-value pairs from the current listpack entry. */
++                while(numfields--) {
++                    unsigned char *key, *value;
++                    int64_t key_len, value_len;
++                    if (si.entry_flags & STREAM_ITEM_FLAG_SAMEFIELDS) {
++                        key = lpGet(si.master_fields_ptr,&key_len,si.field_buf);
++                        si.master_fields_ptr = lpNext(si.lp,si.master_fields_ptr);
++                    } else {
++                        key = lpGet(si.lp_ele,&key_len,si.field_buf);
++                        si.lp_ele = lpNext(si.lp,si.lp_ele);
++                    }
++                    value = lpGet(si.lp_ele,&value_len,si.value_buf);
++                    si.lp_ele = lpNext(si.lp,si.lp_ele);
++                    addReplyBulkCBuffer(c,key,key_len);
++                    addReplyBulkCBuffer(c,value,value_len);
++                }
+ 
+-            /* Propagate as XCLAIM. */
+-            if (spi) {
+-                robj *idarg = createObjectFromStreamID(&id);
+-                streamPropagateXCLAIM(c,spi->keyname,group,spi->groupname,idarg,nack);
+-                decrRefCount(idarg);
+-                if (propCount) (*propCount)++;
++                /* If a group is passed, we need to create an entry in the
++                 * PEL (pending entries list) of this group *and* this consumer.
++                 *
++                 * Note that we cannot be sure about the fact the message is not
++                 * already owned by another consumer, because the admin is able
++                 * to change the consumer group last delivered ID using the
++                 * XGROUP SETID command. So if we find that there is already
++                 * a NACK for the entry, we need to associate it to the new
++                 * consumer. */
++                if (group && !noack) {
++                    unsigned char pelbuf[sizeof(streamID)];
++                    {
++                        uint64_t encoded[2];
++                        encoded[0] = htonu64(id.ms);
++                        encoded[1] = htonu64(id.seq);
++                        memcpy(pelbuf,encoded,sizeof(encoded));
++                    }
++
++                    streamNACK *nack = zmalloc(sizeof(*nack));
++                    nack->delivery_time = commandTimeSnapshot();
++                    nack->delivery_count = 1;
++                    nack->consumer = consumer;
++                    int group_inserted =
++                        raxTryInsert(group->pel,pelbuf,sizeof(pelbuf),nack,NULL);
++                    int consumer_inserted =
++                        raxTryInsert(consumer->pel,pelbuf,sizeof(pelbuf),nack,NULL);
++
++                    if (group_inserted == 0) {
++                        zfree(nack);
++                        void *result;
++                        int found = raxFind(group->pel,pelbuf,sizeof(pelbuf),&result);
++                        serverAssert(found);
++                        nack = result;
++                        raxRemove(nack->consumer->pel,pelbuf,sizeof(pelbuf),NULL);
++                        nack->consumer = consumer;
++                        nack->delivery_time = commandTimeSnapshot();
++                        nack->delivery_count = 1;
++                        raxInsert(consumer->pel,pelbuf,sizeof(pelbuf),nack,NULL);
++                    } else if (group_inserted == 1 && consumer_inserted == 0) {
++                        serverPanic("NACK half-created. Should not be possible.");
++                    }
++
++                    consumer->active_time = commandTimeSnapshot();
++
++                    /* Propagate as XCLAIM. */
++                    if (spi) {
++                        robj *argv[14];
++                        robj *idarg = createObjectFromStreamID(&id);
++                        argv[0] = shared.xclaim;
++                        argv[1] = spi->keyname;
++                        argv[2] = spi->groupname;
++                        argv[3] = createStringObject(nack->consumer->name,sdslen(nack->consumer->name));
++                        argv[4] = shared.integers[0];
++                        argv[5] = idarg;
++                        argv[6] = shared.time;
++                        argv[7] = createStringObjectFromLongLong(nack->delivery_time);
++                        argv[8] = shared.retrycount;
++                        argv[9] = createStringObjectFromLongLong(nack->delivery_count);
++                        argv[10] = shared.force;
++                        argv[11] = shared.justid;
++                        argv[12] = shared.lastid;
++                        argv[13] = createObjectFromStreamID(&group->last_id);
++
++                        alsoPropagate(c->db->id,argv,14,PROPAGATE_AOF|PROPAGATE_REPL);
++
++                        decrRefCount(argv[3]);
++                        decrRefCount(argv[7]);
++                        decrRefCount(argv[9]);
++                        decrRefCount(argv[13]);
++                        decrRefCount(idarg);
++                        if (propCount) (*propCount)++;
++                    }
++                }
++
++                arraylen++;
++                if (count && count == arraylen) goto stream_range_done;
++                break;
+             }
+-        }
+ 
+-        arraylen++;
+-        if (count && count == arraylen) break;
++            /* If we do not emit, we have to discard if we are going
++             * forward, or seek the previous entry if we are going
++             * backward. */
++            if (!si.rev) {
++                int64_t to_discard = (item_flags & STREAM_ITEM_FLAG_SAMEFIELDS) ?
++                                      numfields : numfields*2;
++                for (int64_t i = 0; i < to_discard; i++)
++                    si.lp_ele = lpNext(si.lp,si.lp_ele);
++            } else {
++                int64_t prev_times = 4; /* flag + id ms + id seq + one more to
++                                           go back to the previous entry "count"
++                                           field. */
++                if (!(item_flags & STREAM_ITEM_FLAG_SAMEFIELDS)) prev_times++;
++                while(prev_times--) si.lp_ele = lpPrev(si.lp,si.lp_ele);
++            }
++        }
+     }
+ 
++stream_range_done:
+     if (spi && propagate_last_id) {
+-        streamPropagateGroupID(c,spi->keyname,group,spi->groupname);
++        robj *argv[7];
++        argv[0] = shared.xgroup;
++        argv[1] = shared.setid;
++        argv[2] = spi->keyname;
++        argv[3] = spi->groupname;
++        argv[4] = createObjectFromStreamID(&group->last_id);
++        argv[5] = shared.entriesread;
++        argv[6] = createStringObjectFromLongLong(group->entries_read);
++
++        alsoPropagate(c->db->id,argv,7,PROPAGATE_AOF|PROPAGATE_REPL);
++
++        decrRefCount(argv[4]);
++        decrRefCount(argv[6]);
+         if (propCount) (*propCount)++;
+     }
+ 
+-    streamIteratorStop(&si);
++    raxStop(&si.ri);
+     if (arraylen_ptr) setDeferredArrayLen(c,arraylen_ptr,arraylen);
+     return arraylen;
+ }

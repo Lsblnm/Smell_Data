@@ -1,0 +1,227 @@
+diff --git a/tokio/src/fs/file.rs b/tokio/src/fs/file.rs
+index 78470664..b0b06259 100644
+--- a/tokio/src/fs/file.rs
++++ b/tokio/src/fs/file.rs
+@@ -7,11 +7,11 @@ use crate::io::blocking::{Buf, DEFAULT_MAX_BUF_SIZE};
+ use crate::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
+ use crate::sync::Mutex;
+ 
+-use std::cmp;
+ use std::fmt;
+ use std::fs::{Metadata, Permissions};
+ use std::future::Future;
+-use std::io::{self, Seek, SeekFrom};
++use std::io::{self, Read, Seek, SeekFrom};
++use std::mem::MaybeUninit;
+ use std::path::Path;
+ use std::pin::Pin;
+ use std::sync::Arc;
+@@ -602,46 +602,177 @@ impl AsyncRead for File {
+                     }
+ 
+                     let std = me.std.clone();
++                    let filled_len = dst.filled().len();
++                    let dst_capacity = dst.capacity();
++                    let dst_remaining = if dst_capacity > filled_len {
++                        dst_capacity - filled_len
++                    } else {
++                        0
++                    };
++                    let max_buf_size = if dst_remaining > me.max_buf_size {
++                        me.max_buf_size
++                    } else {
++                        dst_remaining
++                    };
+ 
+-                    let max_buf_size = cmp::min(dst.remaining(), me.max_buf_size);
+                     inner.state = State::Busy(spawn_blocking(move || {
+-                        // SAFETY: the `Read` implementation of `std` does not
+-                        // read from the buffer it is borrowing and correctly
+-                        // reports the length of the data written into the buffer.
+-                        let res = unsafe { buf.read_from(&mut &*std, max_buf_size) };
+-                        (Operation::Read(res), buf)
++                        let current_len = buf.buf.len();
++                        let current_pos = buf.pos;
++                        let unread = if current_len > current_pos {
++                            current_len - current_pos
++                        } else {
++                            0
++                        };
++                        assert_eq!(unread, 0);
++                        assert_eq!(current_pos, 0);
++
++                        buf.buf.clear();
++                        buf.pos = 0;
++                        buf.buf.reserve(max_buf_size);
++
++                        let spare = buf.buf.spare_capacity_mut();
++                        let read_slice = unsafe {
++                            // SAFETY: the `Read` implementation of `std` does not
++                            // read from the buffer it is borrowing and correctly
++                            // reports the length of the data written into the buffer.
++                            &mut *(&mut spare[..max_buf_size] as *mut [MaybeUninit<u8>]
++                                as *mut [u8])
++                        };
++
++                        let mut rd = &*std;
++                        let read_res = loop {
++                            match Read::read(&mut rd, read_slice) {
++                                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
++                                res => break res,
++                            }
++                        };
++
++                        match read_res {
++                            Ok(n) => {
++                                unsafe {
++                                    buf.buf.set_len(n);
++                                }
++                                buf.pos = 0;
++                                (Operation::Read(Ok(n)), buf)
++                            }
++                            Err(e) => {
++                                buf.buf.clear();
++                                buf.pos = 0;
++                                (Operation::Read(Err(e)), buf)
++                            }
++                        }
+                     }));
+                 }
+                 State::Busy(ref mut rx) => {
+-                    let (op, mut buf) = ready!(Pin::new(rx).poll(cx))?;
++                    let poll_result = Pin::new(rx).poll(cx);
++                    let join_result = match poll_result {
++                        Poll::Pending => return Poll::Pending,
++                        Poll::Ready(result) => result,
++                    };
++                    let (op, mut buf) = match join_result {
++                        Ok(complete) => complete,
++                        Err(join_err) => return Poll::Ready(Err(join_err.into())),
++                    };
+ 
+                     match op {
+-                        Operation::Read(Ok(_)) => {
+-                            buf.copy_to(dst);
++                        Operation::Read(Ok(_bytes_read)) => {
++                            let buf_len = buf.buf.len();
++                            let buf_pos = buf.pos;
++                            let available = if buf_len > buf_pos {
++                                buf_len - buf_pos
++                            } else {
++                                0
++                            };
++
++                            let filled_len = dst.filled().len();
++                            let dst_capacity = dst.capacity();
++                            let dst_remaining = if dst_capacity > filled_len {
++                                dst_capacity - filled_len
++                            } else {
++                                0
++                            };
++
++                            let to_copy = if available > dst_remaining {
++                                dst_remaining
++                            } else {
++                                available
++                            };
++
++                            let mut copied = 0;
++                            while copied < to_copy {
++                                let remaining_to_copy = to_copy - copied;
++                                let chunk = remaining_to_copy.min(8192);
++                                if chunk == 0 {
++                                    break;
++                                } else {
++                                    let start = buf_pos + copied;
++                                    let end = start + chunk;
++                                    if end <= buf.buf.len() {
++                                        let src = &buf.buf[start..end];
++                                        let unfilled = dst.initialize_unfilled_to(chunk);
++                                        unfilled.copy_from_slice(src);
++                                        dst.advance(chunk);
++                                        copied += chunk;
++                                    } else {
++                                        break;
++                                    }
++                                }
++                            }
++                            buf.pos = buf_pos + copied;
++
++                            if buf.pos >= buf.buf.len() {
++                                buf.buf.truncate(0);
++                                buf.pos = 0;
++                            }
++
+                             inner.state = State::Idle(Some(buf));
+                             return Poll::Ready(Ok(()));
+                         }
+                         Operation::Read(Err(e)) => {
+-                            assert!(buf.is_empty());
+-
++                            let buf_len = buf.buf.len();
++                            let buf_pos = buf.pos;
++                            let unread = if buf_len > buf_pos {
++                                buf_len - buf_pos
++                            } else {
++                                0
++                            };
++                            assert_eq!(unread, 0);
+                             inner.state = State::Idle(Some(buf));
+                             return Poll::Ready(Err(e));
+                         }
+                         Operation::Write(Ok(())) => {
+-                            assert!(buf.is_empty());
++                            let buf_len = buf.buf.len();
++                            let buf_pos = buf.pos;
++                            let unread = if buf_len > buf_pos {
++                                buf_len - buf_pos
++                            } else {
++                                0
++                            };
++                            assert_eq!(unread, 0);
+                             inner.state = State::Idle(Some(buf));
+                             continue;
+                         }
+                         Operation::Write(Err(e)) => {
+                             assert!(inner.last_write_err.is_none());
+-                            inner.last_write_err = Some(e.kind());
++                            let kind = e.kind();
++                            inner.last_write_err = Some(kind);
+                             inner.state = State::Idle(Some(buf));
+                         }
+                         Operation::Seek(result) => {
+-                            assert!(buf.is_empty());
++                            let buf_len = buf.buf.len();
++                            let buf_pos = buf.pos;
++                            let unread = if buf_len > buf_pos {
++                                buf_len - buf_pos
++                            } else {
++                                0
++                            };
++                            assert_eq!(unread, 0);
+                             inner.state = State::Idle(Some(buf));
+-                            if let Ok(pos) = result {
+-                                inner.pos = pos;
++                            match result {
++                                Ok(pos) => {
++                                    inner.pos = pos;
++                                }
++                                Err(_) => {}
+                             }
+                             continue;
+                         }
+diff --git a/tokio/src/io/blocking.rs b/tokio/src/io/blocking.rs
+index 1af50654..a361265a 100644
+--- a/tokio/src/io/blocking.rs
++++ b/tokio/src/io/blocking.rs
+@@ -20,8 +20,8 @@ pub(crate) struct Blocking<T> {
+ 
+ #[derive(Debug)]
+ pub(crate) struct Buf {
+-    buf: Vec<u8>,
+-    pos: usize,
++    pub(crate) buf: Vec<u8>,
++    pub(crate) pos: usize,
+ }
+ 
+ pub(crate) const DEFAULT_MAX_BUF_SIZE: usize = 2 * 1024 * 1024;

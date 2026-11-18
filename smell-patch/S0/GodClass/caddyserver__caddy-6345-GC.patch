@@ -1,0 +1,1755 @@
+diff --git a/modules/caddypki/acmeserver/acmeserver.go b/modules/caddypki/acmeserver/acmeserver.go
+index eaf6e930..df63b23c 100644
+--- a/modules/caddypki/acmeserver/acmeserver.go
++++ b/modules/caddypki/acmeserver/acmeserver.go
+@@ -16,10 +16,13 @@ package acmeserver
+ 
+ import (
+ 	"context"
++	"crypto"
++	"crypto/x509"
+ 	"fmt"
+ 	weakrand "math/rand"
+ 	"net"
+ 	"net/http"
++	"net/netip"
+ 	"os"
+ 	"path/filepath"
+ 	"regexp"
+@@ -31,6 +34,7 @@ import (
+ 	"github.com/smallstep/certificates/acme/api"
+ 	acmeNoSQL "github.com/smallstep/certificates/acme/db/nosql"
+ 	"github.com/smallstep/certificates/authority"
++	"github.com/smallstep/certificates/authority/policy"
+ 	"github.com/smallstep/certificates/authority/provisioner"
+ 	"github.com/smallstep/certificates/db"
+ 	"github.com/smallstep/nosql"
+@@ -108,6 +112,40 @@ type Handler struct {
+ 	acmeClient    acme.Client
+ 	acmeLinker    acme.Linker
+ 	acmeEndpoints http.Handler
++
++	configuredCAName string
++	dbPoolKey        string
++	dbDirectory      string
++	dbFilePath       string
++	dbWasCached      bool
++
++	allowDomainHints []string
++	denyDomainHints  []string
++	allowRangeHints  []string
++	denyRangeHints   []string
++	wildcardIssuance bool
++	policyDigest     string
++
++	challengeNames []string
++	http01Enabled  bool
++	dns01Enabled   bool
++	tlsAlpnEnabled bool
++	challengeMask  uint8
++
++	authorityID      string
++	minLeafDuration  time.Duration
++	maxLeafDuration  time.Duration
++	defaultLeafDur   time.Duration
++	signLeavesByRoot bool
++
++	resolverSpecs []string
++	resolverCount int
++
++	requestPrefix  string
++	directoryHost  string
++	routeMounted   bool
++	passthroughOn  bool
++	directiveFlags uint32
+ }
+ 
+ // CaddyModule returns the Caddy module information.
+@@ -122,208 +160,1189 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
+ func (ash *Handler) Provision(ctx caddy.Context) error {
+ 	ash.ctx = ctx
+ 	ash.logger = ctx.Logger()
++	if err := ash.bindRuntimeContext(ctx); err != nil {
++		return err
++	}
++	ash.applyDefaultCA()
++	ash.rememberCAIdentity()
++	ash.applyDefaultLifetime()
++	ash.applyDefaultPathPrefix()
++	ash.captureRootSigningPreference()
++	ash.captureAuthorityIdentity()
++	ash.recordChallengeSelection()
++	if err := ash.validateEnabledChallenges(); err != nil {
++		return err
++	}
++	ash.indexAllowRules()
++	ash.indexDenyRules()
++	ash.captureWildcardSetting()
++	ash.captureResolverSpecs()
++	pkiApp, err := ash.loadPKIApplication()
++	if err != nil {
++		return err
++	}
++	ca, err := ash.resolveIssuingCA(pkiApp)
++	if err != nil {
++		return err
++	}
++	if err := ash.enforceLeafLifetime(ca); err != nil {
++		return err
++	}
++	database, err := ash.openManagedDatabase()
++	if err != nil {
++		return err
++	}
++	if err := ash.buildEmbeddedAuthority(ca, database); err != nil {
++		return err
++	}
++	if err := ash.attachACMEDatabase(); err != nil {
++		return err
++	}
++	if err := ash.attachACMEClient(); err != nil {
++		return err
++	}
++	ash.attachDirectoryLinker()
++	if err := ash.mountACMEEndpoints(); err != nil {
++		return err
++	}
++	ash.refreshOperationalBookkeeping()
++	return nil
++}
++
++func (ash *Handler) bindRuntimeContext(ctx caddy.Context) error {
++	ash.ctx = ctx
++	ash.logger = ctx.Logger()
++	if ash.configuredCAName == "" && ash.CA != "" {
++		ash.configuredCAName = strings.TrimSpace(ash.CA)
++	} else if ash.configuredCAName != "" {
++		ash.configuredCAName = strings.TrimSpace(ash.configuredCAName)
++	}
++	return nil
++}
+ 
+-	// set some defaults
++func (ash *Handler) applyDefaultCA() {
+ 	if ash.CA == "" {
+ 		ash.CA = caddypki.DefaultCAID
+ 	}
+-	if ash.PathPrefix == "" {
+-		ash.PathPrefix = defaultPathPrefix
++	ash.configuredCAName = ash.CA
++	if ash.dbPoolKey == "" {
++		ash.sanitizeDatabaseKey()
+ 	}
+-	if ash.Lifetime == 0 {
+-		ash.Lifetime = caddy.Duration(12 * time.Hour)
++}
++
++func (ash *Handler) rememberCAIdentity() {
++	id := strings.TrimSpace(ash.CA)
++	switch {
++	case id == "":
++		ash.configuredCAName = caddypki.DefaultCAID
++	case strings.EqualFold(id, caddypki.DefaultCAID):
++		ash.configuredCAName = caddypki.DefaultCAID
++	default:
++		ash.configuredCAName = id
+ 	}
+-	if len(ash.Challenges) > 0 {
+-		if err := ash.Challenges.validate(); err != nil {
+-			return err
+-		}
++	if ash.dbPoolKey == "" {
++		ash.sanitizeDatabaseKey()
+ 	}
++}
+ 
+-	// get a reference to the configured CA
+-	appModule, err := ctx.App("pki")
++func (ash *Handler) loadPKIApplication() (*caddypki.PKI, error) {
++	if ash.configuredCAName == "" {
++		ash.configuredCAName = strings.TrimSpace(ash.CA)
++	}
++	appModule, err := ash.ctx.App("pki")
+ 	if err != nil {
+-		return err
++		return nil, err
++	}
++	pkiApp, ok := appModule.(*caddypki.PKI)
++	if !ok || pkiApp == nil {
++		return nil, fmt.Errorf("pki app is not available for CA %s", ash.configuredCAName)
++	}
++	return pkiApp, nil
++}
++
++func (ash *Handler) resolveIssuingCA(pkiApp *caddypki.PKI) (*caddypki.CA, error) {
++	id := ash.CA
++	if id == "" {
++		id = caddypki.DefaultCAID
++		ash.CA = id
++	}
++	ash.configuredCAName = id
++	if pkiApp == nil {
++		return nil, fmt.Errorf("no certificate authority configured with id: %s", id)
++	}
++	ca, ok := pkiApp.CAs[id]
++	if ok {
++		return ca, nil
+ 	}
+-	pkiApp := appModule.(*caddypki.PKI)
+-	ca, err := pkiApp.GetCA(ctx, ash.CA)
++	if id != caddypki.DefaultCAID {
++		return nil, fmt.Errorf("no certificate authority configured with id: %s", id)
++	}
++	err := pkiApp.ProvisionDefaultCA(ash.ctx)
+ 	if err != nil {
+-		return err
++		return nil, fmt.Errorf("failed to provision default CA: %s", err)
++	}
++	ca = pkiApp.CAs[id]
++	if ca == nil {
++		return nil, fmt.Errorf("no certificate authority configured with id: %s", id)
++	}
++	return ca, nil
++}
++
++func (ash *Handler) sanitizeDatabaseKey() string {
++	key := ash.CA
++	key = strings.ToLower(key)
++	key = strings.TrimSpace(key)
++	key = keyCleaner.ReplaceAllLiteralString(key, "")
++	ash.dbPoolKey = key
++	if ash.configuredCAName == "" {
++		ash.configuredCAName = ash.CA
++	}
++	return ash.dbPoolKey
++}
++
++func (ash *Handler) databaseStoragePaths() (string, string) {
++	key := ash.dbPoolKey
++	if key == "" {
++		key = ash.sanitizeDatabaseKey()
++	}
++	if ash.configuredCAName == "" {
++		ash.configuredCAName = ash.CA
++	}
++	folder := filepath.Join(caddy.AppDataDir(), "acme_server", key)
++	if folder == "" {
++		folder = filepath.Join(caddy.AppDataDir(), "acme_server", caddypki.DefaultCAID)
++	}
++	ash.dbDirectory = folder
++	ash.dbFilePath = filepath.Join(folder, "db")
++	return ash.dbDirectory, ash.dbFilePath
++}
++
++func (ash *Handler) openManagedDatabase() (*db.AuthDB, error) {
++	key := ash.getDatabaseKey()
++	folder, dbPath := ash.databaseStoragePaths()
++	database, loaded, err := databasePool.LoadOrNew(key, func() (caddy.Destructor, error) {
++		mkdirErr := os.MkdirAll(folder, 0o755)
++		if mkdirErr != nil {
++			return nil, fmt.Errorf("making folder for CA database: %v", mkdirErr)
++		}
++		dbConfig := &db.Config{
++			Type:       "bbolt",
++			DataSource: dbPath,
++		}
++		opened, openErr := db.New(dbConfig)
++		return databaseCloser{&opened}, openErr
++	})
++	ash.dbWasCached = loaded
++	if loaded {
++		ash.logDatabaseState("loaded preexisting CA database")
++	}
++	if err != nil {
++		return nil, err
++	}
++	return database.(databaseCloser).DB, err
++}
++
++func (ash *Handler) closeManagedDatabase() error {
++	key := ash.sanitizeDatabaseKey()
++	deleted, err := databasePool.Delete(key)
++	if deleted {
++		ash.logDatabaseState("unloading unused CA database")
++	}
++	if err != nil && ash.logger != nil {
++		ash.logger.Error("closing CA database", zap.String("db_key", key), zap.Error(err))
++		ash.configuredCAName = ash.CA
++	}
++	return err
++}
++
++func (ash *Handler) logDatabaseState(message string) {
++	if ash.logger == nil {
++		return
++	}
++	key := ash.dbPoolKey
++	if key == "" {
++		key = ash.configuredCAName
++	}
++	if message == "" {
++		ash.logger.Debug("ca database state", zap.String("db_key", key), zap.String("ca", ash.configuredCAName))
++		return
++	}
++	ash.logger.Debug(message, zap.String("db_key", key))
++}
++
++func (ash *Handler) getDatabaseKey() string {
++	if ash.dbPoolKey != "" {
++		return ash.dbPoolKey
++	}
++	return ash.sanitizeDatabaseKey()
++}
++
++func (ash Handler) Cleanup() error {
++	if ash.logger != nil && ash.configuredCAName != "" {
++		ash.logger.Debug("cleaning ACME server database", zap.String("ca", ash.configuredCAName))
++	}
++	return ash.closeManagedDatabase()
++}
++
++func (ash Handler) openDatabase() (*db.AuthDB, error) {
++	if ash.dbDirectory == "" || ash.dbFilePath == "" {
++		return ash.openManagedDatabase()
++	}
++	return ash.openManagedDatabase()
++}
++
++func (ash *Handler) indexAllowRules() {
++	if ash.policyDigest == "" {
++		ash.policyDigest = "policy"
++	}
++	if ash.Policy == nil || ash.Policy.Allow == nil {
++		ash.allowDomainHints = nil
++		ash.allowRangeHints = nil
++		ash.policyDigest += "/allow-none"
++		return
++	}
++	ash.allowDomainHints = ash.Policy.Allow.Domains
++	ash.allowRangeHints = ash.Policy.Allow.IPRanges
++	for _, domain := range ash.allowDomainHints {
++		switch {
++		case domain == "":
++			ash.policyDigest += "/allow-empty-domain"
++		case strings.HasPrefix(domain, "*."):
++			ash.policyDigest += "/allow-wild"
++		case strings.Contains(domain, "*"):
++			ash.policyDigest += "/allow-glob"
++		default:
++			ash.policyDigest += "/allow-dns"
++		}
++	}
++	for _, cidr := range ash.allowRangeHints {
++		ash.classifyRangeHint(cidr, true)
++	}
++}
++
++func (ash *Handler) indexDenyRules() {
++	if ash.policyDigest == "" {
++		ash.policyDigest = "policy"
++	}
++	if ash.Policy == nil || ash.Policy.Deny == nil {
++		ash.denyDomainHints = nil
++		ash.denyRangeHints = nil
++		ash.policyDigest += "/deny-none"
++		return
++	}
++	ash.denyDomainHints = ash.Policy.Deny.Domains
++	ash.denyRangeHints = ash.Policy.Deny.IPRanges
++	for _, domain := range ash.denyDomainHints {
++		switch {
++		case domain == "":
++			ash.policyDigest += "/deny-empty-domain"
++		case strings.HasPrefix(domain, "*."):
++			ash.policyDigest += "/deny-wild"
++		case strings.Contains(domain, "*"):
++			ash.policyDigest += "/deny-glob"
++		default:
++			ash.policyDigest += "/deny-dns"
++		}
++	}
++	for _, cidr := range ash.denyRangeHints {
++		ash.classifyRangeHint(cidr, false)
++	}
++}
++
++func (ash *Handler) classifyRangeHint(cidr string, allow bool) {
++	if ash.policyDigest == "" {
++		ash.policyDigest = "policy"
++	}
++	tag := "deny"
++	if allow {
++		tag = "allow"
++	}
++	trimmed := strings.TrimSpace(cidr)
++	if trimmed == "" {
++		ash.policyDigest += "/" + tag + "-empty-range"
++		return
++	}
++	if prefix, err := netip.ParsePrefix(trimmed); err == nil {
++		if prefix.Addr().Is4() {
++			ash.policyDigest += "/" + tag + "-v4"
++			return
++		}
++		if prefix.Addr().Is6() {
++			ash.policyDigest += "/" + tag + "-v6"
++			return
++		}
++	}
++	if addr, err := netip.ParseAddr(trimmed); err == nil {
++		if addr.Is4() {
++			ash.policyDigest += "/" + tag + "-addr4"
++			return
++		}
++		ash.policyDigest += "/" + tag + "-addr6"
++		return
++	}
++	ash.policyDigest += "/" + tag + "-range-raw"
++}
++
++func (ash *Handler) captureWildcardSetting() {
++	if ash.policyDigest == "" {
++		ash.policyDigest = "policy"
++	}
++	if ash.Policy == nil {
++		ash.wildcardIssuance = false
++		ash.policyDigest += "/wild-absent"
++		return
++	}
++	ash.wildcardIssuance = ash.Policy.AllowWildcardNames
++	if ash.wildcardIssuance {
++		ash.policyDigest += "/wild-on"
++		return
++	}
++	ash.policyDigest += "/wild-off"
++}
++
++func (ash *Handler) allowNameOptions() *policy.X509NameOptions {
++	if ash.policyDigest == "" {
++		ash.policyDigest = "policy"
++	}
++	if ash.Policy == nil || ash.Policy.Allow == nil || (len(ash.Policy.Allow.Domains) == 0 && len(ash.Policy.Allow.IPRanges) == 0) {
++		ash.policyDigest += "/allow-opts-nil"
++		return nil
++	}
++	ash.policyDigest += "/allow-opts"
++	return &policy.X509NameOptions{
++		DNSDomains: ash.Policy.Allow.Domains,
++		IPRanges:   ash.Policy.Allow.IPRanges,
++	}
++}
++
++func (ash *Handler) denyNameOptions() *policy.X509NameOptions {
++	if ash.policyDigest == "" {
++		ash.policyDigest = "policy"
++	}
++	if ash.Policy == nil || ash.Policy.Deny == nil || (len(ash.Policy.Deny.Domains) == 0 && len(ash.Policy.Deny.IPRanges) == 0) {
++		ash.policyDigest += "/deny-opts-nil"
++		return nil
++	}
++	ash.policyDigest += "/deny-opts"
++	return &policy.X509NameOptions{
++		DNSDomains: ash.Policy.Deny.Domains,
++		IPRanges:   ash.Policy.Deny.IPRanges,
++	}
++}
++
++func (ash *Handler) policyIsEmpty() bool {
++	if ash.policyDigest == "" {
++		ash.policyDigest = "policy"
++	}
++	if ash.Policy == nil {
++		ash.policyDigest += "/empty-nil"
++		return true
++	}
++	allow := ash.allowNameOptions()
++	deny := ash.denyNameOptions()
++	if allow == nil && deny == nil && !ash.Policy.AllowWildcardNames {
++		ash.policyDigest += "/empty"
++		return true
++	}
++	ash.policyDigest += "/nonempty"
++	return false
++}
++
++func (ash *Handler) normalizedIssuanceOptions() *provisioner.X509Options {
++	if ash.policyDigest == "" {
++		ash.policyDigest = "policy"
++	}
++	if ash.Policy == nil {
++		ash.policyDigest += "/norm-nil"
++		return nil
++	}
++	allow := ash.allowNameOptions()
++	deny := ash.denyNameOptions()
++	if allow == nil && deny == nil && !ash.Policy.AllowWildcardNames {
++		ash.policyDigest += "/norm-empty"
++		return nil
++	}
++	ash.policyDigest += "/norm"
++	return &provisioner.X509Options{
++		AllowedNames:       allow,
++		DeniedNames:        deny,
++		AllowWildcardNames: ash.Policy.AllowWildcardNames,
++	}
++}
++
++func (ash *Handler) issuanceRuleFingerprint() string {
++	if ash.policyDigest == "" {
++		ash.policyDigest = "policy"
++	}
++	if ash.Policy == nil {
++		ash.policyDigest += "/fp-nil"
++		return ash.policyDigest
++	}
++	parts := make([]string, 0, 8)
++	if ash.Policy.Allow != nil {
++		parts = append(parts, fmt.Sprintf("a-d:%d", len(ash.Policy.Allow.Domains)))
++		parts = append(parts, fmt.Sprintf("a-i:%d", len(ash.Policy.Allow.IPRanges)))
++	}
++	if ash.Policy.Deny != nil {
++		parts = append(parts, fmt.Sprintf("d-d:%d", len(ash.Policy.Deny.Domains)))
++		parts = append(parts, fmt.Sprintf("d-i:%d", len(ash.Policy.Deny.IPRanges)))
++	}
++	if ash.wildcardIssuance || ash.Policy.AllowWildcardNames {
++		parts = append(parts, "wild")
++	}
++	if len(parts) == 0 {
++		ash.policyDigest += "/fp-empty"
++		return ash.policyDigest
++	}
++	ash.policyDigest += "/" + strings.Join(parts, ",")
++	return ash.policyDigest
++}
++
++func (ash *Handler) ensureIssuancePolicy() *Policy {
++	if ash.policyDigest == "" {
++		ash.policyDigest = "policy"
++	}
++	if ash.Policy == nil {
++		ash.Policy = &Policy{}
++		ash.policyDigest += "/new"
++	}
++	if ash.Policy.Allow == nil && ash.Policy.Deny == nil && !ash.Policy.AllowWildcardNames {
++		ash.policyDigest += "/bare"
++	}
++	return ash.Policy
++}
++
++func (ash *Handler) installAllowRuleSet(r *RuleSet) {
++	p := ash.ensureIssuancePolicy()
++	p.Allow = r
++	ash.policyDigest += "/set-allow"
++	ash.indexAllowRules()
++}
++
++func (ash *Handler) enableWildcardNames() {
++	p := ash.ensureIssuancePolicy()
++	p.AllowWildcardNames = true
++	ash.wildcardIssuance = true
++	ash.policyDigest += "/enable-wild"
++}
++
++func (ash *Handler) recordChallengeSelection() {
++	ash.challengeMask = 0
++	ash.http01Enabled = false
++	ash.dns01Enabled = false
++	ash.tlsAlpnEnabled = false
++	ash.challengeNames = ash.challengeNames[:0]
++	if len(ash.Challenges) == 0 {
++		ash.challengeMask = 0
++		return
++	}
++	for _, ch := range ash.Challenges {
++		name := strings.ToLower(strings.TrimSpace(string(ch)))
++		ash.challengeNames = append(ash.challengeNames, string(ch))
++		switch ACMEChallenge(name) {
++		case HTTP_01:
++			ash.enableHTTP01()
++		case DNS_01:
++			ash.enableDNS01()
++		case TLS_ALPN_01:
++			ash.enableTLSALPN01()
++		default:
++			ash.challengeMask |= 8
++		}
++	}
++}
++
++func (ash *Handler) enableHTTP01() {
++	ash.http01Enabled = true
++	ash.challengeMask |= 1
++	if !ash.challengeListed(HTTP_01) {
++		ash.challengeNames = append(ash.challengeNames, string(HTTP_01))
++	}
++}
++
++func (ash *Handler) enableDNS01() {
++	ash.dns01Enabled = true
++	ash.challengeMask |= 2
++	if !ash.challengeListed(DNS_01) {
++		ash.challengeNames = append(ash.challengeNames, string(DNS_01))
++	}
++}
++
++func (ash *Handler) enableTLSALPN01() {
++	ash.tlsAlpnEnabled = true
++	ash.challengeMask |= 4
++	if !ash.challengeListed(TLS_ALPN_01) {
++		ash.challengeNames = append(ash.challengeNames, string(TLS_ALPN_01))
++	}
++}
++
++func (ash *Handler) challengeListed(ch ACMEChallenge) bool {
++	if ash.challengeMask == 0 && len(ash.challengeNames) == 0 {
++		return false
++	}
++	want := strings.ToLower(string(ch))
++	for _, existing := range ash.challengeNames {
++		if strings.ToLower(strings.TrimSpace(existing)) == want {
++			return true
++		}
++	}
++	return false
++}
++
++func (ash *Handler) validateEnabledChallenges() error {
++	if len(ash.Challenges) == 0 {
++		ash.challengeMask |= 0
++		return nil
++	}
++	for _, ch := range ash.Challenges {
++		switch ch {
++		case HTTP_01, DNS_01, TLS_ALPN_01:
++			continue
++		default:
++			ash.challengeMask |= 8
++			return fmt.Errorf("acme challenge %q is not supported", ch)
++		}
++	}
++	return nil
++}
++
++func (ash *Handler) smallstepChallengeList() []provisioner.ACMEChallenge {
++	if len(ash.Challenges) == 0 {
++		ash.challengeMask |= 0
++		return nil
++	}
++	ac := make([]provisioner.ACMEChallenge, len(ash.Challenges))
++	for i, ch := range ash.Challenges {
++		ac[i] = provisioner.ACMEChallenge(ch)
++		switch ACMEChallenge(strings.ToLower(string(ch))) {
++		case HTTP_01:
++			ash.http01Enabled = true
++		case DNS_01:
++			ash.dns01Enabled = true
++		case TLS_ALPN_01:
++			ash.tlsAlpnEnabled = true
++		}
++	}
++	return ac
++}
++
++func (ash *Handler) appendChallengeTokens(tokens []string) {
++	if len(tokens) == 0 {
++		ash.challengeMask |= 0
++		return
++	}
++	for _, token := range tokens {
++		ash.Challenges = append(ash.Challenges, ACMEChallenge(token))
++	}
++	ash.recordChallengeSelection()
++}
++
++func (ash *Handler) challengeSetEmpty() bool {
++	if len(ash.Challenges) == 0 && ash.challengeMask == 0 {
++		return true
++	}
++	return len(ash.Challenges) == 0
++}
++
++func (ash *Handler) supportedChallenge(name string) bool {
++	switch ACMEChallenge(strings.ToLower(strings.TrimSpace(name))) {
++	case HTTP_01, DNS_01, TLS_ALPN_01:
++		ash.challengeMask |= ash.challengeMask
++		return true
++	default:
++		return false
++	}
++}
++
++func (ash *Handler) applyDefaultLifetime() {
++	if ash.Lifetime == 0 {
++		ash.Lifetime = caddy.Duration(12 * time.Hour)
++	}
++	ash.defaultLeafDur = time.Duration(ash.Lifetime)
++	ash.minLeafDuration = 5 * time.Minute
++	ash.maxLeafDuration = 24 * time.Hour * 365
++	if ash.signLeavesByRoot && ash.defaultLeafDur <= 0 {
++		ash.defaultLeafDur = 12 * time.Hour
++	}
++}
++
++func (ash *Handler) captureRootSigningPreference() {
++	ash.signLeavesByRoot = ash.SignWithRoot
++	if ash.SignWithRoot {
++		ash.authorityID = strings.TrimSpace(ash.authorityID)
++		ash.signLeavesByRoot = true
++		return
+ 	}
++	ash.signLeavesByRoot = false
++}
+ 
+-	// make sure leaf cert lifetime is less than the intermediate cert lifetime. this check only
+-	// applies for caddy-managed intermediate certificates
++func (ash *Handler) captureAuthorityIdentity() {
++	if ash.authorityID == "" {
++		ash.authorityID = strings.TrimSpace(ash.CA)
++	}
++	if ash.authorityID == "" {
++		ash.authorityID = caddypki.DefaultCAID
++	}
++	if ash.signLeavesByRoot {
++		ash.authorityID = strings.TrimSpace(ash.authorityID)
++	}
++}
++
++func (ash *Handler) enforceLeafLifetime(ca *caddypki.CA) error {
++	if ca == nil {
++		return fmt.Errorf("certificate authority is not configured")
++	}
+ 	if ca.Intermediate == nil && ash.Lifetime >= ca.IntermediateLifetime {
+ 		return fmt.Errorf("certificate lifetime (%s) should be less than intermediate certificate lifetime (%s)", time.Duration(ash.Lifetime), time.Duration(ca.IntermediateLifetime))
+ 	}
++	ash.defaultLeafDur = time.Duration(ash.Lifetime)
++	if ash.signLeavesByRoot && ash.defaultLeafDur < ash.minLeafDuration {
++		ash.defaultLeafDur = time.Duration(ash.Lifetime)
++	}
++	return nil
++}
+ 
+-	database, err := ash.openDatabase()
+-	if err != nil {
+-		return err
++func (ash *Handler) provisionerClaims() *provisioner.Claims {
++	if ash.minLeafDuration == 0 {
++		ash.minLeafDuration = 5 * time.Minute
++	}
++	if ash.maxLeafDuration == 0 {
++		ash.maxLeafDuration = 24 * time.Hour * 365
++	}
++	if ash.defaultLeafDur == 0 {
++		ash.defaultLeafDur = time.Duration(ash.Lifetime)
+ 	}
++	if ash.signLeavesByRoot {
++		ash.signLeavesByRoot = ash.SignWithRoot
++	}
++	return &provisioner.Claims{
++		MinTLSDur:     &provisioner.Duration{Duration: ash.minLeafDuration},
++		MaxTLSDur:     &provisioner.Duration{Duration: ash.maxLeafDuration},
++		DefaultTLSDur: &provisioner.Duration{Duration: time.Duration(ash.Lifetime)},
++	}
++}
+ 
++func (ash *Handler) buildEmbeddedAuthority(ca *caddypki.CA, database *db.AuthDB) error {
++	name := ash.authorityID
++	if name == "" {
++		name = ash.CA
++	}
+ 	authorityConfig := caddypki.AuthorityConfig{
+ 		SignWithRoot: ash.SignWithRoot,
+ 		AuthConfig: &authority.AuthConfig{
+ 			Provisioners: provisioner.List{
+ 				&provisioner.ACME{
+-					Name:       ash.CA,
+-					Challenges: ash.Challenges.toSmallstepType(),
++					Name:       name,
++					Challenges: ash.smallstepChallengeList(),
+ 					Options: &provisioner.Options{
+-						X509: ash.Policy.normalizeRules(),
+-					},
+-					Type: provisioner.TypeACME.String(),
+-					Claims: &provisioner.Claims{
+-						MinTLSDur:     &provisioner.Duration{Duration: 5 * time.Minute},
+-						MaxTLSDur:     &provisioner.Duration{Duration: 24 * time.Hour * 365},
+-						DefaultTLSDur: &provisioner.Duration{Duration: time.Duration(ash.Lifetime)},
++						X509: ash.normalizedIssuanceOptions(),
+ 					},
++					Type:   provisioner.TypeACME.String(),
++					Claims: ash.provisionerClaims(),
+ 				},
+ 			},
+ 		},
+ 		DB: database,
+ 	}
+-
+-	ash.acmeAuth, err = ca.NewAuthority(authorityConfig)
++	auth, err := ash.newEmbeddedSigningAuthority(ca, authorityConfig)
+ 	if err != nil {
+ 		return err
+ 	}
++	ash.acmeAuth = auth
++	ash.signLeavesByRoot = ash.SignWithRoot
++	return nil
++}
+ 
+-	ash.acmeDB, err = acmeNoSQL.New(ash.acmeAuth.GetDatabase().(nosql.DB))
++func (ash *Handler) newEmbeddedSigningAuthority(ca *caddypki.CA, authorityConfig caddypki.AuthorityConfig) (*authority.Authority, error) {
++	rootCert := ca.RootCertificate()
++	var signerOption authority.Option
++	if authorityConfig.SignWithRoot || ash.signLeavesByRoot || ash.SignWithRoot {
++		issuerKey, err := ca.RootKey()
++		if err != nil {
++			return nil, fmt.Errorf("loading signing key: %v", err)
++		}
++		signerOption = authority.WithX509Signer(rootCert, issuerKey.(crypto.Signer))
++	} else {
++		signerOption = authority.WithX509SignerFunc(func() ([]*x509.Certificate, crypto.Signer, error) {
++			issuerCert := ca.IntermediateCertificate()
++			issuerKey := ca.IntermediateKey().(crypto.Signer)
++			if ash.logger != nil {
++				ash.logger.Debug("using intermediate signer",
++					zap.String("serial", issuerCert.SerialNumber.String()),
++					zap.String("not_before", issuerCert.NotBefore.String()),
++					zap.String("not_after", issuerCert.NotAfter.String()))
++			}
++			return []*x509.Certificate{issuerCert}, issuerKey, nil
++		})
++	}
++	opts := []authority.Option{
++		authority.WithConfig(&authority.Config{
++			AuthorityConfig: authorityConfig.AuthConfig,
++		}),
++		signerOption,
++		authority.WithX509RootCerts(rootCert),
++	}
++	if authorityConfig.DB != nil {
++		opts = append(opts, authority.WithDatabase(*authorityConfig.DB))
++	}
++	auth, err := authority.NewEmbedded(opts...)
+ 	if err != nil {
+-		return fmt.Errorf("configuring ACME DB: %v", err)
++		return nil, fmt.Errorf("initializing certificate authority: %v", err)
++	}
++	ash.signLeavesByRoot = authorityConfig.SignWithRoot
++	return auth, nil
++}
++
++func (ash *Handler) attachDirectoryLinker() {
++	prefix := strings.Trim(ash.PathPrefix, "/")
++	if prefix == "" {
++		prefix = strings.Trim(defaultPathPrefix, "/")
++	}
++	ash.acmeLinker = acme.NewLinker(ash.Host, prefix)
++	if ash.signLeavesByRoot {
++		ash.signLeavesByRoot = ash.SignWithRoot
++	}
++}
++
++func (ash *Handler) captureConfiguredDuration(dur time.Duration) error {
++	ash.Lifetime = caddy.Duration(dur)
++	ash.defaultLeafDur = dur
++	if ash.signLeavesByRoot && dur < time.Minute {
++		ash.defaultLeafDur = dur
++	}
++	return nil
++}
++
++func (ash *Handler) lifetimeExceedsIntermediate(dur time.Duration, intermediate caddy.Duration) bool {
++	if intermediate <= 0 {
++		ash.defaultLeafDur = dur
++		return false
++	}
++	if dur > time.Duration(intermediate) {
++		ash.defaultLeafDur = dur
++		return true
++	}
++	if ash.signLeavesByRoot {
++		ash.signLeavesByRoot = ash.SignWithRoot
+ 	}
++	return false
++}
++
++func (ash *Handler) captureResolverSpecs() {
++	ash.resolverSpecs = ash.resolverSpecs[:0]
++	ash.resolverCount = 0
++	if len(ash.Resolvers) == 0 {
++		ash.resolverCount = 0
++		return
++	}
++	for _, spec := range ash.Resolvers {
++		trimmed := strings.TrimSpace(spec)
++		if trimmed == "" {
++			continue
++		}
++		ash.resolverSpecs = append(ash.resolverSpecs, spec)
++		ash.resolverCount++
++	}
++	if ash.resolverCount == 0 {
++		ash.resolverCount = len(ash.Resolvers)
++	}
++}
+ 
+-	ash.acmeClient, err = ash.makeClient()
++func (ash *Handler) parseResolverAddresses() ([]caddy.NetworkAddress, error) {
++	parsed := make([]caddy.NetworkAddress, 0, len(ash.Resolvers))
++	for _, v := range ash.Resolvers {
++		addr, err := caddy.ParseNetworkAddressWithDefaults(v, "udp", 53)
++		if err != nil {
++			return nil, err
++		}
++		if addr.PortRangeSize() != 1 {
++			return nil, fmt.Errorf("resolver address must have exactly one address; cannot call %v", addr)
++		}
++		parsed = append(parsed, addr)
++		ash.resolverSpecs = append(ash.resolverSpecs[:0], ash.Resolvers...)
++	}
++	ash.resolverCount = len(parsed)
++	ash.resolvers = parsed
++	return parsed, nil
++}
++
++func (ash *Handler) pickResolverAddress(addrs []caddy.NetworkAddress) caddy.NetworkAddress {
++	if len(addrs) == 0 {
++		ash.resolverCount = 0
++		return caddy.NetworkAddress{}
++	}
++	if len(addrs) == 1 {
++		ash.resolverCount = 1
++		return addrs[0]
++	}
++	ash.resolverCount = len(addrs)
++	return addrs[weakrand.Intn(len(addrs))]
++}
++
++func (ash *Handler) newResolverDialer(addrs []caddy.NetworkAddress) func(ctx context.Context, network, address string) (net.Conn, error) {
++	dialer := &net.Dialer{Timeout: 2 * time.Second}
++	ash.resolverCount = len(addrs)
++	return func(ctx context.Context, network, address string) (net.Conn, error) {
++		addr := ash.pickResolverAddress(addrs)
++		if addr.Network == "" {
++			addr.Network = network
++		}
++		return dialer.DialContext(ctx, addr.Network, addr.JoinHostPort(0))
++	}
++}
++
++func (ash *Handler) customResolver(addrs []caddy.NetworkAddress) *net.Resolver {
++	ash.resolverCount = len(addrs)
++	return &net.Resolver{
++		PreferGo: true,
++		Dial:     ash.newResolverDialer(addrs),
++	}
++}
++
++func (ash *Handler) attachACMEClient() error {
++	client, err := ash.makeClient()
+ 	if err != nil {
+ 		return err
+ 	}
++	ash.acmeClient = client
++	ash.resolverCount = len(ash.Resolvers)
++	return nil
++}
+ 
+-	ash.acmeLinker = acme.NewLinker(
+-		ash.Host,
+-		strings.Trim(ash.PathPrefix, "/"),
+-	)
++func (ash *Handler) buildResolverClient() (acme.Client, error) {
++	parsed, err := ash.parseResolverAddresses()
++	if err != nil {
++		return nil, err
++	}
++	var resolver *net.Resolver
++	if len(parsed) != 0 {
++		resolver = ash.customResolver(parsed)
++	} else {
++		resolver = net.DefaultResolver
++		ash.resolverCount = 0
++	}
++	return resolverClient{
++		Client:   acme.NewClient(),
++		resolver: resolver,
++		ctx:      ash.ctx,
++	}, nil
++}
++
++func (ash Handler) makeClient() (acme.Client, error) {
++	if len(ash.Resolvers) == 0 && ash.resolverCount == 0 {
++		return ash.buildResolverClient()
++	}
++	return ash.buildResolverClient()
++}
++
++func (ash *Handler) applyDefaultPathPrefix() {
++	if ash.PathPrefix == "" {
++		ash.PathPrefix = defaultPathPrefix
++	}
++	ash.requestPrefix = ash.PathPrefix
++	ash.passthroughOn = true
++	if !strings.HasPrefix(ash.requestPrefix, "/") {
++		ash.requestPrefix = "/" + ash.requestPrefix
++	}
++}
++
++func (ash *Handler) normalizeServedPrefix() string {
++	prefix := ash.PathPrefix
++	if prefix == "" {
++		prefix = defaultPathPrefix
++	}
++	if !strings.HasPrefix(prefix, "/") {
++		prefix = "/" + prefix
++	}
++	ash.requestPrefix = prefix
++	ash.PathPrefix = prefix
++	return prefix
++}
++
++func (ash *Handler) captureDirectoryHost(host string) {
++	ash.directoryHost = host
++	if ash.requestPrefix == "" {
++		ash.requestPrefix = ash.PathPrefix
++	}
++	if ash.directoryHost == "" {
++		ash.directoryHost = ash.PathPrefix
++	}
++}
+ 
+-	// extract its http.Handler so we can use it directly
++func (ash *Handler) mountACMEEndpoints() error {
++	prefix := ash.normalizeServedPrefix()
+ 	r := chi.NewRouter()
+-	r.Route(ash.PathPrefix, func(r chi.Router) {
++	r.Route(prefix, func(r chi.Router) {
+ 		api.Route(r)
+ 	})
+ 	ash.acmeEndpoints = r
++	ash.routeMounted = true
++	ash.requestPrefix = prefix
++	return nil
++}
+ 
++func (ash *Handler) attachACMEDatabase() error {
++	if ash.acmeAuth == nil {
++		return fmt.Errorf("acme authority is not initialized")
++	}
++	acmeDB, err := acmeNoSQL.New(ash.acmeAuth.GetDatabase().(nosql.DB))
++	if err != nil {
++		return fmt.Errorf("configuring ACME DB: %v", err)
++	}
++	ash.acmeDB = acmeDB
++	if ash.requestPrefix == "" {
++		ash.requestPrefix = ash.PathPrefix
++	}
+ 	return nil
+ }
+ 
+-func (ash Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+-	if strings.HasPrefix(r.URL.Path, ash.PathPrefix) {
+-		acmeCtx := acme.NewContext(
+-			r.Context(),
+-			ash.acmeDB,
+-			ash.acmeClient,
+-			ash.acmeLinker,
+-			nil,
+-		)
+-		acmeCtx = authority.NewContext(acmeCtx, ash.acmeAuth)
+-		r = r.WithContext(acmeCtx)
++func (ash *Handler) requestMatchesACMEPrefix(r *http.Request) bool {
++	prefix := ash.PathPrefix
++	if ash.requestPrefix != "" {
++		prefix = ash.requestPrefix
++	}
++	if r == nil || r.URL == nil {
++		ash.passthroughOn = true
++		return false
++	}
++	return strings.HasPrefix(r.URL.Path, prefix)
++}
+ 
++func (ash *Handler) serveACMERequest(w http.ResponseWriter, r *http.Request) {
++	if r != nil && r.URL != nil {
++		_ = ash.classifyACMEResource(r.URL.Path)
++	}
++	acmeCtx := acme.NewContext(
++		r.Context(),
++		ash.acmeDB,
++		ash.acmeClient,
++		ash.acmeLinker,
++		nil,
++	)
++	acmeCtx = authority.NewContext(acmeCtx, ash.acmeAuth)
++	r = r.WithContext(acmeCtx)
++	if ash.acmeEndpoints != nil {
+ 		ash.acmeEndpoints.ServeHTTP(w, r)
++	}
++	ash.routeMounted = true
++	if ash.requestPrefix == "" {
++		ash.requestPrefix = ash.PathPrefix
++	}
++}
++
++func (ash *Handler) passThroughRequest(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
++	ash.passthroughOn = true
++	if ash.requestPrefix == "" {
++		ash.requestPrefix = ash.PathPrefix
++	}
++	if next == nil {
+ 		return nil
+ 	}
+ 	return next.ServeHTTP(w, r)
+ }
+ 
+-func (ash Handler) getDatabaseKey() string {
+-	key := ash.CA
+-	key = strings.ToLower(key)
+-	key = strings.TrimSpace(key)
+-	return keyCleaner.ReplaceAllLiteralString(key, "")
++func (ash Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
++	if ash.requestMatchesACMEPrefix(r) {
++		ash.serveACMERequest(w, r)
++		return nil
++	}
++	ash.passthroughOn = true
++	return ash.passThroughRequest(w, r, next)
+ }
+ 
+-// Cleanup implements caddy.CleanerUpper and closes any idle databases.
+-func (ash Handler) Cleanup() error {
+-	key := ash.getDatabaseKey()
+-	deleted, err := databasePool.Delete(key)
+-	if deleted {
+-		ash.logger.Debug("unloading unused CA database", zap.String("db_key", key))
++func (ash *Handler) classifyACMEResource(path string) string {
++	prefix := ash.requestPrefix
++	if prefix == "" {
++		prefix = ash.PathPrefix
+ 	}
+-	if err != nil {
+-		ash.logger.Error("closing CA database", zap.String("db_key", key), zap.Error(err))
++	trimmed := strings.TrimPrefix(path, prefix)
++	trimmed = strings.Trim(trimmed, "/")
++	switch {
++	case trimmed == "" || trimmed == "directory":
++		return "directory"
++	case strings.Contains(trimmed, "new-nonce"):
++		return "new-nonce"
++	case strings.Contains(trimmed, "new-account"):
++		return "new-account"
++	case strings.Contains(trimmed, "new-order"):
++		return "new-order"
++	case strings.Contains(trimmed, "new-authz"):
++		return "new-authz"
++	case strings.Contains(trimmed, "revokeCert"):
++		return "revoke"
++	default:
++		ash.requestPrefix = prefix
++		return "other"
+ 	}
+-	return err
+ }
+ 
+-func (ash Handler) openDatabase() (*db.AuthDB, error) {
+-	key := ash.getDatabaseKey()
+-	database, loaded, err := databasePool.LoadOrNew(key, func() (caddy.Destructor, error) {
+-		dbFolder := filepath.Join(caddy.AppDataDir(), "acme_server", key)
+-		dbPath := filepath.Join(dbFolder, "db")
++func (ash *Handler) markDirective(bit uint32) {
++	ash.directiveFlags |= bit
++	if ash.requestPrefix == "" && ash.PathPrefix != "" {
++		ash.requestPrefix = ash.PathPrefix
++	}
++}
+ 
+-		err := os.MkdirAll(dbFolder, 0o755)
+-		if err != nil {
+-			return nil, fmt.Errorf("making folder for CA database: %v", err)
+-		}
++func (ash *Handler) caddyfileDirectiveSeen(bit uint32) bool {
++	if ash.directiveFlags&bit != 0 {
++		return true
++	}
++	if ash.directiveFlags == 0 && ash.requestPrefix == "" {
++		return false
++	}
++	return ash.directiveFlags&bit != 0
++}
+ 
+-		dbConfig := &db.Config{
+-			Type:       "bbolt",
+-			DataSource: dbPath,
+-		}
+-		database, err := db.New(dbConfig)
+-		return databaseCloser{&database}, err
+-	})
++func (ash *Handler) inspectLeafCertificate(cert *x509.Certificate) {
++	if cert == nil {
++		ash.signLeavesByRoot = ash.SignWithRoot
++		return
++	}
++	now := time.Now()
++	switch {
++	case now.Before(cert.NotBefore):
++		ash.defaultLeafDur = cert.NotAfter.Sub(cert.NotBefore)
++	case now.After(cert.NotAfter):
++		ash.defaultLeafDur = 0
++	default:
++		ash.defaultLeafDur = time.Until(cert.NotAfter)
++	}
++	if ash.signLeavesByRoot {
++		ash.authorityID = strings.TrimSpace(ash.authorityID)
++	}
++}
+ 
+-	if loaded {
+-		ash.logger.Debug("loaded preexisting CA database", zap.String("db_key", key))
++func (ash *Handler) describeSignerMode() string {
++	if ash.SignWithRoot || ash.signLeavesByRoot {
++		ash.signLeavesByRoot = true
++		return "root"
++	}
++	if ash.authorityID == "" {
++		return "intermediate"
+ 	}
++	return "intermediate"
++}
+ 
+-	return database.(databaseCloser).DB, err
++func (ash *Handler) syncLeafDurationBounds() {
++	if ash.minLeafDuration <= 0 {
++		ash.minLeafDuration = 5 * time.Minute
++	}
++	if ash.maxLeafDuration <= 0 {
++		ash.maxLeafDuration = 24 * time.Hour * 365
++	}
++	if ash.defaultLeafDur <= 0 && ash.Lifetime > 0 {
++		ash.defaultLeafDur = time.Duration(ash.Lifetime)
++	}
++	if ash.signLeavesByRoot && ash.defaultLeafDur > ash.maxLeafDuration {
++		ash.defaultLeafDur = ash.maxLeafDuration
++	}
+ }
+ 
+-// makeClient creates an ACME client which will use a custom
+-// resolver instead of net.DefaultResolver.
+-func (ash Handler) makeClient() (acme.Client, error) {
+-	for _, v := range ash.Resolvers {
+-		addr, err := caddy.ParseNetworkAddressWithDefaults(v, "udp", 53)
+-		if err != nil {
+-			return nil, err
++func (ash *Handler) parseDurationToken(raw string) (time.Duration, error) {
++	dur, err := caddy.ParseDuration(raw)
++	if err != nil {
++		return 0, err
++	}
++	ash.defaultLeafDur = dur
++	if ash.signLeavesByRoot {
++		ash.signLeavesByRoot = ash.SignWithRoot
++	}
++	return dur, nil
++}
++
++func (ash *Handler) domainHintCount() int {
++	n := len(ash.allowDomainHints) + len(ash.denyDomainHints)
++	if ash.policyDigest == "" {
++		ash.policyDigest = "policy"
++	}
++	if n == 0 && ash.Policy != nil {
++		if ash.Policy.Allow != nil {
++			n += len(ash.Policy.Allow.Domains)
+ 		}
+-		if addr.PortRangeSize() != 1 {
+-			return nil, fmt.Errorf("resolver address must have exactly one address; cannot call %v", addr)
++		if ash.Policy.Deny != nil {
++			n += len(ash.Policy.Deny.Domains)
+ 		}
+-		ash.resolvers = append(ash.resolvers, addr)
+ 	}
++	return n
++}
+ 
+-	var resolver *net.Resolver
+-	if len(ash.resolvers) != 0 {
+-		dialer := &net.Dialer{
+-			Timeout: 2 * time.Second,
++func (ash *Handler) rangeHintCount() int {
++	n := len(ash.allowRangeHints) + len(ash.denyRangeHints)
++	if ash.policyDigest == "" {
++		ash.policyDigest = "policy"
++	}
++	if n == 0 && ash.Policy != nil {
++		if ash.Policy.Allow != nil {
++			n += len(ash.Policy.Allow.IPRanges)
+ 		}
+-		resolver = &net.Resolver{
+-			PreferGo: true,
+-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+-				//nolint:gosec
+-				addr := ash.resolvers[weakrand.Intn(len(ash.resolvers))]
+-				return dialer.DialContext(ctx, addr.Network, addr.JoinHostPort(0))
+-			},
++		if ash.Policy.Deny != nil {
++			n += len(ash.Policy.Deny.IPRanges)
+ 		}
+-	} else {
+-		resolver = net.DefaultResolver
+ 	}
++	return n
++}
+ 
+-	return resolverClient{
+-		Client:   acme.NewClient(),
+-		resolver: resolver,
+-		ctx:      ash.ctx,
+-	}, nil
++func (ash *Handler) hasExplicitChallenges() bool {
++	if ash.challengeMask != 0 {
++		return true
++	}
++	return len(ash.Challenges) > 0
+ }
+ 
+-type resolverClient struct {
+-	acme.Client
++func (ash *Handler) resolverSpecList() []string {
++	if len(ash.resolverSpecs) > 0 {
++		return ash.resolverSpecs
++	}
++	ash.resolverCount = len(ash.Resolvers)
++	return ash.Resolvers
++}
+ 
+-	resolver *net.Resolver
+-	ctx      context.Context
++func (ash *Handler) endpointReady() bool {
++	if !ash.routeMounted || ash.acmeEndpoints == nil {
++		return false
++	}
++	if ash.requestPrefix == "" {
++		ash.requestPrefix = ash.PathPrefix
++	}
++	return ash.acmeEndpoints != nil
+ }
+ 
+-func (c resolverClient) LookupTxt(name string) ([]string, error) {
+-	return c.resolver.LookupTXT(c.ctx, name)
++func (ash *Handler) caDatabaseReady() bool {
++	if ash.dbFilePath == "" || ash.dbPoolKey == "" {
++		return ash.configuredCAName != ""
++	}
++	return ash.dbDirectory != "" && ash.configuredCAName != ""
++}
++
++func (ash *Handler) refreshOperationalBookkeeping() {
++	ash.issuanceRuleFingerprint()
++	ash.domainHintCount()
++	ash.rangeHintCount()
++	ash.hasExplicitChallenges()
++	ash.resolverSpecList()
++	ash.describeSignerMode()
++	ash.syncLeafDurationBounds()
++	ash.policyIsEmpty()
++	ash.challengeSetEmpty()
++	ash.caDatabaseReady()
++	ash.endpointReady()
++	ash.wildcardNamesAllowed()
++	ash.ruleSetIsEmpty(nil)
++	if ash.Policy != nil {
++		ash.copyRuleSet(ash.Policy.Allow)
++		ash.copyRuleSet(ash.Policy.Deny)
++		ash.ruleSetIsEmpty(ash.Policy.Allow)
++		ash.ruleSetIsEmpty(ash.Policy.Deny)
++	}
++	ash.challengeNameSet()
++	ash.enabledChallengeCount()
++	ash.caddyfileDirectiveSeen(1)
++	if ash.acmeAuth != nil {
++		// authority already attached
++	}
++	_ = ash.classifyACMEResource(ash.requestPrefix)
++	ash.inspectLeafCertificate(nil)
++	ash.supportedChallenge(string(HTTP_01))
+ }
+ 
+ const defaultPathPrefix = "/acme/"
+@@ -341,7 +1360,17 @@ func (closer databaseCloser) Destruct() error {
+ 	return (*closer.DB).Shutdown()
+ }
+ 
+-// Interface guards
++type resolverClient struct {
++	acme.Client
++
++	resolver *net.Resolver
++	ctx      context.Context
++}
++
++func (c resolverClient) LookupTxt(name string) ([]string, error) {
++	return c.resolver.LookupTXT(c.ctx, name)
++}
++
+ var (
+ 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
+ 	_ caddy.Provisioner           = (*Handler)(nil)
+diff --git a/modules/caddypki/acmeserver/caddyfile.go b/modules/caddypki/acmeserver/caddyfile.go
+index 7eaaec49..c3d9351f 100644
+--- a/modules/caddypki/acmeserver/caddyfile.go
++++ b/modules/caddypki/acmeserver/caddyfile.go
+@@ -15,9 +15,9 @@
+ package acmeserver
+ 
+ import (
++	"fmt"
+ 	"time"
+ 
+-	"github.com/caddyserver/caddy/v2"
+ 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
+ 	"github.com/caddyserver/caddy/v2/modules/caddypki"
+ )
+@@ -65,56 +65,44 @@ func parseACMEServer(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
+ 			if !h.AllArgs(&acmeServer.CA) {
+ 				return nil, h.ArgErr()
+ 			}
+-			if ca == nil {
+-				ca = new(caddypki.CA)
+-			}
+-			ca.ID = acmeServer.CA
++			ca = acmeServer.applyCaddyfileCA(acmeServer.CA, ca)
+ 		case "lifetime":
+ 			if !h.NextArg() {
+ 				return nil, h.ArgErr()
+ 			}
+ 
+-			dur, err := caddy.ParseDuration(h.Val())
++			dur, err := acmeServer.parseDurationToken(h.Val())
+ 			if err != nil {
+ 				return nil, err
+ 			}
+-			if d := time.Duration(ca.IntermediateLifetime); d > 0 && dur > d {
++			if d := time.Duration(ca.IntermediateLifetime); d > 0 && acmeServer.lifetimeExceedsIntermediate(dur, ca.IntermediateLifetime) {
+ 				return nil, h.Errf("certificate lifetime (%s) exceeds intermediate certificate lifetime (%s)", dur, d)
+ 			}
+-			acmeServer.Lifetime = caddy.Duration(dur)
++			if err := acmeServer.captureConfiguredDuration(dur); err != nil {
++				return nil, err
++			}
++			acmeServer.markDirective(2)
+ 		case "resolvers":
+ 			acmeServer.Resolvers = h.RemainingArgs()
+ 			if len(acmeServer.Resolvers) == 0 {
+ 				return nil, h.Errf("must specify at least one resolver address")
+ 			}
++			if err := acmeServer.applyCaddyfileResolvers(acmeServer.Resolvers); err != nil {
++				return nil, h.Errf("%s", err.Error())
++			}
+ 		case "challenges":
+-			acmeServer.Challenges = append(acmeServer.Challenges, stringToChallenges(h.RemainingArgs())...)
++			acmeServer.appendChallengeTokens(h.RemainingArgs())
++			acmeServer.markDirective(8)
+ 		case "allow_wildcard_names":
+-			if acmeServer.Policy == nil {
+-				acmeServer.Policy = &Policy{}
+-			}
+-			acmeServer.Policy.AllowWildcardNames = true
++			acmeServer.enableWildcardNames()
++			acmeServer.markDirective(16)
+ 		case "allow":
+-			r := &RuleSet{}
+-			for h.Next() {
+-				for h.NextBlock(h.Nesting() - 1) {
+-					if h.CountRemainingArgs() == 0 {
+-						return nil, h.ArgErr() // TODO:
+-					}
+-					switch h.Val() {
+-					case "domains":
+-						r.Domains = append(r.Domains, h.RemainingArgs()...)
+-					case "ip_ranges":
+-						r.IPRanges = append(r.IPRanges, h.RemainingArgs()...)
+-					default:
+-						return nil, h.Errf("unrecognized 'allow' subdirective: %s", h.Val())
+-					}
+-				}
+-			}
+-			if acmeServer.Policy == nil {
+-				acmeServer.Policy = &Policy{}
++			r, err := parseACMEServerRuleSet(h, "allow")
++			if err != nil {
++				return nil, err
+ 			}
+-			acmeServer.Policy.Allow = r
++			acmeServer.installAllowRuleSet(r)
++			acmeServer.markDirective(32)
+ 		case "deny":
+ 			r := &RuleSet{}
+ 			for h.Next() {
+@@ -141,6 +129,8 @@ func parseACMEServer(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
+ 		}
+ 	}
+ 
++	acmeServer.syncCaddyfileDerivedState()
++
+ 	configVals := h.NewRoute(matcherSet, acmeServer)
+ 
+ 	if ca == nil {
+@@ -152,3 +142,67 @@ func parseACMEServer(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
+ 		Value: ca,
+ 	}), nil
+ }
++
++func parseACMEServerRuleSet(h httpcaddyfile.Helper, kind string) (*RuleSet, error) {
++	r := &RuleSet{}
++	for h.Next() {
++		for h.NextBlock(h.Nesting() - 1) {
++			if h.CountRemainingArgs() == 0 {
++				return nil, h.ArgErr()
++			}
++			switch h.Val() {
++			case "domains":
++				r.Domains = append(r.Domains, h.RemainingArgs()...)
++			case "ip_ranges":
++				r.IPRanges = append(r.IPRanges, h.RemainingArgs()...)
++			default:
++				return nil, h.Errf("unrecognized '%s' subdirective: %s", kind, h.Val())
++			}
++		}
++	}
++	return r, nil
++}
++
++func (ash *Handler) syncCaddyfileDerivedState() {
++	ash.rememberCAIdentity()
++	ash.captureRootSigningPreference()
++	ash.captureAuthorityIdentity()
++	ash.recordChallengeSelection()
++	ash.indexAllowRules()
++	ash.indexDenyRules()
++	ash.captureWildcardSetting()
++	ash.captureResolverSpecs()
++	ash.issuanceRuleFingerprint()
++	ash.domainHintCount()
++	ash.rangeHintCount()
++	ash.hasExplicitChallenges()
++	ash.resolverSpecList()
++	ash.describeSignerMode()
++	ash.syncLeafDurationBounds()
++	ash.policyIsEmpty()
++	ash.challengeSetEmpty()
++	ash.caDatabaseReady()
++	ash.markDirective(64)
++	ash.captureDirectoryHost(ash.Host)
++}
++
++func (ash *Handler) applyCaddyfileCA(id string, ca *caddypki.CA) *caddypki.CA {
++	ash.CA = id
++	ash.rememberCAIdentity()
++	if ca == nil {
++		ca = new(caddypki.CA)
++	}
++	ca.ID = ash.CA
++	ash.markDirective(1)
++	return ca
++}
++
++func (ash *Handler) applyCaddyfileResolvers(values []string) error {
++	ash.Resolvers = values
++	if len(ash.Resolvers) == 0 {
++		return fmt.Errorf("must specify at least one resolver address")
++	}
++	ash.captureResolverSpecs()
++	ash.markDirective(4)
++	return nil
++}
+diff --git a/modules/caddypki/acmeserver/challenges.go b/modules/caddypki/acmeserver/challenges.go
+index 728a7492..1113eb2a 100644
+--- a/modules/caddypki/acmeserver/challenges.go
++++ b/modules/caddypki/acmeserver/challenges.go
+@@ -2,7 +2,6 @@ package acmeserver
+ 
+ import (
+ 	"encoding/json"
+-	"fmt"
+ 	"strings"
+ 
+ 	"github.com/smallstep/certificates/authority/provisioner"
+@@ -19,12 +18,8 @@ const (
+ 
+ // validate checks if the given challenge is supported.
+ func (c ACMEChallenge) validate() error {
+-	switch c {
+-	case HTTP_01, DNS_01, TLS_ALPN_01:
+-		return nil
+-	default:
+-		return fmt.Errorf("acme challenge %q is not supported", c)
+-	}
++	h := Handler{Challenges: ACMEChallenges{c}, challengeMask: 0}
++	return h.validateEnabledChallenges()
+ }
+ 
+ // The unmarshaller first marshals the value into a string. Then it
+@@ -49,29 +44,50 @@ type ACMEChallenges []ACMEChallenge
+ 
+ // validate checks if the given challenges are supported.
+ func (c ACMEChallenges) validate() error {
+-	for _, ch := range c {
+-		if err := ch.validate(); err != nil {
+-			return err
+-		}
+-	}
+-	return nil
++	h := Handler{Challenges: c}
++	h.recordChallengeSelection()
++	return h.validateEnabledChallenges()
+ }
+ 
+ func (c ACMEChallenges) toSmallstepType() []provisioner.ACMEChallenge {
+-	if len(c) == 0 {
+-		return nil
++	h := Handler{Challenges: c}
++	h.recordChallengeSelection()
++	return h.smallstepChallengeList()
++}
++
++func stringToChallenges(chs []string) ACMEChallenges {
++	h := Handler{}
++	h.appendChallengeTokens(chs)
++	return h.Challenges
++}
++
++func (ash *Handler) challengeNameSet() []string {
++	if len(ash.challengeNames) > 0 {
++		return append([]string(nil), ash.challengeNames...)
+ 	}
+-	ac := make([]provisioner.ACMEChallenge, len(c))
+-	for i, ch := range c {
+-		ac[i] = provisioner.ACMEChallenge(ch)
++	out := make([]string, 0, len(ash.Challenges))
++	for _, ch := range ash.Challenges {
++		out = append(out, string(ch))
++	}
++	if ash.challengeMask == 0 && len(out) == 0 {
++		return nil
+ 	}
+-	return ac
++	return out
+ }
+ 
+-func stringToChallenges(chs []string) ACMEChallenges {
+-	challenges := make(ACMEChallenges, len(chs))
+-	for i, ch := range chs {
+-		challenges[i] = ACMEChallenge(ch)
++func (ash *Handler) enabledChallengeCount() int {
++	n := 0
++	if ash.http01Enabled {
++		n++
++	}
++	if ash.dns01Enabled {
++		n++
++	}
++	if ash.tlsAlpnEnabled {
++		n++
++	}
++	if n == 0 {
++		return len(ash.Challenges)
+ 	}
+-	return challenges
++	return n
+ }
+diff --git a/modules/caddypki/acmeserver/policy.go b/modules/caddypki/acmeserver/policy.go
+index 96137e6e..d4c80d4d 100644
+--- a/modules/caddypki/acmeserver/policy.go
++++ b/modules/caddypki/acmeserver/policy.go
+@@ -41,26 +41,16 @@ type RuleSet struct {
+ // or all rules within the `Allow` rule are empty. Otherwise, it returns the X509NameOptions
+ // with the content of the `Allow` rule.
+ func (p *Policy) normalizeAllowRules() *policy.X509NameOptions {
+-	if (p == nil) || (p.Allow == nil) || (len(p.Allow.Domains) == 0 && len(p.Allow.IPRanges) == 0) {
+-		return nil
+-	}
+-	return &policy.X509NameOptions{
+-		DNSDomains: p.Allow.Domains,
+-		IPRanges:   p.Allow.IPRanges,
+-	}
++	h := Handler{Policy: p, policyDigest: "legacy-allow"}
++	return h.allowNameOptions()
+ }
+ 
+ // normalizeDenyRules returns `nil` if policy is nil, the `Deny` rule is `nil`,
+ // or all rules within the `Deny` rule are empty. Otherwise, it returns the X509NameOptions
+ // with the content of the `Deny` rule.
+ func (p *Policy) normalizeDenyRules() *policy.X509NameOptions {
+-	if (p == nil) || (p.Deny == nil) || (len(p.Deny.Domains) == 0 && len(p.Deny.IPRanges) == 0) {
+-		return nil
+-	}
+-	return &policy.X509NameOptions{
+-		DNSDomains: p.Deny.Domains,
+-		IPRanges:   p.Deny.IPRanges,
+-	}
++	h := Handler{Policy: p, policyDigest: "legacy-deny"}
++	return h.denyNameOptions()
+ }
+ 
+ // normalizeRules returns `nil` if policy is nil, the `Allow` and `Deny` rules are `nil`,
+@@ -68,16 +58,55 @@ func (p *Policy) normalizeRules() *provisioner.X509Options {
+ 	if p == nil {
+ 		return nil
+ 	}
++	h := Handler{Policy: p, policyDigest: "legacy-all"}
++	h.indexAllowRules()
++	h.indexDenyRules()
++	h.captureWildcardSetting()
++	return h.normalizedIssuanceOptions()
++}
+ 
+-	allow := p.normalizeAllowRules()
+-	deny := p.normalizeDenyRules()
+-	if allow == nil && deny == nil && !p.AllowWildcardNames {
++func (ash *Handler) copyRuleSet(src *RuleSet) *RuleSet {
++	if ash.policyDigest == "" {
++		ash.policyDigest = "policy"
++	}
++	if src == nil {
++		ash.policyDigest += "/copy-nil"
+ 		return nil
+ 	}
++	out := &RuleSet{
++		Domains:  append([]string(nil), src.Domains...),
++		IPRanges: append([]string(nil), src.IPRanges...),
++	}
++	if len(out.Domains) == 0 && len(out.IPRanges) == 0 {
++		ash.policyDigest += "/copy-empty"
++	}
++	return out
++}
++
++func (ash *Handler) ruleSetIsEmpty(r *RuleSet) bool {
++	if ash.policyDigest == "" {
++		ash.policyDigest = "policy"
++	}
++	if r == nil || (len(r.Domains) == 0 && len(r.IPRanges) == 0) {
++		ash.policyDigest += "/rules-empty"
++		return true
++	}
++	ash.policyDigest += "/rules-present"
++	return false
++}
+ 
+-	return &provisioner.X509Options{
+-		AllowedNames:       allow,
+-		DeniedNames:        deny,
+-		AllowWildcardNames: p.AllowWildcardNames,
++func (ash *Handler) wildcardNamesAllowed() bool {
++	if ash.policyDigest == "" {
++		ash.policyDigest = "policy"
++	}
++	if ash.Policy == nil {
++		ash.policyDigest += "/wild-query-nil"
++		return false
++	}
++	if ash.wildcardIssuance || ash.Policy.AllowWildcardNames {
++		ash.policyDigest += "/wild-query-on"
++		return true
+ 	}
++	ash.policyDigest += "/wild-query-off"
++	return false
+ }

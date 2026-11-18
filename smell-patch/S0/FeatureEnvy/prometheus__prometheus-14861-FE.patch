@@ -1,0 +1,500 @@
+diff --git a/promql/engine.go b/promql/engine.go
+index dd855c6d2..01bc53196 100644
+--- a/promql/engine.go
++++ b/promql/engine.go
+@@ -441,6 +441,185 @@ func (ng *Engine) Close() error {
+ 	return nil
+ }
+ 
++// rangeEval evaluates the given expressions, and then for each step calls
++// the given funcCall with the values computed for each expression at that
++// step. The return value is the combination into time series of all the
++// function call results.
++// The prepSeries function (if provided) can be used to prepare the helper
++// for each series, then passed to each call funcCall.
++func (ng *Engine) rangeEval(ev *evaluator, ctx context.Context, prepSeries func(labels.Labels, *EvalSeriesHelper), funcCall func([]parser.Value, [][]EvalSeriesHelper, *EvalNodeHelper) (Vector, annotations.Annotations), exprs ...parser.Expr) (Matrix, annotations.Annotations) {
++	numSteps := int((ev.endTimestamp-ev.startTimestamp)/ev.interval) + 1
++	matrixes := make([]Matrix, len(exprs))
++	origMatrixes := make([]Matrix, len(exprs))
++	originalNumSamples := ev.currentSamples
++
++	var warnings annotations.Annotations
++	for i, e := range exprs {
++		// Functions will take string arguments from the expressions, not the values.
++		if e != nil && e.Type() != parser.ValueTypeString {
++			// ev.currentSamples will be updated to the correct value within the ev.eval call.
++			val, ws := ev.eval(ctx, e)
++			warnings.Merge(ws)
++			matrixes[i] = val.(Matrix)
++
++			// Keep a copy of the original point slices so that they
++			// can be returned to the pool.
++			origMatrixes[i] = make(Matrix, len(matrixes[i]))
++			copy(origMatrixes[i], matrixes[i])
++		}
++	}
++
++	vectors := make([]Vector, len(exprs))    // Input vectors for the function.
++	args := make([]parser.Value, len(exprs)) // Argument to function.
++	// Create an output vector that is as big as the input matrix with
++	// the most time series.
++	biggestLen := 1
++	for i := range exprs {
++		vectors[i] = make(Vector, 0, len(matrixes[i]))
++		if len(matrixes[i]) > biggestLen {
++			biggestLen = len(matrixes[i])
++		}
++	}
++	enh := &EvalNodeHelper{Out: make(Vector, 0, biggestLen), enableDelayedNameRemoval: ng.enableDelayedNameRemoval}
++	type seriesAndTimestamp struct {
++		Series
++		ts int64
++	}
++	seriess := make(map[uint64]seriesAndTimestamp, biggestLen) // Output series by series hash.
++	tempNumSamples := ev.currentSamples
++
++	var (
++		seriesHelpers [][]EvalSeriesHelper
++		bufHelpers    [][]EvalSeriesHelper // Buffer updated on each step
++	)
++
++	// If the series preparation function is provided, we should run it for
++	// every single series in the matrix.
++	if prepSeries != nil {
++		seriesHelpers = make([][]EvalSeriesHelper, len(exprs))
++		bufHelpers = make([][]EvalSeriesHelper, len(exprs))
++
++		for i := range exprs {
++			seriesHelpers[i] = make([]EvalSeriesHelper, len(matrixes[i]))
++			bufHelpers[i] = make([]EvalSeriesHelper, len(matrixes[i]))
++
++			for si, series := range matrixes[i] {
++				prepSeries(series.Metric, &seriesHelpers[i][si])
++			}
++		}
++	}
++
++	for ts := ev.startTimestamp; ts <= ev.endTimestamp; ts += ev.interval {
++		if err := contextDone(ctx, "expression evaluation"); err != nil {
++			ev.error(err)
++		}
++		// Reset number of samples in memory after each timestamp.
++		ev.currentSamples = tempNumSamples
++		// Gather input vectors for this timestamp.
++		for i := range exprs {
++			vectors[i] = vectors[i][:0]
++
++			if prepSeries != nil {
++				bufHelpers[i] = bufHelpers[i][:0]
++			}
++
++			for si, series := range matrixes[i] {
++				switch {
++				case len(series.Floats) > 0 && series.Floats[0].T == ts:
++					vectors[i] = append(vectors[i], Sample{Metric: series.Metric, F: series.Floats[0].F, T: ts, DropName: series.DropName})
++					// Move input vectors forward so we don't have to re-scan the same
++					// past points at the next step.
++					matrixes[i][si].Floats = series.Floats[1:]
++				case len(series.Histograms) > 0 && series.Histograms[0].T == ts:
++					vectors[i] = append(vectors[i], Sample{Metric: series.Metric, H: series.Histograms[0].H, T: ts, DropName: series.DropName})
++					matrixes[i][si].Histograms = series.Histograms[1:]
++				default:
++					continue
++				}
++				if prepSeries != nil {
++					bufHelpers[i] = append(bufHelpers[i], seriesHelpers[i][si])
++				}
++				// Don't add histogram size here because we only
++				// copy the pointer above, not the whole
++				// histogram.
++				ev.currentSamples++
++				if ev.currentSamples > ng.maxSamplesPerQuery {
++					ev.error(ErrTooManySamples(env))
++				}
++			}
++			args[i] = vectors[i]
++			ev.samplesStats.UpdatePeak(ev.currentSamples)
++		}
++
++		// Make the function call.
++		enh.Ts = ts
++		result, ws := funcCall(args, bufHelpers, enh)
++		enh.Out = result[:0] // Reuse result vector.
++		warnings.Merge(ws)
++
++		vecNumSamples := result.TotalSamples()
++		ev.currentSamples += vecNumSamples
++		// When we reset currentSamples to tempNumSamples during the next iteration of the loop it also
++		// needs to include the samples from the result here, as they're still in memory.
++		tempNumSamples += vecNumSamples
++		ev.samplesStats.UpdatePeak(ev.currentSamples)
++
++		if ev.currentSamples > ng.maxSamplesPerQuery {
++			ev.error(ErrTooManySamples(env))
++		}
++
++		// If this could be an instant query, shortcut so as not to change sort order.
++		if ev.endTimestamp == ev.startTimestamp {
++			if !ng.enableDelayedNameRemoval && result.ContainsSameLabelset() {
++				ev.errorf("vector cannot contain metrics with the same labelset")
++			}
++			mat := make(Matrix, len(result))
++			for i, s := range result {
++				if s.H == nil {
++					mat[i] = Series{Metric: s.Metric, Floats: []FPoint{{T: ts, F: s.F}}, DropName: s.DropName}
++				} else {
++					mat[i] = Series{Metric: s.Metric, Histograms: []HPoint{{T: ts, H: s.H}}, DropName: s.DropName}
++				}
++			}
++			ev.currentSamples = originalNumSamples + mat.TotalSamples()
++			ev.samplesStats.UpdatePeak(ev.currentSamples)
++			return mat, warnings
++		}
++
++		// Add samples in output vector to output series.
++		for _, sample := range result {
++			h := sample.Metric.Hash()
++			ss, ok := seriess[h]
++			if ok {
++				if ss.ts == ts { // If we've seen this output series before at this timestamp, it's a duplicate.
++					ev.errorf("vector cannot contain metrics with the same labelset")
++				}
++				ss.ts = ts
++			} else {
++				ss = seriesAndTimestamp{Series{Metric: sample.Metric, DropName: sample.DropName}, ts}
++			}
++			addToSeries(&ss.Series, enh.Ts, sample.F, sample.H, numSteps)
++			seriess[h] = ss
++		}
++	}
++
++	// Reuse the original point slices.
++	for _, m := range origMatrixes {
++		for _, s := range m {
++			putFPointSlice(s.Floats)
++			putHPointSlice(s.Histograms)
++		}
++	}
++	// Assemble the output matrix. By the time we get here we know we don't have too many samples.
++	mat := make(Matrix, 0, len(seriess))
++	for _, ss := range seriess {
++		mat = append(mat, ss.Series)
++	}
++	ev.currentSamples = originalNumSamples + mat.TotalSamples()
++	ev.samplesStats.UpdatePeak(ev.currentSamples)
++	return mat, warnings
++}
++
+ // SetQueryLogger sets the query logger.
+ func (ng *Engine) SetQueryLogger(l QueryLogger) {
+ 	ng.queryLoggerLock.Lock()
+@@ -730,6 +909,7 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
+ 			samplesStats:             query.sampleStats,
+ 			noStepSubqueryIntervalFn: ng.noStepSubqueryIntervalFn,
+ 			enableDelayedNameRemoval: ng.enableDelayedNameRemoval,
++			ng:                       ng,
+ 		}
+ 		query.sampleStats.InitStepTracking(start, start, 1)
+ 
+@@ -788,6 +968,7 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
+ 		samplesStats:             query.sampleStats,
+ 		noStepSubqueryIntervalFn: ng.noStepSubqueryIntervalFn,
+ 		enableDelayedNameRemoval: ng.enableDelayedNameRemoval,
++		ng:                       ng,
+ 	}
+ 	query.sampleStats.InitStepTracking(evaluator.startTimestamp, evaluator.endTimestamp, evaluator.interval)
+ 	val, warnings, err := evaluator.Eval(ctxInnerEval, s.Expr)
+@@ -1052,6 +1233,7 @@ type evaluator struct {
+ 	samplesStats             *stats.QuerySamples
+ 	noStepSubqueryIntervalFn func(rangeMillis int64) int64
+ 	enableDelayedNameRemoval bool
++	ng                       *Engine
+ }
+ 
+ // errorf causes a panic with the input formatted into an error.
+@@ -1137,185 +1319,6 @@ func (enh *EvalNodeHelper) resetBuilder(lbls labels.Labels) {
+ 	}
+ }
+ 
+-// rangeEval evaluates the given expressions, and then for each step calls
+-// the given funcCall with the values computed for each expression at that
+-// step. The return value is the combination into time series of all the
+-// function call results.
+-// The prepSeries function (if provided) can be used to prepare the helper
+-// for each series, then passed to each call funcCall.
+-func (ev *evaluator) rangeEval(ctx context.Context, prepSeries func(labels.Labels, *EvalSeriesHelper), funcCall func([]parser.Value, [][]EvalSeriesHelper, *EvalNodeHelper) (Vector, annotations.Annotations), exprs ...parser.Expr) (Matrix, annotations.Annotations) {
+-	numSteps := int((ev.endTimestamp-ev.startTimestamp)/ev.interval) + 1
+-	matrixes := make([]Matrix, len(exprs))
+-	origMatrixes := make([]Matrix, len(exprs))
+-	originalNumSamples := ev.currentSamples
+-
+-	var warnings annotations.Annotations
+-	for i, e := range exprs {
+-		// Functions will take string arguments from the expressions, not the values.
+-		if e != nil && e.Type() != parser.ValueTypeString {
+-			// ev.currentSamples will be updated to the correct value within the ev.eval call.
+-			val, ws := ev.eval(ctx, e)
+-			warnings.Merge(ws)
+-			matrixes[i] = val.(Matrix)
+-
+-			// Keep a copy of the original point slices so that they
+-			// can be returned to the pool.
+-			origMatrixes[i] = make(Matrix, len(matrixes[i]))
+-			copy(origMatrixes[i], matrixes[i])
+-		}
+-	}
+-
+-	vectors := make([]Vector, len(exprs))    // Input vectors for the function.
+-	args := make([]parser.Value, len(exprs)) // Argument to function.
+-	// Create an output vector that is as big as the input matrix with
+-	// the most time series.
+-	biggestLen := 1
+-	for i := range exprs {
+-		vectors[i] = make(Vector, 0, len(matrixes[i]))
+-		if len(matrixes[i]) > biggestLen {
+-			biggestLen = len(matrixes[i])
+-		}
+-	}
+-	enh := &EvalNodeHelper{Out: make(Vector, 0, biggestLen), enableDelayedNameRemoval: ev.enableDelayedNameRemoval}
+-	type seriesAndTimestamp struct {
+-		Series
+-		ts int64
+-	}
+-	seriess := make(map[uint64]seriesAndTimestamp, biggestLen) // Output series by series hash.
+-	tempNumSamples := ev.currentSamples
+-
+-	var (
+-		seriesHelpers [][]EvalSeriesHelper
+-		bufHelpers    [][]EvalSeriesHelper // Buffer updated on each step
+-	)
+-
+-	// If the series preparation function is provided, we should run it for
+-	// every single series in the matrix.
+-	if prepSeries != nil {
+-		seriesHelpers = make([][]EvalSeriesHelper, len(exprs))
+-		bufHelpers = make([][]EvalSeriesHelper, len(exprs))
+-
+-		for i := range exprs {
+-			seriesHelpers[i] = make([]EvalSeriesHelper, len(matrixes[i]))
+-			bufHelpers[i] = make([]EvalSeriesHelper, len(matrixes[i]))
+-
+-			for si, series := range matrixes[i] {
+-				prepSeries(series.Metric, &seriesHelpers[i][si])
+-			}
+-		}
+-	}
+-
+-	for ts := ev.startTimestamp; ts <= ev.endTimestamp; ts += ev.interval {
+-		if err := contextDone(ctx, "expression evaluation"); err != nil {
+-			ev.error(err)
+-		}
+-		// Reset number of samples in memory after each timestamp.
+-		ev.currentSamples = tempNumSamples
+-		// Gather input vectors for this timestamp.
+-		for i := range exprs {
+-			vectors[i] = vectors[i][:0]
+-
+-			if prepSeries != nil {
+-				bufHelpers[i] = bufHelpers[i][:0]
+-			}
+-
+-			for si, series := range matrixes[i] {
+-				switch {
+-				case len(series.Floats) > 0 && series.Floats[0].T == ts:
+-					vectors[i] = append(vectors[i], Sample{Metric: series.Metric, F: series.Floats[0].F, T: ts, DropName: series.DropName})
+-					// Move input vectors forward so we don't have to re-scan the same
+-					// past points at the next step.
+-					matrixes[i][si].Floats = series.Floats[1:]
+-				case len(series.Histograms) > 0 && series.Histograms[0].T == ts:
+-					vectors[i] = append(vectors[i], Sample{Metric: series.Metric, H: series.Histograms[0].H, T: ts, DropName: series.DropName})
+-					matrixes[i][si].Histograms = series.Histograms[1:]
+-				default:
+-					continue
+-				}
+-				if prepSeries != nil {
+-					bufHelpers[i] = append(bufHelpers[i], seriesHelpers[i][si])
+-				}
+-				// Don't add histogram size here because we only
+-				// copy the pointer above, not the whole
+-				// histogram.
+-				ev.currentSamples++
+-				if ev.currentSamples > ev.maxSamples {
+-					ev.error(ErrTooManySamples(env))
+-				}
+-			}
+-			args[i] = vectors[i]
+-			ev.samplesStats.UpdatePeak(ev.currentSamples)
+-		}
+-
+-		// Make the function call.
+-		enh.Ts = ts
+-		result, ws := funcCall(args, bufHelpers, enh)
+-		enh.Out = result[:0] // Reuse result vector.
+-		warnings.Merge(ws)
+-
+-		vecNumSamples := result.TotalSamples()
+-		ev.currentSamples += vecNumSamples
+-		// When we reset currentSamples to tempNumSamples during the next iteration of the loop it also
+-		// needs to include the samples from the result here, as they're still in memory.
+-		tempNumSamples += vecNumSamples
+-		ev.samplesStats.UpdatePeak(ev.currentSamples)
+-
+-		if ev.currentSamples > ev.maxSamples {
+-			ev.error(ErrTooManySamples(env))
+-		}
+-
+-		// If this could be an instant query, shortcut so as not to change sort order.
+-		if ev.endTimestamp == ev.startTimestamp {
+-			if !ev.enableDelayedNameRemoval && result.ContainsSameLabelset() {
+-				ev.errorf("vector cannot contain metrics with the same labelset")
+-			}
+-			mat := make(Matrix, len(result))
+-			for i, s := range result {
+-				if s.H == nil {
+-					mat[i] = Series{Metric: s.Metric, Floats: []FPoint{{T: ts, F: s.F}}, DropName: s.DropName}
+-				} else {
+-					mat[i] = Series{Metric: s.Metric, Histograms: []HPoint{{T: ts, H: s.H}}, DropName: s.DropName}
+-				}
+-			}
+-			ev.currentSamples = originalNumSamples + mat.TotalSamples()
+-			ev.samplesStats.UpdatePeak(ev.currentSamples)
+-			return mat, warnings
+-		}
+-
+-		// Add samples in output vector to output series.
+-		for _, sample := range result {
+-			h := sample.Metric.Hash()
+-			ss, ok := seriess[h]
+-			if ok {
+-				if ss.ts == ts { // If we've seen this output series before at this timestamp, it's a duplicate.
+-					ev.errorf("vector cannot contain metrics with the same labelset")
+-				}
+-				ss.ts = ts
+-			} else {
+-				ss = seriesAndTimestamp{Series{Metric: sample.Metric, DropName: sample.DropName}, ts}
+-			}
+-			addToSeries(&ss.Series, enh.Ts, sample.F, sample.H, numSteps)
+-			seriess[h] = ss
+-		}
+-	}
+-
+-	// Reuse the original point slices.
+-	for _, m := range origMatrixes {
+-		for _, s := range m {
+-			putFPointSlice(s.Floats)
+-			putHPointSlice(s.Histograms)
+-		}
+-	}
+-	// Assemble the output matrix. By the time we get here we know we don't have too many samples.
+-	mat := make(Matrix, 0, len(seriess))
+-	for _, ss := range seriess {
+-		mat = append(mat, ss.Series)
+-	}
+-	ev.currentSamples = originalNumSamples + mat.TotalSamples()
+-	ev.samplesStats.UpdatePeak(ev.currentSamples)
+-	return mat, warnings
+-}
+-
+ func (ev *evaluator) rangeEvalAgg(ctx context.Context, aggExpr *parser.AggregateExpr, sortedGrouping []string, inputMatrix Matrix, param float64) (Matrix, annotations.Annotations) {
+ 	// Keep a copy of the original point slice so that it can be returned to the pool.
+ 	origMatrix := slices.Clone(inputMatrix)
+@@ -1512,7 +1515,7 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value,
+ 				sortedGrouping = append(sortedGrouping, valueLabel.Val)
+ 				slices.Sort(sortedGrouping)
+ 			}
+-			return ev.rangeEval(ctx, nil, func(v []parser.Value, _ [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
++			return ev.ng.rangeEval(ev, ctx, nil, func(v []parser.Value, _ [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
+ 				return ev.aggregationCountValues(e, sortedGrouping, valueLabel.Val, v[0].(Vector), enh)
+ 			}, e.Expr)
+ 		}
+@@ -1595,7 +1598,7 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value,
+ 
+ 		if !matrixArg {
+ 			// Does not have a matrix argument.
+-			return ev.rangeEval(ctx, nil, func(v []parser.Value, _ [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
++			return ev.ng.rangeEval(ev, ctx, nil, func(v []parser.Value, _ [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
+ 				vec, annos := call(v, e.Args, enh)
+ 				return vec, warnings.Merge(annos)
+ 			}, e.Args...)
+@@ -1821,7 +1824,7 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value,
+ 	case *parser.BinaryExpr:
+ 		switch lt, rt := e.LHS.Type(), e.RHS.Type(); {
+ 		case lt == parser.ValueTypeScalar && rt == parser.ValueTypeScalar:
+-			return ev.rangeEval(ctx, nil, func(v []parser.Value, _ [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
++			return ev.ng.rangeEval(ev, ctx, nil, func(v []parser.Value, _ [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
+ 				val := scalarBinop(e.Op, v[0].(Vector)[0].F, v[1].(Vector)[0].F)
+ 				return append(enh.Out, Sample{F: val}), nil
+ 			}, e.LHS, e.RHS)
+@@ -1834,32 +1837,32 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value,
+ 			}
+ 			switch e.Op {
+ 			case parser.LAND:
+-				return ev.rangeEval(ctx, initSignatures, func(v []parser.Value, sh [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
++				return ev.ng.rangeEval(ev, ctx, initSignatures, func(v []parser.Value, sh [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
+ 					return ev.VectorAnd(v[0].(Vector), v[1].(Vector), e.VectorMatching, sh[0], sh[1], enh), nil
+ 				}, e.LHS, e.RHS)
+ 			case parser.LOR:
+-				return ev.rangeEval(ctx, initSignatures, func(v []parser.Value, sh [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
++				return ev.ng.rangeEval(ev, ctx, initSignatures, func(v []parser.Value, sh [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
+ 					return ev.VectorOr(v[0].(Vector), v[1].(Vector), e.VectorMatching, sh[0], sh[1], enh), nil
+ 				}, e.LHS, e.RHS)
+ 			case parser.LUNLESS:
+-				return ev.rangeEval(ctx, initSignatures, func(v []parser.Value, sh [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
++				return ev.ng.rangeEval(ev, ctx, initSignatures, func(v []parser.Value, sh [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
+ 					return ev.VectorUnless(v[0].(Vector), v[1].(Vector), e.VectorMatching, sh[0], sh[1], enh), nil
+ 				}, e.LHS, e.RHS)
+ 			default:
+-				return ev.rangeEval(ctx, initSignatures, func(v []parser.Value, sh [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
++				return ev.ng.rangeEval(ev, ctx, initSignatures, func(v []parser.Value, sh [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
+ 					vec, err := ev.VectorBinop(e.Op, v[0].(Vector), v[1].(Vector), e.VectorMatching, e.ReturnBool, sh[0], sh[1], enh)
+ 					return vec, handleVectorBinopError(err, e)
+ 				}, e.LHS, e.RHS)
+ 			}
+ 
+ 		case lt == parser.ValueTypeVector && rt == parser.ValueTypeScalar:
+-			return ev.rangeEval(ctx, nil, func(v []parser.Value, _ [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
++			return ev.ng.rangeEval(ev, ctx, nil, func(v []parser.Value, _ [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
+ 				vec, err := ev.VectorscalarBinop(e.Op, v[0].(Vector), Scalar{V: v[1].(Vector)[0].F}, false, e.ReturnBool, enh)
+ 				return vec, handleVectorBinopError(err, e)
+ 			}, e.LHS, e.RHS)
+ 
+ 		case lt == parser.ValueTypeScalar && rt == parser.ValueTypeVector:
+-			return ev.rangeEval(ctx, nil, func(v []parser.Value, _ [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
++			return ev.ng.rangeEval(ev, ctx, nil, func(v []parser.Value, _ [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
+ 				vec, err := ev.VectorscalarBinop(e.Op, v[1].(Vector), Scalar{V: v[0].(Vector)[0].F}, true, e.ReturnBool, enh)
+ 				return vec, handleVectorBinopError(err, e)
+ 			}, e.LHS, e.RHS)
+@@ -1867,7 +1870,7 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value,
+ 
+ 	case *parser.NumberLiteral:
+ 		span.SetAttributes(attribute.Float64("value", e.Val))
+-		return ev.rangeEval(ctx, nil, func(v []parser.Value, _ [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
++		return ev.ng.rangeEval(ev, ctx, nil, func(v []parser.Value, _ [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
+ 			return append(enh.Out, Sample{F: e.Val, Metric: labels.EmptyLabels()}), nil
+ 		})
+ 
+@@ -1950,6 +1953,7 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value,
+ 			samplesStats:             ev.samplesStats.NewChild(),
+ 			noStepSubqueryIntervalFn: ev.noStepSubqueryIntervalFn,
+ 			enableDelayedNameRemoval: ev.enableDelayedNameRemoval,
++			ng:                       ev.ng,
+ 		}
+ 
+ 		if e.Step != 0 {
+@@ -1994,6 +1998,7 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value,
+ 			samplesStats:             ev.samplesStats.NewChild(),
+ 			noStepSubqueryIntervalFn: ev.noStepSubqueryIntervalFn,
+ 			enableDelayedNameRemoval: ev.enableDelayedNameRemoval,
++			ng:                       ev.ng,
+ 		}
+ 		res, ws := newEv.eval(ctx, e.Expr)
+ 		ev.currentSamples = newEv.currentSamples
+@@ -2083,7 +2088,7 @@ func (ev *evaluator) rangeEvalTimestampFunctionOverVectorSelector(ctx context.Co
+ 		seriesIterators[i] = storage.NewMemoizedIterator(it, durationMilliseconds(ev.lookbackDelta))
+ 	}
+ 
+-	return ev.rangeEval(ctx, nil, func(v []parser.Value, _ [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
++	return ev.ng.rangeEval(ev, ctx, nil, func(v []parser.Value, _ [][]EvalSeriesHelper, enh *EvalNodeHelper) (Vector, annotations.Annotations) {
+ 		if vs.Timestamp != nil {
+ 			// This is a special case for "timestamp()" when the @ modifier is used, to ensure that
+ 			// we return a point for each time step in this case.

@@ -1,0 +1,204 @@
+diff --git a/src/object.c b/src/object.c
+index ee3564657..f1c1f6d9d 100644
+--- a/src/object.c
++++ b/src/object.c
+@@ -31,6 +31,8 @@
+ #include "server.h"
+ #include "functions.h"
+ #include "intset.h"  /* Compact integer set structure */
++#include "script_lua.h"
++#include "fpconv_dtoa.h"
+ #include <math.h>
+ #include <ctype.h>
+ 
+@@ -127,6 +129,87 @@ robj *createStringObject(const char *ptr, size_t len) {
+         return createRawStringObject(ptr,len);
+ }
+ 
++/* Convert Lua stack values into a Redis argv array of string objects.
++ * Reuses the Lua command argument cache when the cached SDS buffer is large
++ * enough, otherwise creates a new string object. */
++robj **luaArgsToRedisArgv(lua_State *lua, int *argc, int *argv_len) {
++    int j;
++    /* Require at least one argument */
++    *argc = lua_gettop(lua);
++    if (*argc == 0) {
++        luaPushError(lua, "Please specify at least one argument for this redis lib call");
++        return NULL;
++    }
++
++    /* Build the arguments vector (reuse a cached argv from last call) */
++    if (lua_argv_size < *argc) {
++        lua_argv = zrealloc(lua_argv,sizeof(robj*)* *argc);
++        lua_argv_size = *argc;
++    }
++    *argv_len = lua_argv_size;
++
++    for (j = 0; j < *argc; j++) {
++        char *obj_s;
++        size_t obj_len;
++        char dbuf[64];
++
++        if (lua_type(lua,j+1) == LUA_TNUMBER) {
++            /* We can't use lua_tolstring() for number -> string conversion
++             * since Lua uses a format specifier that loses precision. */
++            lua_Number num = lua_tonumber(lua,j+1);
++            obj_len = fpconv_dtoa((double)num, dbuf);
++            dbuf[obj_len] = '\0';
++            obj_s = dbuf;
++        } else {
++            obj_s = (char*)lua_tolstring(lua,j+1,&obj_len);
++            if (obj_s == NULL) break; /* Not a string. */
++        }
++        /* Try to use a cached object. */
++        if (j < LUA_CMD_OBJCACHE_SIZE && lua_args_cached_objects[j] &&
++            lua_args_cached_objects_len[j] >= obj_len)
++        {
++            robj *cached = lua_args_cached_objects[j];
++            if (cached->refcount == 1 &&
++                (cached->encoding == OBJ_ENCODING_RAW ||
++                 cached->encoding == OBJ_ENCODING_EMBSTR) &&
++                cached->ptr != NULL)
++            {
++                sds s = cached->ptr;
++                unsigned char flags = s[-1];
++                size_t alloc = sdsalloc(s);
++                if (alloc >= obj_len) {
++                    lua_args_cached_objects[j] = NULL;
++                    memcpy(s,obj_s,obj_len+1);
++                    if ((flags & SDS_TYPE_MASK) == SDS_TYPE_5) {
++                        unsigned char *fp = ((unsigned char*)s)-1;
++                        *fp = SDS_TYPE_5 | (obj_len << SDS_TYPE_BITS);
++                    } else {
++                        sdssetlen(s, obj_len);
++                    }
++                    lua_argv[j] = cached;
++                    continue;
++                }
++            }
++        }
++        lua_argv[j] = createStringObject(obj_s, obj_len);
++    }
++
++    /* Pop all arguments from the stack, we do not need them anymore
++     * and this way we guaranty we will have room on the stack for the result. */
++    lua_pop(lua, *argc);
++
++    /* Check if one of the arguments passed by the Lua script
++     * is not a string or an integer (lua_isstring() return true for
++     * integers as well). */
++    if (j != *argc) {
++        freeLuaRedisArgv(lua_argv, j, lua_argv_size);
++        luaPushError(lua, "Lua redis lib command arguments must be strings or integers");
++        return NULL;
++    }
++
++    return lua_argv;
++}
++
+ /* Same as CreateRawStringObject, can return NULL if allocation fails */
+ robj *tryCreateRawStringObject(const char *ptr, size_t len) {
+     sds str = sdstrynewlen(ptr,len);
+diff --git a/src/script_lua.c b/src/script_lua.c
+index eca21d60c..47d639794 100644
+--- a/src/script_lua.c
++++ b/src/script_lua.c
+@@ -784,77 +784,14 @@ static void luaReplyToRedisReply(client *c, client* script_client, lua_State *lu
+ /* ---------------------------------------------------------------------------
+  * Lua redis.* functions implementations.
+  * ------------------------------------------------------------------------- */
+-void freeLuaRedisArgv(robj **argv, int argc, int argv_len);
+ 
+ /* Cached argv array across calls. */
+-static robj **lua_argv = NULL;
+-static int lua_argv_size = 0;
++robj **lua_argv = NULL;
++int lua_argv_size = 0;
+ 
+ /* Cache of recently used small arguments to avoid malloc calls. */
+-static robj *lua_args_cached_objects[LUA_CMD_OBJCACHE_SIZE];
+-static size_t lua_args_cached_objects_len[LUA_CMD_OBJCACHE_SIZE];
+-
+-static robj **luaArgsToRedisArgv(lua_State *lua, int *argc, int *argv_len) {
+-    int j;
+-    /* Require at least one argument */
+-    *argc = lua_gettop(lua);
+-    if (*argc == 0) {
+-        luaPushError(lua, "Please specify at least one argument for this redis lib call");
+-        return NULL;
+-    }
+-
+-    /* Build the arguments vector (reuse a cached argv from last call) */
+-    if (lua_argv_size < *argc) {
+-        lua_argv = zrealloc(lua_argv,sizeof(robj*)* *argc);
+-        lua_argv_size = *argc;
+-    }
+-    *argv_len = lua_argv_size;
+-
+-    for (j = 0; j < *argc; j++) {
+-        char *obj_s;
+-        size_t obj_len;
+-        char dbuf[64];
+-
+-        if (lua_type(lua,j+1) == LUA_TNUMBER) {
+-            /* We can't use lua_tolstring() for number -> string conversion
+-             * since Lua uses a format specifier that loses precision. */
+-            lua_Number num = lua_tonumber(lua,j+1);
+-            obj_len = fpconv_dtoa((double)num, dbuf);
+-            dbuf[obj_len] = '\0';
+-            obj_s = dbuf;
+-        } else {
+-            obj_s = (char*)lua_tolstring(lua,j+1,&obj_len);
+-            if (obj_s == NULL) break; /* Not a string. */
+-        }
+-        /* Try to use a cached object. */
+-        if (j < LUA_CMD_OBJCACHE_SIZE && lua_args_cached_objects[j] &&
+-            lua_args_cached_objects_len[j] >= obj_len)
+-        {
+-            sds s = lua_args_cached_objects[j]->ptr;
+-            lua_argv[j] = lua_args_cached_objects[j];
+-            lua_args_cached_objects[j] = NULL;
+-            memcpy(s,obj_s,obj_len+1);
+-            sdssetlen(s, obj_len);
+-        } else {
+-            lua_argv[j] = createStringObject(obj_s, obj_len);
+-        }
+-    }
+-
+-    /* Pop all arguments from the stack, we do not need them anymore
+-     * and this way we guaranty we will have room on the stack for the result. */
+-    lua_pop(lua, *argc);
+-
+-    /* Check if one of the arguments passed by the Lua script
+-     * is not a string or an integer (lua_isstring() return true for
+-     * integers as well). */
+-    if (j != *argc) {
+-        freeLuaRedisArgv(lua_argv, j, lua_argv_size);
+-        luaPushError(lua, "Lua redis lib command arguments must be strings or integers");
+-        return NULL;
+-    }
+-
+-    return lua_argv;
+-}
++robj *lua_args_cached_objects[LUA_CMD_OBJCACHE_SIZE];
++size_t lua_args_cached_objects_len[LUA_CMD_OBJCACHE_SIZE];
+ 
+ void freeLuaRedisArgv(robj **argv, int argc, int argv_len) {
+     int j;
+diff --git a/src/script_lua.h b/src/script_lua.h
+index 4c2b34804..d3592bad7 100644
+--- a/src/script_lua.h
++++ b/src/script_lua.h
+@@ -82,6 +82,12 @@ void luaCallFunction(scriptRunCtx* r_ctx, lua_State *lua, robj** keys, size_t nk
+ void luaExtractErrorInformation(lua_State *lua, errorInfo *err_info);
+ void luaErrorInformationDiscard(errorInfo *err_info);
+ unsigned long luaMemory(lua_State *lua);
++robj **luaArgsToRedisArgv(lua_State *lua, int *argc, int *argv_len);
++void freeLuaRedisArgv(robj **argv, int argc, int argv_len);
++extern robj **lua_argv;
++extern int lua_argv_size;
++extern robj *lua_args_cached_objects[LUA_CMD_OBJCACHE_SIZE];
++extern size_t lua_args_cached_objects_len[LUA_CMD_OBJCACHE_SIZE];
+ 
+ 
+ #endif /* __SCRIPT_LUA_H_ */

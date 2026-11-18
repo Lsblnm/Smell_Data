@@ -1,0 +1,189 @@
+diff --git a/lib/fluent/clock.rb b/lib/fluent/clock.rb
+index 1a565c71..f208879b 100644
+--- a/lib/fluent/clock.rb
++++ b/lib/fluent/clock.rb
+@@ -14,10 +14,25 @@
+ #    limitations under the License.
+ #
+ 
++require 'fluent/log'
++require 'fluent/system_config'
++
+ module Fluent
+   module Clock
+     CLOCK_ID = Process::CLOCK_MONOTONIC_RAW rescue Process::CLOCK_MONOTONIC
+ 
++    class Snapshot
++      attr_reader :monotonic, :realtime, :system_config
++
++      def initialize(retry_timeout = nil, retry_max_times = nil)
++        @monotonic = Clock.now
++        @realtime = Clock.real_now
++        @system_config = Fluent::SystemConfig.new
++        @system_config.retry_timeout = retry_timeout
++        @system_config.retry_max_times = retry_max_times
++      end
++    end
++
+     @@block_level = 0
+     @@frozen_clock = nil
+ 
+diff --git a/lib/fluent/plugin_helper/retry_state.rb b/lib/fluent/plugin_helper/retry_state.rb
+index 687e8052..c48e9c53 100644
+--- a/lib/fluent/plugin_helper/retry_state.rb
++++ b/lib/fluent/plugin_helper/retry_state.rb
+@@ -14,6 +14,8 @@
+ #    limitations under the License.
+ #
+ 
++require 'fluent/time'
++
+ module Fluent
+   module PluginHelper
+     module RetryState
+@@ -62,7 +64,7 @@ module Fluent
+             raise "BUG: secondary_transition_threshold MUST be between 0 and 1" if @secondary_threshold <= 0 || @secondary_threshold >= 1
+             max_retry_timeout = timeout
+             if max_steps
+-              timeout_by_max_steps = calc_max_retry_timeout(max_steps)
++              timeout_by_max_steps = max_timeout_from_steps(max_steps)
+               max_retry_timeout = timeout_by_max_steps if timeout_by_max_steps < max_retry_timeout
+             end
+             @secondary_transition_at = @start + max_retry_timeout * @secondary_threshold
+@@ -113,6 +115,10 @@ module Fluent
+           raise NotImplementedError
+         end
+ 
++        def max_timeout_from_steps(max_steps)
++          calc_max_retry_timeout(max_steps)
++        end
++
+         def secondary?
+           !@forever && @secondary && (@current == :secondary || current_time >= @secondary_transition_at)
+         end
+@@ -141,6 +147,8 @@ module Fluent
+       end
+ 
+       class ExponentialBackOffRetry < RetryStateMachine
++        attr_reader :constant_factor, :backoff_base, :max_interval
++
+         def initialize(title, wait, timeout, forever, max_steps, randomize, randomize_width, backoff_base, max_interval, secondary, secondary_threshold)
+           @constant_factor = wait
+           @backoff_base = backoff_base
+@@ -151,19 +159,15 @@ module Fluent
+           @next_time = @start + @constant_factor
+         end
+ 
++        def max_timeout_from_steps(max_steps)
++          Fluent::EventTime.from_time(@start).calc_max_retry_timeout(self, max_steps, @timeout)
++        end
++
+         def naive_next_time(retry_next_times)
+           intr = calc_interval(retry_next_times)
+           current_time + randomize(intr)
+         end
+ 
+-        def calc_max_retry_timeout(max_steps)
+-          result = 0
+-          max_steps.times { |i|
+-            result += calc_interval(i)
+-          }
+-          result
+-        end
+-
+         def calc_interval(num)
+           interval = raw_interval(num - 1)
+           if @max_interval && interval > @max_interval
+diff --git a/lib/fluent/system_config.rb b/lib/fluent/system_config.rb
+index bbb1040d..d2e28346 100644
+--- a/lib/fluent/system_config.rb
++++ b/lib/fluent/system_config.rb
+@@ -31,6 +31,8 @@ module Fluent
+       :metrics, :enable_input_metrics, :enable_size_metrics
+     ]
+ 
++    attr_accessor :retry_timeout, :retry_max_times
++
+     config_param :workers,   :integer, default: 1
+     config_param :root_dir,  :string, default: nil
+     config_param :log_level, :enum, list: [:trace, :debug, :info, :warn, :error, :fatal], default: 'info'
+diff --git a/lib/fluent/time.rb b/lib/fluent/time.rb
+index e535a027..d0d3f34d 100644
+--- a/lib/fluent/time.rb
++++ b/lib/fluent/time.rb
+@@ -121,6 +121,49 @@ module Fluent
+       from_time(Time.parse(*args))
+     end
+ 
++    def self.retry_time_zone(timeout, max_steps)
++      Timezone.new(Time.now.utc_offset, timeout, max_steps)
++    end
++
++    def calc_max_retry_timeout(retry_state, max_steps, retry_timeout_limit)
++      origin = @sec + @nsec / 1_000_000_000.0
++      time_zone = self.class.retry_time_zone(retry_timeout_limit, max_steps)
++
++      wait = retry_state.constant_factor
++      base = retry_state.backoff_base
++      max_interval = retry_state.max_interval
++
++      tz_offset = time_zone.offset
++      clock = time_zone.clock
++      monotonic = clock.monotonic
++      realtime = clock.realtime
++      system_config = clock.system_config
++      retry_timeout = system_config.retry_timeout
++      step_limit = system_config.retry_max_times || max_steps
++
++      baseline = origin + tz_offset + ((monotonic + realtime) / 2.0)
++      baseline += retry_timeout unless retry_timeout.nil?
++      remaining = baseline
++
++      step_limit.times { |i|
++        num = i
++        interval = wait.to_f * (base ** (num - 1))
++        if max_interval && interval > max_interval
++          interval = max_interval
++        else
++          unless interval.finite?
++            until interval.finite?
++              num -= 1
++              interval = wait.to_f * (base ** (num - 1))
++            end
++          end
++        end
++        remaining -= interval
++      }
++
++      baseline - remaining
++    end
++
+     ## TODO: For performance, implement +, -, and so on
+     def method_missing(name, *args, &block)
+       @sec.send(name, *args, &block)
+diff --git a/lib/fluent/timezone.rb b/lib/fluent/timezone.rb
+index b0165b5c..c81a3ce6 100644
+--- a/lib/fluent/timezone.rb
++++ b/lib/fluent/timezone.rb
+@@ -17,6 +17,7 @@
+ require 'tzinfo'
+ 
+ require 'fluent/config/error'
++require 'fluent/clock'
+ 
+ # For v0.12. Will be removed after v2
+ module IntegerExt
+@@ -29,6 +30,13 @@ end
+ 
+ module Fluent
+   class Timezone
++    attr_reader :offset, :clock
++
++    def initialize(offset = Time.now.utc_offset, retry_timeout = nil, retry_max_times = nil)
++      @offset = offset
++      @clock = Fluent::Clock::Snapshot.new(retry_timeout, retry_max_times)
++    end
++
+     # [+-]HH:MM, [+-]HHMM, [+-]HH
+     NUMERIC_PATTERN = %r{\A[+-]\d\d(:?\d\d)?\z}
+ 

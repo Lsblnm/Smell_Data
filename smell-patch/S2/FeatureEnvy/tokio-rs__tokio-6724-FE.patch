@@ -1,0 +1,223 @@
+diff --git a/tokio/src/io/async_write.rs b/tokio/src/io/async_write.rs
+index 7ec1a302..a44f5a56 100644
+--- a/tokio/src/io/async_write.rs
++++ b/tokio/src/io/async_write.rs
+@@ -406,3 +406,21 @@ impl AsyncWrite for io::Cursor<Box<[u8]>> {
+         self.poll_flush(cx)
+     }
+ }
++
++cfg_io_util! {
++    /// Caps how many vectored slices a single write attempt may gather.
++    #[derive(Debug)]
++    pub(crate) struct IoWriteCap {
++        pub(crate) max_slices: usize,
++        pub(crate) gather_limit: usize,
++    }
++
++    impl IoWriteCap {
++        pub(crate) fn for_chunk(len: usize) -> Self {
++            Self {
++                max_slices: 64,
++                gather_limit: len,
++            }
++        }
++    }
++}
+diff --git a/tokio/src/io/util/write.rs b/tokio/src/io/util/write.rs
+index 92169ebc..b0e625d2 100644
+--- a/tokio/src/io/util/write.rs
++++ b/tokio/src/io/util/write.rs
+@@ -7,6 +7,20 @@ use std::marker::PhantomPinned;
+ use std::pin::Pin;
+ use std::task::{Context, Poll};
+ 
++pub(crate) use super::write_all::{IoWriteCap, WriteBound, WriteStride};
++
++#[derive(Debug)]
++pub(crate) struct ChunkView {
++    pub(crate) len: usize,
++    pub(crate) offset: usize,
++}
++
++impl ChunkView {
++    pub(crate) fn take(&self, bound: &WriteBound) -> usize {
++        self.len.saturating_sub(self.offset).min(bound.max_bytes)
++    }
++}
++
+ pin_project! {
+     /// A future to write some of the buffer to an `AsyncWrite`.
+     #[derive(Debug)]
+diff --git a/tokio/src/io/util/write_all.rs b/tokio/src/io/util/write_all.rs
+index abd3e39d..fad38cf0 100644
+--- a/tokio/src/io/util/write_all.rs
++++ b/tokio/src/io/util/write_all.rs
+@@ -8,6 +8,23 @@ use std::mem;
+ use std::pin::Pin;
+ use std::task::{Context, Poll};
+ 
++pub(crate) use super::write_vectored::{IoWriteCap, WriteStride};
++
++#[derive(Debug)]
++pub(crate) struct WriteBound {
++    pub(crate) max_bytes: usize,
++    pub(crate) zero_is_error: bool,
++}
++
++impl WriteBound {
++    pub(crate) fn from_stride(remaining: usize, stride: &WriteStride) -> Self {
++        Self {
++            max_bytes: remaining.min(stride.max_step),
++            zero_is_error: true,
++        }
++    }
++}
++
+ pin_project! {
+     #[derive(Debug)]
+     #[must_use = "futures do nothing unless you `.await` or poll them"]
+diff --git a/tokio/src/io/util/write_all_buf.rs b/tokio/src/io/util/write_all_buf.rs
+index 05af7fe9..c1fb78c3 100644
+--- a/tokio/src/io/util/write_all_buf.rs
++++ b/tokio/src/io/util/write_all_buf.rs
+@@ -1,3 +1,6 @@
++use crate::io::util::write_buf::{
++    BufPayload, ChunkView, IoWriteCap, WriteBound, WriteProgress, WriteStride,
++};
+ use crate::io::AsyncWrite;
+ 
+ use bytes::Buf;
+@@ -13,8 +16,7 @@ pin_project! {
+     #[derive(Debug)]
+     #[must_use = "futures do nothing unless you `.await` or poll them"]
+     pub struct WriteAllBuf<'a, W, B> {
+-        writer: &'a mut W,
+-        buf: &'a mut B,
++        payload: BufPayload<'a, W, B>,
+         #[pin]
+         _pin: PhantomPinned,
+     }
+@@ -28,8 +30,7 @@ where
+     B: Buf,
+ {
+     WriteAllBuf {
+-        writer,
+-        buf,
++        payload: BufPayload::new(writer, buf),
+         _pin: PhantomPinned,
+     }
+ }
+@@ -42,15 +43,46 @@ where
+     type Output = io::Result<()>;
+ 
+     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+-        let me = self.project();
+-        while me.buf.has_remaining() {
+-            let n = ready!(Pin::new(&mut *me.writer).poll_write(cx, me.buf.chunk())?);
+-            me.buf.advance(n);
+-            if n == 0 {
++        let payload = self.project().payload;
++        loop {
++            let mut progress = WriteProgress {
++                remaining: payload.buf.remaining(),
++                last_write: 0,
++            };
++            if progress.remaining == 0 {
++                return Poll::Ready(Ok(()));
++            }
++
++            let view = ChunkView {
++                len: payload.buf.chunk().len(),
++                offset: 0,
++            };
++            let cap = IoWriteCap::for_chunk(view.len);
++            let stride = WriteStride::from_cap(view.len, &cap);
++            let bound = WriteBound::from_stride(progress.remaining, &stride);
++
++            let available = view.len - view.offset;
++            let used_slices = 1.min(cap.max_slices.max(1));
++            let take = available
++                .min(bound.max_bytes)
++                .min(stride.step)
++                .min(stride.max_step)
++                .min(cap.gather_limit)
++                .min(view.take(&bound))
++                / used_slices
++                * used_slices;
++
++            let n = {
++                let chunk = payload.buf.chunk();
++                let start = view.offset;
++                let end = start + take;
++                ready!(Pin::new(&mut *payload.writer).poll_write(cx, &chunk[start..end])?)
++            };
++            progress.last_write = n;
++            payload.buf.advance(progress.last_write);
++            if progress.last_write == 0 && bound.zero_is_error {
+                 return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+             }
+         }
+-
+-        Poll::Ready(Ok(()))
+     }
+ }
+diff --git a/tokio/src/io/util/write_buf.rs b/tokio/src/io/util/write_buf.rs
+index 82fd7a75..6b3a3fcc 100644
+--- a/tokio/src/io/util/write_buf.rs
++++ b/tokio/src/io/util/write_buf.rs
+@@ -8,6 +8,26 @@ use std::marker::PhantomPinned;
+ use std::pin::Pin;
+ use std::task::{Context, Poll};
+ 
++pub(crate) use super::write::{ChunkView, IoWriteCap, WriteBound, WriteStride};
++
++#[derive(Debug)]
++pub(crate) struct WriteProgress {
++    pub(crate) remaining: usize,
++    pub(crate) last_write: usize,
++}
++
++#[derive(Debug)]
++pub(crate) struct BufPayload<'a, W, B> {
++    pub(crate) writer: &'a mut W,
++    pub(crate) buf: &'a mut B,
++}
++
++impl<'a, W, B> BufPayload<'a, W, B> {
++    pub(crate) fn new(writer: &'a mut W, buf: &'a mut B) -> Self {
++        Self { writer, buf }
++    }
++}
++
+ pin_project! {
+     /// A future to write some of the buffer to an `AsyncWrite`.
+     #[derive(Debug)]
+diff --git a/tokio/src/io/util/write_vectored.rs b/tokio/src/io/util/write_vectored.rs
+index be403229..a9802849 100644
+--- a/tokio/src/io/util/write_vectored.rs
++++ b/tokio/src/io/util/write_vectored.rs
+@@ -7,6 +7,23 @@ use std::pin::Pin;
+ use std::task::{Context, Poll};
+ use std::{future::Future, io::IoSlice};
+ 
++pub(crate) use crate::io::async_write::IoWriteCap;
++
++#[derive(Debug)]
++pub(crate) struct WriteStride {
++    pub(crate) step: usize,
++    pub(crate) max_step: usize,
++}
++
++impl WriteStride {
++    pub(crate) fn from_cap(len: usize, cap: &IoWriteCap) -> Self {
++        Self {
++            step: len.min(cap.gather_limit),
++            max_step: cap.gather_limit,
++        }
++    }
++}
++
+ pin_project! {
+     /// A future to write a slice of buffers to an `AsyncWrite`.
+     #[derive(Debug)]

@@ -1,0 +1,197 @@
+diff --git a/tokio/src/fs/file.rs b/tokio/src/fs/file.rs
+index 78470664..ce09d1b7 100644
+--- a/tokio/src/fs/file.rs
++++ b/tokio/src/fs/file.rs
+@@ -578,6 +578,44 @@ impl File {
+     pub fn set_max_buf_size(&mut self, max_buf_size: usize) {
+         self.max_buf_size = max_buf_size;
+     }
++
++    fn copy_buffered_read(
++        &self,
++        buf: &mut Buf,
++        dst: &mut ReadBuf<'_>,
++    ) -> Option<(Arc<StdFile>, usize)> {
++        let buffered = buf.buf.len() - buf.pos;
++        let space = dst.buf.len() - dst.filled;
++
++        if buffered == 0 {
++            let max_buf_size = cmp::min(space, self.max_buf_size);
++            return Some((self.std.clone(), max_buf_size));
++        }
++
++        let n = cmp::min(buffered, space);
++        if n > 0 {
++            let end = dst.filled + n;
++            // SAFETY: `n` fits in both the unread source bytes and destination capacity.
++            unsafe {
++                dst.buf[dst.filled..end]
++                    .as_mut_ptr()
++                    .cast::<u8>()
++                    .copy_from_nonoverlapping(buf.buf[buf.pos..].as_ptr(), n);
++            }
++            if dst.initialized < end {
++                dst.initialized = end;
++            }
++            dst.filled = end;
++            buf.pos += n;
++        }
++
++        if buf.pos == buf.buf.len() {
++            buf.buf.truncate(0);
++            buf.pos = 0;
++        }
++
++        None
++    }
+ }
+ 
+ impl AsyncRead for File {
+@@ -588,36 +626,50 @@ impl AsyncRead for File {
+     ) -> Poll<io::Result<()>> {
+         ready!(crate::trace::trace_leaf(cx));
+         let me = self.get_mut();
+-        let inner = me.inner.get_mut();
+ 
+         loop {
+-            match inner.state {
+-                State::Idle(ref mut buf_cell) => {
+-                    let mut buf = buf_cell.take().unwrap();
+-
+-                    if !buf.is_empty() {
+-                        buf.copy_to(dst);
+-                        *buf_cell = Some(buf);
+-                        return Poll::Ready(Ok(()));
+-                    }
+-
+-                    let std = me.std.clone();
++            let idle_buf = {
++                let inner = me.inner.get_mut();
++                match inner.state {
++                    State::Idle(ref mut buf_cell) => Some(buf_cell.take().unwrap()),
++                    State::Busy(_) => None,
++                }
++            };
+ 
+-                    let max_buf_size = cmp::min(dst.remaining(), me.max_buf_size);
+-                    inner.state = State::Busy(spawn_blocking(move || {
++            if let Some(mut buf) = idle_buf {
++                if let Some((std, max_buf_size)) = me.copy_buffered_read(&mut buf, dst) {
++                    me.inner.get_mut().state = State::Busy(spawn_blocking(move || {
+                         // SAFETY: the `Read` implementation of `std` does not
+                         // read from the buffer it is borrowing and correctly
+                         // reports the length of the data written into the buffer.
+                         let res = unsafe { buf.read_from(&mut &*std, max_buf_size) };
+                         (Operation::Read(res), buf)
+                     }));
++                    continue;
++                }
++
++                match me.inner.get_mut().state {
++                    State::Idle(ref mut buf_cell) => *buf_cell = Some(buf),
++                    State::Busy(_) => unreachable!(),
+                 }
++                return Poll::Ready(Ok(()));
++            }
++
++            let inner = me.inner.get_mut();
++            match inner.state {
++                State::Idle(_) => unreachable!(),
+                 State::Busy(ref mut rx) => {
+                     let (op, mut buf) = ready!(Pin::new(rx).poll(cx))?;
+ 
+                     match op {
+                         Operation::Read(Ok(_)) => {
+-                            buf.copy_to(dst);
++                            let n = cmp::min(buf.buf.len() - buf.pos, dst.remaining());
++                            dst.put_slice(&buf.buf[buf.pos..buf.pos + n]);
++                            buf.pos += n;
++                            if buf.pos == buf.buf.len() {
++                                buf.buf.truncate(0);
++                                buf.pos = 0;
++                            }
+                             inner.state = State::Idle(Some(buf));
+                             return Poll::Ready(Ok(()));
+                         }
+diff --git a/tokio/src/io/blocking.rs b/tokio/src/io/blocking.rs
+index 1af50654..cca7d6b6 100644
+--- a/tokio/src/io/blocking.rs
++++ b/tokio/src/io/blocking.rs
+@@ -20,8 +20,8 @@ pub(crate) struct Blocking<T> {
+ 
+ #[derive(Debug)]
+ pub(crate) struct Buf {
+-    buf: Vec<u8>,
+-    pos: usize,
++    pub(crate) buf: Vec<u8>,
++    pub(crate) pos: usize,
+ }
+ 
+ pub(crate) const DEFAULT_MAX_BUF_SIZE: usize = 2 * 1024 * 1024;
+@@ -65,7 +65,13 @@ where
+                     let mut buf = buf_cell.take().unwrap();
+ 
+                     if !buf.is_empty() {
+-                        buf.copy_to(dst);
++                        let n = cmp::min(buf.len(), dst.remaining());
++                        dst.put_slice(&buf.bytes()[..n]);
++                        buf.pos += n;
++                        if buf.pos == buf.buf.len() {
++                            buf.buf.truncate(0);
++                            buf.pos = 0;
++                        }
+                         *buf_cell = Some(buf);
+                         return Poll::Ready(Ok(()));
+                     }
+@@ -85,7 +91,13 @@ where
+ 
+                     match res {
+                         Ok(_) => {
+-                            buf.copy_to(dst);
++                            let n = cmp::min(buf.len(), dst.remaining());
++                            dst.put_slice(&buf.bytes()[..n]);
++                            buf.pos += n;
++                            if buf.pos == buf.buf.len() {
++                                buf.buf.truncate(0);
++                                buf.pos = 0;
++                            }
+                             self.state = State::Idle(Some(buf));
+                             return Poll::Ready(Ok(()));
+                         }
+@@ -208,19 +220,6 @@ impl Buf {
+         self.buf.len() - self.pos
+     }
+ 
+-    pub(crate) fn copy_to(&mut self, dst: &mut ReadBuf<'_>) -> usize {
+-        let n = cmp::min(self.len(), dst.remaining());
+-        dst.put_slice(&self.bytes()[..n]);
+-        self.pos += n;
+-
+-        if self.pos == self.buf.len() {
+-            self.buf.truncate(0);
+-            self.pos = 0;
+-        }
+-
+-        n
+-    }
+-
+     pub(crate) fn copy_from(&mut self, src: &[u8], max_buf_size: usize) -> usize {
+         assert!(self.is_empty());
+ 
+diff --git a/tokio/src/io/read_buf.rs b/tokio/src/io/read_buf.rs
+index edef8485..9c5bb558 100644
+--- a/tokio/src/io/read_buf.rs
++++ b/tokio/src/io/read_buf.rs
+@@ -21,9 +21,9 @@ use std::mem::MaybeUninit;
+ /// region, since it is merely unknown whether this region is uninitialized or
+ /// not, and if part of it turns out to be initialized, it must stay initialized.
+ pub struct ReadBuf<'a> {
+-    buf: &'a mut [MaybeUninit<u8>],
+-    filled: usize,
+-    initialized: usize,
++    pub(crate) buf: &'a mut [MaybeUninit<u8>],
++    pub(crate) filled: usize,
++    pub(crate) initialized: usize,
+ }
+ 
+ impl<'a> ReadBuf<'a> {

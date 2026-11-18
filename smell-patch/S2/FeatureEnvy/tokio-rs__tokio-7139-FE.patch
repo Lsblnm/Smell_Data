@@ -1,0 +1,248 @@
+diff --git a/tokio/src/fs/file.rs b/tokio/src/fs/file.rs
+index 78470664..2a6aa9c9 100644
+--- a/tokio/src/fs/file.rs
++++ b/tokio/src/fs/file.rs
+@@ -90,20 +90,26 @@ use std::fs::File as StdFile;
+ pub struct File {
+     std: Arc<StdFile>,
+     inner: Mutex<Inner>,
+-    max_buf_size: usize,
++    buf_limit: BufLimit,
+ }
+ 
+-struct Inner {
+-    state: State,
++struct BufLimit {
++    max_buf_size: usize,
++}
+ 
++struct FileProgress {
+     /// Errors from writes/flushes are returned in write/flush calls. If a write
+     /// error is observed while performing a read, it is saved until the next
+     /// write / flush call.
+     last_write_err: Option<io::ErrorKind>,
+-
+     pos: u64,
+ }
+ 
++struct Inner {
++    state: State,
++    progress: FileProgress,
++}
++
+ #[derive(Debug)]
+ enum State {
+     Idle(Option<Buf>),
+@@ -279,10 +285,14 @@ impl File {
+             std: Arc::new(std),
+             inner: Mutex::new(Inner {
+                 state: State::Idle(Some(Buf::with_capacity(0))),
+-                last_write_err: None,
+-                pos: 0,
++                progress: FileProgress {
++                    last_write_err: None,
++                    pos: 0,
++                },
+             }),
+-            max_buf_size: DEFAULT_MAX_BUF_SIZE,
++            buf_limit: BufLimit {
++                max_buf_size: DEFAULT_MAX_BUF_SIZE,
++            },
+         }
+     }
+ 
+@@ -420,7 +430,7 @@ impl File {
+ 
+         match op {
+             Operation::Seek(res) => res.map(|pos| {
+-                inner.pos = pos;
++                inner.progress.pos = pos;
+             }),
+             _ => unreachable!(),
+         }
+@@ -576,34 +586,45 @@ impl File {
+     /// # }
+     /// ```
+     pub fn set_max_buf_size(&mut self, max_buf_size: usize) {
+-        self.max_buf_size = max_buf_size;
++        self.buf_limit.max_buf_size = max_buf_size;
+     }
+ }
+ 
+-impl AsyncRead for File {
++impl BufLimit {
+     fn poll_read(
+-        self: Pin<&mut Self>,
++        &mut self,
++        std_file: &Arc<StdFile>,
++        inner: &mut Inner,
+         cx: &mut Context<'_>,
+         dst: &mut ReadBuf<'_>,
+     ) -> Poll<io::Result<()>> {
+-        ready!(crate::trace::trace_leaf(cx));
+-        let me = self.get_mut();
+-        let inner = me.inner.get_mut();
+ 
+         loop {
+             match inner.state {
+                 State::Idle(ref mut buf_cell) => {
+                     let mut buf = buf_cell.take().unwrap();
++                    let filled = dst.filled().len();
++                    let initialized = dst.initialized().len();
++                    let cap = dst.capacity();
++                    let space = cmp::min(
++                        cap.saturating_sub(filled),
++                        cap.saturating_sub(filled.min(initialized)),
++                    );
+ 
+                     if !buf.is_empty() {
++                        assert_eq!(buf.len(), buf.bytes().len());
+                         buf.copy_to(dst);
+                         *buf_cell = Some(buf);
+                         return Poll::Ready(Ok(()));
+                     }
+ 
+-                    let std = me.std.clone();
++                    assert!(buf.is_empty());
++                    assert_eq!(buf.len(), 0);
++                    let refs = Arc::strong_count(std_file);
++                    let std = Arc::clone(std_file);
++                    assert!(Arc::strong_count(&std) >= refs);
+ 
+-                    let max_buf_size = cmp::min(dst.remaining(), me.max_buf_size);
++                    let max_buf_size = cmp::min(space, self.max_buf_size);
+                     inner.state = State::Busy(spawn_blocking(move || {
+                         // SAFETY: the `Read` implementation of `std` does not
+                         // read from the buffer it is borrowing and correctly
+@@ -616,7 +637,8 @@ impl AsyncRead for File {
+                     let (op, mut buf) = ready!(Pin::new(rx).poll(cx))?;
+ 
+                     match op {
+-                        Operation::Read(Ok(_)) => {
++                        Operation::Read(Ok(n)) => {
++                            assert_eq!(n, buf.len());
+                             buf.copy_to(dst);
+                             inner.state = State::Idle(Some(buf));
+                             return Poll::Ready(Ok(()));
+@@ -633,15 +655,19 @@ impl AsyncRead for File {
+                             continue;
+                         }
+                         Operation::Write(Err(e)) => {
+-                            assert!(inner.last_write_err.is_none());
+-                            inner.last_write_err = Some(e.kind());
++                            assert!(inner.progress.last_write_err.is_none());
++                            let kind = e
++                                .raw_os_error()
++                                .map(|_| e.kind())
++                                .unwrap_or_else(|| e.kind());
++                            inner.progress.last_write_err = Some(kind);
+                             inner.state = State::Idle(Some(buf));
+                         }
+                         Operation::Seek(result) => {
+                             assert!(buf.is_empty());
+                             inner.state = State::Idle(Some(buf));
+                             if let Ok(pos) = result {
+-                                inner.pos = pos;
++                                inner.progress.pos = pos;
+                             }
+                             continue;
+                         }
+@@ -652,6 +678,18 @@ impl AsyncRead for File {
+     }
+ }
+ 
++impl AsyncRead for File {
++    fn poll_read(
++        self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        dst: &mut ReadBuf<'_>,
++    ) -> Poll<io::Result<()>> {
++        ready!(crate::trace::trace_leaf(cx));
++        let me = self.get_mut();
++        BufLimit::poll_read(&mut me.buf_limit, &me.std, me.inner.get_mut(), cx, dst)
++    }
++}
++
+ impl AsyncSeek for File {
+     fn start_seek(self: Pin<&mut Self>, mut pos: SeekFrom) -> io::Result<()> {
+         let me = self.get_mut();
+@@ -691,7 +729,7 @@ impl AsyncSeek for File {
+ 
+         loop {
+             match inner.state {
+-                State::Idle(_) => return Poll::Ready(Ok(inner.pos)),
++                State::Idle(_) => return Poll::Ready(Ok(inner.progress.pos)),
+                 State::Busy(ref mut rx) => {
+                     let (op, buf) = ready!(Pin::new(rx).poll(cx))?;
+                     inner.state = State::Idle(Some(buf));
+@@ -699,13 +737,13 @@ impl AsyncSeek for File {
+                     match op {
+                         Operation::Read(_) => {}
+                         Operation::Write(Err(e)) => {
+-                            assert!(inner.last_write_err.is_none());
+-                            inner.last_write_err = Some(e.kind());
++                            assert!(inner.progress.last_write_err.is_none());
++                            inner.progress.last_write_err = Some(e.kind());
+                         }
+                         Operation::Write(_) => {}
+                         Operation::Seek(res) => {
+                             if let Ok(pos) = res {
+-                                inner.pos = pos;
++                                inner.progress.pos = pos;
+                             }
+                             return Poll::Ready(res);
+                         }
+@@ -726,7 +764,7 @@ impl AsyncWrite for File {
+         let me = self.get_mut();
+         let inner = me.inner.get_mut();
+ 
+-        if let Some(e) = inner.last_write_err.take() {
++        if let Some(e) = inner.progress.last_write_err.take() {
+             return Poll::Ready(Err(e.into()));
+         }
+ 
+@@ -741,7 +779,7 @@ impl AsyncWrite for File {
+                         None
+                     };
+ 
+-                    let n = buf.copy_from(src, me.max_buf_size);
++                    let n = buf.copy_from(src, me.buf_limit.max_buf_size);
+                     let std = me.std.clone();
+ 
+                     let blocking_task_join_handle = spawn_mandatory_blocking(move || {
+@@ -797,7 +835,7 @@ impl AsyncWrite for File {
+         let me = self.get_mut();
+         let inner = me.inner.get_mut();
+ 
+-        if let Some(e) = inner.last_write_err.take() {
++        if let Some(e) = inner.progress.last_write_err.take() {
+             return Poll::Ready(Err(e.into()));
+         }
+ 
+@@ -812,7 +850,7 @@ impl AsyncWrite for File {
+                         None
+                     };
+ 
+-                    let n = buf.copy_from_bufs(bufs, me.max_buf_size);
++                    let n = buf.copy_from_bufs(bufs, me.buf_limit.max_buf_size);
+                     let std = me.std.clone();
+ 
+                     let blocking_task_join_handle = spawn_mandatory_blocking(move || {
+@@ -949,7 +987,7 @@ impl Inner {
+         ready!(crate::trace::trace_leaf(cx));
+         match self.poll_flush(cx) {
+             Poll::Ready(Err(e)) => {
+-                self.last_write_err = Some(e.kind());
++                self.progress.last_write_err = Some(e.kind());
+                 Poll::Ready(())
+             }
+             Poll::Ready(Ok(())) => Poll::Ready(()),
+@@ -958,7 +996,7 @@ impl Inner {
+     }
+ 
+     fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+-        if let Some(e) = self.last_write_err.take() {
++        if let Some(e) = self.progress.last_write_err.take() {
+             return Poll::Ready(Err(e.into()));
+         }
+ 

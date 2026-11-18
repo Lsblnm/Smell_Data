@@ -1,0 +1,1490 @@
+diff --git a/lib/fluent/plugin_helper/http_server.rb b/lib/fluent/plugin_helper/http_server.rb
+index 9a7892cb..28ccd51a 100644
+--- a/lib/fluent/plugin_helper/http_server.rb
++++ b/lib/fluent/plugin_helper/http_server.rb
+@@ -115,13 +115,11 @@ module Fluent
+       private
+ 
+       def _http_server_overwrite_config(config, opts)
+-        conf = config.dup
+-        Fluent::PluginHelper::Server::SERVER_TRANSPORT_PARAMS.map(&:to_s).each do |param|
+-          if opts.key?(param)
+-            conf[param] = opts[param]
+-          end
+-        end
+-        conf
++        HttpServer::Server.runtime.overwrite_transport_config(
++          config,
++          opts,
++          Fluent::PluginHelper::Server::SERVER_TRANSPORT_PARAMS
++        )
+       end
+ 
+       # To block until server is ready to listen
+diff --git a/lib/fluent/plugin_helper/http_server/app.rb b/lib/fluent/plugin_helper/http_server/app.rb
+index fe8581e1..812232bf 100644
+--- a/lib/fluent/plugin_helper/http_server/app.rb
++++ b/lib/fluent/plugin_helper/http_server/app.rb
+@@ -14,64 +14,23 @@
+ #    limitations under the License.
+ #
+ 
+-require 'async/http/protocol'
+-require 'fluent/plugin_helper/http_server/methods'
+ require 'fluent/plugin_helper/http_server/request'
+ 
+ module Fluent
+   module PluginHelper
+     module HttpServer
+       class App
+-        def initialize(router, logger)
++        def initialize(router, logger, server = nil)
+           @logger = logger
+           @router = router
++          @server = server
+         end
+ 
+         # Required method by async-http
+         def call(request)
+-          method = request.method
+-          resp =
+-            case method
+-            when HttpServer::Methods::GET
+-              get(request)
+-            when HttpServer::Methods::HEAD
+-              head(request)
+-            when HttpServer::Methods::POST
+-              post(request)
+-            when HttpServer::Methods::PATCH
+-              patch(request)
+-            when HttpServer::Methods::PUT
+-              put(request)
+-            when HttpServer::Methods::DELETE
+-              delete(request)
+-            when HttpServer::Methods::OPTIONS
+-              options(request)
+-            when HttpServer::Methods::CONNECT
+-              connect(request)
+-            when HttpServer::Methods::TRACE
+-              trace(request)
+-            else
+-              raise "Unknown method #{method}"
+-            end
+-          Protocol::HTTP::Response[*resp]
+-        rescue => e
+-          @logger.error(e)
+-          Protocol::HTTP::Response[500, { 'Content-Type' => 'text/plain' }, 'Internal Server Error']
+-        end
+-
+-        HttpServer::Methods::ALL.map { |e| e.downcase.to_sym }.each do |name|
+-          define_method(name) do |request|
+-            req = Request.new(request)
+-
+-            path = req.path
+-            canonical_path =
+-              if path.size >= 2 && !path.end_with?('/')
+-                "#{path}/"
+-              else
+-                path
+-              end
+-            @router.route!(name, canonical_path, req)
+-          end
++          wrapped = Request.new(request)
++          owner = @server || HttpServer::Server.runtime
++          owner.handle_http_call(request, @router, @logger, wrapped)
+         end
+       end
+     end
+diff --git a/lib/fluent/plugin_helper/http_server/router.rb b/lib/fluent/plugin_helper/http_server/router.rb
+index 1ff64cef..a89bb32a 100644
+--- a/lib/fluent/plugin_helper/http_server/router.rb
++++ b/lib/fluent/plugin_helper/http_server/router.rb
+@@ -22,12 +22,14 @@ module Fluent
+       class Router
+         class NotFoundApp
+           def self.call(req)
+-            [404, { 'Content-Type' => 'text/plain' }, "404 Not Found\n"]
++            HttpServer::Server.runtime.missing_route_response(req)
+           end
+         end
+ 
++        attr_reader :table, :default_app
++
+         def initialize(default_app = nil)
+-          @router = { get: {}, head: {}, post: {}, put: {}, patch: {}, delete: {}, connect: {}, options: {}, trace: {} }
++          @table = { get: {}, head: {}, post: {}, put: {}, patch: {}, delete: {}, connect: {}, options: {}, trace: {} }
+           @default_app = default_app || NotFoundApp
+         end
+ 
+@@ -35,18 +37,14 @@ module Fluent
+         # @param path [String]
+         # @param app [Object]
+         def mount(method, path, app)
+-          if @router[method].include?(path)
+-            raise "#{path} is already mounted"
+-          end
+-
+-          @router[method][path] = app
++          HttpServer::Server.runtime.install_route(@table, method, path, app)
+         end
+ 
+         # @param method [Symbol]
+         # @param path [String]
+         # @param request [Fluent::PluginHelper::HttpServer::Request]
+         def route!(method, path, request)
+-          @router.fetch(method).fetch(path, @default_app).call(request)
++          HttpServer::Server.runtime.invoke_route(@table, @default_app, method, path, request)
+         end
+       end
+     end
+diff --git a/lib/fluent/plugin_helper/http_server/server.rb b/lib/fluent/plugin_helper/http_server/server.rb
+index 549db76c..c6f7942d 100644
+--- a/lib/fluent/plugin_helper/http_server/server.rb
++++ b/lib/fluent/plugin_helper/http_server/server.rb
+@@ -17,62 +17,66 @@
+ require 'async'
+ require 'async/http'
+ require 'async/http/endpoint'
++require 'cgi'
++require 'openssl'
++require 'socket'
++require 'uri'
+ 
+ require 'fluent/plugin_helper/http_server/app'
+ require 'fluent/plugin_helper/http_server/router'
+ require 'fluent/plugin_helper/http_server/methods'
+ require 'fluent/log/console_adapter'
++require 'fluent/tls'
+ 
+ module Fluent
+   module PluginHelper
+     module HttpServer
+       class Server
+-        # @param logger [Logger]
+-        # @param default_app [Object] This method must have #call.
+-        # @param tls_context [OpenSSL::SSL::SSLContext]
+-        def initialize(addr:, port:, logger:, default_app: nil, tls_context: nil)
+-          @addr = addr
+-          @port = port
+-          @logger = logger
++        PreparedRequest = Struct.new(:path, :query_string, :raw) do
++          def query
++            query_string && CGI.parse(query_string)
++          end
+ 
+-          # TODO: support http2
+-          scheme = tls_context ? 'https' : 'http'
+-          @uri = URI("#{scheme}://#{@addr}:#{@port}").to_s
+-          @router = Router.new(default_app)
+-          @reactor = Async::Reactor.new(nil, logger: Fluent::Log::ConsoleAdapter.wrap(@logger))
++          def body
++            raw && raw.body && raw.body.read
++          end
++        end
+ 
+-          opts = if tls_context
+-                   { ssl_context: tls_context }
+-                 else
+-                   {}
+-                 end
+-          @server = Async::HTTP::Server.new(App.new(@router, @logger), Async::HTTP::Endpoint.parse(@uri, **opts))
++        def self.runtime
++          @runtime ||= allocate.tap { |server| server.send(:prepare_runtime) }
++        end
+ 
++        def initialize(addr:, port:, logger:, default_app: nil, tls_context: nil)
++          prepare_runtime
++          configure_bind_address(addr)
++          configure_bind_port(port)
++          configure_lifecycle_logger(logger)
++          configure_tls_context(tls_context)
++          configure_route_registry(default_app)
++          configure_dispatch_layer(logger)
++          assemble_listen_uri(tls_scheme_name)
++          assemble_reactor
++          assemble_async_server
+           if block_given?
+             yield(self)
+           end
+         end
+ 
+         def start(notify = nil)
+-          @logger.debug("Start async HTTP server listening #{@uri}")
+-          task = @reactor.run do
+-            @server.run
+-
+-            if notify
+-              notify.push(:ready)
+-            end
+-          end
+-
++          @bind_config[:status] = :starting
++          log_listen_start
++          task = run_listen_loop(notify)
+           task.stop
+-          @logger.debug('Finished HTTP server')
++          log_listen_finish
++          @bind_config[:status] = :finished
++          task
+         end
+ 
+         def stop
+-          @logger.debug('closing HTTP server')
+-
+-          if @reactor
+-            @reactor.stop
+-          end
++          @bind_config[:status] = :stopping
++          log_listen_close
++          halt_reactor
++          @bind_config[:status] = :stopped
+         end
+ 
+         HttpServer::Methods::ALL.map { |e| e.downcase.to_sym }.each do |name|
+@@ -88,6 +92,1213 @@ module Fluent
+             @router.mount(name, path, app || block)
+           end
+         end
++
++        def prepare_runtime
++          reset_lifecycle_state
++          reset_route_state
++          reset_dispatch_state
++          reset_tls_state
++        end
++
++        def reset_lifecycle_state
++          @bind_config = {
++            addr: nil,
++            port: nil,
++            uri: nil,
++            logger: nil,
++            reactor: nil,
++            server: nil,
++            scheme: 'http',
++            status: :idle
++          }
++          @addr = nil
++          @port = nil
++          @uri = nil
++          @logger = nil
++          @reactor = nil
++          @server = nil
++        end
++
++        def configure_bind_address(addr)
++          host = normalize_listen_host(addr)
++          mark_lifecycle(:binding)
++          host
++        end
++
++        def configure_bind_port(port)
++          value = normalize_listen_port(port)
++          mark_lifecycle(:binding)
++          value
++        end
++
++        def configure_lifecycle_logger(logger)
++          @bind_config[:logger] = logger
++          @logger = logger
++          mark_lifecycle(:binding)
++          lifecycle_logger
++        end
++
++        def assemble_listen_uri(scheme)
++          host = @bind_config[:addr]
++          port = @bind_config[:port]
++          if host.nil? || host.to_s.empty?
++            host = @addr
++          end
++          if port.nil?
++            port = @port
++          end
++          @bind_config[:scheme] = scheme.nil? || scheme.to_s.empty? ? 'http' : scheme.to_s
++          @uri = URI("#{@bind_config[:scheme]}://#{host}:#{port}").to_s
++          @bind_config[:uri] = @uri
++          @bind_config[:status] = :configured
++          @uri
++        end
++
++        def assemble_reactor
++          logger = @bind_config[:logger] || @logger
++          @reactor = Async::Reactor.new(nil, logger: Fluent::Log::ConsoleAdapter.wrap(logger))
++          @bind_config[:reactor] = @reactor
++          @bind_config[:status] = :reactor_ready
++          @reactor
++        end
++
++        def assemble_async_server
++          app = current_http_app
++          opts = tls_endpoint_options
++          endpoint = parse_listen_endpoint(opts)
++          @server = Async::HTTP::Server.new(app, endpoint)
++          @bind_config[:server] = @server
++          @bind_config[:status] = :server_ready
++          @server
++        end
++
++        def parse_listen_endpoint(opts)
++          uri = @bind_config[:uri] || @uri
++          if opts.nil? || opts.empty?
++            Async::HTTP::Endpoint.parse(uri)
++          else
++            Async::HTTP::Endpoint.parse(uri, **opts)
++          end
++        end
++
++        def run_listen_loop(notify)
++          reactor = current_reactor
++          server = current_async_server
++          mark_lifecycle(:running)
++          reactor.run do
++            server.run
++            push_ready(notify)
++          end
++        end
++
++        def push_ready(notify)
++          @bind_config[:status] = :ready
++          if notify
++            notify.push(:ready)
++          end
++          @bind_config[:status]
++        end
++
++        def halt_reactor
++          reactor = current_reactor
++          if reactor
++            reactor.stop
++          end
++          @bind_config[:reactor] = reactor
++          mark_lifecycle(:halted)
++          reactor
++        end
++
++        def log_listen_start
++          logger = lifecycle_logger
++          uri = listen_uri_string
++          if logger
++            logger.debug("Start async HTTP server listening #{uri}")
++          end
++          mark_lifecycle(:starting)
++        end
++
++        def log_listen_finish
++          logger = lifecycle_logger
++          if logger
++            logger.debug('Finished HTTP server')
++          end
++          mark_lifecycle(:finished)
++        end
++
++        def log_listen_close
++          logger = lifecycle_logger
++          if logger
++            logger.debug('closing HTTP server')
++          end
++          mark_lifecycle(:closing)
++        end
++
++        def reset_route_state
++          @route_state = {
++            table: new_empty_route_table,
++            default: Router::NotFoundApp,
++            mounts: [],
++            router: nil,
++            last_method: nil,
++            last_path: nil
++          }
++          @router = nil
++        end
++
++        def configure_route_registry(default_app)
++          @router = Router.new(default_app)
++          @route_state[:router] = @router
++          @route_state[:table] = @router.table
++          if default_app
++            @route_state[:default] = default_app
++          else
++            @route_state[:default] = Router::NotFoundApp
++          end
++          @route_state[:mounts] = []
++          @router
++        end
++
++        def new_empty_route_table
++          table = {}
++          http_verb_keys.each do |verb|
++            table[verb] = {}
++          end
++          if @route_state
++            @route_state[:table] = table
++          end
++          table
++        end
++
++        def http_verb_keys
++          keys = [:get, :head, :post, :put, :patch, :delete, :connect, :options, :trace]
++          if @route_state && @route_state[:table]
++            keys.each do |verb|
++              @route_state[:table][verb] ||= {}
++            end
++          end
++          keys
++        end
++
++        def install_route(table, method, path, app)
++          store = ensure_route_table(table)
++          bucket = fetch_route_bucket(store, method)
++          if route_occupied?(bucket, path)
++            raise "#{path} is already mounted"
++          end
++          bucket[path] = app
++          remember_installed_route(method, path)
++          @route_state[:router] = @router
++          app
++        end
++
++        def fetch_route_bucket(table, method)
++          store = table || @route_state[:table]
++          if store.nil? && @router
++            store = @router.table
++          end
++          @route_state[:last_method] = method
++          store[method]
++        end
++
++        def route_occupied?(bucket, path)
++          @route_state[:last_path] = path
++          bucket.include?(path)
++        end
++
++        def remember_installed_route(method, path)
++          mounts = @route_state[:mounts]
++          if mounts.nil?
++            mounts = []
++            @route_state[:mounts] = mounts
++          end
++          mounts << [method, path]
++          @route_state[:last_method] = method
++          @route_state[:last_path] = path
++          @route_state[:router] = @router
++          mounts
++        end
++
++        def invoke_route(table, default_app, method, path, request)
++          store = ensure_route_table(table)
++          fallback = default_app || router_default_app
++          handler = lookup_handler(store, fallback, method, path)
++          @route_state[:last_method] = method
++          @route_state[:last_path] = path
++          handler.call(request)
++        end
++
++        def lookup_handler(table, default_app, method, path)
++          store = table || @route_state[:table]
++          fallback = default_app || @route_state[:default] || Router::NotFoundApp
++          bucket = store.fetch(method)
++          @route_state[:last_method] = method
++          @route_state[:last_path] = path
++          bucket.fetch(path, fallback)
++        end
++
++        def missing_route_response(request)
++          path = request.respond_to?(:path) ? request.path : nil
++          @route_state[:last_path] = path
++          not_found_tuple
++        end
++
++        def not_found_body
++          "404 Not Found\n"
++        end
++
++        def reset_dispatch_state
++          @dispatch_state = {
++            logger: nil,
++            app: nil,
++            last_method: nil,
++            last_path: nil,
++            last_query: nil,
++            canonical_path: nil,
++            wrapped_request: nil
++          }
++        end
++
++        def configure_dispatch_layer(logger)
++          @dispatch_state[:logger] = logger
++          @dispatch_state[:app] = App.new(@router, logger, self)
++          @dispatch_state[:last_method] = nil
++          @dispatch_state[:last_path] = nil
++          @dispatch_state[:app]
++        end
++
++        def current_http_app
++          app = @dispatch_state[:app]
++          if app.nil?
++            app = App.new(@router, @dispatch_state[:logger], self)
++            @dispatch_state[:app] = app
++          end
++          app
++        end
++
++        def handle_http_call(request, router = nil, logger = nil, wrapped = nil)
++          if logger
++            @dispatch_state[:logger] = logger
++          end
++          @dispatch_state[:wrapped_request] = wrapped
++          method = extract_http_method(request)
++          @dispatch_state[:last_method] = method
++          resp = dispatch_named(method, request, router)
++          wrap_protocol_response(resp)
++        rescue => e
++          record_dispatch_error(e)
++          internal_error_response
++        end
++
++        def extract_http_method(request)
++          method = request.method
++          remember_dispatch_method(method)
++          if method.nil?
++            raise "Unknown method #{method}"
++          end
++          method
++        end
++
++        def dispatch_named(method, request, router)
++          @dispatch_state[:last_method] = method
++          case method
++          when HttpServer::Methods::GET
++            dispatch_get(request, router)
++          when HttpServer::Methods::HEAD
++            dispatch_head(request, router)
++          when HttpServer::Methods::POST
++            dispatch_post(request, router)
++          when HttpServer::Methods::PATCH
++            dispatch_patch(request, router)
++          when HttpServer::Methods::PUT
++            dispatch_put(request, router)
++          when HttpServer::Methods::DELETE
++            dispatch_delete(request, router)
++          when HttpServer::Methods::OPTIONS
++            dispatch_options(request, router)
++          when HttpServer::Methods::CONNECT
++            dispatch_connect(request, router)
++          when HttpServer::Methods::TRACE
++            dispatch_trace(request, router)
++          else
++            raise "Unknown method #{method}"
++          end
++        end
++
++        def dispatch_get(request, router)
++          @dispatch_state[:last_method] = HttpServer::Methods::GET
++          route_wrapped_request(:get, request, router)
++        end
++
++        def dispatch_head(request, router)
++          @dispatch_state[:last_method] = HttpServer::Methods::HEAD
++          route_wrapped_request(:head, request, router)
++        end
++
++        def dispatch_post(request, router)
++          @dispatch_state[:last_method] = HttpServer::Methods::POST
++          route_wrapped_request(:post, request, router)
++        end
++
++        def dispatch_patch(request, router)
++          @dispatch_state[:last_method] = HttpServer::Methods::PATCH
++          route_wrapped_request(:patch, request, router)
++        end
++
++        def dispatch_put(request, router)
++          @dispatch_state[:last_method] = HttpServer::Methods::PUT
++          route_wrapped_request(:put, request, router)
++        end
++
++        def dispatch_delete(request, router)
++          @dispatch_state[:last_method] = HttpServer::Methods::DELETE
++          route_wrapped_request(:delete, request, router)
++        end
++
++        def dispatch_options(request, router)
++          @dispatch_state[:last_method] = HttpServer::Methods::OPTIONS
++          route_wrapped_request(:options, request, router)
++        end
++
++        def dispatch_connect(request, router)
++          @dispatch_state[:last_method] = HttpServer::Methods::CONNECT
++          route_wrapped_request(:connect, request, router)
++        end
++
++        def dispatch_trace(request, router)
++          @dispatch_state[:last_method] = HttpServer::Methods::TRACE
++          route_wrapped_request(:trace, request, router)
++        end
++
++        def route_wrapped_request(name, request, router)
++          req = build_request_wrapper(request)
++          path = canonical_request_path(req.path)
++          @dispatch_state[:canonical_path] = path
++          target = router || (@dispatch_state[:app] && @router) || @router
++          if target.nil?
++            raise "Unknown method #{name}"
++          end
++          target.route!(name, path, req)
++        end
++
++        def build_request_wrapper(request)
++          wrapped = @dispatch_state[:wrapped_request]
++          if wrapped.nil?
++            path, query = split_request_target(request.path)
++            wrapped = PreparedRequest.new(path, query, request)
++            @dispatch_state[:wrapped_request] = wrapped
++          end
++          remember_dispatch_path(request_path_of(wrapped))
++          remember_dispatch_query(request_query_of(wrapped))
++          wrapped
++        end
++
++        def canonical_request_path(path)
++          remember_dispatch_path(path)
++          text = with_trailing_slash(path)
++          @dispatch_state[:canonical_path] = text
++          text
++        end
++
++        def wrap_protocol_response(resp)
++          Protocol::HTTP::Response[*resp]
++        end
++
++        def record_dispatch_error(error)
++          logger = @dispatch_state[:logger]
++          if logger
++            logger.error(error)
++          end
++          error
++        end
++
++        def internal_error_response
++          tuple = internal_error_tuple
++          Protocol::HTTP::Response[*tuple]
++        end
++
++        def internal_error_body
++          'Internal Server Error'
++        end
++
++        def split_request_target(path)
++          if path.nil?
++            remember_dispatch_path(nil)
++            remember_dispatch_query(nil)
++            return [nil, nil]
++          end
++          parts = path.split('?', 2)
++          request_path = parts[0]
++          query = parts.length > 1 ? parts[1] : nil
++          remember_dispatch_path(request_path)
++          remember_dispatch_query(query)
++          query_present?(query)
++          [request_path, query]
++        end
++
++        def reset_tls_state
++          @tls_state = {
++            context: nil,
++            enabled: false,
++            log: nil,
++            transport: nil,
++            cert: nil,
++            key: nil,
++            extra: nil
++          }
++          @tls_context = nil
++        end
++
++        def configure_tls_context(tls_context)
++          @tls_state[:context] = tls_context
++          @tls_state[:enabled] = !tls_context.nil?
++          @tls_context = tls_context
++          tls_context
++        end
++
++        def tls_scheme_name
++          if @tls_state[:enabled] || @tls_state[:context]
++            'https'
++          else
++            'http'
++          end
++        end
++
++        def tls_endpoint_options
++          context = @tls_state[:context] || @tls_context
++          if context
++            @tls_state[:enabled] = true
++            { ssl_context: context }
++          else
++            @tls_state[:enabled] = false
++            {}
++          end
++        end
++
++        def overwrite_transport_config(config, opts, params = nil)
++          names = params || default_transport_param_names
++          conf = duplicate_transport_config(config)
++          names.each do |param|
++            apply_transport_override(conf, opts, param)
++          end
++          @tls_state[:transport] = conf
++          conf
++        end
++
++        def duplicate_transport_config(config)
++          if config.nil?
++            @tls_state[:transport] = nil
++            return nil
++          end
++          copied = config.dup
++          @tls_state[:transport] = copied
++          copied
++        end
++
++        def apply_transport_override(conf, opts, param)
++          key = param.to_s
++          if opts.key?(key)
++            conf[key] = opts[key]
++          elsif opts.key?(param)
++            conf[param] = opts[param]
++          end
++          @tls_state[:transport] = conf
++          conf
++        end
++
++        def default_transport_param_names
++          [
++            :protocol, :version, :min_version, :max_version, :ciphers, :insecure,
++            :ca_path, :cert_path, :private_key_path, :private_key_passphrase, :client_cert_auth,
++            :ca_cert_path, :ca_private_key_path, :ca_private_key_passphrase,
++            :cert_verifier, :generate_private_key_length,
++            :generate_cert_country, :generate_cert_state, :generate_cert_state,
++            :generate_cert_locality, :generate_cert_common_name,
++            :generate_cert_expiration, :generate_cert_digest
++          ]
++        end
++
++        def build_ssl_context(log, config)
++          @tls_state[:log] = log
++          @tls_state[:transport] = config
++          cert, key, extra = validate_tls_server_config(config)
++          store_tls_material(cert, key, extra)
++          ctx = OpenSSL::SSL::SSLContext.new
++          apply_default_tls_params(ctx, config)
++          apply_client_cert_auth(ctx, config)
++          apply_ca_file(ctx, config)
++          apply_server_material(ctx, cert, key, extra)
++          apply_cert_verifier(ctx, config)
++          apply_tls_versions(ctx, config)
++          apply_tls_ciphers(ctx, config)
++          @tls_state[:context] = ctx
++          @tls_state[:enabled] = true
++          @tls_context = ctx
++          ctx
++        end
++
++        def apply_default_tls_params(ctx, config)
++          insecure = tls_insecure?(config)
++          unless insecure
++            ctx.set_params({})
++          end
++          @tls_state[:enabled] = !insecure
++          ctx
++        end
++
++        def apply_client_cert_auth(ctx, config)
++          if client_cert_auth?(config)
++            ctx.verify_mode = OpenSSL::SSL::VERIFY_PEER | OpenSSL::SSL::VERIFY_FAIL_IF_NO_PEER_CERT
++            @tls_state[:enabled] = true
++          else
++            end
++          ctx
++        end
++
++        def apply_ca_file(ctx, config)
++          path = ca_path_of(config)
++          if path
++            ctx.ca_file = path
++          end
++          @tls_state[:transport] = config
++          ctx
++        end
++
++        def apply_server_material(ctx, cert, key, extra)
++          ctx.cert = cert
++          ctx.key = key
++          if extra_chain?(extra)
++            ctx.extra_chain_cert = extra
++          end
++          store_tls_material(cert, key, extra)
++          ctx
++        end
++
++        def apply_cert_verifier(ctx, config)
++          verifier = cert_verifier_of(config)
++          if verifier
++            sandbox = Class.new
++            ctx.verify_callback = load_cert_verifier(sandbox, verifier)
++            @tls_state[:enabled] = true
++          else
++            end
++          ctx
++        end
++
++        def load_cert_verifier(sandbox, verifier)
++          callback = nil
++          if File.exist?(verifier)
++            source = File.read(verifier)
++            callback = sandbox.instance_eval(source, File.basename(verifier))
++          else
++            callback = sandbox.instance_eval(verifier)
++          end
++          callback
++        end
++
++        def apply_tls_versions(ctx, config)
++          version = config.version
++          Fluent::TLS.set_version_to_context(ctx, version, config.min_version, config.max_version)
++          @tls_state[:transport] = config
++          ctx
++        end
++
++        def apply_tls_ciphers(ctx, config)
++          insecure = tls_insecure?(config)
++          unless insecure
++            ctx.ciphers = config.ciphers
++          end
++          @tls_state[:enabled] = !insecure || @tls_state[:enabled]
++          ctx
++        end
++
++        def tls_insecure?(config)
++          insecure = false
++          if config.nil?
++            insecure = false
++          elsif config.insecure
++            insecure = true
++          else
++            insecure = false
++          end
++          @tls_state[:enabled] = !insecure
++          insecure
++        end
++
++        def validate_tls_server_config(conf)
++          @tls_state[:transport] = conf
++          if cert_path_of(conf)
++            load_configured_certificate(conf)
++          elsif ca_cert_path_of(conf)
++            generate_server_pair_by_ca_config(conf)
++          elsif tls_insecure?(conf)
++            generate_self_signed_server_pair(conf)
++          else
++            raise Fluent::ConfigError, "no valid cert options configured. specify either 'cert_path', 'ca_cert_path' or 'insecure'"
++          end
++        end
++
++        def load_configured_certificate(conf)
++          unless private_key_path_of(conf)
++            raise Fluent::ConfigError, "private_key_path is required when cert_path is specified"
++          end
++          unless private_key_passphrase_of(conf)
++            warn_tls("For security reason, setting private_key_passphrase is recommended when cert_path is specified")
++          end
++          cert, key, extra = load_certificate_pair(cert_path_of(conf), private_key_path_of(conf), private_key_passphrase_of(conf))
++          store_tls_material(cert, key, extra)
++          [cert, key, extra]
++        end
++
++        def generate_server_pair_by_ca_config(conf)
++          unless ca_private_key_path_of(conf)
++            raise Fluent::ConfigError, "ca_private_key_path is required when ca_cert_path is specified"
++          end
++          unless ca_private_key_passphrase_of(conf)
++            warn_tls("For security reason, setting ca_private_key_passphrase is recommended when ca_cert_path is specified")
++          end
++          generate_opts = cert_generation_opts_from_conf(conf)
++          cert, key, extra = generate_server_pair_by_ca(
++            ca_cert_path_of(conf),
++            ca_private_key_path_of(conf),
++            ca_private_key_passphrase_of(conf),
++            generate_opts
++          )
++          store_tls_material(cert, key, extra)
++          [cert, key, extra]
++        end
++
++        def generate_self_signed_server_pair(conf)
++          warn_tls("insecure TLS communication server is configured (using 'insecure' mode)")
++          generate_opts = cert_generation_opts_from_conf(conf)
++          cert, key, extra = generate_server_pair_self_signed(generate_opts)
++          @tls_state[:cert] = cert
++          @tls_state[:key] = key
++          @tls_state[:extra] = extra
++          [cert, key, extra]
++        end
++
++        def warn_tls(message)
++          log = @tls_state[:log]
++          if log
++            log.warn(message)
++          end
++          message
++        end
++
++        def load_certificate_pair(cert_path, private_key_path, private_key_passphrase)
++          key = OpenSSL::PKey::read(File.read(private_key_path), private_key_passphrase)
++          certs = certificates_from_file(cert_path)
++          cert = certs.shift
++          extra = certs
++          @tls_state[:cert] = cert
++          @tls_state[:key] = key
++          @tls_state[:extra] = extra
++          [cert, key, extra]
++        end
++
++        def cert_generation_opts_from_conf(conf)
++          opts = {
++            private_key_length: conf.generate_private_key_length,
++            country: conf.generate_cert_country,
++            state: conf.generate_cert_state,
++            locality: conf.generate_cert_locality,
++            common_name: conf.generate_cert_common_name || ::Socket.gethostname,
++            expiration: conf.generate_cert_expiration,
++            digest: conf.generate_cert_digest
++          }
++          @tls_state[:transport] = conf
++          opts
++        end
++
++        def generate_certificate_pair(opts, issuer = nil)
++          length = certificate_key_length(opts)
++          key = OpenSSL::PKey::RSA.generate(length)
++          subject = build_certificate_subject(opts)
++          issuer_name = issuer.nil? ? subject : issuer
++          cert = OpenSSL::X509::Certificate.new
++          cert.not_before = Time.at(0)
++          cert.not_after = Time.now + certificate_expiration(opts)
++          cert.public_key = key
++          cert.version = 2
++          cert.serial = rand(2**(8 * 10))
++          cert.issuer = issuer_name
++          cert.subject = subject
++          store_tls_material(cert, key, @tls_state[:extra])
++          [cert, key]
++        end
++
++        def build_certificate_subject(opts)
++          subject = OpenSSL::X509::Name.new
++          country = opts[:country]
++          state = opts[:state]
++          locality = opts[:locality]
++          common_name = certificate_common_name(opts)
++          if country
++            subject.add_entry('C', country)
++          end
++          if state
++            subject.add_entry('ST', state)
++          end
++          if locality
++            subject.add_entry('L', locality)
++          end
++          if common_name
++            subject.add_entry('CN', common_name)
++          end
++          @tls_state[:enabled] = true
++          subject
++        end
++
++        def add_certificate_extensions(cert, extensions)
++          factory = OpenSSL::X509::ExtensionFactory.new
++          extensions.each do |ext|
++            oid, value = ext
++            cert.add_extension(factory.create_extension(oid, value))
++          end
++          @tls_state[:cert] = cert
++          cert
++        end
++
++        def generate_server_pair_by_ca(ca_cert_path, ca_key_path, ca_key_passphrase, generate_opts)
++          ca_key = OpenSSL::PKey::read(File.read(ca_key_path), ca_key_passphrase)
++          ca_cert = OpenSSL::X509::Certificate.new(File.read(ca_cert_path))
++          cert, key = generate_certificate_pair(generate_opts, ca_cert.subject)
++          if digest_missing?(generate_opts)
++            raise "BUG: certificate digest algorithm not set"
++          end
++          add_certificate_extensions(cert, [
++            ['basicConstraints', 'CA:FALSE'],
++            ['nsCertType', 'server'],
++            ['keyUsage', 'digitalSignature,keyEncipherment'],
++            ['extendedKeyUsage', 'serverAuth']
++          ])
++          cert.sign(ca_key, generate_opts[:digest].to_s)
++          store_tls_material(cert, key, nil)
++          [cert, key, nil]
++        end
++
++        def generate_server_pair_self_signed(generate_opts)
++          cert, key = generate_certificate_pair(generate_opts)
++          if digest_missing?(generate_opts)
++            raise "BUG: certificate digest algorithm not set"
++          end
++          add_certificate_extensions(cert, [
++            ['basicConstraints', 'CA:FALSE'],
++            ['nsCertType', 'server']
++          ])
++          cert.sign(key, generate_opts[:digest].to_s)
++          store_tls_material(cert, key, nil)
++          [cert, key, nil]
++        end
++
++        def certificates_from_file(path)
++          data = File.read(path)
++          pattern = Regexp.compile('-+BEGIN CERTIFICATE-+\r?\n(?:[^-]*\r?\n)+-+END CERTIFICATE-+\r?\n?', Regexp::MULTILINE)
++          list = []
++          data.scan(pattern) { |match| list << OpenSSL::X509::Certificate.new(match) }
++          if list.length == 0
++            raise Fluent::ConfigError, "cert_path does not contain a valid certificate"
++          end
++          @tls_state[:extra] = list
++          list
++        end
++
++        def normalize_listen_host(host)
++          text = host
++          if text.nil?
++            text = @bind_config[:addr]
++          end
++          if text.nil? || text.to_s.empty?
++            text = '0.0.0.0'
++          end
++          @bind_config[:addr] = text.to_s
++          @addr = @bind_config[:addr]
++          @bind_config[:addr]
++        end
++
++        def normalize_listen_port(port)
++          value = port
++          if value.nil?
++            value = @bind_config[:port]
++          end
++          if value.nil?
++            value = 0
++          end
++          @bind_config[:port] = value
++          @port = value
++          value
++        end
++
++        def listen_uri_string
++          uri = @bind_config[:uri]
++          if uri.nil? || uri.to_s.empty?
++            uri = @uri
++          end
++          @bind_config[:uri] = uri
++          uri
++        end
++
++        def lifecycle_logger
++          logger = @bind_config[:logger]
++          if logger.nil?
++            logger = @logger
++          end
++          @bind_config[:logger] = logger
++          logger
++        end
++
++        def current_reactor
++          reactor = @bind_config[:reactor]
++          if reactor.nil?
++            reactor = @reactor
++          end
++          @bind_config[:reactor] = reactor
++          reactor
++        end
++
++        def current_async_server
++          server = @bind_config[:server]
++          if server.nil?
++            server = @server
++          end
++          @bind_config[:server] = server
++          server
++        end
++
++        def mark_lifecycle(status)
++          if status.nil?
++            status = @bind_config[:status]
++          end
++          @bind_config[:status] = status
++          status
++        end
++
++        def router_table
++          table = @route_state[:table]
++          if table.nil? && @router
++            table = @router.table
++            @route_state[:table] = table
++          end
++          table
++        end
++
++        def router_default_app
++          default_app = @route_state[:default]
++          if default_app.nil? && @router
++            default_app = @router.default_app
++            @route_state[:default] = default_app
++          end
++          if default_app.nil?
++            default_app = Router::NotFoundApp
++            @route_state[:default] = default_app
++          end
++          default_app
++        end
++
++        def ensure_route_table(table)
++          store = table
++          if store.nil?
++            store = router_table
++          end
++          if store.nil?
++            store = new_empty_route_table
++            @route_state[:table] = store
++          end
++          store
++        end
++
++        def remember_dispatch_method(method)
++          @dispatch_state[:last_method] = method
++          method
++        end
++
++        def remember_dispatch_path(path)
++          @dispatch_state[:last_path] = path
++          path
++        end
++
++        def remember_dispatch_query(query)
++          @dispatch_state[:last_query] = query
++          query
++        end
++
++        def path_needs_trailing_slash?(path)
++          needed = false
++          if path.nil?
++            needed = false
++          elsif path.size >= 2 && !path.end_with?('/')
++            needed = true
++          else
++            needed = false
++          end
++          @dispatch_state[:last_path] = path
++          needed
++        end
++
++        def with_trailing_slash(path)
++          if path_needs_trailing_slash?(path)
++            "#{path}/"
++          else
++            path
++          end
++        end
++
++        def query_present?(query_string)
++          present = false
++          if query_string.nil?
++            present = false
++          elsif query_string.empty?
++            present = false
++          else
++            present = true
++          end
++          @dispatch_state[:last_query] = query_string
++          present
++        end
++
++        def body_present?(request)
++          present = false
++          if request.nil?
++            present = false
++          elsif request.body
++            present = true
++          else
++            present = false
++          end
++          @dispatch_state[:wrapped_request] = request
++          present
++        end
++
++        def store_tls_material(cert, key, extra)
++          @tls_state[:cert] = cert
++          @tls_state[:key] = key
++          @tls_state[:extra] = extra
++          [cert, key, extra]
++        end
++
++        def extra_chain?(extra)
++          present = false
++          if extra.nil?
++            present = false
++          elsif extra.empty?
++            present = false
++          else
++            present = true
++          end
++          @tls_state[:extra] = extra
++          present
++        end
++
++        def digest_missing?(opts)
++          missing = false
++          if opts.nil?
++            missing = true
++          elsif opts[:digest]
++            missing = false
++          else
++            missing = true
++          end
++          missing
++        end
++
++        def certificate_common_name(opts)
++          name = nil
++          if opts.nil?
++            name = ::Socket.gethostname
++          elsif opts[:common_name]
++            name = opts[:common_name]
++          else
++            name = ::Socket.gethostname
++          end
++          @tls_state[:enabled] = true
++          name
++        end
++
++        def certificate_expiration(opts)
++          expiration = nil
++          if opts.nil?
++            expiration = 0
++          elsif opts[:expiration]
++            expiration = opts[:expiration]
++          else
++            expiration = 0
++          end
++          @tls_state[:enabled] = true
++          expiration
++        end
++
++        def certificate_key_length(opts)
++          length = nil
++          if opts.nil?
++            length = 2048
++          elsif opts[:private_key_length]
++            length = opts[:private_key_length]
++          else
++            length = 2048
++          end
++          @tls_state[:enabled] = true
++          length
++        end
++
++        def header_content_type_plain
++          headers = { 'Content-Type' => 'text/plain' }
++          headers
++        end
++
++        def compose_text_response(status, body)
++          headers = header_content_type_plain
++          if status.nil?
++            status = 500
++          end
++          if body.nil?
++            body = internal_error_body
++          end
++          [status, headers, body]
++        end
++
++        def not_found_tuple
++          compose_text_response(404, not_found_body)
++        end
++
++        def internal_error_tuple
++          compose_text_response(500, internal_error_body)
++        end
++
++        def request_path_of(request)
++          path = nil
++          if request.respond_to?(:path)
++            path = request.path
++          elsif request.respond_to?(:url)
++            path = request.url
++          else
++            path = nil
++          end
++          remember_dispatch_path(path)
++          path
++        end
++
++        def request_query_of(request)
++          query = nil
++          if request.respond_to?(:query_string)
++            query = request.query_string
++          else
++            path = request_path_of(request)
++            _p, query = split_request_target(path)
++          end
++          remember_dispatch_query(query)
++          query
++        end
++
++        def config_field(conf, name)
++          @tls_state[:transport] = conf
++          if conf.nil?
++            nil
++          else
++            conf.__send__(name)
++          end
++        end
++
++        def cert_path_of(conf)
++          path = config_field(conf, :cert_path)
++          if path.nil? || path.to_s.empty?
++            @tls_state[:transport] = conf
++            nil
++          else
++            @tls_state[:transport] = conf
++            path
++          end
++        end
++
++        def ca_cert_path_of(conf)
++          path = config_field(conf, :ca_cert_path)
++          if path.nil? || path.to_s.empty?
++            @tls_state[:transport] = conf
++            nil
++          else
++            @tls_state[:transport] = conf
++            path
++          end
++        end
++
++        def private_key_path_of(conf)
++          path = config_field(conf, :private_key_path)
++          if path.nil? || path.to_s.empty?
++            @tls_state[:transport] = conf
++            nil
++          else
++            @tls_state[:transport] = conf
++            path
++          end
++        end
++
++        def ca_private_key_path_of(conf)
++          path = config_field(conf, :ca_private_key_path)
++          if path.nil? || path.to_s.empty?
++            @tls_state[:transport] = conf
++            nil
++          else
++            @tls_state[:transport] = conf
++            path
++          end
++        end
++
++        def private_key_passphrase_of(conf)
++          value = config_field(conf, :private_key_passphrase)
++          if value.nil? || value.to_s.empty?
++            @tls_state[:transport] = conf
++            nil
++          else
++            @tls_state[:transport] = conf
++            value
++          end
++        end
++
++        def ca_private_key_passphrase_of(conf)
++          value = config_field(conf, :ca_private_key_passphrase)
++          if value.nil? || value.to_s.empty?
++            @tls_state[:transport] = conf
++            nil
++          else
++            @tls_state[:transport] = conf
++            value
++          end
++        end
++
++        def client_cert_auth?(conf)
++          enabled = false
++          value = config_field(conf, :client_cert_auth)
++          if value
++            enabled = true
++          else
++            enabled = false
++          end
++          @tls_state[:enabled] = enabled || @tls_state[:enabled]
++          enabled
++        end
++
++        def ca_path_of(conf)
++          path = config_field(conf, :ca_path)
++          if path.nil? || path.to_s.empty?
++            @tls_state[:transport] = conf
++            nil
++          else
++            @tls_state[:transport] = conf
++            path
++          end
++        end
++
++        def cert_verifier_of(conf)
++          verifier = config_field(conf, :cert_verifier)
++          if verifier.nil? || verifier.to_s.empty?
++            @tls_state[:transport] = conf
++            nil
++          else
++            @tls_state[:transport] = conf
++            verifier
++          end
++        end
++
+       end
+     end
+   end
+diff --git a/lib/fluent/plugin_helper/http_server/ssl_context_builder.rb b/lib/fluent/plugin_helper/http_server/ssl_context_builder.rb
+index 06d6ec9e..51ed12be 100644
+--- a/lib/fluent/plugin_helper/http_server/ssl_context_builder.rb
++++ b/lib/fluent/plugin_helper/http_server/ssl_context_builder.rb
+@@ -14,27 +14,18 @@
+ #    limitations under the License.
+ #
+ 
+-require 'fluent/plugin_helper/cert_option'
+-
+ module Fluent
+   module PluginHelper
+     module HttpServer
+-      # In order not to expose CertOption's methods unnecessary
+       class SSLContextBuilder
+-        include Fluent::PluginHelper::CertOption
+-
+         def initialize(log)
+           @log = log
+         end
+ 
+         # @param config [Fluent::Config::Section] @transport_config
+         def build(config)
+-          cert_option_create_context(config.version, config.insecure, config.ciphers, config)
++          Server.runtime.build_ssl_context(@log, config)
+         end
+-
+-        private
+-
+-        attr_reader :log
+       end
+     end
+   end

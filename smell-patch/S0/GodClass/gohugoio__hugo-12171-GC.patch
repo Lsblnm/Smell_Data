@@ -1,0 +1,1935 @@
+diff --git a/hugolib/content_map_page.go b/hugolib/content_map_page.go
+index 89df951e9..2ef24b1a9 100644
+--- a/hugolib/content_map_page.go
++++ b/hugolib/content_map_page.go
+@@ -14,37 +14,46 @@
+ package hugolib
+ 
+ import (
++	"bytes"
+ 	"context"
++	"errors"
+ 	"fmt"
++	"html/template"
+ 	"io"
+ 	"path"
++	"path/filepath"
+ 	"sort"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
++	"unicode/utf8"
+ 
+ 	"github.com/bep/logg"
+ 	"github.com/gohugoio/hugo/cache/dynacache"
++	"github.com/gohugoio/hugo/common/herrors"
+ 	"github.com/gohugoio/hugo/common/loggers"
++	"github.com/gohugoio/hugo/common/maps"
+ 	"github.com/gohugoio/hugo/common/paths"
+ 	"github.com/gohugoio/hugo/common/predicate"
+ 	"github.com/gohugoio/hugo/common/rungroup"
+ 	"github.com/gohugoio/hugo/common/types"
++	"github.com/gohugoio/hugo/helpers"
++	"github.com/gohugoio/hugo/hugofs"
+ 	"github.com/gohugoio/hugo/hugofs/files"
+ 	"github.com/gohugoio/hugo/hugolib/doctree"
+ 	"github.com/gohugoio/hugo/identity"
++	"github.com/gohugoio/hugo/markup/converter"
++	"github.com/gohugoio/hugo/markup/tableofcontents"
+ 	"github.com/gohugoio/hugo/output"
+ 	"github.com/gohugoio/hugo/resources"
+-	"github.com/spf13/cast"
+-
+-	"github.com/gohugoio/hugo/common/maps"
+-
+ 	"github.com/gohugoio/hugo/resources/kinds"
+ 	"github.com/gohugoio/hugo/resources/page"
+ 	"github.com/gohugoio/hugo/resources/page/pagemeta"
+ 	"github.com/gohugoio/hugo/resources/resource"
++	"github.com/gohugoio/hugo/tpl"
++	"github.com/spf13/cast"
+ )
+ 
+ var pagePredicates = struct {
+@@ -100,6 +109,25 @@ type pageMap struct {
+ 	contentTableOfContents *dynacache.Partition[string, *resources.StaleValue[contentTableOfContents]]
+ 
+ 	cfg contentMapConfig
++
++	// Page resolution state, used when resolving refs and content nodes.
++	finderSite  *Site
++	finderTree  *doctree.NodeShiftTree[contentNodeI]
++	finderIndex *contentTreeReverseIndex
++
++	// Tree navigation state, used for ancestor/section walks.
++	navTree *doctree.NodeShiftTree[contentNodeI]
++	navSite *Site
++
++	// Collection and content orchestration state absorbed from page/content helpers.
++	collectionCache *dynacache.Partition[string, page.Pages]
++	contentCaches   pageContentCaches
++}
++
++type pageContentCaches struct {
++	rendered *dynacache.Partition[string, *resources.StaleValue[contentSummary]]
++	plain    *dynacache.Partition[string, *resources.StaleValue[contentPlainPlainWords]]
++	toc      *dynacache.Partition[string, *resources.StaleValue[contentTableOfContents]]
+ }
+ 
+ // pageTrees holds pages and resources in a tree structure for all sites/languages.
+@@ -502,6 +530,9 @@ func (m *pageMap) forEachResourceInPage(
+ 
+ func (m *pageMap) getResourcesForPage(ps *pageState) (resource.Resources, error) {
+ 	var res resource.Resources
++	if m.treeResources == nil {
++		return res, nil
++	}
+ 	m.forEachResourceInPage(ps, doctree.LockTypeNone, false, func(resourceKey string, n contentNodeI, match doctree.DimensionFlag) (bool, error) {
+ 		rs := n.(*resourceSource)
+ 		if rs.r != nil {
+@@ -911,6 +942,18 @@ func newPageMap(i int, s *Site, mcache *dynacache.Cache, pageTrees *pageTrees) *
+ 		contentTreeReverseIndexMap: &contentTreeReverseIndexMap{},
+ 	}
+ 
++	m.finderSite = s
++	m.finderTree = m.treePages
++	m.finderIndex = m.pageReverseIndex
++	m.navTree = m.treePages
++	m.navSite = s
++	m.collectionCache = m.cachePages
++	m.contentCaches = pageContentCaches{
++		rendered: m.cacheContentRendered,
++		plain:    m.cacheContentPlain,
++		toc:      m.contentTableOfContents,
++	}
++
+ 	return m
+ }
+ 
+@@ -1981,3 +2024,837 @@ type viewName struct {
+ func (v viewName) IsZero() bool {
+ 	return v.singular == ""
+ }
++
++func (m *pageMap) lookupPageRef(context page.Page, ref string) (page.Page, error) {
++	n, err := m.lookupContentNode(context, true, ref)
++	if err != nil {
++		return nil, err
++	}
++	if n == nil {
++		return nil, nil
++	}
++	if found := m.finderTree.Get(n.Path()); found != nil {
++		n = found
++	}
++	if p, ok := n.(page.Page); ok {
++		return p, nil
++	}
++	return nil, nil
++}
++
++func (m *pageMap) lookupPage(context page.Page, ref string) (page.Page, error) {
++	n, err := m.lookupContentNode(context, false, ref)
++	if err != nil {
++		return nil, err
++	}
++	if n == nil {
++		return nil, nil
++	}
++	if found := m.finderTree.Get(n.Path()); found != nil {
++		n = found
++	}
++	if p, ok := n.(page.Page); ok {
++		return p, nil
++	}
++	return nil, nil
++}
++
++func (m *pageMap) lookupPageOldVersion(kind string, sections ...string) page.Page {
++	if m.finderTree == nil {
++		return nil
++	}
++	refs := append([]string{kind}, path.Join(sections...))
++	p, _ := m.lookupPageForRefs(refs...)
++	return p
++}
++
++func (m *pageMap) lookupPageForRefs(ref ...string) (page.Page, error) {
++	if m.finderTree == nil {
++		return nil, nil
++	}
++	var refs []string
++	for _, r := range ref {
++		if r != "" && r != "/" {
++			refs = append(refs, r)
++		}
++	}
++
++	var key string
++	if len(refs) > 2 {
++		return nil, fmt.Errorf(`too many arguments to .Site.GetPage: %v. Use lookups on the form {{ .Site.GetPage "/posts/mypage-md" }}`, ref)
++	}
++
++	if len(refs) == 0 || refs[0] == kinds.KindHome {
++		key = "/"
++	} else if len(refs) == 1 {
++		if len(ref) == 2 && refs[0] == kinds.KindSection {
++			key = "/"
++		} else {
++			key = refs[0]
++		}
++	} else {
++		key = refs[1]
++	}
++
++	key = filepath.ToSlash(key)
++	if !strings.HasPrefix(key, "/") {
++		key = "/" + key
++	}
++
++	return m.lookupPage(nil, key)
++}
++
++func (m *pageMap) lookupContentNode(context page.Page, isReflink bool, ref string) (contentNodeI, error) {
++	if m.finderTree == nil {
++		return nil, nil
++	}
++	ref = paths.ToSlashTrimTrailing(ref)
++	inRef := ref
++	if ref == "" {
++		ref = "/"
++	}
++
++	if paths.HasExt(ref) {
++		return m.lookupContentNodeForRef(context, isReflink, true, inRef, ref)
++	}
++
++	if ref == "/" {
++		if n, err := m.lookupContentNodeForRef(context, isReflink, false, inRef, "/_index"+defaultContentExt); n != nil || err != nil {
++			return n, err
++		}
++	} else if strings.HasSuffix(ref, "/index") {
++		if n, err := m.lookupContentNodeForRef(context, isReflink, false, inRef, ref+"/index"+defaultContentExt); n != nil || err != nil {
++			return n, err
++		}
++		if n, err := m.lookupContentNodeForRef(context, isReflink, false, inRef, ref+defaultContentExt); n != nil || err != nil {
++			return n, err
++		}
++	} else {
++		if n, err := m.lookupContentNodeForRef(context, isReflink, false, inRef, ref+defaultContentExt); n != nil || err != nil {
++			return n, err
++		}
++	}
++
++	return nil, nil
++}
++
++func (m *pageMap) lookupContentNodeForRef(context page.Page, isReflink, hadExtension bool, inRef, ref string) (contentNodeI, error) {
++	s := m.finderSite
++	if m.finderTree == nil || s == nil {
++		return nil, nil
++	}
++	contentPathParser := s.Conf.PathParser()
++
++	if context != nil && !strings.HasPrefix(ref, "/") {
++		var baseDir string
++		if pi := context.PathInfo(); pi != nil {
++			if pi.IsBranchBundle() || (hadExtension && strings.HasPrefix(ref, "../")) {
++				baseDir = pi.Dir()
++			} else {
++				baseDir = pi.ContainerDir()
++			}
++		}
++
++		rel := path.Join(baseDir, ref)
++		relPath, _ := contentPathParser.ParseBaseAndBaseNameNoIdentifier(files.ComponentFolderContent, rel)
++
++		n, err := m.lookupContentNodeFromPath(relPath, ref)
++		if n != nil || err != nil {
++			return n, err
++		}
++
++		if hadExtension && context.File() != nil {
++			if n, err := m.lookupContentNodeFromReverseLookup(inRef, context.File().FileInfo()); n != nil || err != nil {
++				return n, err
++			}
++		}
++	}
++
++	if strings.HasPrefix(ref, ".") {
++		return nil, nil
++	}
++
++	relPath, nameNoIdentifier := contentPathParser.ParseBaseAndBaseNameNoIdentifier(files.ComponentFolderContent, ref)
++	n, err := m.lookupContentNodeFromPath(relPath, ref)
++	if n != nil || err != nil {
++		return n, err
++	}
++
++	if hadExtension && s.home != nil && s.home.File() != nil {
++		if n, err := m.lookupContentNodeFromReverseLookup(inRef, s.home.File().FileInfo()); n != nil || err != nil {
++			return n, err
++		}
++	}
++
++	var doSimpleLookup bool
++	if isReflink || context == nil {
++		slashCount := strings.Count(inRef, "/")
++		if slashCount <= 1 {
++			doSimpleLookup = slashCount == 0 || ref[0] == '/'
++		}
++	}
++
++	if !doSimpleLookup {
++		return nil, nil
++	}
++
++	n = m.finderIndex.Get(nameNoIdentifier)
++	if n == ambiguousContentNode {
++		return nil, fmt.Errorf("page reference %q is ambiguous", inRef)
++	}
++
++	return n, nil
++}
++
++func (m *pageMap) lookupContentNodeFromReverseLookup(ref string, fi hugofs.FileMetaInfo) (contentNodeI, error) {
++	s := m.finderSite
++	meta := fi.Meta()
++	dir := meta.Filename
++	if !fi.IsDir() {
++		dir = filepath.Dir(meta.Filename)
++	}
++
++	realFilename := filepath.Join(dir, ref)
++	pcs, err := s.BaseFs.Content.ReverseLookup(realFilename, true)
++	if err != nil {
++		return nil, err
++	}
++
++	for _, pc := range pcs {
++		pi := s.Conf.PathParser().Parse(pc.Component, pc.Path)
++		if n := m.finderTree.Get(pi.Base()); n != nil {
++			return n, nil
++		}
++	}
++	return nil, nil
++}
++
++func (m *pageMap) lookupContentNodeFromPath(s string, ref string) (contentNodeI, error) {
++	n := m.finderTree.Get(s)
++	if n != nil {
++		return n, nil
++	}
++	return nil, nil
++}
++
++func (m *pageMap) navigateIsAncestor(p *pageState, other any) bool {
++	n, ok := other.(contentNodeI)
++	if !ok {
++		return false
++	}
++	if n.Path() == p.Path() {
++		return false
++	}
++	if existing := m.navTree.Get(n.Path()); existing != nil {
++		n = existing
++	}
++	return strings.HasPrefix(n.Path(), paths.AddTrailingSlash(p.Path()))
++}
++
++func (m *pageMap) navigateIsDescendant(p *pageState, other any) bool {
++	n, ok := other.(contentNodeI)
++	if !ok {
++		return false
++	}
++	if n.Path() == p.Path() {
++		return false
++	}
++	if existing := m.navTree.Get(n.Path()); existing != nil {
++		n = existing
++	}
++	return strings.HasPrefix(p.Path(), paths.AddTrailingSlash(n.Path()))
++}
++
++func (m *pageMap) navigateCurrentSection(p *pageState) page.Page {
++	if kinds.IsBranch(p.Kind()) {
++		return p
++	}
++
++	dir := p.m.pathInfo.Dir()
++	if dir == "/" {
++		return m.navSite.home
++	}
++
++	_, n := m.navTree.LongestPrefix(dir, true, func(n contentNodeI) bool { return n.isContentNodeBranch() })
++	if n != nil {
++		return n.(page.Page)
++	}
++
++	panic(fmt.Sprintf("CurrentSection not found for %q in lang %s", p.Path(), p.Lang()))
++}
++
++func (m *pageMap) navigateFirstSection(p *pageState) page.Page {
++	s := p.m.pathInfo.Dir()
++	if s == "/" {
++		return m.navSite.home
++	}
++
++	for {
++		k, n := m.navTree.LongestPrefix(s, true, func(n contentNodeI) bool { return n.isContentNodeBranch() })
++		if n == nil {
++			return nil
++		}
++		if strings.Count(k, "/") < 2 {
++			return n.(page.Page)
++		}
++		if s == "" {
++			return nil
++		}
++		s = paths.Dir(s)
++	}
++}
++
++func (m *pageMap) navigateInSection(p *pageState, other any) bool {
++	if p == nil || types.IsNil(other) || m.navTree == nil {
++		return false
++	}
++	pp, ok := other.(page.Page)
++	if !ok {
++		return false
++	}
++	if n := m.navTree.Get(p.Path()); n != nil {
++		if ps, ok := n.(*pageState); ok {
++			p = ps
++		}
++	}
++	return m.navigateCurrentSection(p) == pp.CurrentSection()
++}
++
++func (m *pageMap) navigateParent(p *pageState) page.Page {
++	if p.IsHome() {
++		return nil
++	}
++
++	dir := p.m.pathInfo.ContainerDir()
++	if dir == "" {
++		return m.navSite.home
++	}
++
++	_, n := m.navTree.LongestPrefix(dir, true, nil)
++	if n != nil {
++		return n.(page.Page)
++	}
++	return nil
++}
++
++func (m *pageMap) navigateAncestors(p *pageState) page.Pages {
++	var ancestors page.Pages
++	if m.navTree == nil {
++		return ancestors
++	}
++	parent := m.navigateParent(p)
++	for parent != nil {
++		if n := m.navTree.Get(parent.Path()); n != nil {
++			if ps, ok := n.(page.Page); ok {
++				parent = ps
++			}
++		}
++		ancestors = append(ancestors, parent)
++		parent = parent.Parent()
++	}
++	return ancestors
++}
++
++func (m *pageMap) navigateSections(p *pageState) page.Pages {
++	var (
++		pages               page.Pages
++		currentBranchPrefix string
++		s                   = p.Path()
++		prefix              = paths.AddTrailingSlash(s)
++		tree                = m.navTree
++	)
++
++	w := &doctree.NodeShiftTreeWalker[contentNodeI]{
++		Tree:   tree,
++		Prefix: prefix,
++	}
++	w.Handle = func(ss string, n contentNodeI, match doctree.DimensionFlag) (bool, error) {
++		if !n.isContentNodeBranch() {
++			return false, nil
++		}
++		if currentBranchPrefix == "" || !strings.HasPrefix(ss, currentBranchPrefix) {
++			if ps, ok := n.(*pageState); ok && ps.IsSection() && ps.m.shouldList(false) && ps.Parent() == p {
++				pages = append(pages, ps)
++			} else {
++				w.SkipPrefix(ss + "/")
++			}
++		}
++		currentBranchPrefix = ss + "/"
++		return false, nil
++	}
++
++	if err := w.Walk(context.Background()); err != nil {
++		panic(err)
++	}
++
++	page.SortByDefault(pages)
++	return pages
++}
++
++func (m *pageMap) navigateSectionsEntries(p *pageState) []string {
++	if m.navTree == nil {
++		return nil
++	}
++	sp := m.navigateSectionsPath(p)
++	if sp == "/" {
++		return nil
++	}
++	entries := strings.Split(sp[1:], "/")
++	if len(entries) == 0 {
++		return nil
++	}
++	return entries
++}
++
++func (m *pageMap) navigateSectionsPath(p *pageState) string {
++	if m.navTree == nil {
++		return p.Path()
++	}
++	return m.navigateCurrentSection(p).Path()
++}
++
++func (m *pageMap) collectRegularPagesRecursive(p *pageState) page.Pages {
++	if m.collectionCache == nil {
++		return nil
++	}
++	switch p.Kind() {
++	case kinds.KindSection, kinds.KindHome:
++		return m.getPagesInSection(
++			pageMapQueryPagesInSection{
++				pageMapQueryPagesBelowPath: pageMapQueryPagesBelowPath{
++					Path:    p.Path(),
++					Include: pagePredicates.ShouldListLocal.And(pagePredicates.KindPage),
++				},
++				Recursive: true,
++			},
++		)
++	default:
++		return m.collectRegularPages(p)
++	}
++}
++
++func (m *pageMap) collectRegularPages(p *pageState) page.Pages {
++	if m.collectionCache == nil {
++		return nil
++	}
++	switch p.Kind() {
++	case kinds.KindPage:
++	case kinds.KindSection, kinds.KindHome, kinds.KindTaxonomy:
++		return m.getPagesInSection(
++			pageMapQueryPagesInSection{
++				pageMapQueryPagesBelowPath: pageMapQueryPagesBelowPath{
++					Path:    p.Path(),
++					Include: pagePredicates.ShouldListLocal.And(pagePredicates.KindPage),
++				},
++			},
++		)
++	case kinds.KindTerm:
++		return m.getPagesWithTerm(
++			pageMapQueryPagesBelowPath{
++				Path:    p.Path(),
++				Include: pagePredicates.ShouldListLocal.And(pagePredicates.KindPage),
++			},
++		)
++	default:
++		return m.s.RegularPages()
++	}
++	return nil
++}
++
++func (m *pageMap) collectPages(p *pageState) page.Pages {
++	if m.collectionCache == nil {
++		return nil
++	}
++	switch p.Kind() {
++	case kinds.KindPage:
++	case kinds.KindSection, kinds.KindHome:
++		return m.getPagesInSection(
++			pageMapQueryPagesInSection{
++				pageMapQueryPagesBelowPath: pageMapQueryPagesBelowPath{
++					Path:    p.Path(),
++					KeyPart: "page-section",
++					Include: pagePredicates.ShouldListLocal.And(
++						pagePredicates.KindPage.Or(pagePredicates.KindSection),
++					),
++				},
++			},
++		)
++	case kinds.KindTerm:
++		return m.getPagesWithTerm(
++			pageMapQueryPagesBelowPath{
++				Path: p.Path(),
++			},
++		)
++	case kinds.KindTaxonomy:
++		return m.getPagesInSection(
++			pageMapQueryPagesInSection{
++				pageMapQueryPagesBelowPath: pageMapQueryPagesBelowPath{
++					Path:    p.Path(),
++					KeyPart: "term",
++					Include: pagePredicates.ShouldListLocal.And(pagePredicates.KindTerm),
++				},
++				Recursive: true,
++			},
++		)
++	default:
++		return m.s.Pages()
++	}
++	return nil
++}
++
++func (m *pageMap) collectTerms(p *pageState, taxonomy string) page.Pages {
++	if m.collectionCache == nil {
++		return nil
++	}
++	return m.getTermsForPageInTaxonomy(p.Path(), taxonomy)
++}
++
++func (m *pageMap) collectResources(p *pageState) resource.Resources {
++	if m.treeResources == nil {
++		return nil
++	}
++	return m.getOrCreateResourcesForPage(p)
++}
++
++func (m *pageMap) collectAllTranslations(p *pageState) page.Pages {
++	if m.collectionCache == nil {
++		return nil
++	}
++	key := p.Path() + "/" + "translations-all"
++	pages, err := m.getOrCreatePagesFromCache(key, func(string) (page.Pages, error) {
++		if p.m.pageConfig.TranslationKey != "" {
++			pas, _ := m.s.h.translationKeyPages.Get(p.m.pageConfig.TranslationKey)
++			pasc := make(page.Pages, len(pas))
++			copy(pasc, pas)
++			page.SortByLanguage(pasc)
++			return pasc, nil
++		}
++		var pas page.Pages
++		m.treePages.ForEeachInDimension(p.Path(), doctree.DimensionLanguage.Index(),
++			func(n contentNodeI) bool {
++				if n != nil {
++					pas = append(pas, n.(page.Page))
++				}
++				return false
++			},
++		)
++
++		pas = pagePredicates.ShouldLink.Filter(pas)
++		page.SortByLanguage(pas)
++		return pas, nil
++	})
++	if err != nil {
++		panic(err)
++	}
++	return pages
++}
++
++func (m *pageMap) collectTranslations(p *pageState) page.Pages {
++	if m.collectionCache == nil {
++		return nil
++	}
++	key := p.Path() + "/" + "translations"
++	pages, err := m.getOrCreatePagesFromCache(key, func(string) (page.Pages, error) {
++		var pas page.Pages
++		for _, pp := range m.collectAllTranslations(p) {
++			if !pp.Eq(p) {
++				pas = append(pas, pp)
++			}
++		}
++		return pas, nil
++	})
++	if err != nil {
++		panic(err)
++	}
++	return pages
++}
++
++func (m *pageMap) renderCachedContent(ctx context.Context, c *cachedContent, cp *pageContentOutput) (contentSummary, error) {
++	ctx = tpl.Context.DependencyScope.Set(ctx, pageDependencyScopeGlobal)
++	key := c.pi.sourceKey + "/" + cp.po.f.Name
++	versionv := cp.contentRenderedVersion
++
++	v, err := m.contentCaches.rendered.GetOrCreate(key, func(string) (*resources.StaleValue[contentSummary], error) {
++		cp.po.p.s.Log.Trace(logg.StringFunc(func() string {
++			return fmt.Sprintln("contentRendered", key)
++		}))
++
++		cp.po.p.s.h.contentRenderCounter.Add(1)
++		cp.contentRendered = true
++		po := cp.po
++
++		ct, err := m.buildContentTableOfContents(ctx, c, cp)
++		if err != nil {
++			return nil, err
++		}
++
++		rs := &resources.StaleValue[contentSummary]{
++			IsStaleFunc: func() bool {
++				return c.IsStale() || cp.contentRenderedVersion != versionv
++			},
++		}
++
++		if len(c.pi.itemsStep2) == 0 {
++			return rs, nil
++		}
++
++		var b []byte
++		if ct.astDoc != nil {
++			r, ok, err := po.contentRenderer.RenderContent(ctx, ct.contentToRender, ct.astDoc)
++			if err != nil {
++				return nil, err
++			}
++			if !ok {
++				return nil, errors.New("invalid state: astDoc is set but RenderContent returned false")
++			}
++			b = r.Bytes()
++		} else {
++			b = make([]byte, len(ct.contentToRender))
++			copy(b, ct.contentToRender)
++		}
++
++		var hasShortcodeVariants bool
++		tokenHandler := func(ctx context.Context, token string) ([]byte, error) {
++			if token == tocShortcodePlaceholder {
++				return []byte(ct.tableOfContentsHTML), nil
++			}
++			renderer, found := ct.contentPlaceholders[token]
++			if found {
++				repl, more, err := renderer.renderShortcode(ctx)
++				if err != nil {
++					return nil, err
++				}
++				hasShortcodeVariants = hasShortcodeVariants || more
++				return repl, nil
++			}
++			panic(fmt.Errorf("unknown shortcode token %q (number of tokens: %d)", token, len(ct.contentPlaceholders)))
++		}
++
++		b, err = expandShortcodeTokens(ctx, b, tokenHandler)
++		if err != nil {
++			return nil, err
++		}
++		if hasShortcodeVariants {
++			cp.po.p.pageOutputTemplateVariationsState.Add(1)
++		}
++
++		var result contentSummary
++		if c.pi.hasSummaryDivider {
++			isHTML := cp.po.p.m.pageConfig.Markup == "html"
++			if isHTML {
++				i := bytes.Index(b, internalSummaryDividerPre)
++				result.summary = helpers.BytesToHTML(b[:i])
++				b = b[i+len(internalSummaryDividerPre):]
++			} else {
++				summary, content, err := splitUserDefinedSummaryAndContent(cp.po.p.m.pageConfig.Markup, b)
++				if err != nil {
++					cp.po.p.s.Log.Errorf("Failed to set user defined summary for page %q: %s", cp.po.p.pathOrTitle(), err)
++				} else {
++					b = content
++					result.summary = helpers.BytesToHTML(summary)
++				}
++			}
++			result.summaryTruncated = c.pi.summaryTruncated
++		}
++		result.content = helpers.BytesToHTML(b)
++		rs.Value = result
++		return rs, nil
++	})
++	if err != nil {
++		return contentSummary{}, cp.po.p.wrapError(err)
++	}
++	return v.Value, nil
++}
++
++func (m *pageMap) mustBuildContentTableOfContents(ctx context.Context, c *cachedContent, cp *pageContentOutput) contentTableOfContents {
++	if m.contentCaches.toc == nil {
++		panic("content table of contents cache is not initialized")
++	}
++	ct, err := m.buildContentTableOfContents(ctx, c, cp)
++	if err != nil {
++		panic(err)
++	}
++	return ct
++}
++
++func (m *pageMap) buildContentTableOfContents(ctx context.Context, c *cachedContent, cp *pageContentOutput) (contentTableOfContents, error) {
++	key := c.pi.sourceKey + "/" + cp.po.f.Name
++	versionv := cp.contentRenderedVersion
++
++	v, err := m.contentCaches.toc.GetOrCreate(key, func(string) (*resources.StaleValue[contentTableOfContents], error) {
++		source, err := c.pi.contentSource(c)
++		if err != nil {
++			return nil, err
++		}
++
++		var ct contentTableOfContents
++		if err := cp.initRenderHooks(); err != nil {
++			return nil, err
++		}
++		f := cp.po.f
++		po := cp.po
++		p := po.p
++		ct.contentPlaceholders, err = c.shortcodeState.prepareShortcodesForPage(ctx, p, f, false)
++		if err != nil {
++			return nil, err
++		}
++
++		ctxCallback := func(cp2 *pageContentOutput, ct2 contentTableOfContents) {
++			for k, v := range ct2.contentPlaceholders {
++				ct.contentPlaceholders[k] = v
++			}
++
++			if p.s.conf.Internal.Watch {
++				for _, s := range cp2.po.p.m.content.shortcodeState.shortcodes {
++					for _, templ := range s.templs {
++						cp.trackDependency(templ.(identity.IdentityProvider))
++					}
++				}
++			}
++
++			cp.po.p.m.content.shortcodeState.transferNames(cp2.po.p.m.content.shortcodeState)
++			if cp2.po.p.pageOutputTemplateVariationsState.Load() > 0 {
++				cp.po.p.pageOutputTemplateVariationsState.Add(1)
++			}
++		}
++
++		ctx = setGetContentCallbackInContext.Set(ctx, ctxCallback)
++
++		var hasVariants bool
++		ct.contentToRender, hasVariants, err = c.pi.contentToRender(ctx, source, ct.contentPlaceholders)
++		if err != nil {
++			return nil, err
++		}
++		if hasVariants {
++			p.pageOutputTemplateVariationsState.Add(1)
++		}
++
++		isHTML := cp.po.p.m.pageConfig.Markup == "html"
++		if !isHTML {
++			createAndSetToC := func(tocProvider converter.TableOfContentsProvider) {
++				cfg := p.s.ContentSpec.Converters.GetMarkupConfig()
++				ct.tableOfContents = tocProvider.TableOfContents()
++				ct.tableOfContentsHTML = template.HTML(
++					ct.tableOfContents.ToHTML(
++						cfg.TableOfContents.StartLevel,
++						cfg.TableOfContents.EndLevel,
++						cfg.TableOfContents.Ordered,
++					),
++				)
++			}
++
++			parseResult, ok, err := po.contentRenderer.ParseContent(ctx, ct.contentToRender)
++			if err != nil {
++				return nil, err
++			}
++			if ok {
++				createAndSetToC(parseResult)
++				ct.astDoc = parseResult.Doc()
++			} else {
++				r, err := po.contentRenderer.ParseAndRenderContent(ctx, ct.contentToRender, true)
++				if err != nil {
++					return nil, err
++				}
++				ct.contentToRender = r.Bytes()
++				if tocProvider, ok := r.(converter.TableOfContentsProvider); ok {
++					createAndSetToC(tocProvider)
++				} else {
++					tmpContent, tmpTableOfContents := helpers.ExtractTOC(ct.contentToRender)
++					ct.tableOfContentsHTML = helpers.BytesToHTML(tmpTableOfContents)
++					ct.tableOfContents = tableofcontents.Empty
++					ct.contentToRender = tmpContent
++				}
++			}
++		}
++
++		return &resources.StaleValue[contentTableOfContents]{
++			Value: ct,
++			IsStaleFunc: func() bool {
++				return c.IsStale() || cp.contentRenderedVersion != versionv
++			},
++		}, nil
++	})
++	if err != nil {
++		return contentTableOfContents{}, err
++	}
++	return v.Value, nil
++}
++
++func (m *pageMap) buildPlainContent(ctx context.Context, c *cachedContent, cp *pageContentOutput) (contentPlainPlainWords, error) {
++	key := c.pi.sourceKey + "/" + cp.po.f.Name
++	versionv := cp.contentRenderedVersion
++
++	v, err := m.contentCaches.plain.GetOrCreateWitTimeout(key, cp.po.p.s.Conf.Timeout(), func(string) (*resources.StaleValue[contentPlainPlainWords], error) {
++		var result contentPlainPlainWords
++		rs := &resources.StaleValue[contentPlainPlainWords]{
++			IsStaleFunc: func() bool {
++				return c.IsStale() || cp.contentRenderedVersion != versionv
++			},
++		}
++
++		rendered, err := m.renderCachedContent(ctx, c, cp)
++		if err != nil {
++			return nil, err
++		}
++
++		result.plain = tpl.StripHTML(string(rendered.content))
++		result.plainWords = strings.Fields(result.plain)
++		isCJKLanguage := cp.po.p.m.pageConfig.IsCJKLanguage
++
++		if isCJKLanguage {
++			result.wordCount = 0
++			for _, word := range result.plainWords {
++				runeCount := utf8.RuneCountInString(word)
++				if len(word) == runeCount {
++					result.wordCount++
++				} else {
++					result.wordCount += runeCount
++				}
++			}
++		} else {
++			result.wordCount = helpers.TotalWords(result.plain)
++		}
++
++		if result.fuzzyWordCount == 0 {
++			result.fuzzyWordCount = (result.wordCount + 100) / 100 * 100
++		}
++
++		if isCJKLanguage {
++			result.readingTime = (result.wordCount + 500) / 501
++		} else {
++			result.readingTime = (result.wordCount + 212) / 213
++		}
++
++		if rendered.summary != "" {
++			result.summary = rendered.summary
++			result.summaryTruncated = rendered.summaryTruncated
++		} else if cp.po.p.m.pageConfig.Summary != "" {
++			b, err := cp.po.contentRenderer.ParseAndRenderContent(ctx, []byte(cp.po.p.m.pageConfig.Summary), false)
++			if err != nil {
++				return nil, err
++			}
++			html := cp.po.p.s.ContentSpec.TrimShortHTML(b.Bytes())
++			result.summary = helpers.BytesToHTML(html)
++		} else {
++			var summary string
++			var truncated bool
++			if isCJKLanguage {
++				summary, truncated = cp.po.p.s.ContentSpec.TruncateWordsByRune(result.plainWords)
++			} else {
++				summary, truncated = cp.po.p.s.ContentSpec.TruncateWordsToWholeSentence(result.plain)
++			}
++			result.summary = template.HTML(summary)
++			result.summaryTruncated = truncated
++		}
++
++		rs.Value = result
++		return rs, nil
++	})
++	if err != nil {
++		if herrors.IsTimeoutError(err) {
++			err = fmt.Errorf("timed out rendering the page content. You may have a circular loop in a shortcode, or your site may have resources that take longer to build than the `timeout` limit in your Hugo config file: %w", err)
++		}
++		return contentPlainPlainWords{}, err
++	}
++	return v.Value, nil
++}
+diff --git a/hugolib/page.go b/hugolib/page.go
+index c743d4282..56532c517 100644
+--- a/hugolib/page.go
++++ b/hugolib/page.go
+@@ -21,7 +21,6 @@ import (
+ 	"sync/atomic"
+ 
+ 	"github.com/gohugoio/hugo/hugofs"
+-	"github.com/gohugoio/hugo/hugolib/doctree"
+ 	"github.com/gohugoio/hugo/identity"
+ 	"github.com/gohugoio/hugo/media"
+ 	"github.com/gohugoio/hugo/output"
+@@ -220,7 +219,7 @@ func (p *pageState) CodeOwners() []string {
+ // GetTerms gets the terms defined on this page in the given taxonomy.
+ // The pages returned will be ordered according to the front matter.
+ func (p *pageState) GetTerms(taxonomy string) page.Pages {
+-	return p.s.pageMap.getTermsForPageInTaxonomy(p.Path(), taxonomy)
++	return p.s.pageMap.collectTerms(p, taxonomy)
+ }
+ 
+ func (p *pageState) MarshalJSON() ([]byte, error) {
+@@ -228,20 +227,7 @@ func (p *pageState) MarshalJSON() ([]byte, error) {
+ }
+ 
+ func (p *pageState) RegularPagesRecursive() page.Pages {
+-	switch p.Kind() {
+-	case kinds.KindSection, kinds.KindHome:
+-		return p.s.pageMap.getPagesInSection(
+-			pageMapQueryPagesInSection{
+-				pageMapQueryPagesBelowPath: pageMapQueryPagesBelowPath{
+-					Path:    p.Path(),
+-					Include: pagePredicates.ShouldListLocal.And(pagePredicates.KindPage),
+-				},
+-				Recursive: true,
+-			},
+-		)
+-	default:
+-		return p.RegularPages()
+-	}
++	return p.s.pageMap.collectRegularPagesRecursive(p)
+ }
+ 
+ func (p *pageState) PagesRecursive() page.Pages {
+@@ -249,66 +235,11 @@ func (p *pageState) PagesRecursive() page.Pages {
+ }
+ 
+ func (p *pageState) RegularPages() page.Pages {
+-	switch p.Kind() {
+-	case kinds.KindPage:
+-	case kinds.KindSection, kinds.KindHome, kinds.KindTaxonomy:
+-		return p.s.pageMap.getPagesInSection(
+-			pageMapQueryPagesInSection{
+-				pageMapQueryPagesBelowPath: pageMapQueryPagesBelowPath{
+-					Path:    p.Path(),
+-					Include: pagePredicates.ShouldListLocal.And(pagePredicates.KindPage),
+-				},
+-			},
+-		)
+-	case kinds.KindTerm:
+-		return p.s.pageMap.getPagesWithTerm(
+-			pageMapQueryPagesBelowPath{
+-				Path:    p.Path(),
+-				Include: pagePredicates.ShouldListLocal.And(pagePredicates.KindPage),
+-			},
+-		)
+-	default:
+-		return p.s.RegularPages()
+-	}
+-	return nil
++	return p.s.pageMap.collectRegularPages(p)
+ }
+ 
+ func (p *pageState) Pages() page.Pages {
+-	switch p.Kind() {
+-	case kinds.KindPage:
+-	case kinds.KindSection, kinds.KindHome:
+-		return p.s.pageMap.getPagesInSection(
+-			pageMapQueryPagesInSection{
+-				pageMapQueryPagesBelowPath: pageMapQueryPagesBelowPath{
+-					Path:    p.Path(),
+-					KeyPart: "page-section",
+-					Include: pagePredicates.ShouldListLocal.And(
+-						pagePredicates.KindPage.Or(pagePredicates.KindSection),
+-					),
+-				},
+-			},
+-		)
+-	case kinds.KindTerm:
+-		return p.s.pageMap.getPagesWithTerm(
+-			pageMapQueryPagesBelowPath{
+-				Path: p.Path(),
+-			},
+-		)
+-	case kinds.KindTaxonomy:
+-		return p.s.pageMap.getPagesInSection(
+-			pageMapQueryPagesInSection{
+-				pageMapQueryPagesBelowPath: pageMapQueryPagesBelowPath{
+-					Path:    p.Path(),
+-					KeyPart: "term",
+-					Include: pagePredicates.ShouldListLocal.And(pagePredicates.KindTerm),
+-				},
+-				Recursive: true,
+-			},
+-		)
+-	default:
+-		return p.s.Pages()
+-	}
+-	return nil
++	return p.s.pageMap.collectPages(p)
+ }
+ 
+ // RawContent returns the un-rendered source content without
+@@ -329,7 +260,7 @@ func (p *pageState) RawContent() string {
+ }
+ 
+ func (p *pageState) Resources() resource.Resources {
+-	return p.s.pageMap.getOrCreateResourcesForPage(p)
++	return p.s.pageMap.collectResources(p)
+ }
+ 
+ func (p *pageState) HasShortcode(name string) bool {
+@@ -364,53 +295,12 @@ func (p *pageState) TranslationKey() string {
+ 
+ // AllTranslations returns all translations, including the current Page.
+ func (p *pageState) AllTranslations() page.Pages {
+-	key := p.Path() + "/" + "translations-all"
+-	pages, err := p.s.pageMap.getOrCreatePagesFromCache(key, func(string) (page.Pages, error) {
+-		if p.m.pageConfig.TranslationKey != "" {
+-			// translationKey set by user.
+-			pas, _ := p.s.h.translationKeyPages.Get(p.m.pageConfig.TranslationKey)
+-			pasc := make(page.Pages, len(pas))
+-			copy(pasc, pas)
+-			page.SortByLanguage(pasc)
+-			return pasc, nil
+-		}
+-		var pas page.Pages
+-		p.s.pageMap.treePages.ForEeachInDimension(p.Path(), doctree.DimensionLanguage.Index(),
+-			func(n contentNodeI) bool {
+-				if n != nil {
+-					pas = append(pas, n.(page.Page))
+-				}
+-				return false
+-			},
+-		)
+-
+-		pas = pagePredicates.ShouldLink.Filter(pas)
+-		page.SortByLanguage(pas)
+-		return pas, nil
+-	})
+-	if err != nil {
+-		panic(err)
+-	}
+-
+-	return pages
++	return p.s.pageMap.collectAllTranslations(p)
+ }
+ 
+ // Translations returns the translations excluding the current Page.
+ func (p *pageState) Translations() page.Pages {
+-	key := p.Path() + "/" + "translations"
+-	pages, err := p.s.pageMap.getOrCreatePagesFromCache(key, func(string) (page.Pages, error) {
+-		var pas page.Pages
+-		for _, pp := range p.AllTranslations() {
+-			if !pp.Eq(p) {
+-				pas = append(pas, pp)
+-			}
+-		}
+-		return pas, nil
+-	})
+-	if err != nil {
+-		panic(err)
+-	}
+-	return pages
++	return p.s.pageMap.collectTranslations(p)
+ }
+ 
+ func (ps *pageState) initCommonProviders(pp pagePaths) error {
+diff --git a/hugolib/page__content.go b/hugolib/page__content.go
+index 62e78c612..3f8128806 100644
+--- a/hugolib/page__content.go
++++ b/hugolib/page__content.go
+@@ -14,29 +14,20 @@
+ package hugolib
+ 
+ import (
+-	"bytes"
+ 	"context"
+-	"errors"
+ 	"fmt"
+ 	"html/template"
+ 	"io"
+ 	"strconv"
+-	"strings"
+-	"unicode/utf8"
+ 
+-	"github.com/bep/logg"
+ 	"github.com/gohugoio/hugo/common/hcontext"
+ 	"github.com/gohugoio/hugo/common/herrors"
+ 	"github.com/gohugoio/hugo/common/hugio"
+-	"github.com/gohugoio/hugo/helpers"
+-	"github.com/gohugoio/hugo/identity"
+-	"github.com/gohugoio/hugo/markup/converter"
+ 	"github.com/gohugoio/hugo/markup/tableofcontents"
+ 	"github.com/gohugoio/hugo/parser/metadecoders"
+ 	"github.com/gohugoio/hugo/parser/pageparser"
+ 	"github.com/gohugoio/hugo/resources"
+ 	"github.com/gohugoio/hugo/resources/resource"
+-	"github.com/gohugoio/hugo/tpl"
+ )
+ 
+ const (
+@@ -485,322 +476,19 @@ type contentPlainPlainWords struct {
+ }
+ 
+ func (c *cachedContent) contentRendered(ctx context.Context, cp *pageContentOutput) (contentSummary, error) {
+-	ctx = tpl.Context.DependencyScope.Set(ctx, pageDependencyScopeGlobal)
+-	key := c.pi.sourceKey + "/" + cp.po.f.Name
+-	versionv := cp.contentRenderedVersion
+-
+-	v, err := c.pm.cacheContentRendered.GetOrCreate(key, func(string) (*resources.StaleValue[contentSummary], error) {
+-		cp.po.p.s.Log.Trace(logg.StringFunc(func() string {
+-			return fmt.Sprintln("contentRendered", key)
+-		}))
+-
+-		cp.po.p.s.h.contentRenderCounter.Add(1)
+-		cp.contentRendered = true
+-		po := cp.po
+-
+-		ct, err := c.contentToC(ctx, cp)
+-		if err != nil {
+-			return nil, err
+-		}
+-
+-		rs := &resources.StaleValue[contentSummary]{
+-			IsStaleFunc: func() bool {
+-				return c.IsStale() || cp.contentRenderedVersion != versionv
+-			},
+-		}
+-
+-		if len(c.pi.itemsStep2) == 0 {
+-			// Nothing to do.
+-			return rs, nil
+-		}
+-
+-		var b []byte
+-
+-		if ct.astDoc != nil {
+-			// The content is parsed, but not rendered.
+-			r, ok, err := po.contentRenderer.RenderContent(ctx, ct.contentToRender, ct.astDoc)
+-			if err != nil {
+-				return nil, err
+-			}
+-			if !ok {
+-				return nil, errors.New("invalid state: astDoc is set but RenderContent returned false")
+-			}
+-
+-			b = r.Bytes()
+-
+-		} else {
+-			// Copy the content to be rendered.
+-			b = make([]byte, len(ct.contentToRender))
+-			copy(b, ct.contentToRender)
+-		}
+-
+-		// There are one or more replacement tokens to be replaced.
+-		var hasShortcodeVariants bool
+-		tokenHandler := func(ctx context.Context, token string) ([]byte, error) {
+-			if token == tocShortcodePlaceholder {
+-				return []byte(ct.tableOfContentsHTML), nil
+-			}
+-			renderer, found := ct.contentPlaceholders[token]
+-			if found {
+-				repl, more, err := renderer.renderShortcode(ctx)
+-				if err != nil {
+-					return nil, err
+-				}
+-				hasShortcodeVariants = hasShortcodeVariants || more
+-				return repl, nil
+-			}
+-			// This should never happen.
+-			panic(fmt.Errorf("unknown shortcode token %q (number of tokens: %d)", token, len(ct.contentPlaceholders)))
+-		}
+-
+-		b, err = expandShortcodeTokens(ctx, b, tokenHandler)
+-		if err != nil {
+-			return nil, err
+-		}
+-		if hasShortcodeVariants {
+-			cp.po.p.pageOutputTemplateVariationsState.Add(1)
+-		}
+-
+-		var result contentSummary // hasVariants bool
+-
+-		if c.pi.hasSummaryDivider {
+-			isHTML := cp.po.p.m.pageConfig.Markup == "html"
+-			if isHTML {
+-				// Use the summary sections as provided by the user.
+-				i := bytes.Index(b, internalSummaryDividerPre)
+-				result.summary = helpers.BytesToHTML(b[:i])
+-				b = b[i+len(internalSummaryDividerPre):]
+-
+-			} else {
+-				summary, content, err := splitUserDefinedSummaryAndContent(cp.po.p.m.pageConfig.Markup, b)
+-				if err != nil {
+-					cp.po.p.s.Log.Errorf("Failed to set user defined summary for page %q: %s", cp.po.p.pathOrTitle(), err)
+-				} else {
+-					b = content
+-					result.summary = helpers.BytesToHTML(summary)
+-				}
+-			}
+-			result.summaryTruncated = c.pi.summaryTruncated
+-		}
+-		result.content = helpers.BytesToHTML(b)
+-		rs.Value = result
+-
+-		return rs, nil
+-	})
+-	if err != nil {
+-		return contentSummary{}, cp.po.p.wrapError(err)
+-	}
+-
+-	return v.Value, nil
++	return c.pm.renderCachedContent(ctx, c, cp)
+ }
+ 
+ func (c *cachedContent) mustContentToC(ctx context.Context, cp *pageContentOutput) contentTableOfContents {
+-	ct, err := c.contentToC(ctx, cp)
+-	if err != nil {
+-		panic(err)
+-	}
+-	return ct
++	return c.pm.mustBuildContentTableOfContents(ctx, c, cp)
+ }
+ 
+ var setGetContentCallbackInContext = hcontext.NewContextDispatcher[func(*pageContentOutput, contentTableOfContents)]("contentCallback")
+ 
+ func (c *cachedContent) contentToC(ctx context.Context, cp *pageContentOutput) (contentTableOfContents, error) {
+-	key := c.pi.sourceKey + "/" + cp.po.f.Name
+-	versionv := cp.contentRenderedVersion
+-
+-	v, err := c.pm.contentTableOfContents.GetOrCreate(key, func(string) (*resources.StaleValue[contentTableOfContents], error) {
+-		source, err := c.pi.contentSource(c)
+-		if err != nil {
+-			return nil, err
+-		}
+-
+-		var ct contentTableOfContents
+-		if err := cp.initRenderHooks(); err != nil {
+-			return nil, err
+-		}
+-		f := cp.po.f
+-		po := cp.po
+-		p := po.p
+-		ct.contentPlaceholders, err = c.shortcodeState.prepareShortcodesForPage(ctx, p, f, false)
+-		if err != nil {
+-			return nil, err
+-		}
+-
+-		// Callback called from above (e.g. in .RenderString)
+-		ctxCallback := func(cp2 *pageContentOutput, ct2 contentTableOfContents) {
+-			// Merge content placeholders
+-			for k, v := range ct2.contentPlaceholders {
+-				ct.contentPlaceholders[k] = v
+-			}
+-
+-			if p.s.conf.Internal.Watch {
+-				for _, s := range cp2.po.p.m.content.shortcodeState.shortcodes {
+-					for _, templ := range s.templs {
+-						cp.trackDependency(templ.(identity.IdentityProvider))
+-					}
+-				}
+-			}
+-
+-			// Transfer shortcode names so HasShortcode works for shortcodes from included pages.
+-			cp.po.p.m.content.shortcodeState.transferNames(cp2.po.p.m.content.shortcodeState)
+-			if cp2.po.p.pageOutputTemplateVariationsState.Load() > 0 {
+-				cp.po.p.pageOutputTemplateVariationsState.Add(1)
+-			}
+-		}
+-
+-		ctx = setGetContentCallbackInContext.Set(ctx, ctxCallback)
+-
+-		var hasVariants bool
+-		ct.contentToRender, hasVariants, err = c.pi.contentToRender(ctx, source, ct.contentPlaceholders)
+-		if err != nil {
+-			return nil, err
+-		}
+-
+-		if hasVariants {
+-			p.pageOutputTemplateVariationsState.Add(1)
+-		}
+-
+-		isHTML := cp.po.p.m.pageConfig.Markup == "html"
+-
+-		if !isHTML {
+-			createAndSetToC := func(tocProvider converter.TableOfContentsProvider) {
+-				cfg := p.s.ContentSpec.Converters.GetMarkupConfig()
+-				ct.tableOfContents = tocProvider.TableOfContents()
+-				ct.tableOfContentsHTML = template.HTML(
+-					ct.tableOfContents.ToHTML(
+-						cfg.TableOfContents.StartLevel,
+-						cfg.TableOfContents.EndLevel,
+-						cfg.TableOfContents.Ordered,
+-					),
+-				)
+-			}
+-
+-			// If the converter supports doing the parsing separately, we do that.
+-			parseResult, ok, err := po.contentRenderer.ParseContent(ctx, ct.contentToRender)
+-			if err != nil {
+-				return nil, err
+-			}
+-			if ok {
+-				// This is Goldmark.
+-				// Store away the parse result for later use.
+-				createAndSetToC(parseResult)
+-
+-				ct.astDoc = parseResult.Doc()
+-
+-			} else {
+-
+-				// This is Asciidoctor etc.
+-				r, err := po.contentRenderer.ParseAndRenderContent(ctx, ct.contentToRender, true)
+-				if err != nil {
+-					return nil, err
+-				}
+-
+-				ct.contentToRender = r.Bytes()
+-
+-				if tocProvider, ok := r.(converter.TableOfContentsProvider); ok {
+-					createAndSetToC(tocProvider)
+-				} else {
+-					tmpContent, tmpTableOfContents := helpers.ExtractTOC(ct.contentToRender)
+-					ct.tableOfContentsHTML = helpers.BytesToHTML(tmpTableOfContents)
+-					ct.tableOfContents = tableofcontents.Empty
+-					ct.contentToRender = tmpContent
+-				}
+-			}
+-		}
+-
+-		return &resources.StaleValue[contentTableOfContents]{
+-			Value: ct,
+-			IsStaleFunc: func() bool {
+-				return c.IsStale() || cp.contentRenderedVersion != versionv
+-			},
+-		}, nil
+-	})
+-	if err != nil {
+-		return contentTableOfContents{}, err
+-	}
+-
+-	return v.Value, nil
++	return c.pm.buildContentTableOfContents(ctx, c, cp)
+ }
+ 
+ func (c *cachedContent) contentPlain(ctx context.Context, cp *pageContentOutput) (contentPlainPlainWords, error) {
+-	key := c.pi.sourceKey + "/" + cp.po.f.Name
+-
+-	versionv := cp.contentRenderedVersion
+-
+-	v, err := c.pm.cacheContentPlain.GetOrCreateWitTimeout(key, cp.po.p.s.Conf.Timeout(), func(string) (*resources.StaleValue[contentPlainPlainWords], error) {
+-		var result contentPlainPlainWords
+-		rs := &resources.StaleValue[contentPlainPlainWords]{
+-			IsStaleFunc: func() bool {
+-				return c.IsStale() || cp.contentRenderedVersion != versionv
+-			},
+-		}
+-
+-		rendered, err := c.contentRendered(ctx, cp)
+-		if err != nil {
+-			return nil, err
+-		}
+-
+-		result.plain = tpl.StripHTML(string(rendered.content))
+-		result.plainWords = strings.Fields(result.plain)
+-
+-		isCJKLanguage := cp.po.p.m.pageConfig.IsCJKLanguage
+-
+-		if isCJKLanguage {
+-			result.wordCount = 0
+-			for _, word := range result.plainWords {
+-				runeCount := utf8.RuneCountInString(word)
+-				if len(word) == runeCount {
+-					result.wordCount++
+-				} else {
+-					result.wordCount += runeCount
+-				}
+-			}
+-		} else {
+-			result.wordCount = helpers.TotalWords(result.plain)
+-		}
+-
+-		// TODO(bep) is set in a test. Fix that.
+-		if result.fuzzyWordCount == 0 {
+-			result.fuzzyWordCount = (result.wordCount + 100) / 100 * 100
+-		}
+-
+-		if isCJKLanguage {
+-			result.readingTime = (result.wordCount + 500) / 501
+-		} else {
+-			result.readingTime = (result.wordCount + 212) / 213
+-		}
+-
+-		if rendered.summary != "" {
+-			result.summary = rendered.summary
+-			result.summaryTruncated = rendered.summaryTruncated
+-		} else if cp.po.p.m.pageConfig.Summary != "" {
+-			b, err := cp.po.contentRenderer.ParseAndRenderContent(ctx, []byte(cp.po.p.m.pageConfig.Summary), false)
+-			if err != nil {
+-				return nil, err
+-			}
+-			html := cp.po.p.s.ContentSpec.TrimShortHTML(b.Bytes())
+-			result.summary = helpers.BytesToHTML(html)
+-		} else {
+-			var summary string
+-			var truncated bool
+-			if isCJKLanguage {
+-				summary, truncated = cp.po.p.s.ContentSpec.TruncateWordsByRune(result.plainWords)
+-			} else {
+-				summary, truncated = cp.po.p.s.ContentSpec.TruncateWordsToWholeSentence(result.plain)
+-			}
+-			result.summary = template.HTML(summary)
+-			result.summaryTruncated = truncated
+-		}
+-
+-		rs.Value = result
+-
+-		return rs, nil
+-	})
+-	if err != nil {
+-		if herrors.IsTimeoutError(err) {
+-			err = fmt.Errorf("timed out rendering the page content. You may have a circular loop in a shortcode, or your site may have resources that take longer to build than the `timeout` limit in your Hugo config file: %w", err)
+-		}
+-		return contentPlainPlainWords{}, err
+-	}
+-	return v.Value, nil
++	return c.pm.buildPlainContent(ctx, c, cp)
+ }
+diff --git a/hugolib/page__tree.go b/hugolib/page__tree.go
+index e54d596bc..f683f21eb 100644
+--- a/hugolib/page__tree.go
++++ b/hugolib/page__tree.go
+@@ -14,14 +14,6 @@
+ package hugolib
+ 
+ import (
+-	"context"
+-	"fmt"
+-	"strings"
+-
+-	"github.com/gohugoio/hugo/common/paths"
+-	"github.com/gohugoio/hugo/common/types"
+-	"github.com/gohugoio/hugo/hugolib/doctree"
+-	"github.com/gohugoio/hugo/resources/kinds"
+ 	"github.com/gohugoio/hugo/resources/page"
+ )
+ 
+@@ -31,150 +23,35 @@ type pageTree struct {
+ }
+ 
+ func (pt pageTree) IsAncestor(other any) bool {
+-	n, ok := other.(contentNodeI)
+-	if !ok {
+-		return false
+-	}
+-
+-	if n.Path() == pt.p.Path() {
+-		return false
+-	}
+-
+-	return strings.HasPrefix(n.Path(), paths.AddTrailingSlash(pt.p.Path()))
++	return pt.p.s.pageMap.navigateIsAncestor(pt.p, other)
+ }
+ 
+ func (pt pageTree) IsDescendant(other any) bool {
+-	n, ok := other.(contentNodeI)
+-	if !ok {
+-		return false
+-	}
+-
+-	if n.Path() == pt.p.Path() {
+-		return false
+-	}
+-
+-	return strings.HasPrefix(pt.p.Path(), paths.AddTrailingSlash(n.Path()))
++	return pt.p.s.pageMap.navigateIsDescendant(pt.p, other)
+ }
+ 
+ func (pt pageTree) CurrentSection() page.Page {
+-	if kinds.IsBranch(pt.p.Kind()) {
+-		return pt.p
+-	}
+-
+-	dir := pt.p.m.pathInfo.Dir()
+-	if dir == "/" {
+-		return pt.p.s.home
+-	}
+-
+-	_, n := pt.p.s.pageMap.treePages.LongestPrefix(dir, true, func(n contentNodeI) bool { return n.isContentNodeBranch() })
+-	if n != nil {
+-		return n.(page.Page)
+-	}
+-
+-	panic(fmt.Sprintf("CurrentSection not found for %q in lang %s", pt.p.Path(), pt.p.Lang()))
++	return pt.p.s.pageMap.navigateCurrentSection(pt.p)
+ }
+ 
+ func (pt pageTree) FirstSection() page.Page {
+-	s := pt.p.m.pathInfo.Dir()
+-	if s == "/" {
+-		return pt.p.s.home
+-	}
+-
+-	for {
+-		k, n := pt.p.s.pageMap.treePages.LongestPrefix(s, true, func(n contentNodeI) bool { return n.isContentNodeBranch() })
+-		if n == nil {
+-			return nil
+-		}
+-
+-		// /blog
+-		if strings.Count(k, "/") < 2 {
+-			return n.(page.Page)
+-		}
+-
+-		if s == "" {
+-			return nil
+-		}
+-
+-		s = paths.Dir(s)
+-
+-	}
++	return pt.p.s.pageMap.navigateFirstSection(pt.p)
+ }
+ 
+ func (pt pageTree) InSection(other any) bool {
+-	if pt.p == nil || types.IsNil(other) {
+-		return false
+-	}
+-
+-	p, ok := other.(page.Page)
+-	if !ok {
+-		return false
+-	}
+-
+-	return pt.CurrentSection() == p.CurrentSection()
++	return pt.p.s.pageMap.navigateInSection(pt.p, other)
+ }
+ 
+ func (pt pageTree) Parent() page.Page {
+-	if pt.p.IsHome() {
+-		return nil
+-	}
+-
+-	dir := pt.p.m.pathInfo.ContainerDir()
+-
+-	if dir == "" {
+-		return pt.p.s.home
+-	}
+-
+-	_, n := pt.p.s.pageMap.treePages.LongestPrefix(dir, true, nil)
+-	if n != nil {
+-		return n.(page.Page)
+-	}
+-	return nil
++	return pt.p.s.pageMap.navigateParent(pt.p)
+ }
+ 
+ func (pt pageTree) Ancestors() page.Pages {
+-	var ancestors page.Pages
+-	parent := pt.Parent()
+-	for parent != nil {
+-		ancestors = append(ancestors, parent)
+-		parent = parent.Parent()
+-	}
+-	return ancestors
++	return pt.p.s.pageMap.navigateAncestors(pt.p)
+ }
+ 
+ func (pt pageTree) Sections() page.Pages {
+-	var (
+-		pages               page.Pages
+-		currentBranchPrefix string
+-		s                   = pt.p.Path()
+-		prefix              = paths.AddTrailingSlash(s)
+-		tree                = pt.p.s.pageMap.treePages
+-	)
+-
+-	w := &doctree.NodeShiftTreeWalker[contentNodeI]{
+-		Tree:   tree,
+-		Prefix: prefix,
+-	}
+-	w.Handle = func(ss string, n contentNodeI, match doctree.DimensionFlag) (bool, error) {
+-		if !n.isContentNodeBranch() {
+-			return false, nil
+-		}
+-		if currentBranchPrefix == "" || !strings.HasPrefix(ss, currentBranchPrefix) {
+-			if p, ok := n.(*pageState); ok && p.IsSection() && p.m.shouldList(false) && p.Parent() == pt.p {
+-				pages = append(pages, p)
+-			} else {
+-				w.SkipPrefix(ss + "/")
+-			}
+-		}
+-		currentBranchPrefix = ss + "/"
+-		return false, nil
+-	}
+-
+-	if err := w.Walk(context.Background()); err != nil {
+-		panic(err)
+-	}
+-
+-	page.SortByDefault(pages)
+-	return pages
++	return pt.p.s.pageMap.navigateSections(pt.p)
+ }
+ 
+ func (pt pageTree) Page() page.Page {
+@@ -182,17 +59,9 @@ func (pt pageTree) Page() page.Page {
+ }
+ 
+ func (p pageTree) SectionsEntries() []string {
+-	sp := p.SectionsPath()
+-	if sp == "/" {
+-		return nil
+-	}
+-	entries := strings.Split(sp[1:], "/")
+-	if len(entries) == 0 {
+-		return nil
+-	}
+-	return entries
++	return p.p.s.pageMap.navigateSectionsEntries(p.p)
+ }
+ 
+ func (p pageTree) SectionsPath() string {
+-	return p.CurrentSection().Path()
++	return p.p.s.pageMap.navigateSectionsPath(p.p)
+ }
+diff --git a/hugolib/pagecollections.go b/hugolib/pagecollections.go
+index 5ed2a28f0..b3e7502b6 100644
+--- a/hugolib/pagecollections.go
++++ b/hugolib/pagecollections.go
+@@ -14,17 +14,7 @@
+ package hugolib
+ 
+ import (
+-	"fmt"
+-	"path"
+-	"path/filepath"
+-	"strings"
+-
+ 	"github.com/gohugoio/hugo/hugofs"
+-	"github.com/gohugoio/hugo/hugofs/files"
+-
+-	"github.com/gohugoio/hugo/common/paths"
+-
+-	"github.com/gohugoio/hugo/resources/kinds"
+ 	"github.com/gohugoio/hugo/resources/page"
+ )
+ 
+@@ -44,220 +34,39 @@ func newPageFinder(m *pageMap) *pageFinder {
+ // getPageRef resolves a Page from ref/relRef, with a slightly more comprehensive
+ // search path than getPage.
+ func (c *pageFinder) getPageRef(context page.Page, ref string) (page.Page, error) {
+-	n, err := c.getContentNode(context, true, ref)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	if p, ok := n.(page.Page); ok {
+-		return p, nil
+-	}
+-	return nil, nil
++	return c.pageMap.lookupPageRef(context, ref)
+ }
+ 
+ func (c *pageFinder) getPage(context page.Page, ref string) (page.Page, error) {
+-	n, err := c.getContentNode(context, false, ref)
+-	if err != nil {
+-		return nil, err
+-	}
+-	if p, ok := n.(page.Page); ok {
+-		return p, nil
+-	}
+-	return nil, nil
++	return c.pageMap.lookupPage(context, ref)
+ }
+ 
+ // Only used in tests.
+ func (c *pageFinder) getPageOldVersion(kind string, sections ...string) page.Page {
+-	refs := append([]string{kind}, path.Join(sections...))
+-	p, _ := c.getPageForRefs(refs...)
+-	return p
++	return c.pageMap.lookupPageOldVersion(kind, sections...)
+ }
+ 
+ // This is an adapter func for the old API with Kind as first argument.
+ // This is invoked when you do .Site.GetPage. We drop the Kind and fails
+ // if there are more than 2 arguments, which would be ambiguous.
+ func (c *pageFinder) getPageForRefs(ref ...string) (page.Page, error) {
+-	var refs []string
+-	for _, r := range ref {
+-		// A common construct in the wild is
+-		// .Site.GetPage "home" "" or
+-		// .Site.GetPage "home" "/"
+-		if r != "" && r != "/" {
+-			refs = append(refs, r)
+-		}
+-	}
+-
+-	var key string
+-
+-	if len(refs) > 2 {
+-		// This was allowed in Hugo <= 0.44, but we cannot support this with the
+-		// new API. This should be the most unusual case.
+-		return nil, fmt.Errorf(`too many arguments to .Site.GetPage: %v. Use lookups on the form {{ .Site.GetPage "/posts/mypage-md" }}`, ref)
+-	}
+-
+-	if len(refs) == 0 || refs[0] == kinds.KindHome {
+-		key = "/"
+-	} else if len(refs) == 1 {
+-		if len(ref) == 2 && refs[0] == kinds.KindSection {
+-			// This is an old style reference to the "Home Page section".
+-			// Typically fetched via {{ .Site.GetPage "section" .Section }}
+-			// See https://github.com/gohugoio/hugo/issues/4989
+-			key = "/"
+-		} else {
+-			key = refs[0]
+-		}
+-	} else {
+-		key = refs[1]
+-	}
+-
+-	key = filepath.ToSlash(key)
+-	if !strings.HasPrefix(key, "/") {
+-		key = "/" + key
+-	}
+-
+-	return c.getPage(nil, key)
++	return c.pageMap.lookupPageForRefs(ref...)
+ }
+ 
+ const defaultContentExt = ".md"
+ 
+ func (c *pageFinder) getContentNode(context page.Page, isReflink bool, ref string) (contentNodeI, error) {
+-	ref = paths.ToSlashTrimTrailing(ref)
+-	inRef := ref
+-	if ref == "" {
+-		ref = "/"
+-	}
+-
+-	if paths.HasExt(ref) {
+-		return c.getContentNodeForRef(context, isReflink, true, inRef, ref)
+-	}
+-
+-	// We are always looking for a content file and having an extension greatly simplifies the code that follows,
+-	// even in the case where the extension does not match this one.
+-	if ref == "/" {
+-		if n, err := c.getContentNodeForRef(context, isReflink, false, inRef, "/_index"+defaultContentExt); n != nil || err != nil {
+-			return n, err
+-		}
+-	} else if strings.HasSuffix(ref, "/index") {
+-		if n, err := c.getContentNodeForRef(context, isReflink, false, inRef, ref+"/index"+defaultContentExt); n != nil || err != nil {
+-			return n, err
+-		}
+-		if n, err := c.getContentNodeForRef(context, isReflink, false, inRef, ref+defaultContentExt); n != nil || err != nil {
+-			return n, err
+-		}
+-	} else {
+-		if n, err := c.getContentNodeForRef(context, isReflink, false, inRef, ref+defaultContentExt); n != nil || err != nil {
+-			return n, err
+-		}
+-	}
+-
+-	return nil, nil
++	return c.pageMap.lookupContentNode(context, isReflink, ref)
+ }
+ 
+ func (c *pageFinder) getContentNodeForRef(context page.Page, isReflink, hadExtension bool, inRef, ref string) (contentNodeI, error) {
+-	s := c.pageMap.s
+-	contentPathParser := s.Conf.PathParser()
+-
+-	if context != nil && !strings.HasPrefix(ref, "/") {
+-		// Try the page-relative path first.
+-		// Branch pages: /mysection, "./mypage" => /mysection/mypage
+-		// Regular pages: /mysection/mypage.md, Path=/mysection/mypage, "./someotherpage" => /mysection/mypage/../someotherpage
+-		// Regular leaf bundles: /mysection/mypage/index.md, Path=/mysection/mypage, "./someotherpage" => /mysection/mypage/../someotherpage
+-		// Given the above, for regular pages we use the containing folder.
+-		var baseDir string
+-		if pi := context.PathInfo(); pi != nil {
+-			if pi.IsBranchBundle() || (hadExtension && strings.HasPrefix(ref, "../")) {
+-				baseDir = pi.Dir()
+-			} else {
+-				baseDir = pi.ContainerDir()
+-			}
+-		}
+-
+-		rel := path.Join(baseDir, ref)
+-
+-		relPath, _ := contentPathParser.ParseBaseAndBaseNameNoIdentifier(files.ComponentFolderContent, rel)
+-
+-		n, err := c.getContentNodeFromPath(relPath, ref)
+-		if n != nil || err != nil {
+-			return n, err
+-		}
+-
+-		if hadExtension && context.File() != nil {
+-			if n, err := c.getContentNodeFromRefReverseLookup(inRef, context.File().FileInfo()); n != nil || err != nil {
+-				return n, err
+-			}
+-		}
+-
+-	}
+-
+-	if strings.HasPrefix(ref, ".") {
+-		// Page relative, no need to look further.
+-		return nil, nil
+-	}
+-
+-	relPath, nameNoIdentifier := contentPathParser.ParseBaseAndBaseNameNoIdentifier(files.ComponentFolderContent, ref)
+-
+-	n, err := c.getContentNodeFromPath(relPath, ref)
+-
+-	if n != nil || err != nil {
+-		return n, err
+-	}
+-
+-	if hadExtension && s.home != nil && s.home.File() != nil {
+-		if n, err := c.getContentNodeFromRefReverseLookup(inRef, s.home.File().FileInfo()); n != nil || err != nil {
+-			return n, err
+-		}
+-	}
+-
+-	var doSimpleLookup bool
+-	if isReflink || context == nil {
+-		slashCount := strings.Count(inRef, "/")
+-		if slashCount <= 1 {
+-			doSimpleLookup = slashCount == 0 || ref[0] == '/'
+-		}
+-	}
+-
+-	if !doSimpleLookup {
+-		return nil, nil
+-	}
+-
+-	n = c.pageMap.pageReverseIndex.Get(nameNoIdentifier)
+-	if n == ambiguousContentNode {
+-		return nil, fmt.Errorf("page reference %q is ambiguous", inRef)
+-	}
+-
+-	return n, nil
++	return c.pageMap.lookupContentNodeForRef(context, isReflink, hadExtension, inRef, ref)
+ }
+ 
+ func (c *pageFinder) getContentNodeFromRefReverseLookup(ref string, fi hugofs.FileMetaInfo) (contentNodeI, error) {
+-	s := c.pageMap.s
+-	meta := fi.Meta()
+-	dir := meta.Filename
+-	if !fi.IsDir() {
+-		dir = filepath.Dir(meta.Filename)
+-	}
+-
+-	realFilename := filepath.Join(dir, ref)
+-
+-	pcs, err := s.BaseFs.Content.ReverseLookup(realFilename, true)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	// There may be multiple matches, but we will only use the first one.
+-	for _, pc := range pcs {
+-		pi := s.Conf.PathParser().Parse(pc.Component, pc.Path)
+-		if n := c.pageMap.treePages.Get(pi.Base()); n != nil {
+-			return n, nil
+-		}
+-	}
+-	return nil, nil
++	return c.pageMap.lookupContentNodeFromReverseLookup(ref, fi)
+ }
+ 
+ func (c *pageFinder) getContentNodeFromPath(s string, ref string) (contentNodeI, error) {
+-	n := c.pageMap.treePages.Get(s)
+-	if n != nil {
+-		return n, nil
+-	}
+-
+-	return nil, nil
++	return c.pageMap.lookupContentNodeFromPath(s, ref)
+ }

@@ -1,0 +1,366 @@
+diff --git a/tokio/src/sync/broadcast.rs b/tokio/src/sync/broadcast.rs
+index 69ede8f8..3482bd4b 100644
+--- a/tokio/src/sync/broadcast.rs
++++ b/tokio/src/sync/broadcast.rs
+@@ -112,7 +112,7 @@
+ use crate::loom::cell::UnsafeCell;
+ use crate::loom::sync::atomic::AtomicUsize;
+ use crate::loom::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+-use crate::util::linked_list::{self, LinkedList};
++use crate::util::linked_list::{LinkedList, Pointers, Waiter};
+ 
+ use std::fmt;
+ use std::future::Future;
+@@ -123,6 +123,8 @@ use std::sync::atomic::Ordering::SeqCst;
+ use std::task::{Context, Poll, Waker};
+ use std::usize;
+ 
++use super::Tail;
++
+ /// Sending-half of the [`broadcast`] channel.
+ ///
+ /// May be used from many threads. Messages can be sent with
+@@ -308,21 +310,6 @@ struct Shared<T> {
+     num_tx: AtomicUsize,
+ }
+ 
+-/// Next position to write a value.
+-struct Tail {
+-    /// Next position to write to.
+-    pos: u64,
+-
+-    /// Number of active receivers.
+-    rx_cnt: usize,
+-
+-    /// True if the channel is closed.
+-    closed: bool,
+-
+-    /// Receivers waiting for a value.
+-    waiters: LinkedList<Waiter, <Waiter as linked_list::Link>::Target>,
+-}
+-
+ /// Slot in the buffer.
+ struct Slot<T> {
+     /// Remaining number of receivers that are expected to see this value.
+@@ -346,29 +333,6 @@ struct Slot<T> {
+     val: UnsafeCell<Option<T>>,
+ }
+ 
+-/// An entry in the wait queue.
+-struct Waiter {
+-    /// True if queued.
+-    queued: bool,
+-
+-    /// Task waiting on the broadcast channel.
+-    waker: Option<Waker>,
+-
+-    /// Intrusive linked-list pointers.
+-    pointers: linked_list::Pointers<Waiter>,
+-
+-    /// Should not be `Unpin`.
+-    _p: PhantomPinned,
+-}
+-
+-generate_addr_of_methods! {
+-    impl<> Waiter {
+-        unsafe fn addr_of_pointers(self: NonNull<Self>) -> NonNull<linked_list::Pointers<Waiter>> {
+-            &self.pointers
+-        }
+-    }
+-}
+-
+ struct RecvGuard<'a, T> {
+     slot: RwLockReadGuard<'a, Slot<T>>,
+ }
+@@ -673,21 +637,6 @@ fn new_receiver<T>(shared: Arc<Shared<T>>) -> Receiver<T> {
+     Receiver { shared, next }
+ }
+ 
+-impl Tail {
+-    fn notify_rx(&mut self) {
+-        while let Some(mut waiter) = self.waiters.pop_back() {
+-            // Safety: `waiters` lock is still held.
+-            let waiter = unsafe { waiter.as_mut() };
+-
+-            assert!(waiter.queued);
+-            waiter.queued = false;
+-
+-            let waker = waiter.waker.take().unwrap();
+-            waker.wake();
+-        }
+-    }
+-}
+-
+ impl<T> Clone for Sender<T> {
+     fn clone(&self) -> Sender<T> {
+         let shared = self.shared.clone();
+@@ -773,22 +722,26 @@ impl<T> Receiver<T> {
+         self.len() == 0
+     }
+ 
++}
++
++impl<T> Shared<T> {
+     /// Locks the next value if there is one.
+-    fn recv_ref(
+-        &mut self,
++    fn recv_ref<'a>(
++        &'a self,
++        receiver: &'a mut Receiver<T>,
+         waiter: Option<(&UnsafeCell<Waiter>, &Waker)>,
+-    ) -> Result<RecvGuard<'_, T>, TryRecvError> {
+-        let idx = (self.next & self.shared.mask as u64) as usize;
++    ) -> Result<RecvGuard<'a, T>, TryRecvError> {
++        let idx = (receiver.next & (self.buffer.len() as u64 - 1)) as usize;
+ 
+         // The slot holding the next value to read
+-        let mut slot = self.shared.buffer[idx].read().unwrap();
++        let mut slot = self.buffer[idx].read().unwrap();
+ 
+-        if slot.pos != self.next {
+-            let next_pos = slot.pos.wrapping_add(self.shared.buffer.len() as u64);
++        if slot.pos != receiver.next {
++            let next_pos = slot.pos.wrapping_add(self.buffer.len() as u64);
+ 
+             // The receiver has read all current values in the channel and there
+             // is no waiter to register
+-            if waiter.is_none() && next_pos == self.next {
++            if waiter.is_none() && next_pos == receiver.next {
+                 return Err(TryRecvError::Empty);
+             }
+ 
+@@ -801,18 +754,18 @@ impl<T> Receiver<T> {
+             // the slot lock.
+             drop(slot);
+ 
+-            let mut tail = self.shared.tail.lock();
++            let mut tail = self.tail.lock();
+ 
+             // Acquire slot lock again
+-            slot = self.shared.buffer[idx].read().unwrap();
++            slot = self.buffer[idx].read().unwrap();
+ 
+             // Make sure the position did not change. This could happen in the
+             // unlikely event that the buffer is wrapped between dropping the
+             // read lock and acquiring the tail lock.
+-            if slot.pos != self.next {
+-                let next_pos = slot.pos.wrapping_add(self.shared.buffer.len() as u64);
++            if slot.pos != receiver.next {
++                let next_pos = slot.pos.wrapping_add(self.buffer.len() as u64);
+ 
+-                if next_pos == self.next {
++                if next_pos == receiver.next {
+                     // Store the waker
+                     if let Some((waiter, waker)) = waiter {
+                         // Safety: called while locked.
+@@ -861,26 +814,26 @@ impl<T> Receiver<T> {
+                 }
+                 let next = tail
+                     .pos
+-                    .wrapping_sub(self.shared.buffer.len() as u64 + adjust);
++                    .wrapping_sub(self.buffer.len() as u64 + adjust);
+ 
+-                let missed = next.wrapping_sub(self.next);
++                let missed = next.wrapping_sub(receiver.next);
+ 
+                 drop(tail);
+ 
+                 // The receiver is slow but no values have been missed
+                 if missed == 0 {
+-                    self.next = self.next.wrapping_add(1);
++                    receiver.next = receiver.next.wrapping_add(1);
+ 
+                     return Ok(RecvGuard { slot });
+                 }
+ 
+-                self.next = next;
++                receiver.next = next;
+ 
+                 return Err(TryRecvError::Lagged(missed));
+             }
+         }
+ 
+-        self.next = self.next.wrapping_add(1);
++        receiver.next = receiver.next.wrapping_add(1);
+ 
+         if slot.closed {
+             return Err(TryRecvError::Closed);
+@@ -1036,7 +989,8 @@ impl<T: Clone> Receiver<T> {
+     /// }
+     /// ```
+     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+-        let guard = self.recv_ref(None)?;
++        let shared = self.shared.clone();
++        let guard = shared.recv_ref(self, None)?;
+         guard.clone_value().ok_or(TryRecvError::Closed)
+     }
+ }
+@@ -1050,8 +1004,10 @@ impl<T> Drop for Receiver<T> {
+ 
+         drop(tail);
+ 
++        let shared = self.shared.clone();
++
+         while self.next < until {
+-            match self.recv_ref(None) {
++            match shared.recv_ref(self, None) {
+                 Ok(_) => {}
+                 // The channel is closed
+                 Err(TryRecvError::Closed) => break,
+@@ -1071,7 +1027,7 @@ impl<'a, T> Recv<'a, T> {
+             waiter: UnsafeCell::new(Waiter {
+                 queued: false,
+                 waker: None,
+-                pointers: linked_list::Pointers::new(),
++                pointers: Pointers::new(),
+                 _p: PhantomPinned,
+             }),
+         }
+@@ -1099,7 +1055,8 @@ where
+     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {
+         let (receiver, waiter) = self.project();
+ 
+-        let guard = match receiver.recv_ref(Some((waiter, cx.waker()))) {
++        let shared = receiver.shared.clone();
++        let guard = match shared.recv_ref(receiver, Some((waiter, cx.waker()))) {
+             Ok(value) => value,
+             Err(TryRecvError::Empty) => return Poll::Pending,
+             Err(TryRecvError::Lagged(n)) => return Poll::Ready(Err(RecvError::Lagged(n))),
+@@ -1133,26 +1090,6 @@ impl<'a, T> Drop for Recv<'a, T> {
+     }
+ }
+ 
+-/// # Safety
+-///
+-/// `Waiter` is forced to be !Unpin.
+-unsafe impl linked_list::Link for Waiter {
+-    type Handle = NonNull<Waiter>;
+-    type Target = Waiter;
+-
+-    fn as_raw(handle: &NonNull<Waiter>) -> NonNull<Waiter> {
+-        *handle
+-    }
+-
+-    unsafe fn from_raw(ptr: NonNull<Waiter>) -> NonNull<Waiter> {
+-        ptr
+-    }
+-
+-    unsafe fn pointers(target: NonNull<Waiter>) -> NonNull<linked_list::Pointers<Waiter>> {
+-        Waiter::addr_of_pointers(target)
+-    }
+-}
+-
+ impl<T> fmt::Debug for Sender<T> {
+     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+         write!(fmt, "broadcast::Sender")
+diff --git a/tokio/src/sync/mod.rs b/tokio/src/sync/mod.rs
+index 457e6ab2..10b98fed 100644
+--- a/tokio/src/sync/mod.rs
++++ b/tokio/src/sync/mod.rs
+@@ -470,6 +470,39 @@ cfg_sync! {
+     pub use self::once_cell::{OnceCell, SetError};
+ 
+     pub mod watch;
++
++    /// Next position to write a value in a broadcast channel.
++    pub(crate) struct Tail {
++        /// Next position to write to.
++        pub(crate) pos: u64,
++
++        /// Number of active receivers.
++        pub(crate) rx_cnt: usize,
++
++        /// True if the channel is closed.
++        pub(crate) closed: bool,
++
++        /// Receivers waiting for a value.
++        pub(crate) waiters: crate::util::linked_list::LinkedList<
++            crate::util::linked_list::Waiter,
++            <crate::util::linked_list::Waiter as crate::util::linked_list::Link>::Target,
++        >,
++    }
++
++    impl Tail {
++        pub(crate) fn notify_rx(&mut self) {
++            while let Some(mut waiter) = self.waiters.pop_back() {
++                // Safety: `waiters` lock is still held.
++                let waiter = unsafe { waiter.as_mut() };
++
++                assert!(waiter.queued);
++                waiter.queued = false;
++
++                let waker = waiter.waker.take().unwrap();
++                waker.wake();
++            }
++        }
++    }
+ }
+ 
+ cfg_not_sync! {
+diff --git a/tokio/src/util/linked_list.rs b/tokio/src/util/linked_list.rs
+index 9698f727..3961a857 100644
+--- a/tokio/src/util/linked_list.rs
++++ b/tokio/src/util/linked_list.rs
+@@ -12,6 +12,9 @@ use core::marker::{PhantomData, PhantomPinned};
+ use core::mem::ManuallyDrop;
+ use core::ptr::{self, NonNull};
+ 
++#[cfg(feature = "sync")]
++use std::task::Waker;
++
+ /// An intrusive linked list.
+ ///
+ /// Currently, the list is not emptied on drop. It is the caller's
+@@ -352,6 +355,52 @@ impl<T> fmt::Debug for Pointers<T> {
+     }
+ }
+ 
++
++#[cfg(feature = "sync")]
++pub(crate) struct Waiter {
++    /// True if queued.
++    pub(crate) queued: bool,
++
++    /// Task waiting on the broadcast channel.
++    pub(crate) waker: Option<Waker>,
++
++    /// Intrusive linked-list pointers.
++    pub(crate) pointers: Pointers<Waiter>,
++
++    /// Should not be `Unpin`.
++    pub(crate) _p: PhantomPinned,
++}
++
++#[cfg(feature = "sync")]
++generate_addr_of_methods! {
++    impl<> Waiter {
++        unsafe fn addr_of_pointers(self: NonNull<Self>) -> NonNull<Pointers<Waiter>> {
++            &self.pointers
++        }
++    }
++}
++
++/// # Safety
++///
++/// `Waiter` is forced to be !Unpin.
++#[cfg(feature = "sync")]
++unsafe impl Link for Waiter {
++    type Handle = NonNull<Waiter>;
++    type Target = Waiter;
++
++    fn as_raw(handle: &NonNull<Waiter>) -> NonNull<Waiter> {
++        *handle
++    }
++
++    unsafe fn from_raw(ptr: NonNull<Waiter>) -> NonNull<Waiter> {
++        ptr
++    }
++
++    unsafe fn pointers(target: NonNull<Waiter>) -> NonNull<Pointers<Waiter>> {
++        Waiter::addr_of_pointers(target)
++    }
++}
++
+ #[cfg(test)]
+ #[cfg(not(loom))]
+ mod tests {
