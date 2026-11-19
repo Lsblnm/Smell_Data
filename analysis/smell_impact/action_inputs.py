@@ -8,6 +8,7 @@ import re
 
 from measure import OUT, ROOT, TRACES
 from static_metrics import MAY_WRITE
+from answer_sources import lucene_prompt_evidence
 
 
 def local_path(value):
@@ -118,10 +119,7 @@ def event(model, group, task, line):
 
 
 def case_checks():
-    lucene = "apache__lucene-12626"
-    b = event("gpt", "None-FE", lucene, 10)
-    v = event("gpt", "FE-S2", lucene, 24)
-    assert b["input"] == v["input"] and (b["status"], v["status"]) == ("completed", "error")
+    lucene_prompt_evidence()
 
     gson = "google__gson-2479"
     a = event("deepseek", "None-GC", gson, 6)
@@ -176,6 +174,7 @@ def case_checks():
     assert changed[0] == changed[1] and len(changed[0]) == 4
     return dict(
         lucene_same_patch_different_status=True,
+        lucene_edit_matches_existing_and_fix_in_prompt=True,
         gson_original_matches=len(old),
         gson_injected_matches=len(new),
         gson_preserved_matches=len(old & new),

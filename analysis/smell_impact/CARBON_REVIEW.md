@@ -32,7 +32,7 @@ Carbon 对 GPT 的 God Class 统计有说服力。S0、S1、S2 的注入补丁�
 
 窗口可以直接跳到文件深处。核查 262 条 GPT God Class S2 有效轨迹，69 条用结构化 `read` 实际返回了目标文件第 2,000 ～ 6,500 行范围内的源码，62 条在首次可识别改写之前就已读到。Lucene #13494 先搜索，再一次读取第 5,180 ～ 5,699 行。这个检查说明长文件深处的代码有机会进入上下文，无法据此认定其中每个方法都相关或都无关。[实际工具返回](../../traj_results/opencode/gpt/GC-S2/apache__lucene-13494/trajectory.jsonl#L15)
 
-Long Method 也可以对照两条具体轨迹。Lucene #12626 的修复点从方法入口后 2 行移到 291 行，首次修改前的目标文件读取从 1 次增至 5 次。Preact #4316 的方法有 250 LOC、CC 50、8 层嵌套，但修复所需的事件分支就在首次 260 行读取内，仍只读一次就开始改，两侧均通过，token 从 197,059 降至 126,297。**可见性和所需控制流路径**比“长方法每一行都必须读”更贴近这两条记录。[Lucene 最后一次定位读取](../../traj_results/opencode/gpt/LM-S2/apache__lucene-12626/trajectory.jsonl#L21) · [Preact 首次读取](../../traj_results/opencode/gpt/LM-S2/preactjs__preact-4316/trajectory.jsonl#L6)
+Long Method 也可以对照两条具体轨迹。Lucene #12626 的题面已给出修法。把这项已知修复应用到变体时，修复点从方法入口后 2 行移到 291 行，首次修改前的目标文件读取从 1 次增至 5 次。Preact #4316 的方法有 250 LOC、CC 50、8 层嵌套，但修复所需的事件分支就在首次 260 行读取内，仍只读一次就开始改，两侧均通过，token 从 197,059 降至 126,297。**可见性和所需控制流路径**比“长方法每一行都必须读”更贴近这两条记录。[Lucene 最后一次定位读取](../../traj_results/opencode/gpt/LM-S2/apache__lucene-12626/trajectory.jsonl#L21) · [Preact 首次读取](../../traj_results/opencode/gpt/LM-S2/preactjs__preact-4316/trajectory.jsonl#L6)
 
 论文的 160 行分界来自分组比较。180 行是 GPT 无注入组结构化读取中显式请求上限的中位数。对 828 个 GPT 长方法配对，再做一次敏感性检查，同时考虑原题固定效应、注入档位和连续的对数 LOC，另加“超过 160 行”的阶跃项，估计为 +16.8%（−1.9% ～ +38.9%）。数据容许窗口附近存在明显增幅，也容许沿连续规模变化。它不足以确立通用的 160 行硬上限。[原分组](../smell_paper/analysis.py#L174) · [读取上限的计算](../smell_paper/analysis.py#L218)
 
@@ -55,4 +55,4 @@ Long Method 也可以对照两条具体轨迹。Lucene #12626 的修复点从方
 
 复核脚本读取原补丁、轨迹、评测结果及逐题配对表。运行 `uv run --python 3.12 analysis/smell_impact/audit_carbon.py` 可复算文中的附加检验。本次未重跑模型。[复核脚本](audit_carbon.py)
 
-对“为什么需要多定位、多读和返工”的进一步核对，逐项追踪了失效的旧方法位置、同一关键词增加的命中、移出阅读窗口的状态赋值，以及放宽数组判断后失败的具体断言。[代码变化与工具动作的逐项对照](METRIC_FINDINGS.md#L91)
+对“为什么需要多定位、多读和返工”的进一步核对，逐项追踪了题面所给修法与注入后代码位置的错位、同一关键词增加的命中、移出阅读窗口的状态赋值，以及放宽数组判断后失败的具体断言。[代码变化与工具动作的逐项对照](METRIC_FINDINGS.md#L91)

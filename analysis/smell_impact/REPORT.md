@@ -4,7 +4,7 @@
 
 **最清楚的差异出现在修复成本。** 同一道题注入坏味后，GPT、GLM、DeepSeek 的总 token 分别增加 7.8%、30.9%、29.5%。三个模型都更频繁地回到已看过的相关文件。GPT 有 895 对运行在注入前后都通过了评测，在这一子集中，注入组仍多用 11.9% 的 token。**成功率的证据更弱。** GPT 的六组通过率差都偏负，按原题汇总后为 −1.2 个百分点，95% 区间从 −4.9 到 +2.3 个百分点。GLM 和 DeepSeek 的轨迹支持分析成本，仓库尚缺这两个模型的最终测试判定。
 
-**哪些属性造成了开销？** 按实际数值重算后，Long Method 的 LOC、圈复杂度、嵌套深度分别与总 token 有弱正关联，但三者随注入一起变化，现有设计识别不了唯一因素。证据更直接的是具体开发步骤。Lucene 一项状态恢复修复中，方法入口到状态赋值从 2 行拉长到 291 行，GPT 首次改代码前从一次读取增至五次。Laravel 的消息处理任务则主要把额外 token 花在首次修改后的兼容性返工上。详细分析逐题列出了原始需求、代码位置、相同读取请求的输出、分阶段 token 和反例。[连续指标与修复过程](METRIC_FINDINGS.md) · [完整指标图册](output/pdf/metric-atlas.pdf)
+**哪些属性造成了开销？** 按实际数值重算后，Long Method 的 LOC、圈复杂度、嵌套深度分别与总 token 有弱正关联，但三者随注入一起变化，现有设计识别不了唯一因素。证据更直接的是具体开发步骤。Lucene 一项题面已给出修复代码的状态恢复任务中，方法入口到状态赋值从 2 行拉长到 291 行，GPT 首次改代码前从一次读取增至五次。Laravel 的消息处理任务则主要把额外 token 花在首次修改后的兼容性返工上。详细分析逐题列出了原始需求、代码位置、相同读取请求的输出、分阶段 token 和反例。[连续指标与修复过程](METRIC_FINDINGS.md) · [完整指标图册](output/pdf/metric-atlas.pdf)
 
 ## 1. Token 与耗时
 
@@ -78,12 +78,12 @@
 
 **God Class 让同一文件承载更多无关候选代码。** 三个模型每题对已看过的注入相关文件分别多回访 0.81、1.89、3.14 次。Gson 的适配器注册任务中，DeepSeek 对注入后的 `GsonBuilder` 搜索 `JsonElement`，还命中了新增的树读写方法，结果延伸到 6,400 行以后。它随后分段读类、查调用和文档。无注入是 10 轮、139,996 token，注入是 16 轮、288,529 token。两条轨迹都运行了定向和模块 Maven 测试，仓内只提供它们的运行轨迹。[注入说明](../../smell-patch-intro/S2/GodClass/google__gson-2479-GC.json) · [对照读取](../../traj_results/opencode/deepseek/None-GC/google__gson-2479/trajectory.jsonl#L10) · [注入后的搜索与分段读取](../../traj_results/opencode/deepseek/GC-S2/google__gson-2479/trajectory.jsonl#L5)
 
-**Long Method 的代价取决于修复点能否直接定位。** Lucene 的 `SegmentInfos.replace` 修复只需复制 `userData`。无注入的 GPT 读一次方法附近的代码就定位了赋值点。注入把原方法展开为含校验和多步状态更新的长流程，GPT 按多个行区间阅读同一文件，再搜索 `lastGeneration`，最终仍只加了一行。用量从 107,537 升到 182,469 token。Preact 的 `onFocusIn`/`onFocusOut` 有可精确搜索的名字，GPT 一次就读到了膨胀后的 `setProperty` 中的目标分支。两边都通过，注入反而从 16 轮减至 10 轮，token 从 197,059 降至 126,297。长方法增加了可能要检查的代码，局部线索的明确程度影响一次具体修复会用到多少。[Lucene 对照](../../traj_results/opencode/gpt/None-LM/apache__lucene-12626/trajectory.jsonl#L6) · [Lucene 分段读取](../../traj_results/opencode/gpt/LM-S2/apache__lucene-12626/trajectory.jsonl#L6) · [Preact 对照](../../traj_results/opencode/gpt/None-LM/preactjs__preact-4316/trajectory.jsonl#L18) · [Preact 注入后直接定位](../../traj_results/opencode/gpt/LM-S2/preactjs__preact-4316/trajectory.jsonl#L13)
+**Long Method 的代价取决于修复点能否直接定位。** Lucene 的题面给出了完整修复代码，要求 `SegmentInfos.replace` 复制 `userData`。无注入的 GPT 读一次方法附近的代码就确认了题面所给的赋值点。注入把原方法展开为含校验和多步状态更新的长流程，GPT 按多个行区间阅读同一文件，再搜索 `lastGeneration`，最终仍只加了一行。用量从 107,537 升到 182,469 token。Preact 的 `onFocusIn`/`onFocusOut` 有可精确搜索的名字，GPT 一次就读到了膨胀后的 `setProperty` 中的目标分支。两边都通过，注入反而从 16 轮减至 10 轮，token 从 197,059 降至 126,297。长方法增加了可能要检查的代码，局部线索的明确程度影响一次具体修复会用到多少。[Lucene 对照](../../traj_results/opencode/gpt/None-LM/apache__lucene-12626/trajectory.jsonl#L6) · [Lucene 分段读取](../../traj_results/opencode/gpt/LM-S2/apache__lucene-12626/trajectory.jsonl#L6) · [Preact 对照](../../traj_results/opencode/gpt/None-LM/preactjs__preact-4316/trajectory.jsonl#L18) · [Preact 注入后直接定位](../../traj_results/opencode/gpt/LM-S2/preactjs__preact-4316/trajectory.jsonl#L13)
 
 ### 用失败和反向轨迹检验解释
 
 - **多读有时仍然失败。** 在 fmt 的 C++ 范围格式化任务里，GPT 的 Long Method S2 轨迹反复调整嵌套 formatter 的分派与引用类别，发现新的回归后撤回改动。它最终报告仍有一项本地失败，并将其归于已有基线。对照获评通过，注入获评未通过，轮数 36 → 65，token 912,042 → 2,356,938。轨迹直接证明了返工；最终评测具体是哪一条断言失败，仓内没有逐项日志。[对照轨迹](../../traj_results/opencode/gpt/None-LM/fmtlib__fmt-3158/trajectory.jsonl#L85) · [注入后的回退](../../traj_results/opencode/gpt/LM-S2/fmtlib__fmt-3158/trajectory.jsonl#L191) · [最终验证说明](../../traj_results/opencode/gpt/LM-S2/fmtlib__fmt-3158/trajectory.jsonl#L210)
-- **判定翻转也可能出现在相同修复上。** 在同一道 Lucene 题中，GPT 对照和 God Class S2 都在同一文件、同一方法、同一条赋值之后增加 `userData = other.userData;`，最终却是对照未通过、注入通过。对照在 Agent 侧跑过定向测试，注入侧下载 Gradle wrapper 失败。六组中的 196 个翻转有 5 个连改动路径和增删行文本都相同，底层代码和测试环境仍可能有别。凭通过标签无法把这些例子归为 Agent 的代码理解变好或变差。[对照补丁](../../traj_results/opencode/gpt/None-GC/apache__lucene-12626/patch.diff) · [注入补丁](../../traj_results/opencode/gpt/GC-S2/apache__lucene-12626/patch.diff) · [工具实际返回的网络错误](../../traj_results/opencode/gpt/GC-S2/apache__lucene-12626/trajectory.jsonl#L20)
+- **判定翻转也可能出现在相同修复上。** 在同一道题面已给出改法的 Lucene 题中，GPT 对照和 God Class S2 都在同一文件、同一方法、同一条赋值之后增加 `userData = other.userData;`，最终却是对照未通过、注入通过。对照在 Agent 侧跑过定向测试，注入侧下载 Gradle wrapper 失败。六组中的 196 个翻转有 5 个连改动路径和增删行文本都相同，底层代码和测试环境仍可能有别。凭通过标签无法把这些例子归为 Agent 的代码理解变好或变差。[对照补丁](../../traj_results/opencode/gpt/None-GC/apache__lucene-12626/patch.diff) · [注入补丁](../../traj_results/opencode/gpt/GC-S2/apache__lucene-12626/patch.diff) · [工具实际返回的网络错误](../../traj_results/opencode/gpt/GC-S2/apache__lucene-12626/trajectory.jsonl#L20)
 - **额外轮数解释不了所有 token，外部参考也能改变解题路径。** GLM 在 Lombok 两个版本都读取了已有修复提交。在 God Class S2 中，它明确提到应用该上游修复。两侧读的是同一个 `HandleUtilityClass.java`，一次读取的返回量分别为 7,974 和 62,222 个字符。注入侧轮数反而从 26 降到 24，总 token 却从 481,404 升到 776,009。这同时展示了每次读取的体积效应和现成补丁对能力判断的干扰。[对照读取](../../traj_results/opencode/glm/None-GC/projectlombok__lombok-3326/trajectory.jsonl#L16) · [注入后读取](../../traj_results/opencode/glm/GC-S2/projectlombok__lombok-3326/trajectory.jsonl#L9) · [上游修复记录](../../traj_results/opencode/glm/GC-S2/projectlombok__lombok-3326/trajectory.jsonl#L51)
 
 ## 4. 这些结论能推广多远
@@ -95,7 +95,7 @@
 | 其余 14 个仓库独立汇总 | +6.7%（−1.0% ～ +14.3%） | +31.1%（+21.6% ～ +43.5%） | +32.2%（+18.8% ～ +44.6%） |
 | 剔除任一侧带网页获取、克隆、指定提交查询等标记的配对 | +8.1%（2,286 对） | +29.4%（1,023 对） | +26.4%（1,216 对） |
 
-14 个仓库中，每道任务显式读取或检索注入相关文件的次数仍分别多 0.53、1.24、2.10 次，三者的 95% 区间都在零以上。这个按仓库的拆分验证了机制在不同代码库中的表现。GPT 的总量效应较小，单看这 14 个仓库，token 区间包含零。网页和历史查询过滤会同时排除正常参考，并不能识别全部上游补丁访问。
+14 个仓库中，每道任务显式读取或检索注入相关文件的次数仍分别多 0.53、1.24、2.10 次，三者的 95% 区间都在零以上。这个按仓库的拆分验证了机制在不同代码库中的表现。GPT 的总量效应较小，单看这 14 个仓库，token 区间包含零。网页和历史查询过滤会同时排除正常参考，覆盖不到题面直接附带的解法，也会漏掉部分上游补丁访问。[已核实的答案来源及剔除试算](METRIC_FINDINGS.md#answer-access)
 
 有三项限制直接影响归因。
 
