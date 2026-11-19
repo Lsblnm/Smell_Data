@@ -9,7 +9,8 @@
 | `figures/` | 13 张论文插图（`figures/slide/` 为幻灯片无标题版本） |
 | `structural.py` | 补丁底层结构特征（拓扑耦合、控制流分支增量、故障点纠缠）与四阶段轨迹拆解模块 |
 | `accounting.py` | 多轮对话上下文重算来源精确拆解模块 |
-| `data/results.json` | 论文与幻灯片全部统计量和置信区间的唯一数据源 |
+| [data/results.json](data/results.json) | 论文与幻灯片全部统计量和置信区间的唯一数据源 |
+| [../task_redesign/README.md](../task_redesign/README.md) | **Benchmark v2 任务改造执行套件**（12 份改造版 `S0～S2` 提示词模板、1,110 份存量补丁复用映射与增量调度工单） |
 
 一键复现（Python 3.12）：
 
